@@ -16,8 +16,7 @@ inline void NgramScalarFun(DataChunk &args, ExpressionState &state, Vector &resu
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	auto ngram_scalar_function =
-	    ScalarFunction("ngram", {LogicalType::VARCHAR}, LogicalType::VARCHAR, NgramScalarFun);
+	auto ngram_scalar_function = ScalarFunction("ngram", {LogicalType::VARCHAR}, LogicalType::VARCHAR, NgramScalarFun);
 
 	loader.RegisterFunction(ngram_scalar_function);
 }

@@ -340,3 +340,30 @@ Status ledger:
 | Incomplete | Gate | p95 target met at TB spot check; community install works | Missing: benchmark evidence + install run. |
 | Incomplete | Risk | duckdb-fts trigram sidecar overlaps scope | Missing: recheck of duckdb-fts state before submission. |
 | Incomplete | Doc | User docs: maintenance contract, fallbacks, settings | Missing: docs. |
+
+## Phase 7: Restore Full Platform CI Matrix
+
+Goal:
+This repo's CI builds and tests the extension on every distribution platform, macOS
+first among them. (Community-extensions CI builds all platforms on duckdb-org
+infrastructure regardless; this phase makes platform breakage visible here, pre-merge.)
+
+Scope:
+- Remove the `exclude_archs` trim from `.github/workflows/MainDistributionPipeline.yml`
+  (added during development to conserve private-repo Actions minutes; macOS runners bill
+  at 10x). Restore macOS (osx_amd64, osx_arm64), then Windows and Wasm targets.
+- Fix any platform-specific build or test failures the wider matrix surfaces.
+
+Out of scope:
+- New functionality; this phase only widens build/test coverage.
+
+Completion gate:
+Full distribution matrix green on the pinned DuckDB release, including macOS.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 7A: Re-enable macOS archs in CI | Missing: workflow change + green run. |
+| Incomplete | Work | 7B: Re-enable Windows + Wasm archs | Missing: workflow change + green run. |
+| Incomplete | Gate | Full matrix green incl. macOS | Missing: CI evidence. |

@@ -16,8 +16,3 @@ query I
 SELECT ngram('Sam');
 ----
 ...........🦆 Sam
-
-query I
-SELECT ngram_openssl_version('Michael') ILIKE 'Ngram Michael, my linked OpenSSL version is OpenSSL%';
-----
-true

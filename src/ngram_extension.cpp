@@ -6,9 +6,6 @@
 #include "duckdb/function/scalar_function.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
-// OpenSSL linked through vcpkg
-#include <openssl/opensslv.h>
-
 namespace duckdb {
 
 inline void NgramScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -18,25 +15,11 @@ inline void NgramScalarFun(DataChunk &args, ExpressionState &state, Vector &resu
 	});
 }
 
-inline void NgramOpenSSLVersionScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &name_vector = args.data[0];
-	UnaryExecutor::Execute<string_t, string_t>(name_vector, result, args.size(), [&](string_t name) {
-		return StringVector::AddString(result, "Ngram " + name.GetString() + ", my linked OpenSSL version is " +
-		                                           OPENSSL_VERSION_TEXT);
-	});
-}
-
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register a scalar function
 	auto ngram_scalar_function =
 	    ScalarFunction("ngram", {LogicalType::VARCHAR}, LogicalType::VARCHAR, NgramScalarFun);
 
 	loader.RegisterFunction(ngram_scalar_function);
-
-	// Register another scalar function
-	auto ngram_openssl_version_scalar_function = ScalarFunction("ngram_openssl_version", {LogicalType::VARCHAR},
-	                                                             LogicalType::VARCHAR, NgramOpenSSLVersionScalarFun);
-	loader.RegisterFunction(ngram_openssl_version_scalar_function);
 }
 
 void NgramExtension::Load(ExtensionLoader &loader) {

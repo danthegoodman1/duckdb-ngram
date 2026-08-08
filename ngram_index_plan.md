@@ -181,7 +181,7 @@ Status ledger:
 | Complete | Scope | Extension scaffold builds against pinned duckdb | Repo github.com/danthegoodman1/duckdb-ngram (private), duckdb submodule @ v1.5.5, local `make`/`make test` green. |
 | Complete | Work | 1C: Re-verify Key Research Facts against pinned duckdb v1.5.5 and re-pin the plan's file:line references | Full verification pass 2026-08-08; Key Research Facts section rewritten with v1.5.5 pins. Notable: `RowIdOptimizerExtension` demo and `KEEP_ROW_IDS` are main-only; ILIKE reaches `table_filters` too; `DataTable::Fetch` handles transaction-local rowids natively; plan verification is DEBUG-build-only. |
 | Complete | Work | 1A: `trigrams()` scalar function with shared normalization module | src/trigram.cpp + src/trigrams_function.cpp; positional optional args (named args unsupported for scalar functions); test/sql/trigrams.test. |
-| Partial | Work | 1B: Needle decomposition + short-needle detection | DecomposeNeedle + too_short in src/trigram.cpp, shares ExtractGrams with 1A; direct tests come with the Phase 2/3 SQL surface that exposes it. |
+| Complete | Work | 1B: Needle decomposition + short-needle detection | DecomposeNeedle + too_short in src/trigram.cpp, shares ExtractGrams with 1A; O(k²) dedupe replaced with a set (first-occurrence order kept). Exercised directly through the Phase 3 surface: dedupe ('aaaa' probes one gram), short-needle fallback, gram-boundary lengths, and per-index gram/case options in test/sql/ngram_search*.test. |
 | Complete | Gate | Loads in CLI; extraction matches reference on unicode fixtures | CLI load + generated fixture suite (scripts/gen_trigram_fixtures.py, incl. Cherokee/Deseret/Kelvin/ẞ/sigma); reviewer's full-codepoint sweep vs `lower()`: 0 divergences. CI green: run 31267278753. |
 | Complete | Test | sqllogictest suite for extraction edge cases | test/sql/trigrams.test + generated test/sql/trigrams_fixtures.test. |
 
@@ -259,13 +259,15 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Scope | Exhaustive explicit search path | Missing: implementation. |
-| Incomplete | Work | 3A: Rarest-first selection + intersection (`ngram_candidates`) | Missing: implementation + tests. |
-| Incomplete | Work | 3B: Fetch driver + recheck + vacuum lock (`ngram_search`) | Missing: implementation + tests. |
-| Incomplete | Work | 3C: HWM tail-scan union + transaction-local phase | Missing: implementation + visibility tests. |
-| Incomplete | Gate | Differential identity vs brute force under concurrency | Missing: passing property-test run. |
-| Incomplete | Test | Property-based differential suite | Missing: harness. |
-| Incomplete | Risk | Rowid instability during vacuum if lock scope wrong | Missing: targeted race test. |
+| Complete | Scope | Exhaustive explicit search path | src/ngram_search.cpp: `ngram_search(table, needle[, col := ...])` + `ngram_candidates(table, column, needle)` table functions, `ngram_max_grams_per_query` setting (default 8). Named parameter is `col` because `column` is a reserved keyword. |
+| Complete | Work | 3A: Rarest-first selection + intersection (`ngram_candidates`) | Stats scan supplies posting counts; K rarest probed via per-gram segment scans with an equality TableFilter (zone-map pruned, postings blobs of non-matching rows never read); sorted linear-merge intersection with live-segment and min/max-overlap pruning; a needle gram absent from the index short-circuits to empty. Short needle → "all indexed rowids" fallback. test/sql/ngram_search.test (superset + exact-content assertions). |
+| Complete | Work | 3B: Fetch driver + recheck + vacuum lock (`ngram_search`) | Batched `DataTable::Fetch` in STANDARD_VECTOR_SIZE slices (driver modeled on table_scan.cpp:102-265 incl. the TASK_EXECUTOR HAVE_MORE_OUTPUT caveat); recheck folds through the shared `NormalizeString` (CI index) or raw bytes (CS index). `SharedVacuumLock` held unconditionally from before meta/segments reads until end of query; on v1.5.5 every rowid-moving checkpoint takes the exclusive vacuum lock or degrades to a concurrent (non-moving) checkpoint (storage_manager.cpp:672-683), so mid-query row motion is impossible by construction. |
+| Complete | Work | 3C: HWM tail-scan union + transaction-local phase | One storage scan with a `rowid > hwm` ConstantFilter (rowid zone maps prune indexed row groups, RowGroup::CheckRowIdFilter) covers both the committed tail and transaction-local rows (local rowids >= MAX_ROW_ID always pass); shadow-table reads run through the caller's transaction, so an index created inside a still-open transaction is searchable there. test/sql/ngram_search_visibility.test. |
+| Complete | Gate | Differential identity vs brute force under concurrency | 5 sqllogictest files, 525 new assertions (`make test`: 1456 across 13 files, green). scripts/differential_search.py property harness (randomized alphabet/gram/case/rows corpora; substring, splice-trap, case-flipped, absent, short, and empty needles; committed → tail → in-transaction → deleted → post-vacuum-subset phases; deterministic per seed, PYTHONHASHSEED-independent): recorded runs seed 1026533771 = 6458 checks, seed 555000 (3 trials) = 2370, seed 7 = 1520 — 0 failures, counts reproduced across independent runs. Concurrency: test/sql/ngram_search_concurrent.test, 6 threads × 4 rounds of INSERT/UPDATE/DELETE/CHECKPOINT racing snapshot-atomic differential queries plus searches inside uncommitted writing transactions (269 assertions). |
+| Complete | Test | Property-based differential suite | scripts/differential_search.py (bounded, seed-reporting, exit-code gated) + CI-bounded test/sql/ngram_search_differential.test and ngram_search_scale.test (multi-segment corpus across the 2^20 boundary). |
+| Complete | Risk | Rowid instability during vacuum if lock scope wrong | During a query: excluded by the shared vacuum lock (see 3B). Between queries: real and pinned by test — see the staleness row below. Race coverage: concurrent CHECKPOINTs against searches with deletes in flight (ngram_search_concurrent.test) and a deterministic post-vacuum check (ngram_search_scale.test). |
+| Complete | Doc | Phase 3 staleness contract: misses-only, false positives never | Recheck + visibility make false positives impossible in every scenario (post-vacuum subset phase of the harness + scale test assert this against a genuinely compacted table: 916k of 917k rowids moved, results stayed ⊆ truth). Three misses-only gaps remain until Phase 5, documented on SearchBind and pinned in tests: (a) in-place UPDATE introducing the needle into a row <= hwm (v1.5.5 updates in place unless an ART index forces delete+insert, table_catalog_entry.cpp:327-336); (b) DELETE of indexed rows followed by checkpoint vacuum, which merges row groups, moves surviving rowids (invalidating postings) and shrinks the table end so even later INSERTs can land below the stale hwm; (c) DROP TABLE + re-CREATE under the same name binds the dead index (see the Phase 5 recreation-detection bullet). |
+| Incomplete | Work | 10GB latency benchmark (rare/moderate/dense needle vs brute scan) | Deferred until the metered gate build on ~/duckdb-ngram-bench/gate10gb.db finishes; numbers recorded here when run. |
 
 ## Phase 4: Transparent Optimizer Rewrite
 
@@ -318,10 +320,24 @@ Scope:
 - `PRAGMA ngram_refresh`: index rows between HWM and current max rowid into a new segment
   generation; advance HWM transactionally with the segment write.
 - `PRAGMA ngram_compact`: LSM-style merge of segment generations; purge tombstoned rowids.
-- Delete handling: stale candidates are eliminated by fetch/recheck; compaction reclaims.
-  Update handling: updates to indexed columns produce new rowids (delete+insert) — detect
-  and document; optional `maintenance := 'incremental'` trigger mode (evaluate DuckDB
+- Delete handling: stale candidates are eliminated by fetch/recheck until a checkpoint
+  vacuums the deletes; vacuum merges row groups and MOVES surviving rowids
+  (`row_group_collection.cpp` VacuumState: any table without native indexes has
+  `can_change_row_ids = true`), stranding postings and leaving the recorded HWM above the
+  table's new end, so refresh must detect row motion (or rebuild) — recheck keeps this
+  misses-only, never false positives. Update handling: v1.5.5 updates rows IN PLACE
+  (same rowid) unless the updated column is covered by an ART index
+  (`table_catalog_entry.cpp:327-336`), so an update that introduces a match into an
+  indexed row is invisible until refresh — refresh must re-index updated rows, not just
+  the HWM tail; optional `maintenance := 'incremental'` trigger mode (evaluate DuckDB
   trigger maturity; duckdb-fts main uses this pattern).
+- Recreation detection: DROP TABLE leaves the shadow schema behind, and the name-based
+  ownership guard matches a recreated table of the same name, so queries silently use the
+  dead index (misses-only; pinned in test/sql/ngram_search_visibility.test). v1.5.5 has no
+  stable cross-restart table identity token (catalog OIDs are per-process) and no DDL
+  hooks. Store a schema fingerprint (column names + types) in meta to catch recreations
+  that change shape; a same-shape recreation stays a documented gap unless a stronger
+  token turns up.
 
 Out of scope:
 - Automatic background scheduling (user/cron-driven).

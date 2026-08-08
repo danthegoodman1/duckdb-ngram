@@ -1,6 +1,7 @@
 #include "ngram/trigram.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "utf8proc_wrapper.hpp"
 
 namespace duckdb {
@@ -41,16 +42,14 @@ NeedleDecomposition DecomposeNeedle(const char *data, idx_t len, const GramOptio
 	NeedleDecomposition result;
 	string scratch;
 	vector<idx_t> offsets;
+	unordered_set<string> seen;
 	bool emitted = false;
 	ExtractGrams(data, len, options, scratch, offsets, [&](const char *gram, idx_t gram_len) {
 		emitted = true;
 		string gram_str(gram, gram_len);
-		for (auto &existing : result.grams) {
-			if (existing == gram_str) {
-				return;
-			}
+		if (seen.insert(gram_str).second) {
+			result.grams.push_back(std::move(gram_str));
 		}
-		result.grams.push_back(std::move(gram_str));
 	});
 	result.too_short = !emitted;
 	return result;

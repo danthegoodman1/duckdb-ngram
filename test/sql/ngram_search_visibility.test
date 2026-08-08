@@ -1,0 +1,202 @@
+# name: test/sql/ngram_search_visibility.test
+# description: ngram_search transaction visibility and staleness contract
+# group: [sql]
+
+# Covers uncommitted rows, deletes, updates, the high-water-mark tail, and an
+# index created inside a still-open transaction.
+
+require ngram
+
+statement ok
+CREATE TABLE docs(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO docs VALUES (1, 'a tent pitched'), (2, 'no match'), (3, 'ten cents');
+
+statement ok
+PRAGMA create_ngram_index('docs', 's');
+
+# uncommitted inserts are visible to their own transaction only
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO docs VALUES (100, 'uncommitted tent row');
+
+query I con1
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+100
+
+query I con2
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+
+# rows deleted inside the transaction are not returned there but stay visible elsewhere
+statement ok con1
+DELETE FROM docs WHERE id = 1;
+
+query I con1
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+100
+
+query I con2
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+
+statement ok con1
+ROLLBACK;
+
+query I con1
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+
+# committed rows past the high-water mark are found without any refresh
+statement ok con1
+INSERT INTO docs VALUES (4, 'tent number two');
+
+query I con2
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+4
+
+query I con2
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('docs', 'tent') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'tent'))
+	UNION ALL
+	(SELECT * FROM docs WHERE contains(lower(s), 'tent') EXCEPT SELECT * FROM ngram_search('docs', 'tent'))
+);
+----
+0
+
+# an update that removes the needle from an indexed row takes effect
+# immediately: the stale candidate is eliminated by fetch + recheck
+statement ok
+UPDATE docs SET s = 'nothing here' WHERE id = 1;
+
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+4
+
+# updates to rows past the high-water mark take effect immediately too: the
+# tail scan reads them fresh
+statement ok
+UPDATE docs SET s = 'tent restored above hwm' WHERE id = 4;
+
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+4
+
+# KNOWN PHASE 3 LIMITATION (the documented staleness contract, resolved by
+# PRAGMA ngram_refresh in Phase 5): an in-place UPDATE that introduces the
+# needle into an already-indexed row (rowid <= hwm) is invisible to
+# ngram_search until the index is refreshed. DuckDB v1.5.5 updates rows in
+# place (same rowid) unless an ART index forces delete+insert, so the index
+# holds only the row's original grams. Recheck still guarantees no false
+# positives. When refresh lands, this block must flip to finding id 2.
+statement ok
+UPDATE docs SET s = 'tent snuck into an indexed row' WHERE id = 2;
+
+query I
+SELECT id FROM docs WHERE contains(lower(s), 'tent') ORDER BY id;
+----
+2
+4
+
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+4
+
+statement ok
+UPDATE docs SET s = 'no match' WHERE id = 2;
+
+# searching inside the transaction that built the index works: the shadow
+# tables are still transaction-local
+statement ok con1
+CREATE TABLE fresh(id INTEGER, s VARCHAR);
+
+statement ok con1
+INSERT INTO fresh VALUES (1, 'brand new tent'), (2, 'nothing');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+PRAGMA create_ngram_index('fresh', 's');
+
+query I con1
+SELECT id FROM ngram_search('fresh', 'tent');
+----
+1
+
+# the other connection cannot see the index yet
+statement error con2
+SELECT * FROM ngram_search('fresh', 'tent');
+----
+no ngram index exists
+
+statement ok con1
+COMMIT;
+
+query I con2
+SELECT id FROM ngram_search('fresh', 'tent');
+----
+1
+
+# a checkpoint between build and search does not disturb results on an
+# append-only table (no deletes: vacuum cannot move rowids)
+statement ok
+INSERT INTO docs VALUES (5, 'tent after checkpoint');
+
+statement ok
+CHECKPOINT;
+
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+4
+5
+
+# KNOWN PHASE 3 LIMITATION (the third documented staleness class, alongside
+# in-place updates and post-vacuum row motion): DROP TABLE leaves the shadow
+# schema behind, and the name-based ownership guard matches a recreated table
+# of the same name, so searches bind the dead index — stale postings and a
+# stale high-water mark hide the new rows (misses only; recheck still forbids
+# false positives). v1.5.5 has no stable cross-restart table identity token or
+# DDL hook; Phase 5 recreation detection must flip this block to finding id 1.
+statement ok
+CREATE TABLE reborn(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO reborn VALUES (1, 'nothing here');
+
+statement ok
+PRAGMA create_ngram_index('reborn', 's');
+
+statement ok
+DROP TABLE reborn;
+
+statement ok
+CREATE TABLE reborn(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO reborn VALUES (1, 'a tent');
+
+query I
+SELECT count(*) FROM reborn WHERE contains(lower(s), 'tent');
+----
+1
+
+query I
+SELECT count(*) FROM ngram_search('reborn', 'tent');
+----
+0

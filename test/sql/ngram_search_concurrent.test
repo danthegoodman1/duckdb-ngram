@@ -1,0 +1,121 @@
+# name: test/sql/ngram_search_concurrent.test
+# description: ngram_search racing concurrent INSERT/UPDATE/DELETE/CHECKPOINT
+# group: [sql]
+
+# Every differential check is a single query, so both sides share one snapshot:
+# identity must hold at any interleaving. Deletes stay confined to rows past
+# the index high-water mark: checkpoint vacuum squeezes deleted gaps out by
+# rewriting row groups, and with all gaps in the tail the indexed rowids keep
+# their positions and moved tail rows stay past the high-water mark. Deleting
+# indexed rows and then checkpointing strands the index's postings until
+# PRAGMA ngram_refresh (Phase 5).
+
+require ngram
+
+load __TEST_DIR__/ngram_search_concurrent.db
+
+statement ok
+CREATE TABLE churn AS
+SELECT i AS id,
+	CASE WHEN i % 5 = 0 THEN 'planted tent ' || md5(i::VARCHAR)
+	     WHEN i % 5 = 1 THEN 'ten cent trap ' || md5(i::VARCHAR)
+	     WHEN i % 23 = 3 THEN NULL
+	     ELSE md5(i::VARCHAR) END AS s
+FROM range(3000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('churn', 's');
+
+concurrentloop t 0 6
+
+loop i 0 4
+
+# each thread appends to its own id range: some true matches, some traps
+statement ok
+INSERT INTO churn
+SELECT 100000 + ${t} * 10000 + ${i} * 1000 + j,
+	CASE WHEN j % 3 = 0 THEN 'racing tent ' || j
+	     WHEN j % 3 = 1 THEN 'often entered ' || j
+	     ELSE md5(j::VARCHAR) END
+FROM range(150) r(j);
+
+# snapshot-atomic differential identity while other threads write
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT SELECT id FROM churn WHERE contains(lower(s), 'tent'))
+	UNION ALL
+	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT SELECT id FROM ngram_search('churn', 'tent'))
+);
+----
+0
+
+# rewrite some of this thread's tail rows without the needle (removing the
+# needle is always exact; introducing it below the high-water mark is the
+# documented Phase 5 refresh gap)
+statement ok
+UPDATE churn SET s = 'rewritten ' || id WHERE id >= 100000 + ${t} * 10000 + ${i} * 1000 AND id < 100000 + ${t} * 10000 + ${i} * 1000 + 50;
+
+statement ok
+DELETE FROM churn WHERE id >= 100000 + ${t} * 10000 + ${i} * 1000 + 50 AND id < 100000 + ${t} * 10000 + ${i} * 1000 + 100;
+
+# checkpoints race the searches; a transaction-related refusal is fine, any
+# other error (internal errors included) fails the test
+statement maybe
+CHECKPOINT;
+----
+<REGEX>:.*(Cannot (FORCE )?CHECKPOINT|cannot checkpoint).*
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT SELECT id FROM churn WHERE contains(lower(s), 'tent'))
+	UNION ALL
+	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT SELECT id FROM ngram_search('churn', 'tent'))
+);
+----
+0
+
+# search inside an uncommitted writing transaction racing the other threads
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO churn VALUES (900000 + ${t} * 100 + ${i}, 'uncommitted tent ' || ${t});
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT SELECT id FROM churn WHERE contains(lower(s), 'tent'))
+	UNION ALL
+	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT SELECT id FROM ngram_search('churn', 'tent'))
+);
+----
+0
+
+query I
+SELECT count(*) FROM ngram_search('churn', 'uncommitted tent');
+----
+1
+
+statement ok
+ROLLBACK;
+
+endloop
+
+endloop
+
+# after the storm: full identity, and a final vacuum-eligible checkpoint
+statement ok
+CHECKPOINT;
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT SELECT id FROM churn WHERE contains(lower(s), 'tent'))
+	UNION ALL
+	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT SELECT id FROM ngram_search('churn', 'tent'))
+);
+----
+0
+
+query I
+SELECT count(*) > 0 FROM ngram_search('churn', 'tent');
+----
+true

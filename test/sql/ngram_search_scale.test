@@ -1,0 +1,93 @@
+# name: test/sql/ngram_search_scale.test
+# description: query path across the 2^20 rowid segment boundary
+# group: [sql]
+
+require ngram
+
+# file-backed so the delete+checkpoint block at the end runs a real vacuum
+load __TEST_DIR__/ngram_search_scale.db
+
+# 1.15M rows crosses the rowid >> 20 segment boundary (2^20 = 1048576), so
+# probes must union and intersect postings across multiple segments
+statement ok
+CREATE TABLE big AS SELECT i AS id, i::VARCHAR AS s FROM range(1150000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('big', 's');
+
+query I
+SELECT count(DISTINCT segment_no) FROM ngram_main_big.segments_s;
+----
+2
+
+# needles matching rows in both segments; '048576' brackets the boundary itself
+foreach needle 999999 048576 114999 000 123456
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('big', '${needle}') EXCEPT SELECT * FROM big WHERE contains(s, '${needle}'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, '${needle}') EXCEPT SELECT * FROM ngram_search('big', '${needle}'))
+);
+----
+0
+
+endloop
+
+# candidates land in both segments and stay a superset of the truth
+query I
+SELECT count(DISTINCT rowid >> 20) FROM ngram_candidates('big', 's', '99999');
+----
+2
+
+query I
+SELECT count(*) FROM (
+	SELECT rowid FROM big WHERE contains(s, '99999')
+	EXCEPT SELECT rowid FROM ngram_candidates('big', 's', '99999'));
+----
+0
+
+# exact result spot check at the segment boundary: rows whose text contains
+# the boundary rowid's digits
+query I
+SELECT count(*) FROM ngram_search('big', '1048576');
+----
+1
+
+query I
+SELECT id FROM ngram_search('big', '1048576');
+----
+1048576
+
+# rows appended past the high-water mark in the second segment are found
+statement ok
+INSERT INTO big VALUES (9999999, 'tail-1048576-tail');
+
+query I
+SELECT id FROM ngram_search('big', '1048576') ORDER BY id;
+----
+1048576
+9999999
+
+# delete indexed rows, then checkpoint: vacuum merges the shrunken row groups
+# and moves surviving rowids out from under the index (the Phase 5 refresh
+# scenario). The index may now miss moved rows, but recheck keeps false
+# positives impossible: results remain a subset of the truth for any needle.
+statement ok
+DELETE FROM big WHERE id % 3 = 1 AND id < 700000;
+
+statement ok
+CHECKPOINT;
+
+foreach needle 999999 048576 000 123456
+
+query I
+SELECT count(*) FROM (
+	SELECT * FROM ngram_search('big', '${needle}') EXCEPT SELECT * FROM big WHERE contains(s, '${needle}'));
+----
+0
+
+endloop
+
+statement ok
+PRAGMA drop_ngram_index('big', 's');

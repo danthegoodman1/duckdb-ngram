@@ -1,0 +1,147 @@
+# name: test/sql/ngram_search_differential.test
+# description: differential identity of ngram_search vs brute-force contains
+# group: [sql]
+
+# Runs over a pseudo-random corpus, before and after tail inserts and deletes.
+
+require ngram
+
+# deterministic pseudo-random corpus: md5-derived noise with planted words,
+# traps, unicode, NULLs, and empty strings; id keeps every row distinct so the
+# EXCEPT-based comparison is exact for multisets
+statement ok
+CREATE TABLE corpus AS
+SELECT i AS id,
+	CASE WHEN i % 23 = 0 THEN NULL
+	     WHEN i % 17 = 0 THEN ''
+	     ELSE
+		substr(md5(i::VARCHAR), 1, 1 + (i % 13)) ||
+		CASE WHEN i % 3 = 0 THEN ' ten' ELSE '' END ||
+		CASE WHEN i % 5 = 0 THEN ' ent' ELSE '' END ||
+		CASE WHEN i % 7 = 0 THEN ' tent' ELSE '' END ||
+		CASE WHEN i % 11 = 0 THEN ' TeNt city' ELSE '' END ||
+		CASE WHEN i % 2 = 0 THEN ' öft' ELSE ' TEN CENT' END ||
+		' ' || substr(md5((i * 7)::VARCHAR), 1 + (i % 5), 6)
+	END AS s
+FROM range(5000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('corpus', 's');
+
+# grow a tail past the high-water mark with the same generator
+statement ok
+INSERT INTO corpus
+SELECT i AS id,
+	CASE WHEN i % 23 = 0 THEN NULL
+	     WHEN i % 17 = 0 THEN ''
+	     ELSE
+		substr(md5(i::VARCHAR), 1, 1 + (i % 13)) ||
+		CASE WHEN i % 7 = 0 THEN ' tent' ELSE ' öft TEN' END ||
+		' ' || substr(md5((i * 7)::VARCHAR), 1 + (i % 5), 6)
+	END AS s
+FROM range(5000, 7000) t(i);
+
+# needles: planted words, traps, unicode, md5 fragments (present and absent),
+# short needles, gram-boundary lengths
+foreach needle tent ten ent TENT tEnT öft ÖFT cent city zzzz d41d8 3cf fff ffff 0123 a ab e5 ff
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('corpus', '${needle}') EXCEPT SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')))
+	UNION ALL
+	(SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')) EXCEPT SELECT * FROM ngram_search('corpus', '${needle}'))
+);
+----
+0
+
+endloop
+
+# needles with spaces
+foreach space_needle ten_tent TeNt_city ten_cent _ten _öft
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('corpus', replace('${space_needle}', '_', ' '))
+	 EXCEPT SELECT * FROM corpus WHERE contains(lower(s), lower(replace('${space_needle}', '_', ' '))))
+	UNION ALL
+	(SELECT * FROM corpus WHERE contains(lower(s), lower(replace('${space_needle}', '_', ' ')))
+	 EXCEPT SELECT * FROM ngram_search('corpus', replace('${space_needle}', '_', ' ')))
+);
+----
+0
+
+endloop
+
+# candidates ⊇ true matches among indexed rows, for every probeable needle
+foreach needle tent TENT öft cent d41d8 ffff city
+
+query I
+SELECT count(*) FROM (
+	SELECT rowid FROM corpus
+	WHERE contains(lower(s), lower('${needle}')) AND rowid <= (SELECT hwm_rowid FROM ngram_main_corpus.meta_s)
+	EXCEPT SELECT rowid FROM ngram_candidates('corpus', 's', '${needle}'));
+----
+0
+
+endloop
+
+# tighten the gram cap and re-run: probing fewer grams only grows candidate
+# sets, never changes results
+statement ok
+SET ngram_max_grams_per_query = 2;
+
+foreach needle tent TeNt d41d8 ffff city
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('corpus', '${needle}') EXCEPT SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')))
+	UNION ALL
+	(SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')) EXCEPT SELECT * FROM ngram_search('corpus', '${needle}'))
+);
+----
+0
+
+endloop
+
+statement ok
+RESET ngram_max_grams_per_query;
+
+# delete a spread of rows (indexed and tail) and re-run: stale candidates must
+# be filtered by visibility, never returned. No checkpoint runs between the
+# deletes and the checks, so vacuum cannot move the surviving rowids (the
+# post-vacuum case is the Phase 5 refresh contract).
+statement ok
+DELETE FROM corpus WHERE id % 4 = 1;
+
+foreach needle tent ten öft cent d41d8 ffff a
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('corpus', '${needle}') EXCEPT SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')))
+	UNION ALL
+	(SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')) EXCEPT SELECT * FROM ngram_search('corpus', '${needle}'))
+);
+----
+0
+
+endloop
+
+# case-sensitive index over the same corpus: matching is exact byte-wise
+statement ok
+CREATE TABLE corpus_cs AS SELECT id, s FROM corpus;
+
+statement ok
+PRAGMA create_ngram_index('corpus_cs', 's', case_insensitive = false);
+
+foreach needle tent TeNt TEN öft ÖFT d41d8 D41D8
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('corpus_cs', '${needle}') EXCEPT SELECT * FROM corpus_cs WHERE contains(s, '${needle}'))
+	UNION ALL
+	(SELECT * FROM corpus_cs WHERE contains(s, '${needle}') EXCEPT SELECT * FROM ngram_search('corpus_cs', '${needle}'))
+);
+----
+0
+
+endloop

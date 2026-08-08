@@ -21,15 +21,15 @@ static string ShadowSchemaName(const string &schema, const string &table) {
 	return "ngram_" + schema + "_" + table;
 }
 
-static string MetaTableName(const string &column) {
+string MetaTableName(const string &column) {
 	return "meta_" + column;
 }
 
-static string SegmentsTableName(const string &column) {
+string SegmentsTableName(const string &column) {
 	return "segments_" + column;
 }
 
-static string StatsTableName(const string &column) {
+string StatsTableName(const string &column) {
 	return "stats_" + column;
 }
 
@@ -41,16 +41,8 @@ static string Lit(const string &value) {
 	return KeywordHelper::WriteQuoted(value);
 }
 
-struct ResolvedTarget {
-	string catalog_name;
-	string schema_name;
-	string table_name;
-	string column_name;
-	string shadow_schema;
-};
-
-static ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, const string &column_name,
-                                    bool require_column) {
+ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, const string &column_name,
+                             bool require_column) {
 	auto qname = QualifiedName::Parse(table_input);
 	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, qname.name);
 	auto entry = Catalog::GetEntry(context, qname.catalog, qname.schema, lookup, OnEntryNotFound::THROW_EXCEPTION);
@@ -90,12 +82,20 @@ static ResolvedTarget ResolveTarget(ClientContext &context, const string &table_
 	target.catalog_name = table_entry.ParentCatalog().GetName();
 	target.schema_name = table_entry.ParentSchema().name;
 	target.table_name = table_entry.name;
+	// store the catalog's spelling of the column: lookups are case-insensitive,
+	// but generated shadow-table names and name comparisons are not. When the
+	// column no longer exists on the base table (e.g. dropping an orphaned
+	// index after the column was removed), the user's spelling passes through.
 	target.column_name = column_name;
+	if (!column_name.empty() && table_entry.ColumnExists(column_name)) {
+		target.column_name = table_entry.GetColumn(column_name).Name();
+	}
 	target.shadow_schema = ShadowSchemaName(target.schema_name, target.table_name);
+	target.entry = &table_entry;
 	return target;
 }
 
-static bool ShadowTableExists(ClientContext &context, const ResolvedTarget &target, const string &name) {
+bool ShadowTableExists(ClientContext &context, const ResolvedTarget &target, const string &name) {
 	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, name);
 	auto entry =
 	    Catalog::GetEntry(context, target.catalog_name, target.shadow_schema, lookup, OnEntryNotFound::RETURN_NULL);
@@ -129,8 +129,7 @@ static string OwnershipGuard(const ResolvedTarget &target, const string &meta_qu
 	       " END AS ngram_ownership_check FROM " + meta_qualified + ";\n";
 }
 
-//! Names of meta_* tables currently present in the target's shadow schema
-static vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &target) {
+vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &target) {
 	vector<string> result;
 	auto schema_entry =
 	    Catalog::GetSchema(context, target.catalog_name, target.shadow_schema, OnEntryNotFound::RETURN_NULL);
@@ -169,6 +168,8 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	}
 
 	auto target = ResolveTarget(context, table_input, column_name, true);
+	// generated names and the meta row must use the catalog's spelling
+	column_name = target.column_name;
 
 	auto base = Ident(target.catalog_name) + "." + Ident(target.schema_name) + "." + Ident(target.table_name);
 	auto shadow = Ident(target.catalog_name) + "." + Ident(target.shadow_schema);
@@ -221,9 +222,9 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	          base + ") AS hwm_rowid;\n";
 	script += "CREATE OR REPLACE TEMP TABLE " + pairs +
 	          " AS "
-	          "SELECT rowid AS r, rowid >> 20 AS segment_no, unnest(trigrams(" +
-	          column + ", " + gram_str + ", " + ci_str + ")) AS gram FROM " + base + " WHERE " + column +
-	          " IS NOT NULL;\n";
+	          "SELECT rowid AS r, rowid >> " +
+	          to_string(SEGMENT_SHIFT) + " AS segment_no, unnest(trigrams(" + column + ", " + gram_str + ", " + ci_str +
+	          ")) AS gram FROM " + base + " WHERE " + column + " IS NOT NULL;\n";
 	// The sorted-stream packer holds one (gram, segment_no) run per thread instead
 	// of every group at once. The sort feeding it spills, but external sorting
 	// costs roughly 12-15 MB of overhead per thread, so the build's memory floor
@@ -250,6 +251,8 @@ static string DropNgramIndexQuery(ClientContext &context, const FunctionParamete
 	auto column_name = parameters.values[1].ToString();
 
 	auto target = ResolveTarget(context, table_input, column_name, false);
+	// shadow-table names use the catalog's spelling when the column still exists
+	column_name = target.column_name;
 	if (!ShadowTableExists(context, target, MetaTableName(column_name))) {
 		throw CatalogException("No ngram index exists on %s.%s", target.table_name, column_name);
 	}

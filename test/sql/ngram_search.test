@@ -1,0 +1,452 @@
+# name: test/sql/ngram_search.test
+# description: ngram_search / ngram_candidates explicit query path
+# group: [sql]
+
+require ngram
+
+statement ok
+CREATE TABLE docs(id INTEGER, s VARCHAR);
+
+# rows 2 and 5 are false-positive traps for needle 'tent': they contain the
+# grams 'ten' and 'ent' but not the substring
+statement ok
+INSERT INTO docs VALUES
+	(1, 'Hello world'),
+	(2, 'often entered'),
+	(3, NULL),
+	(4, ''),
+	(5, 'ten cents'),
+	(6, 'a tent pitched'),
+	(7, 'TENT SHOUTING'),
+	(8, 'öft ÖFT often'),
+	(9, 'contentment'),
+	(10, 'ab'),
+	(11, 'connection reset by peer');
+
+statement ok
+PRAGMA create_ngram_index('docs', 's');
+
+# rows inserted after the build sit past the high-water mark and must still be found
+statement ok
+INSERT INTO docs VALUES (12, 'tail tent row'), (13, 'tail noise'), (14, NULL);
+
+# happy path: false-positive traps rechecked away, tail row found, case folded
+query II
+SELECT id, s FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+6	a tent pitched
+7	TENT SHOUTING
+9	contentment
+12	tail tent row
+
+# candidates: every indexed row whose grams cover the needle, traps included,
+# tail rows (rowid > hwm) excluded
+query I
+SELECT rowid FROM ngram_candidates('docs', 's', 'tent') ORDER BY rowid;
+----
+1
+4
+5
+6
+8
+
+# candidates are a superset of the true matches among indexed rows
+query I
+SELECT count(*) FROM (
+	SELECT rowid FROM docs WHERE contains(lower(s), 'tent') AND rowid <= (SELECT hwm_rowid FROM ngram_main_docs.meta_s)
+	EXCEPT SELECT rowid FROM ngram_candidates('docs', 's', 'tent'));
+----
+0
+
+# differential identity against brute force for a spread of needles: traps,
+# unicode (case folded both directions), needles longer than the gram cap,
+# absent grams, single characters
+foreach needle tent ten often Hello world contentment zzz öft ÖFT Öft ll o x connection
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('docs', '${needle}') EXCEPT SELECT * FROM docs WHERE contains(lower(s), lower('${needle}')))
+	UNION ALL
+	(SELECT * FROM docs WHERE contains(lower(s), lower('${needle}')) EXCEPT SELECT * FROM ngram_search('docs', '${needle}'))
+);
+----
+0
+
+endloop
+
+# needles containing spaces (foreach cannot carry them)
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('docs', 'ten c') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'ten c'))
+	UNION ALL
+	(SELECT * FROM docs WHERE contains(lower(s), 'ten c') EXCEPT SELECT * FROM ngram_search('docs', 'ten c'))
+);
+----
+0
+
+query II
+SELECT id, s FROM ngram_search('docs', 'connection reset') ORDER BY id;
+----
+11	connection reset by peer
+
+# empty needle: contains(s, '') is true for every non-NULL value
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('docs', '') EXCEPT SELECT * FROM docs WHERE contains(s, ''))
+	UNION ALL
+	(SELECT * FROM docs WHERE contains(s, '') EXCEPT SELECT * FROM ngram_search('docs', ''))
+);
+----
+0
+
+# short needle: search falls back to an exhaustive full scan
+query II
+SELECT id, s FROM ngram_search('docs', 'ab') ORDER BY id;
+----
+10	ab
+
+# short needle: candidates degrade to "all indexed rowids" (rowid <= hwm, NULLs
+# included) so callers fall back to a full scan of the indexed range
+query I
+SELECT count(*) FROM ngram_candidates('docs', 's', 'ab');
+----
+11
+
+query I
+SELECT count(*) FROM ngram_candidates('docs', 's', '');
+----
+11
+
+# a needle gram indexed in no row proves there is no indexed match
+query I
+SELECT count(*) FROM ngram_candidates('docs', 's', 'zzz');
+----
+0
+
+# rarest-gram cap: identity holds however few grams are probed
+statement ok
+SET ngram_max_grams_per_query = 1;
+
+query II
+SELECT id, s FROM ngram_search('docs', 'connection reset') ORDER BY id;
+----
+11	connection reset by peer
+
+query II
+SELECT id, s FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+6	a tent pitched
+7	TENT SHOUTING
+9	contentment
+12	tail tent row
+
+statement ok
+RESET ngram_max_grams_per_query;
+
+statement ok
+SET ngram_max_grams_per_query = 0;
+
+statement error
+SELECT * FROM ngram_search('docs', 'tent');
+----
+ngram_max_grams_per_query must be at least 1
+
+statement ok
+RESET ngram_max_grams_per_query;
+
+# needle decomposition dedupes repeated grams (ledger 1B): 'aaaa' decomposes to
+# the single gram 'aaa', probed once
+statement ok
+INSERT INTO docs VALUES (15, 'aaaa'), (16, 'aaab');
+
+query II
+SELECT id, s FROM ngram_search('docs', 'aaaa') ORDER BY id;
+----
+15	aaaa
+
+query II
+SELECT id, s FROM ngram_search('docs', 'aaa') ORDER BY id;
+----
+15	aaaa
+16	aaab
+
+# NULL and invalid arguments
+statement error
+SELECT * FROM ngram_search(NULL, 'tent');
+----
+table cannot be NULL
+
+statement error
+SELECT * FROM ngram_search('docs', NULL);
+----
+needle cannot be NULL
+
+statement error
+SELECT * FROM ngram_search('docs', 'tent', col := NULL);
+----
+col cannot be NULL
+
+statement error
+SELECT * FROM ngram_search('docs', 'tent', col := '');
+----
+col cannot be empty
+
+statement error
+SELECT * FROM ngram_candidates('docs', NULL, 'tent');
+----
+column cannot be NULL
+
+statement error
+SELECT * FROM ngram_candidates('docs', 's', NULL);
+----
+needle cannot be NULL
+
+# missing table / missing index / unindexed column
+statement error
+SELECT * FROM ngram_search('nope', 'tent');
+----
+does not exist
+
+statement error
+SELECT * FROM ngram_search('docs', 'tent', col := 'id');
+----
+no ngram index exists
+
+statement error
+SELECT * FROM ngram_candidates('docs', 'id', 'tent');
+----
+no ngram index exists
+
+statement ok
+CREATE TABLE unindexed(s VARCHAR);
+
+statement error
+SELECT * FROM ngram_search('unindexed', 'tent');
+----
+no ngram index exists
+
+# a view is not a searchable base table
+statement ok
+CREATE VIEW docs_view AS SELECT * FROM docs;
+
+statement error
+SELECT * FROM ngram_search('docs_view', 'tent');
+----
+view, not a table
+
+# a second indexed column requires disambiguation
+statement ok
+ALTER TABLE docs ADD COLUMN t VARCHAR;
+
+statement ok
+UPDATE docs SET t = CASE WHEN id = 1 THEN 'Needle in t' ELSE 'nothing' END;
+
+statement ok
+PRAGMA create_ngram_index('docs', 't', gram = 2, case_insensitive = false);
+
+statement error
+SELECT * FROM ngram_search('docs', 'tent');
+----
+multiple columns
+
+# the gram-2 case-sensitive index searches exactly
+query I
+SELECT id FROM ngram_search('docs', 'Ne', col := 't') ORDER BY id;
+----
+1
+
+query I
+SELECT count(*) FROM ngram_search('docs', 'ne', col := 't') WHERE id = 1;
+----
+0
+
+query I
+SELECT id FROM ngram_search('docs', 'tent', col := 's') ORDER BY id;
+----
+6
+7
+9
+12
+
+statement ok
+PRAGMA drop_ngram_index('docs', 't');
+
+# after dropping the second index, the bare form works again
+query I
+SELECT count(*) FROM ngram_search('docs', 'tent');
+----
+4
+
+# dropping the searched index surfaces a clear binder error
+statement ok
+CREATE TABLE dropme(s VARCHAR);
+
+statement ok
+INSERT INTO dropme VALUES ('a tent');
+
+statement ok
+PRAGMA create_ngram_index('dropme', 's');
+
+statement ok
+PRAGMA drop_ngram_index('dropme', 's');
+
+statement error
+SELECT * FROM ngram_search('dropme', 'tent');
+----
+no ngram index exists
+
+# evil identifiers: dotted table name, keyword and unicode column names
+statement ok
+CREATE TABLE "my.table"("select" VARCHAR, "sträße" VARCHAR);
+
+statement ok
+INSERT INTO "my.table" VALUES ('hello world', 'guten tag'), ('tent select', 'sträßenbahn');
+
+statement ok
+PRAGMA create_ngram_index('"my.table"', 'select');
+
+statement ok
+PRAGMA create_ngram_index('"my.table"', 'sträße');
+
+query I
+SELECT "select" FROM ngram_search('"my.table"', 'tent', col := 'select');
+----
+tent select
+
+query I
+SELECT "sträße" FROM ngram_search('"my.table"', 'sträßen', col := 'sträße');
+----
+sträßenbahn
+
+query I
+SELECT rowid FROM ngram_candidates('"my.table"', 'sträße', 'tag');
+----
+0
+
+# identifier casing: catalog lookups are case-insensitive, so any casing of
+# the table or column reaches the same index
+query I
+SELECT count(*) FROM ngram_search('docs', 'tent', col := 'S');
+----
+4
+
+query I
+SELECT count(*) FROM ngram_search('DOCS', 'tent');
+----
+4
+
+query I
+SELECT count(*) FROM ngram_candidates('docs', 'S', 'tent');
+----
+5
+
+# an index created with a differently-cased column spelling stores the
+# catalog's spelling, so every later operation finds it under any casing
+statement ok
+CREATE TABLE cased(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO cased VALUES (1, 'a tent'), (2, 'nothing');
+
+statement ok
+PRAGMA create_ngram_index('cased', 'S');
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE schema_name = 'ngram_main_cased' AND table_name IN ('meta_s', 'segments_s', 'stats_s');
+----
+3
+
+query I
+SELECT column_name FROM ngram_main_cased.meta_s;
+----
+s
+
+query I
+SELECT id FROM ngram_search('cased', 'tent');
+----
+1
+
+query I
+SELECT id FROM ngram_search('cased', 'tent', col := 'S');
+----
+1
+
+query I
+SELECT rowid FROM ngram_candidates('cased', 'S', 'tent');
+----
+0
+
+statement error
+PRAGMA create_ngram_index('cased', 's');
+----
+already exists
+
+statement ok
+PRAGMA drop_ngram_index('CASED', 's');
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_cased';
+----
+0
+
+# the reverse spelling: a column whose catalog name is uppercase
+statement ok
+CREATE TABLE cased2(id INTEGER, "S" VARCHAR);
+
+statement ok
+INSERT INTO cased2 VALUES (1, 'another tent');
+
+statement ok
+PRAGMA create_ngram_index('cased2', 's');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_cased2' AND table_name = 'meta_S';
+----
+1
+
+query I
+SELECT id FROM ngram_search('cased2', 'tent', col := 's');
+----
+1
+
+statement ok
+PRAGMA drop_ngram_index('cased2', 'S');
+
+# shadow-schema collision: searching through a colliding schema name must not
+# answer from the foreign index
+statement ok
+CREATE SCHEMA a;
+
+statement ok
+CREATE TABLE a.b_c(s VARCHAR);
+
+statement ok
+INSERT INTO a.b_c VALUES ('hello tent');
+
+statement ok
+CREATE SCHEMA a_b;
+
+statement ok
+CREATE TABLE a_b.c(s VARCHAR);
+
+statement ok
+INSERT INTO a_b.c VALUES ('goodbye tent');
+
+statement ok
+PRAGMA create_ngram_index('a.b_c', 's');
+
+statement error
+SELECT * FROM ngram_search('a_b.c', 'tent');
+----
+shadow schema collision
+
+statement error
+SELECT * FROM ngram_candidates('a_b.c', 's', 'tent');
+----
+shadow schema collision
+
+query I
+SELECT s FROM ngram_search('a.b_c', 'tent');
+----
+hello tent

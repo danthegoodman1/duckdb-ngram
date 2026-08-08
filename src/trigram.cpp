@@ -19,15 +19,11 @@ void NormalizeString(const char *data, idx_t len, const GramOptions &options, st
 			i++;
 			continue;
 		}
+		// DuckDB guarantees VARCHARs hold valid UTF-8; on invalid input
+		// UTF8ToCodepoint raises an engine exception rather than returning,
+		// so sz is always the positive length of the decoded codepoint here
 		int sz = 0;
 		auto codepoint = Utf8Proc::UTF8ToCodepoint(data + i, sz);
-		if (sz <= 0) {
-			// DuckDB guarantees valid UTF-8 in VARCHAR; treat a stray byte as one
-			// codepoint so we cannot loop forever on unexpected input
-			normalized.push_back(data[i]);
-			i++;
-			continue;
-		}
 		auto folded = options.case_insensitive ? Utf8Proc::CodepointToLower(codepoint) : codepoint;
 		char utf8_bytes[4];
 		int utf8_sz = 0;

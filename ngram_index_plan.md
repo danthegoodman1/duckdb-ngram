@@ -23,35 +23,76 @@ to seq scan, still exhaustive).
 
 ## Key Research Facts (self-contained reference)
 
-Findings from reading duckdb main (checkout `e500d778`, Aug 2026) and ecosystem survey:
+Verified against the pinned build target duckdb v1.5.5 (`d8cdaa33`). The original research
+commit (main `e500d778`, exactly one squashed dev cycle ahead of v1.5.5) is kept as
+submodule tag `research-e500d778` for the main-only references flagged below.
 
 - **Correctness invariant**: any row containing the needle contains every trigram of the
   needle, so intersecting posting lists yields a superset of true matches; recheck with
   the original predicate filters to the exact answer. Dropping constraints (rarest-K
   trigram selection, hashing, skipped hot trigrams, index lag) only grows candidates.
-- **Rewrite recognition is easy**: the optimizer normalizes `col LIKE '%x%'` to
-  `contains(col, 'x')` (`src/optimizer/rule/like_optimizations.cpp`) *before* post-optimize
-  extension hooks run, and pushes it into `LogicalGet.table_filters` as an
-  `ExpressionFilter`, deleting the `LogicalFilter`. `ILIKE` (`~~*`) is NOT normalized and
-  must be matched manually. `regexp_matches` with extractable literals also normalizes to
-  `contains` where possible.
-- **No planner hook for custom indexes**: `table_scan.cpp` index scans are hardcoded to
-  ART (`TableScanInitGlobal`, gate at `src/function/table/table_scan.cpp:817`).
-  `IndexType::create_plan` is CREATE-INDEX-build only. The blessed pattern is an
-  `OptimizerExtension` (post-optimize) swapping `get.function`/`get.bind_data` for a
-  custom table function — this is duckdb-vss's `hnsw_index_scan` shape. In-tree demo of
-  rewrite + rowid `ExpressionFilter` + recheck: `test/extension/loadable_extension_demo.cpp:757`
-  (`RowIdOptimizerExtension`).
-- **Rowid fetch**: `DataTable::Fetch` is public, but the batched fetch driver must be
-  reimplemented (~40 lines; template at `table_scan.cpp:109-271`), including the
-  transaction-local-storage second phase (or uncommitted rows are silently dropped) and
-  holding `DuckTransactionManager::SharedVacuumLock()` from probe through fetch
-  (`table_scan.cpp:807-815`) so rowids cannot shift mid-query.
-- **The fetched-storage phase does not re-apply filters** — recheck is the extension's
-  responsibility, which the design requires anyway.
+- **Rewrite recognition**: the EXPRESSION_REWRITER pass normalizes `col LIKE '%x%'` to
+  `contains(col, 'x')` (`src/optimizer/rule/like_optimizations.cpp:135-137`) and
+  FILTER_PUSHDOWN moves it into `LogicalGet.table_filters` as an `ExpressionFilter`
+  (`src/optimizer/filter_combiner.cpp:378-413`), deleting the `LogicalFilter` — both
+  before post-optimize extension hooks run (`src/optimizer/optimizer.cpp:331-351`).
+  `ILIKE` is NOT normalized to contains but IS pushed into `table_filters` as
+  `(col ~~* '%x%')` (expression pushdown accepts any single-column non-volatile
+  expression, `table_scan.cpp:891-893`), so both cases are read from the same place.
+  `regexp_matches` with a pure literal also becomes `contains`
+  (`regex_optimizations.cpp:180-199`). On v1.5.5 `contains()` is a stable terminal form —
+  the post-v1.5.5 IN-list/prefix rewrites do not exist yet; recheck when bumping the pin.
+  Pushed expressions have column refs rebound to `BoundReferenceExpression(..., 0)` over a
+  one-column chunk.
+- **No planner hook for custom indexes**: `TableScanInitGlobal` binds and scans ART only
+  (`src/function/table/table_scan.cpp:735-740`); `IndexType` has no scan hook. The blessed
+  pattern is an `OptimizerExtension` (post-optimize) swapping `get.function`/`get.bind_data`
+  for a custom table function (both public, `logical_get.hpp:32-44`) — duckdb-vss's
+  `hnsw_index_scan` shape. Register via `OptimizerExtension::Register(config, ext)`;
+  extension passes run as `OptimizerType::EXTENSION`, so `SET
+  disabled_optimizers='extension'` is a free kill switch for differential testing. No
+  in-tree v1.5.5 demo of the rowid + `ExpressionFilter` + recheck shape exists (main's
+  `RowIdOptimizerExtension` is post-v1.5.5; readable at
+  `research-e500d778:test/extension/loadable_extension_demo.cpp:848` for reference only).
+- **Rowid fetch**: `DataTable::Fetch` is public (`data_table.hpp:104-106`) and already
+  handles mixed committed + transaction-local rowids with original-order restoration
+  (`data_table.cpp:485-557`), so no separate local-fetch phase is needed for rows the
+  index knows. The batched fetch driver template is `table_scan.cpp:102-265` (storage
+  phase `:196-222`; the LOCAL_STORAGE scan phase `:223-237` covers rows an index has
+  never seen — for ngram that role belongs to the HWM tail scan). Hold
+  `DuckTransactionManager::SharedVacuumLock()` (`duck_transaction_manager.hpp:84`)
+  unconditionally from probe through fetch — v1.5.5's built-in acquisition gate
+  (`table_scan.cpp:724-733`) is narrower than main's, and unconditional is the safe
+  superset. Async caveat: when the storage phase yields an empty chunk, set the
+  `HAVE_MORE_OUTPUT` async result instead of looping (`table_scan.cpp:212-216`).
+- **The fetched-storage path does not re-apply filters** (no TableFilter parameter
+  anywhere in `Fetch` → `RowGroupCollection::Fetch` → `RowGroup::FetchRow`); recheck is
+  the extension's responsibility, which the design requires anyway. Asymmetry: the
+  LOCAL_STORAGE scan phase DOES apply pushed filters (`table_scan.cpp:148`).
+- **Plan verification is DEBUG-only on v1.5.5** (`column_binding_resolver.cpp:238-245`):
+  in release builds a broken rewrite surfaces as `InternalException` at physical planning
+  (`physical_plan_generator.cpp:37-41`), not at optimizer Verify. Run rewrite tests
+  against a DEBUG duckdb build to get per-pass verification.
+- **Interaction risk**: `LATE_MATERIALIZATION` runs before extension hooks
+  (`optimizer.cpp:282-287`) and can restructure a `LogicalGet` into a rowid-join shape
+  for `ORDER BY`/`LIMIT` plans — plan-shape tests must cover
+  `LIKE '%x%' ORDER BY ... LIMIT n`.
+- **Pragma mechanics** (`statement_preprocessor.cpp`, byte-identical to main): a pragma's
+  `query` callback runs during whole-batch preprocessing inside a transaction context.
+  Multi-statement expansions are wrapped in BEGIN/COMMIT only when >1 statement and not
+  already inside a transaction; single-statement expansions are NOT wrapped; expansions
+  ending in a SELECT are not wrapped; inside a user transaction the wrapper instead sets
+  `current_transaction_invalidation_policy` globally and restores the hardcoded default
+  (a user's custom policy is silently reset — document).
 - **Shadow tables** persist/recover as ordinary tables; a database opened without the
-  extension reads and writes normally (index schema is inert). This beats the custom-index
-  route's `MissingExtensionException` on write.
+  extension reads and writes normally (verified against the stock duckdb 1.5.5 wheel).
+  This beats the custom-index route, which on v1.5.5 still pins fixed-size buffers after
+  first touch (`fixed_size_buffer.hpp:120-144` FIXME), writes the whole index image to
+  the WAL at CREATE INDEX (`write_ahead_log.cpp:372-408`; the default
+  `BoundIndex::SerializeToWAL` throws, `bound_index.cpp:177-179`), forces rowid-stable
+  non-compacting vacuum for any non-ART index (`row_group_collection.cpp:28-39`,
+  `:1359-1369`; main's `KEEP_ROW_IDS` naming does not exist on v1.5.5), and raises
+  `MissingExtensionException` on write when the extension is absent (`index_binder.cpp:27`).
 - **Ecosystem**: no trigram/ngram/substring index exists among ~290 community extensions;
   duckdb/duckdb discussion #16071 (trigram tokenizer) is open, unanswered. duckdb-fts main
   branch is adding a token-level trigram sidecar (not general `LIKE '%x%'` over raw
@@ -138,10 +179,10 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Scope | Extension scaffold builds against pinned duckdb | Repo github.com/danthegoodman1/duckdb-ngram (private), duckdb submodule @ v1.5.5, local `make`/`make test` green. |
-| Incomplete | Work | 1C: Re-verify Key Research Facts against pinned duckdb v1.5.5 and re-pin the plan's file:line references (research used main `e500d77`, kept as submodule tag `research-e500d778`) | Missing: verification pass over hook ordering, `table_scan.cpp` gates, `KEEP_ROW_IDS` vacuum behavior. |
+| Complete | Work | 1C: Re-verify Key Research Facts against pinned duckdb v1.5.5 and re-pin the plan's file:line references | Full verification pass 2026-08-08; Key Research Facts section rewritten with v1.5.5 pins. Notable: `RowIdOptimizerExtension` demo and `KEEP_ROW_IDS` are main-only; ILIKE reaches `table_filters` too; `DataTable::Fetch` handles transaction-local rowids natively; plan verification is DEBUG-build-only. |
 | Complete | Work | 1A: `trigrams()` scalar function with shared normalization module | src/trigram.cpp + src/trigrams_function.cpp; positional optional args (named args unsupported for scalar functions); test/sql/trigrams.test. |
 | Partial | Work | 1B: Needle decomposition + short-needle detection | DecomposeNeedle + too_short in src/trigram.cpp, shares ExtractGrams with 1A; direct tests come with the Phase 2/3 SQL surface that exposes it. |
-| Partial | Gate | Loads in CLI; extraction matches reference on unicode fixtures | CLI load + 551 passing assertions incl. generated fixture suite (scripts/gen_trigram_fixtures.py); remaining: CI green on GitHub. |
+| Complete | Gate | Loads in CLI; extraction matches reference on unicode fixtures | CLI load + generated fixture suite (scripts/gen_trigram_fixtures.py, incl. Cherokee/Deseret/Kelvin/ẞ/sigma); reviewer's full-codepoint sweep vs `lower()`: 0 divergences. CI green: run 31267278753. |
 | Complete | Test | sqllogictest suite for extraction edge cases | test/sql/trigrams.test + generated test/sql/trigrams_fixtures.test. |
 
 ## Phase 2: Index Build and Shadow-Table Storage
@@ -176,12 +217,13 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Scope | Shadow schema (segments, metadata, stats) | Schema `ngram_<schema>_<table>` with `meta_/segments_/stats_<column>` tables; blob format documented in src/include/ngram/postings_codec.hpp. |
-| Partial | Work | 2A: SQL-driven parallel build path | Two-pass build in src/index_pragmas.cpp (temp pairs table, then grouped encode): 196 MB corpus builds in ~7 s unmetered. Metered runs blocked on 2D. |
-| Incomplete | Work | 2D: Streaming postings packer to replace grouped `list()` | Grouped `list()` OOMs instantly under ANY `memory_limit` at 190M-pair scale (duckdb 1.5.5; non-list aggregates spill fine — verified). Candidates: table in-out packer over sorted pairs; bitmap-span format; upstream fix. Required for the memory-limit gate. |
+| Complete | Work | 2A: SQL-driven parallel build path | Two-pass build in src/index_pragmas.cpp: temp pairs table, external sort, streaming packer. 196 MB worst-case corpus builds in ~84 s under `memory_limit='1GB'`; differential identity vs brute force: 0 mismatches across 190M postings. |
+| Complete | Work | 2D: Streaming postings packer (`ngram_pack_postings` table in-out fn) replacing grouped `list()` | Grouped `list()` OOMs under ANY memory_limit at scale (even states ≪ limit — verified up to 4GB); packer holds one run per thread, produced identical totals at 500MB. Memory floor is the sort's ~12-15 MB/thread. src/pack_postings.cpp + test/sql/pack_postings.test + build_scale.test. |
 | Complete | Work | 2B: create/drop pragmas + `ngram_index_stats` | src/index_pragmas.cpp + test/sql/create_index.test. Stats delivered as `PRAGMA ngram_index_stats` (pragma named args use `=`, not `:=`). |
 | Complete | Work | 2C: Posting segment codec (delta + varint) | src/postings_codec.cpp + randomized round-trip tests in test/sql/postings_codec.test. Entropy compression deferred to Phase 6 tuning. |
-| Partial | Gate | 10 GB build under memory limit; reopen w/ and w/o extension | Extension-absent verified: stock duckdb 1.5.5 wheel read+wrote the indexed db, index intact on reopen with extension. In-suite restart round-trip in test/sql/index_persistence.test. Memory-limited large build blocked on 2D. |
-| Complete | Test | Persistence + lifecycle sqllogictests | test/sql/create_index.test, index_persistence.test, postings_codec.test (649 assertions green). |
+| Partial | Gate | 10 GB build under memory limit; reopen w/ and w/o extension | Extension-absent verified: stock duckdb 1.5.5 wheel read+wrote the indexed db, index intact on reopen with extension. In-suite restart round-trip in test/sql/index_persistence.test. Remaining: metered 10 GB run (corpus staged at ~/duckdb-ngram-bench/gate10gb.db, 51M rows / 10.05 GB). |
+| Complete | Test | Persistence + lifecycle sqllogictests | 8 test files, 931 assertions green (create_index, index_persistence, postings_codec, pack_postings, build_scale, trigrams, fixtures, ngram). |
+| Complete | Review | Skeptical review of Phases 1-2 (13 findings, 2 blockers: rowid-column shadowing, shadow-schema collision) + fix pass | Reviewer APPROVE 2026-08-08 after re-verifying every fix with repros. Robustness fixes across index_pragmas.cpp (ownership guards, view/temp/NULL-param checks, CASCADE removal), postings_codec.cpp (varint domain checks), trigram.cpp. |
 | Incomplete | Risk | Index size ratio unacceptable (>~60% of corpus) | Worst-case hex corpus (every trigram in ~every row): 205 MB blobs / 196 MB corpus ≈ 105%. Needs real-text corpus measurement; hex is maximally dense. |
 | Complete | Doc | Build pragma cannot reference a table created in the same multi-statement batch | DuckDB expands pragmas before batch execution (statement_preprocessor.cpp); run `create_ngram_index` as its own statement. Noted here; user docs in Phase 6. |
 

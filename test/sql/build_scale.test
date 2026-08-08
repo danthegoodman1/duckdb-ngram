@@ -1,0 +1,79 @@
+# name: test/sql/build_scale.test
+# description: index build at scale: segment boundaries, differential identity, memory-limited smoke
+# group: [sql]
+
+require ngram
+
+# 1.15M rows crosses the rowid >> 20 segment boundary (2^20 = 1048576), so the
+# build must produce more than one segment_no
+statement ok
+CREATE TABLE big AS SELECT i::VARCHAR AS s FROM range(1150000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('big', 's');
+
+# the index is exactly the brute-force extraction (both directions)
+query I
+SELECT count(*) FROM (
+	(SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_big.segments_s
+	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM big WHERE s IS NOT NULL)
+	UNION ALL
+	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM big WHERE s IS NOT NULL
+	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_big.segments_s)
+);
+----
+0
+
+# rowids 0..1149999 span exactly two rowid >> 20 buckets
+query I
+SELECT count(DISTINCT segment_no) FROM ngram_main_big.segments_s;
+----
+2
+
+# stats totals agree with the segments table
+query I
+SELECT (SELECT sum(row_count) FROM ngram_main_big.stats_s) = (SELECT sum(rowid_count) FROM ngram_main_big.segments_s)
+   AND (SELECT count(*) FROM ngram_main_big.stats_s) = (SELECT count(DISTINCT gram) FROM ngram_main_big.segments_s)
+   AND (SELECT sum(segment_count) FROM ngram_main_big.stats_s) = (SELECT count(*) FROM ngram_main_big.segments_s);
+----
+true
+
+# hwm covers all rows
+query I
+SELECT hwm_rowid = (SELECT max(rowid) FROM big) FROM ngram_main_big.meta_s;
+----
+true
+
+statement ok
+PRAGMA drop_ngram_index('big', 's');
+
+# memory-limited build smoke: the sort spills but keeps a per-thread memory
+# floor, so cap threads along with memory (each test file runs in its own
+# database, but RESET below restores this connection for later blocks)
+statement ok
+SET threads = 4;
+
+statement ok
+SET memory_limit = '300MB';
+
+statement ok
+CREATE TABLE mem_corpus AS SELECT md5(i::VARCHAR) AS s FROM range(200000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('mem_corpus', 's');
+
+query I
+SELECT count(*) > 0 FROM ngram_main_mem_corpus.stats_s;
+----
+true
+
+query I
+SELECT hwm_rowid = (SELECT max(rowid) FROM mem_corpus) FROM ngram_main_mem_corpus.meta_s;
+----
+true
+
+statement ok
+RESET memory_limit;
+
+statement ok
+RESET threads;

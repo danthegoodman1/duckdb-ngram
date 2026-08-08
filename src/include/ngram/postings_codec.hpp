@@ -30,6 +30,7 @@ string EncodePostings(vector<int64_t> &rowids);
 void DecodePostings(const char *data, idx_t size, vector<int64_t> &result);
 
 void RegisterPostingsCodec(ExtensionLoader &loader);
+void RegisterPackPostings(ExtensionLoader &loader);
 
 } // namespace ngram
 } // namespace duckdb

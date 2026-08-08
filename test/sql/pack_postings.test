@@ -1,0 +1,98 @@
+# name: test/sql/pack_postings.test
+# description: ngram_pack_postings table function behavior
+# group: [sql]
+
+require ngram
+
+# sorted input: one output row per (gram, segment_no) run; rowids within a run
+# need no ordering (the codec sorts them)
+query ITIIII
+SELECT gram, ngram_decode_postings(postings), segment_no, rowid_count, min_rowid, max_rowid
+FROM ngram_pack_postings((
+	SELECT gram, seg::BIGINT, r::BIGINT
+	FROM (VALUES ('abc', 0, 3), ('abc', 0, 1), ('abc', 1, 5), ('xyz', 0, 2)) t(gram, seg, r)))
+ORDER BY gram, segment_no;
+----
+abc	[1, 3]	0	2	1	3
+abc	[5]	1	1	5	5
+xyz	[2]	0	1	2	2
+
+# duplicate rowids within a run are deduplicated; count/min/max reflect the
+# deduplicated set
+query ITIIII
+SELECT gram, ngram_decode_postings(postings), segment_no, rowid_count, min_rowid, max_rowid
+FROM ngram_pack_postings((
+	SELECT gram, seg::BIGINT, r::BIGINT
+	FROM (VALUES ('dup', 0, 7), ('dup', 0, 7), ('dup', 0, 7), ('dup', 0, 9), ('dup', 0, 7)) t(gram, seg, r)));
+----
+dup	[7, 9]	0	2	7	9
+
+# UNSORTED input fragments a key into multiple partial segments (one per run)...
+query I
+SELECT count(*)
+FROM ngram_pack_postings((
+	SELECT gram, seg::BIGINT, r::BIGINT
+	FROM (VALUES ('aa', 0, 1), ('bb', 0, 2), ('aa', 0, 3), ('aa', 0, 1)) t(gram, seg, r)))
+WHERE gram = 'aa';
+----
+2
+
+# ...but the union of decoded postings is still exactly the input's distinct pairs
+query I
+SELECT count(*) FROM (
+	(SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	 FROM ngram_pack_postings((
+		SELECT gram, seg::BIGINT, r::BIGINT
+		FROM (VALUES ('aa', 0, 1), ('bb', 0, 2), ('aa', 0, 3), ('aa', 0, 1)) t(gram, seg, r)))
+	 EXCEPT SELECT DISTINCT gram, r::BIGINT
+	 FROM (VALUES ('aa', 0, 1), ('bb', 0, 2), ('aa', 0, 3), ('aa', 0, 1)) t(gram, seg, r))
+	UNION ALL
+	(SELECT DISTINCT gram, r::BIGINT
+	 FROM (VALUES ('aa', 0, 1), ('bb', 0, 2), ('aa', 0, 3), ('aa', 0, 1)) t(gram, seg, r)
+	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	 FROM ngram_pack_postings((
+		SELECT gram, seg::BIGINT, r::BIGINT
+		FROM (VALUES ('aa', 0, 1), ('bb', 0, 2), ('aa', 0, 3), ('aa', 0, 1)) t(gram, seg, r))))
+);
+----
+0
+
+# empty input yields no output rows
+query I
+SELECT count(*)
+FROM ngram_pack_postings((SELECT ''::VARCHAR, 0::BIGINT, 0::BIGINT WHERE false));
+----
+0
+
+# NULL in any input column is rejected
+statement error
+SELECT * FROM ngram_pack_postings((SELECT NULL::VARCHAR, 0::BIGINT, 1::BIGINT));
+----
+must not contain NULLs
+
+statement error
+SELECT * FROM ngram_pack_postings((SELECT 'abc'::VARCHAR, NULL::BIGINT, 1::BIGINT));
+----
+must not contain NULLs
+
+statement error
+SELECT * FROM ngram_pack_postings((SELECT 'abc'::VARCHAR, 0::BIGINT, NULL::BIGINT));
+----
+must not contain NULLs
+
+# wrong arity is a binder error
+statement error
+SELECT * FROM ngram_pack_postings((SELECT 'abc'::VARCHAR, 0::BIGINT));
+----
+expects a table
+
+# wrong column types are a binder error
+statement error
+SELECT * FROM ngram_pack_postings((SELECT 1::INTEGER, 0::BIGINT, 1::BIGINT));
+----
+expects a table
+
+statement error
+SELECT * FROM ngram_pack_postings((SELECT 'abc'::VARCHAR, 0::BIGINT, 1.5::DOUBLE));
+----
+expects a table

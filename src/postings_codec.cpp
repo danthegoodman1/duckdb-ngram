@@ -5,6 +5,7 @@
 #include "duckdb/function/scalar_function.hpp"
 
 #include <algorithm>
+#include <limits>
 
 namespace duckdb {
 namespace ngram {
@@ -25,8 +26,17 @@ static uint64_t ReadVarint(const char *data, idx_t size, idx_t &pos) {
 			throw InvalidInputException("ngram: malformed postings blob");
 		}
 		auto byte = static_cast<uint8_t>(data[pos++]);
+		// at shift 63 only the lowest payload bit is in range; anything above
+		// would silently wrap out of uint64
+		if (shift == 63 && (byte & 0x7E) != 0) {
+			throw InvalidInputException("ngram: malformed postings blob");
+		}
 		value |= static_cast<uint64_t>(byte & 0x7F) << shift;
 		if (!(byte & 0x80)) {
+			// counts and rowid deltas both live in [0, INT64_MAX]
+			if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+				throw InvalidInputException("ngram: malformed postings blob");
+			}
 			return value;
 		}
 		shift += 7;
@@ -62,7 +72,16 @@ void DecodePostings(const char *data, idx_t size, vector<int64_t> &result) {
 	auto count = ReadVarint(data, size, pos);
 	uint64_t current = 0;
 	for (uint64_t i = 0; i < count; i++) {
-		current += ReadVarint(data, size, pos);
+		auto delta = ReadVarint(data, size, pos);
+		// deltas between sorted unique rowids are >= 1 (the first entry is an
+		// absolute rowid and may be 0); the sum must stay within int64
+		if (i > 0 && delta == 0) {
+			throw InvalidInputException("ngram: malformed postings blob");
+		}
+		if (delta > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - current) {
+			throw InvalidInputException("ngram: malformed postings blob");
+		}
+		current += delta;
 		result.push_back(static_cast<int64_t>(current));
 	}
 	if (pos != size) {

@@ -11,6 +11,7 @@ namespace duckdb {
 static void LoadInternal(ExtensionLoader &loader) {
 	ngram::RegisterTrigramsFunction(loader);
 	ngram::RegisterPostingsCodec(loader);
+	ngram::RegisterPackPostings(loader);
 	ngram::RegisterIndexPragmas(loader);
 }
 

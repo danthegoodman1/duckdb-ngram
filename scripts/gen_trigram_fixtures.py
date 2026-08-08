@@ -27,6 +27,11 @@ FIXTURES = [
     "ẞôΩ mixed ЩЕДРІСТЬ",
     "tent often entered",
     "MIXEDcase123!@#",
+    "ᏣᎳᎩ ᎦᏬᏂᎯᏍᏗ",  # Cherokee: uppercase syllables lowercase into U+ABxx
+    "𐐔𐐯𐑅𐐨𐑉𐐯𐐻 𐐜",  # Deseret: supplementary-plane letters with case
+    "KELVIN K",  # Kelvin sign U+212A lowercases to ASCII k
+    "STRAẞE ẞ",  # capital sharp s U+1E9E lowercases to ß
+    "ΟΔΥΣΣΕΥΣ ὀδυσσεύς ς",  # capital and final sigma; per-codepoint fold avoids final-sigma context
     "abc",
     "ab",
     "",

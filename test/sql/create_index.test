@@ -164,3 +164,132 @@ SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_empty_docs.segments_s),
 FROM ngram_main_empty_docs.meta_s;
 ----
 -1	0	0	3
+
+# NULL named parameters error instead of hitting an internal error
+statement error
+PRAGMA create_ngram_index('docs', 's', gram = NULL);
+----
+cannot be NULL
+
+statement error
+PRAGMA create_ngram_index('docs', 's', case_insensitive = NULL);
+----
+cannot be NULL
+
+# a view is not an indexable target
+statement ok
+CREATE VIEW docs_view AS SELECT s FROM docs;
+
+statement error
+PRAGMA create_ngram_index('docs_view', 's');
+----
+view, not a table
+
+# temporary tables are rejected up front
+statement ok
+CREATE TEMP TABLE temp_docs(s VARCHAR);
+
+statement error
+PRAGMA create_ngram_index('temp_docs', 's');
+----
+temporary
+
+# a user column named rowid (any case) shadows the row-identifier pseudo-column,
+# so the build would silently index that column's values; refuse instead
+statement ok
+CREATE TABLE has_rowid("RowID" BIGINT, s VARCHAR);
+
+statement error
+PRAGMA create_ngram_index('has_rowid', 's');
+----
+shadows the rowid pseudo-column
+
+# evil identifiers: keyword column name, dotted table name, unicode column name
+statement ok
+CREATE TABLE "my.table"("select" VARCHAR, "sträße" VARCHAR);
+
+statement ok
+INSERT INTO "my.table" VALUES ('hello world', 'guten tag');
+
+statement ok
+PRAGMA create_ngram_index('"my.table"', 'select');
+
+statement ok
+PRAGMA create_ngram_index('"my.table"', 'sträße');
+
+query IIIIIIII
+PRAGMA ngram_index_stats('"my.table"');
+----
+select	3	true	0	9	9	9	27
+sträße	3	true	0	7	7	7	21
+
+statement ok
+PRAGMA drop_ngram_index('"my.table"', 'select');
+
+statement ok
+PRAGMA drop_ngram_index('"my.table"', 'sträße');
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_my.table';
+----
+0
+
+# shadow schema name collision: (schema a, table b_c) and (schema a_b, table c)
+# both map to ngram_a_b_c; the second create must fail loudly, and neither drop
+# nor stats may operate through the colliding schema
+statement ok
+CREATE SCHEMA a;
+
+statement ok
+CREATE TABLE a.b_c(s VARCHAR);
+
+statement ok
+INSERT INTO a.b_c VALUES ('hello world');
+
+statement ok
+CREATE SCHEMA a_b;
+
+statement ok
+CREATE TABLE a_b.c(s VARCHAR);
+
+statement ok
+INSERT INTO a_b.c VALUES ('goodbye');
+
+statement ok
+PRAGMA create_ngram_index('a.b_c', 's');
+
+statement error
+PRAGMA create_ngram_index('a_b.c', 's');
+----
+shadow schema collision
+
+statement error
+PRAGMA drop_ngram_index('a_b.c', 's');
+----
+shadow schema collision
+
+# stats through the colliding name reports nothing rather than the foreign index
+query IIIIIIII
+PRAGMA ngram_index_stats('a_b.c');
+----
+
+# the failed create and refused drop left the owner's index untouched
+query IIIIIIII
+PRAGMA ngram_index_stats('a.b_c');
+----
+s	3	true	0	9	9	9	27
+
+# once the owner drops its index, the schema name is free for the other table
+statement ok
+PRAGMA drop_ngram_index('a.b_c', 's');
+
+statement ok
+PRAGMA create_ngram_index('a_b.c', 's');
+
+query II
+SELECT schema_name, table_name FROM ngram_a_b_c.meta_s;
+----
+a_b	c
+
+statement ok
+PRAGMA drop_ngram_index('a_b.c', 's');

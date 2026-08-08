@@ -51,10 +51,40 @@ SELECT ngram_encode_postings([1, NULL]::BIGINT[]);
 ----
 NULL
 
+query I
+SELECT ngram_decode_postings(ngram_encode_postings([9223372036854775807]::BIGINT[]));
+----
+[9223372036854775807]
+
 statement error
 SELECT ngram_decode_postings('garbage'::BLOB);
 ----
 postings blob
+
+# a varint whose 10th byte carries bits beyond 2^63 would wrap to a negative
+# rowid ([-1] before hardening)
+statement error
+SELECT ngram_decode_postings('\x01\x01\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x7F'::BLOB);
+----
+malformed postings blob
+
+# a varint encoding exactly 2^63 exceeds INT64_MAX (INT64_MIN before hardening)
+statement error
+SELECT ngram_decode_postings('\x01\x01\x80\x80\x80\x80\x80\x80\x80\x80\x80\x01'::BLOB);
+----
+malformed postings blob
+
+# a zero delta after the first entry cannot come from sorted unique rowids
+statement error
+SELECT ngram_decode_postings('\x01\x02\x05\x00'::BLOB);
+----
+malformed postings blob
+
+# deltas summing past INT64_MAX would wrap negative
+statement error
+SELECT ngram_decode_postings('\x01\x02\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x7F\x01'::BLOB);
+----
+malformed postings blob
 
 # randomized round-trip: decode(encode(l)) must equal the sorted unique list
 statement ok

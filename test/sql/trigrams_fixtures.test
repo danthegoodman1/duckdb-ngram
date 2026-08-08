@@ -707,6 +707,262 @@ e123
 3!@#
 
 query I
+SELECT unnest(trigrams('ᏣᎳᎩ ᎦᏬᏂᎯᏍᏗ', 3, true));
+----
+ꮳꮃꭹ
+ꮃꭹ 
+ꭹ ꭶ
+ ꭶꮼ
+ꭶꮼꮒ
+ꮼꮒꭿ
+ꮒꭿꮝ
+ꭿꮝꮧ
+
+query I
+SELECT unnest(trigrams('ᏣᎳᎩ ᎦᏬᏂᎯᏍᏗ', 3, false));
+----
+ᏣᎳᎩ
+ᎳᎩ 
+Ꭹ Ꭶ
+ ᎦᏬ
+ᎦᏬᏂ
+ᏬᏂᎯ
+ᏂᎯᏍ
+ᎯᏍᏗ
+
+query I
+SELECT unnest(trigrams('ᏣᎳᎩ ᎦᏬᏂᎯᏍᏗ', 2, true));
+----
+ꮳꮃ
+ꮃꭹ
+ꭹ 
+ ꭶ
+ꭶꮼ
+ꮼꮒ
+ꮒꭿ
+ꭿꮝ
+ꮝꮧ
+
+query I
+SELECT unnest(trigrams('ᏣᎳᎩ ᎦᏬᏂᎯᏍᏗ', 4, true));
+----
+ꮳꮃꭹ 
+ꮃꭹ ꭶ
+ꭹ ꭶꮼ
+ ꭶꮼꮒ
+ꭶꮼꮒꭿ
+ꮼꮒꭿꮝ
+ꮒꭿꮝꮧ
+
+query I
+SELECT unnest(trigrams('𐐔𐐯𐑅𐐨𐑉𐐯𐐻 𐐜', 3, true));
+----
+𐐼𐐯𐑅
+𐐯𐑅𐐨
+𐑅𐐨𐑉
+𐐨𐑉𐐯
+𐑉𐐯𐐻
+𐐯𐐻 
+𐐻 𐑄
+
+query I
+SELECT unnest(trigrams('𐐔𐐯𐑅𐐨𐑉𐐯𐐻 𐐜', 3, false));
+----
+𐐔𐐯𐑅
+𐐯𐑅𐐨
+𐑅𐐨𐑉
+𐐨𐑉𐐯
+𐑉𐐯𐐻
+𐐯𐐻 
+𐐻 𐐜
+
+query I
+SELECT unnest(trigrams('𐐔𐐯𐑅𐐨𐑉𐐯𐐻 𐐜', 2, true));
+----
+𐐼𐐯
+𐐯𐑅
+𐑅𐐨
+𐐨𐑉
+𐑉𐐯
+𐐯𐐻
+𐐻 
+ 𐑄
+
+query I
+SELECT unnest(trigrams('𐐔𐐯𐑅𐐨𐑉𐐯𐐻 𐐜', 4, true));
+----
+𐐼𐐯𐑅𐐨
+𐐯𐑅𐐨𐑉
+𐑅𐐨𐑉𐐯
+𐐨𐑉𐐯𐐻
+𐑉𐐯𐐻 
+𐐯𐐻 𐑄
+
+query I
+SELECT unnest(trigrams('KELVIN K', 3, true));
+----
+kel
+elv
+lvi
+vin
+in 
+n k
+
+query I
+SELECT unnest(trigrams('KELVIN K', 3, false));
+----
+KEL
+ELV
+LVI
+VIN
+IN 
+N K
+
+query I
+SELECT unnest(trigrams('KELVIN K', 2, true));
+----
+ke
+el
+lv
+vi
+in
+n 
+ k
+
+query I
+SELECT unnest(trigrams('KELVIN K', 4, true));
+----
+kelv
+elvi
+lvin
+vin 
+in k
+
+query I
+SELECT unnest(trigrams('STRAẞE ẞ', 3, true));
+----
+str
+tra
+raß
+aße
+ße 
+e ß
+
+query I
+SELECT unnest(trigrams('STRAẞE ẞ', 3, false));
+----
+STR
+TRA
+RAẞ
+AẞE
+ẞE 
+E ẞ
+
+query I
+SELECT unnest(trigrams('STRAẞE ẞ', 2, true));
+----
+st
+tr
+ra
+aß
+ße
+e 
+ ß
+
+query I
+SELECT unnest(trigrams('STRAẞE ẞ', 4, true));
+----
+stra
+traß
+raße
+aße 
+ße ß
+
+query I
+SELECT unnest(trigrams('ΟΔΥΣΣΕΥΣ ὀδυσσεύς ς', 3, true));
+----
+οδυ
+δυσ
+υσσ
+σσε
+σευ
+ευσ
+υσ 
+σ ὀ
+ ὀδ
+ὀδυ
+δυσ
+υσσ
+σσε
+σεύ
+εύς
+ύς 
+ς ς
+
+query I
+SELECT unnest(trigrams('ΟΔΥΣΣΕΥΣ ὀδυσσεύς ς', 3, false));
+----
+ΟΔΥ
+ΔΥΣ
+ΥΣΣ
+ΣΣΕ
+ΣΕΥ
+ΕΥΣ
+ΥΣ 
+Σ ὀ
+ ὀδ
+ὀδυ
+δυσ
+υσσ
+σσε
+σεύ
+εύς
+ύς 
+ς ς
+
+query I
+SELECT unnest(trigrams('ΟΔΥΣΣΕΥΣ ὀδυσσεύς ς', 2, true));
+----
+οδ
+δυ
+υσ
+σσ
+σε
+ευ
+υσ
+σ 
+ ὀ
+ὀδ
+δυ
+υσ
+σσ
+σε
+εύ
+ύς
+ς 
+ ς
+
+query I
+SELECT unnest(trigrams('ΟΔΥΣΣΕΥΣ ὀδυσσεύς ς', 4, true));
+----
+οδυσ
+δυσσ
+υσσε
+σσευ
+σευσ
+ευσ 
+υσ ὀ
+σ ὀδ
+ ὀδυ
+ὀδυσ
+δυσσ
+υσσε
+σσεύ
+σεύς
+εύς 
+ύς ς
+
+query I
 SELECT unnest(trigrams('abc', 3, true));
 ----
 abc

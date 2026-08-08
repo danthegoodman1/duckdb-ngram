@@ -13,7 +13,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/ngram_extension.cpp src/trigram.cpp src/trigrams_function.cpp)
+set(EXTENSION_SOURCES src/ngram_extension.cpp src/trigram.cpp src/trigrams_function.cpp src/postings_codec.cpp
+                      src/index_pragmas.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

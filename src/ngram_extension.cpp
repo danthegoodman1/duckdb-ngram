@@ -2,12 +2,16 @@
 
 #include "ngram_extension.hpp"
 #include "duckdb.hpp"
+#include "ngram/index_pragmas.hpp"
+#include "ngram/postings_codec.hpp"
 #include "ngram/trigram.hpp"
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	ngram::RegisterTrigramsFunction(loader);
+	ngram::RegisterPostingsCodec(loader);
+	ngram::RegisterIndexPragmas(loader);
 }
 
 void NgramExtension::Load(ExtensionLoader &loader) {

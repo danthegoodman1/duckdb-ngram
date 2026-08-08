@@ -1,0 +1,71 @@
+# name: test/sql/postings_codec.test
+# description: postings blob codec round-trips
+# group: [sql]
+
+require ngram
+
+query I
+SELECT ngram_decode_postings(ngram_encode_postings([1, 5, 9]::BIGINT[]));
+----
+[1, 5, 9]
+
+# encode sorts and deduplicates
+query I
+SELECT ngram_decode_postings(ngram_encode_postings([5, 1, 5, 9, 1]::BIGINT[]));
+----
+[1, 5, 9]
+
+query I
+SELECT ngram_decode_postings(ngram_encode_postings([]::BIGINT[]));
+----
+[]
+
+query I
+SELECT ngram_decode_postings(ngram_encode_postings([0]::BIGINT[]));
+----
+[0]
+
+# large values survive the varint encoding
+query I
+SELECT ngram_decode_postings(ngram_encode_postings([0, 127, 128, 16383, 16384, 4611686018427387904]::BIGINT[]));
+----
+[0, 127, 128, 16383, 16384, 4611686018427387904]
+
+query I
+SELECT ngram_encode_postings(NULL);
+----
+NULL
+
+query I
+SELECT ngram_decode_postings(NULL);
+----
+NULL
+
+statement error
+SELECT ngram_encode_postings([-1]::BIGINT[]);
+----
+negative
+
+statement error
+SELECT ngram_encode_postings([1, NULL]::BIGINT[]);
+----
+NULL
+
+statement error
+SELECT ngram_decode_postings('garbage'::BLOB);
+----
+postings blob
+
+# randomized round-trip: decode(encode(l)) must equal the sorted unique list
+statement ok
+CREATE TABLE codec_fuzz AS
+SELECT list((random() * 1e15)::BIGINT) AS l
+FROM range(10000) t(i)
+GROUP BY i % 97;
+
+query I
+SELECT count(*)
+FROM codec_fuzz
+WHERE ngram_decode_postings(ngram_encode_postings(l)) != list_sort(list_distinct(l));
+----
+0

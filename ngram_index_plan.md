@@ -175,13 +175,15 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Scope | Shadow schema (segments, metadata, stats) | Missing: schema + format doc. |
-| Incomplete | Work | 2A: SQL-driven parallel build path | Missing: implementation + 10 GB build run. |
-| Incomplete | Work | 2B: create/drop pragmas + `ngram_index_stats` | Missing: implementation + tests. |
-| Incomplete | Work | 2C: Posting segment codec (delta + compression) | Missing: codec + round-trip fuzz test. |
-| Incomplete | Gate | 10 GB build under memory limit; reopen w/ and w/o extension | Missing: recorded runs. |
-| Incomplete | Test | Persistence + lifecycle sqllogictests | Missing: test files. |
-| Incomplete | Risk | Index size ratio unacceptable (>~60% of corpus) | Missing: measurement on real corpus. |
+| Complete | Scope | Shadow schema (segments, metadata, stats) | Schema `ngram_<schema>_<table>` with `meta_/segments_/stats_<column>` tables; blob format documented in src/include/ngram/postings_codec.hpp. |
+| Partial | Work | 2A: SQL-driven parallel build path | Two-pass build in src/index_pragmas.cpp (temp pairs table, then grouped encode): 196 MB corpus builds in ~7 s unmetered. Metered runs blocked on 2D. |
+| Incomplete | Work | 2D: Streaming postings packer to replace grouped `list()` | Grouped `list()` OOMs instantly under ANY `memory_limit` at 190M-pair scale (duckdb 1.5.5; non-list aggregates spill fine — verified). Candidates: table in-out packer over sorted pairs; bitmap-span format; upstream fix. Required for the memory-limit gate. |
+| Complete | Work | 2B: create/drop pragmas + `ngram_index_stats` | src/index_pragmas.cpp + test/sql/create_index.test. Stats delivered as `PRAGMA ngram_index_stats` (pragma named args use `=`, not `:=`). |
+| Complete | Work | 2C: Posting segment codec (delta + varint) | src/postings_codec.cpp + randomized round-trip tests in test/sql/postings_codec.test. Entropy compression deferred to Phase 6 tuning. |
+| Partial | Gate | 10 GB build under memory limit; reopen w/ and w/o extension | Extension-absent verified: stock duckdb 1.5.5 wheel read+wrote the indexed db, index intact on reopen with extension. In-suite restart round-trip in test/sql/index_persistence.test. Memory-limited large build blocked on 2D. |
+| Complete | Test | Persistence + lifecycle sqllogictests | test/sql/create_index.test, index_persistence.test, postings_codec.test (649 assertions green). |
+| Incomplete | Risk | Index size ratio unacceptable (>~60% of corpus) | Worst-case hex corpus (every trigram in ~every row): 205 MB blobs / 196 MB corpus ≈ 105%. Needs real-text corpus measurement; hex is maximally dense. |
+| Complete | Doc | Build pragma cannot reference a table created in the same multi-statement batch | DuckDB expands pragmas before batch execution (statement_preprocessor.cpp); run `create_ngram_index` as its own statement. Noted here; user docs in Phase 6. |
 
 ## Phase 3: Explicit Query Path — Exhaustive Search with Recheck
 

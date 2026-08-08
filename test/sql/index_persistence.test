@@ -1,0 +1,59 @@
+# name: test/sql/index_persistence.test
+# description: ngram index survives database close/reopen
+# group: [sql]
+
+load __TEST_DIR__/ngram_persistence.db
+
+require ngram
+
+statement ok
+CREATE TABLE docs(s VARCHAR);
+
+statement ok
+INSERT INTO docs VALUES ('Hello world'), ('hello DUCK'), (NULL), ('connection reset by peer');
+
+statement ok
+PRAGMA create_ngram_index('docs', 's');
+
+query IIIIIIII
+PRAGMA ngram_index_stats('docs');
+----
+s	3	true	3	35	35	39	109
+
+restart
+
+# the reopened index is identical to a brute-force re-extraction
+query I
+SELECT count(*) FROM (
+	(SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_docs.segments_s
+	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL)
+	UNION ALL
+	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL
+	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_docs.segments_s)
+);
+----
+0
+
+query IIIIIIII
+PRAGMA ngram_index_stats('docs');
+----
+s	3	true	3	35	35	39	109
+
+# the base table stays fully usable alongside the index
+statement ok
+INSERT INTO docs VALUES ('post-restart row');
+
+query I
+SELECT count(*) FROM docs;
+----
+5
+
+statement ok
+PRAGMA drop_ngram_index('docs', 's');
+
+restart
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE schema_name LIKE 'ngram_%';
+----
+0

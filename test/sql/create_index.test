@@ -1,0 +1,166 @@
+# name: test/sql/create_index.test
+# description: create_ngram_index / drop_ngram_index / ngram_index_stats lifecycle
+# group: [sql]
+
+require ngram
+
+statement ok
+CREATE TABLE docs(id INTEGER, s VARCHAR, n INTEGER);
+
+statement ok
+INSERT INTO docs VALUES
+	(1, 'Hello world', 10),
+	(2, 'hello DUCK', 20),
+	(3, NULL, 30),
+	(4, 'ab', 40),
+	(5, 'connection reset by peer', 50),
+	(6, 'öft ÖFT often', 60);
+
+statement ok
+PRAGMA create_ngram_index('docs', 's');
+
+# shadow tables exist
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
+----
+3
+
+# options round-trip through the meta table
+query IIIIII
+SELECT format_version, schema_name, table_name, column_name, gram_size, case_insensitive
+FROM ngram_main_docs.meta_s;
+----
+1	main	docs	s	3	true
+
+# hwm covers all rows at build time
+query I
+SELECT hwm_rowid = (SELECT max(rowid) FROM docs) FROM ngram_main_docs.meta_s;
+----
+true
+
+# the index is exactly the brute-force extraction (both directions)
+query I
+SELECT count(*) FROM (
+	(SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_docs.segments_s
+	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL)
+	UNION ALL
+	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL
+	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_docs.segments_s)
+);
+----
+0
+
+# stats agree with the segments table
+query I
+SELECT count(*) FROM ngram_main_docs.stats_s;
+----
+44
+
+query II
+SELECT row_count, segment_count FROM ngram_main_docs.stats_s WHERE gram = 'hel';
+----
+2	1
+
+# duplicate create errors
+statement error
+PRAGMA create_ngram_index('docs', 's');
+----
+already exists
+
+# missing table / missing column / wrong type errors
+statement error
+PRAGMA create_ngram_index('nope', 's');
+----
+does not exist
+
+statement error
+PRAGMA create_ngram_index('docs', 'nope');
+----
+does not have a column
+
+statement error
+PRAGMA create_ngram_index('docs', 'n');
+----
+VARCHAR
+
+statement error
+PRAGMA create_ngram_index('docs', 's', gram = 0);
+----
+at least 1
+
+# stats on an unindexed table errors
+statement error
+PRAGMA ngram_index_stats('unindexed');
+----
+does not exist
+
+statement ok
+CREATE TABLE unindexed(s VARCHAR);
+
+statement error
+PRAGMA ngram_index_stats('unindexed');
+----
+No ngram indexes
+
+# a second indexed column on the same table shares the shadow schema
+statement ok
+ALTER TABLE docs ADD COLUMN t VARCHAR;
+
+statement ok
+UPDATE docs SET t = 'tent often entered';
+
+statement ok
+PRAGMA create_ngram_index('docs', 't', gram = 2, case_insensitive = false);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
+----
+6
+
+query IIIIIIII
+PRAGMA ngram_index_stats('docs');
+----
+s	3	true	5	44	44	48	136
+t	2	false	5	12	12	72	96
+
+# dropping one column's index leaves the other intact
+statement ok
+PRAGMA drop_ngram_index('docs', 's');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
+----
+3
+
+query IIIIIIII
+PRAGMA ngram_index_stats('docs');
+----
+t	2	false	5	12	12	72	96
+
+# dropping the last index removes the shadow schema
+statement ok
+PRAGMA drop_ngram_index('docs', 't');
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_docs';
+----
+0
+
+statement error
+PRAGMA drop_ngram_index('docs', 's');
+----
+No ngram index
+
+# index build on an empty table works and yields empty postings
+statement ok
+CREATE TABLE empty_docs(s VARCHAR);
+
+statement ok
+PRAGMA create_ngram_index('empty_docs', 's');
+
+query IIII
+SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_empty_docs.segments_s),
+       (SELECT count(*) FROM ngram_main_empty_docs.stats_s), gram_size
+FROM ngram_main_empty_docs.meta_s;
+----
+-1	0	0	3

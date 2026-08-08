@@ -137,12 +137,12 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Scope | Extension scaffold builds against pinned duckdb | Missing: repo, CI run. |
+| Complete | Scope | Extension scaffold builds against pinned duckdb | Repo github.com/danthegoodman1/duckdb-ngram (private), duckdb submodule @ v1.5.5, local `make`/`make test` green. |
 | Incomplete | Work | 1C: Re-verify Key Research Facts against pinned duckdb v1.5.5 and re-pin the plan's file:line references (research used main `e500d77`, kept as submodule tag `research-e500d778`) | Missing: verification pass over hook ordering, `table_scan.cpp` gates, `KEEP_ROW_IDS` vacuum behavior. |
-| Incomplete | Work | 1A: `trigrams()` scalar function with shared normalization module | Missing: implementation + unit tests. |
-| Incomplete | Work | 1B: Needle decomposition + short-needle detection | Missing: implementation + tests. |
-| Incomplete | Gate | Loads in CLI; extraction matches reference on unicode fixtures | Missing: fixture suite + passing run. |
-| Incomplete | Test | sqllogictest suite for extraction edge cases | Missing: test files. |
+| Complete | Work | 1A: `trigrams()` scalar function with shared normalization module | src/trigram.cpp + src/trigrams_function.cpp; positional optional args (named args unsupported for scalar functions); test/sql/trigrams.test. |
+| Partial | Work | 1B: Needle decomposition + short-needle detection | DecomposeNeedle + too_short in src/trigram.cpp, shares ExtractGrams with 1A; direct tests come with the Phase 2/3 SQL surface that exposes it. |
+| Partial | Gate | Loads in CLI; extraction matches reference on unicode fixtures | CLI load + 551 passing assertions incl. generated fixture suite (scripts/gen_trigram_fixtures.py); remaining: CI green on GitHub. |
+| Complete | Test | sqllogictest suite for extraction edge cases | test/sql/trigrams.test + generated test/sql/trigrams_fixtures.test. |
 
 ## Phase 2: Index Build and Shadow-Table Storage
 

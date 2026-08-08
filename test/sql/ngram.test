@@ -1,18 +1,17 @@
 # name: test/sql/ngram.test
-# description: test ngram extension
+# description: ngram extension loads and exposes trigrams()
 # group: [sql]
 
 # Before we load the extension, this will fail
 statement error
-SELECT ngram('Sam');
+SELECT trigrams('duck');
 ----
-Catalog Error: Scalar Function with name ngram does not exist!
+Catalog Error
 
 # Require statement will ensure this test is run with this extension loaded
 require ngram
 
-# Confirm the extension works
 query I
-SELECT ngram('Sam');
+SELECT trigrams('duck');
 ----
-...........🦆 Sam
+[duc, uck]

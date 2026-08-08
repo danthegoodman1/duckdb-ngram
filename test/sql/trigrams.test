@@ -1,0 +1,123 @@
+# name: test/sql/trigrams.test
+# description: trigrams() extraction edge cases
+# group: [sql]
+
+require ngram
+
+# case folding is on by default
+query I
+SELECT unnest(trigrams('DuckDB'));
+----
+duc
+uck
+ckd
+kdb
+
+# case folding disabled
+query I
+SELECT unnest(trigrams('DuckDB', 3, false));
+----
+Duc
+uck
+ckD
+kDB
+
+# custom gram size
+query I
+SELECT unnest(trigrams('duck', 2));
+----
+du
+uc
+ck
+
+query I
+SELECT unnest(trigrams('ab', 1));
+----
+a
+b
+
+# input of exactly gram_size codepoints yields one gram
+query I
+SELECT trigrams('abc');
+----
+[abc]
+
+# shorter than gram_size yields an empty list, not NULL
+query I
+SELECT trigrams('ab');
+----
+[]
+
+query I
+SELECT trigrams('');
+----
+[]
+
+# NULL handling
+query I
+SELECT trigrams(NULL);
+----
+NULL
+
+query I
+SELECT trigrams('abc', NULL);
+----
+NULL
+
+query I
+SELECT trigrams('abc', 3, NULL);
+----
+NULL
+
+statement error
+SELECT trigrams('abc', 0);
+----
+gram_size must be at least 1
+
+statement error
+SELECT trigrams('abc', -3);
+----
+gram_size must be at least 1
+
+# grams are codepoint windows, not byte windows
+query I
+SELECT unnest(trigrams('héllo'));
+----
+hél
+éll
+llo
+
+# unicode case folding
+query I
+SELECT unnest(trigrams('HÉLLO'));
+----
+hél
+éll
+llo
+
+# multibyte codepoints count as single positions
+query I
+SELECT unnest(trigrams('a🦆b🦆'));
+----
+a🦆b
+🦆b🦆
+
+# duplicate grams are preserved in extraction order
+query I
+SELECT unnest(trigrams('aaaa'));
+----
+aaa
+aaa
+
+# extraction over a table with mixed NULLs and per-row gram sizes
+statement ok
+CREATE TABLE strings AS
+SELECT * FROM (VALUES ('Hello', 3), (NULL, 3), ('Hello', 2), ('Hi', 3)) t(s, g);
+
+query I
+SELECT trigrams(s, g) FROM strings ORDER BY rowid;
+----
+[hel, ell, llo]
+NULL
+[he, el, ll, lo]
+[]

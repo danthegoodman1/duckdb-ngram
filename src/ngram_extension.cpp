@@ -2,23 +2,12 @@
 
 #include "ngram_extension.hpp"
 #include "duckdb.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include "ngram/trigram.hpp"
 
 namespace duckdb {
 
-inline void NgramScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &name_vector = args.data[0];
-	UnaryExecutor::Execute<string_t, string_t>(name_vector, result, args.size(), [&](string_t name) {
-		return StringVector::AddString(result, "...........🦆 " + name.GetString());
-	});
-}
-
 static void LoadInternal(ExtensionLoader &loader) {
-	auto ngram_scalar_function = ScalarFunction("ngram", {LogicalType::VARCHAR}, LogicalType::VARCHAR, NgramScalarFun);
-
-	loader.RegisterFunction(ngram_scalar_function);
+	ngram::RegisterTrigramsFunction(loader);
 }
 
 void NgramExtension::Load(ExtensionLoader &loader) {

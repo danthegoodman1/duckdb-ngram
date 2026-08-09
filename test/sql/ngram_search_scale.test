@@ -69,21 +69,66 @@ SELECT id FROM ngram_search('big', '1048576') ORDER BY id;
 1048576
 9999999
 
-# delete indexed rows, then checkpoint: vacuum merges the shrunken row groups
-# and moves surviving rowids out from under the index (the Phase 5 refresh
-# scenario). The index may now miss moved rows, but recheck keeps false
-# positives impossible: results remain a subset of the truth for any needle.
+# a refresh over the appended tail indexes it: afterwards the row is a
+# candidate (the tail scan is no longer what finds it)
+statement ok
+PRAGMA ngram_refresh('big');
+
+query I
+SELECT count(*) FROM ngram_candidates('big', 's', '1048576') WHERE rowid > 1149999;
+----
+1
+
+# deleting indexed rows and checkpointing runs a real vacuum: it merges the
+# shrunken row groups, moves surviving rowids out from under the index, and
+# leaves the table shorter than the recorded high-water mark.
+#
+# PHASE 5 CHANGE (was: results stay a subset of the truth, silently missing
+# moved rows). The shrink is proof that rowids the index recorded are gone, so
+# the query paths refuse instead of answering with a hole, and refresh refuses
+# to advance a high-water mark over rows it can no longer place. Recheck still
+# forbids false positives; what changed is that the misses are now surfaced.
 statement ok
 DELETE FROM big WHERE id % 3 = 1 AND id < 700000;
 
 statement ok
 CHECKPOINT;
 
+statement error
+SELECT count(*) FROM ngram_search('big', '999999');
+----
+is stale and cannot be used
+
+statement error
+SELECT count(*) FROM ngram_candidates('big', 's', '999999');
+----
+is stale and cannot be used
+
+statement error
+PRAGMA ngram_refresh('big');
+----
+cannot be maintained incrementally
+
+statement error
+PRAGMA ngram_compact('big');
+----
+cannot be maintained incrementally
+
+# the rebuild the error asks for restores exhaustive search
+statement ok
+PRAGMA drop_ngram_index('big', 's');
+
+statement ok
+PRAGMA create_ngram_index('big', 's');
+
 foreach needle 999999 048576 000 123456
 
 query I
 SELECT count(*) FROM (
-	SELECT * FROM ngram_search('big', '${needle}') EXCEPT SELECT * FROM big WHERE contains(s, '${needle}'));
+	(SELECT * FROM ngram_search('big', '${needle}') EXCEPT SELECT * FROM big WHERE contains(s, '${needle}'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, '${needle}') EXCEPT SELECT * FROM ngram_search('big', '${needle}'))
+);
 ----
 0
 

@@ -23,6 +23,7 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/index_pragmas.hpp"
+#include "ngram/maintenance.hpp"
 #include "ngram/ngram_rewrite.hpp"
 #include "ngram/search_core.hpp"
 #include "ngram/trigram.hpp"
@@ -65,11 +66,16 @@ namespace ngram {
 // case-insensitive indexes; probing a CS index with an ILIKE needle would
 // miss case-variant matches and is never done.
 //
-// The transparent path inherits the Phase 3 misses-only staleness gaps
-// (in-place UPDATE below the high-water mark, post-vacuum row motion, table
-// recreation; see ngram_search's contract). That is why ngram_auto_accelerate
-// defaults to false: enabling it is a knowing trade until Phase 5 maintenance
-// closes the gaps. Recheck still makes false positives impossible.
+// Staleness: the same detectors the explicit path errors on make this path
+// decline instead — a plain LIKE must keep returning every matching row, so a
+// proven-stale index falls back to the plain scan (at plan time, leaving the
+// seq scan; at run time, as the "index stale" full-scan fallback). What
+// remains undetectable is an in-place UPDATE of an indexed row, which
+// PRAGMA ngram_refresh cannot repair either (duckdb v1.5.5 has no trigger or
+// change feed to find such rows — see ngram/maintenance.hpp), so
+// ngram_auto_accelerate stays opt-in: enabling it accepts that a table
+// changed by UPDATEs needs a rebuild to stay exhaustive. Recheck still makes
+// false positives impossible.
 //===----------------------------------------------------------------------===//
 
 static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.05;
@@ -377,6 +383,13 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 		// dropped or malformed shadow tables: a plain LIKE must keep working,
 		// so degrade to the full scan instead of surfacing an index error
 		state.fallback_reason = "index unavailable";
+		return false;
+	}
+	auto &base = ResolveExistingTable(context, bind.catalog_name, bind.schema_name, bind.table_name, "table");
+	if (!CertainStaleReason(info, ComputeTableFingerprint(context, base)).empty()) {
+		// a plain LIKE must return every matching row: a proven-stale index
+		// cannot, so the scan degrades instead of erroring the user's query
+		state.fallback_reason = "index stale";
 		return false;
 	}
 	auto usable = UsableNeedles(bind.needles, info.options);
@@ -712,6 +725,11 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		} catch (std::exception &) {
 			// unusable shadow tables (collision, malformed, unreadable): the
 			// plain seq scan stands
+			continue;
+		}
+		if (!CertainStaleReason(info, ComputeTableFingerprint(context, *table)).empty()) {
+			// the index provably no longer describes this table; a LIKE must
+			// still return every matching row, so leave the seq scan in place
 			continue;
 		}
 		auto usable = UsableNeedles(needles, info.options);

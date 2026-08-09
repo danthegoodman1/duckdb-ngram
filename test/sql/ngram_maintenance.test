@@ -1,0 +1,621 @@
+# name: test/sql/ngram_maintenance.test
+# description: PRAGMA ngram_refresh / ngram_compact and the staleness detectors
+# group: [sql]
+
+require ngram
+
+statement ok
+CREATE TABLE docs(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO docs VALUES (1, 'a tent pitched'), (2, 'no match'), (3, 'ten cents');
+
+statement ok
+PRAGMA create_ngram_index('docs', 's');
+
+#===----------------------------------------------------------------------===#
+# refresh indexes the tail
+#===----------------------------------------------------------------------===#
+
+statement ok
+INSERT INTO docs VALUES (4, 'tent number two'), (5, NULL), (6, 'ab'), (7, 'yet another tent');
+
+# before the refresh the tail rows are found by the brute-force tail scan, so
+# the index itself does not know them: they are not candidates
+query I
+SELECT count(*) FROM ngram_candidates('docs', 's', 'tent') WHERE rowid > 2;
+----
+0
+
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+4
+7
+
+statement ok
+PRAGMA ngram_refresh('docs');
+
+# after the refresh the same rows come out of the index, and the high-water
+# mark covers the whole table (including the NULL and the too-short row)
+query I
+SELECT count(*) FROM ngram_candidates('docs', 's', 'tent') WHERE rowid > 2;
+----
+2
+
+query I
+SELECT hwm_rowid = (SELECT max(rowid) FROM docs) FROM ngram_main_docs.meta_s;
+----
+true
+
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+4
+7
+
+# the refresh appended a generation rather than rewriting the index
+query I
+SELECT count(DISTINCT generation) FROM ngram_main_docs.segments_s;
+----
+2
+
+# a refresh with nothing past the mark is a no-op: same mark, same segments
+statement ok
+PRAGMA ngram_refresh('docs');
+
+query II
+SELECT (SELECT hwm_rowid FROM ngram_main_docs.meta_s), (SELECT count(*) FROM ngram_main_docs.segments_s);
+----
+6	45
+
+# refresh after a DELETE that was not vacuumed is allowed: deleting rows leaves
+# every surviving rowid where it was, and recheck already hides the dead
+# postings. The test harness checkpoints after every statement
+# (checkpoint_wal_size 0), which would vacuum the deleted row away and move
+# rowids, so this raises the threshold first — the vacuum case is the block
+# below and in ngram_search_scale.test.
+statement ok
+SET checkpoint_threshold = '1GB';
+
+statement ok
+DELETE FROM docs WHERE id = 3;
+
+statement ok
+INSERT INTO docs VALUES (8, 'tent after delete');
+
+statement ok
+PRAGMA ngram_refresh('docs');
+
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+4
+7
+8
+
+#===----------------------------------------------------------------------===#
+# compaction
+#===----------------------------------------------------------------------===#
+
+query I
+SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM ngram_main_docs.segments_s
+	GROUP BY gram, segment_no HAVING count(*) > 1);
+----
+true
+
+statement ok
+PRAGMA ngram_compact('docs');
+
+# every (gram, segment_no) is one row again
+query I
+SELECT count(*) FROM (SELECT gram, segment_no FROM ngram_main_docs.segments_s
+	GROUP BY gram, segment_no HAVING count(*) > 1);
+----
+0
+
+# stats hold one row per gram, matching the merged segments
+query I
+SELECT count(*) FROM (SELECT gram FROM ngram_main_docs.stats_s GROUP BY gram HAVING count(*) > 1);
+----
+0
+
+query I
+SELECT count(*) FROM (
+	(SELECT gram, row_count FROM ngram_main_docs.stats_s
+	 EXCEPT SELECT gram, sum(rowid_count)::BIGINT FROM ngram_main_docs.segments_s GROUP BY gram)
+	UNION ALL
+	(SELECT gram, sum(rowid_count)::BIGINT FROM ngram_main_docs.segments_s GROUP BY gram
+	 EXCEPT SELECT gram, row_count FROM ngram_main_docs.stats_s)
+);
+----
+0
+
+# results are unchanged by compaction, and the dead posting of the deleted row
+# is gone from the rewritten segments
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+4
+7
+8
+
+query I
+SELECT count(*) FROM ngram_candidates('docs', 's', 'ten') WHERE rowid = 2;
+----
+0
+
+# compaction is idempotent: a second run finds nothing to merge and changes
+# neither the segment rows nor the answers
+statement ok
+PRAGMA ngram_compact('docs');
+
+query I
+SELECT count(*) FROM (SELECT gram, segment_no FROM ngram_main_docs.segments_s
+	GROUP BY gram, segment_no HAVING count(*) > 1);
+----
+0
+
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+1
+4
+7
+8
+
+# purge := true rewrites every key, so dead postings are dropped everywhere and
+# not only where the merge happened to rewrite the blob
+statement ok
+DELETE FROM docs WHERE id = 1;
+
+query I
+SELECT count(*) FROM ngram_candidates('docs', 's', 'tent') WHERE rowid = 0;
+----
+1
+
+statement ok
+PRAGMA ngram_compact('docs', purge = true);
+
+query I
+SELECT count(*) FROM ngram_candidates('docs', 's', 'tent') WHERE rowid = 0;
+----
+0
+
+query I
+SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
+----
+4
+7
+8
+
+# a full differential check over the compacted index
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('docs', 'ten') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'ten'))
+	UNION ALL
+	(SELECT * FROM docs WHERE contains(lower(s), 'ten') EXCEPT SELECT * FROM ngram_search('docs', 'ten'))
+);
+----
+0
+
+#===----------------------------------------------------------------------===#
+# observability: what the stats pragma reports about maintenance state
+#===----------------------------------------------------------------------===#
+
+statement ok
+INSERT INTO docs VALUES (9, 'tent for the stats');
+
+# hwm behind table_max_rowid is the signal that a refresh has work to do;
+# fragmented_keys and generations are the signal for compaction. A pragma
+# cannot be wrapped in a subquery, so the row is pinned whole.
+query IIIIIIIIIIII
+PRAGMA ngram_index_stats('docs');
+----
+s	3	true	7	8	39	39	0	1	48	126	NULL
+
+#===----------------------------------------------------------------------===#
+# two indexed columns refresh independently
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE two(id INTEGER, a VARCHAR, b VARCHAR);
+
+statement ok
+INSERT INTO two VALUES (1, 'alpha tent', 'beta tent');
+
+statement ok
+PRAGMA create_ngram_index('two', 'a');
+
+statement ok
+PRAGMA create_ngram_index('two', 'b');
+
+statement ok
+INSERT INTO two VALUES (2, 'second tent a', 'second tent b');
+
+statement ok
+PRAGMA ngram_refresh('two', col = 'a');
+
+query II
+SELECT (SELECT hwm_rowid FROM ngram_main_two.meta_a), (SELECT hwm_rowid FROM ngram_main_two.meta_b);
+----
+1	0
+
+query I
+SELECT count(*) FROM ngram_candidates('two', 'a', 'second');
+----
+1
+
+query I
+SELECT count(*) FROM ngram_candidates('two', 'b', 'second');
+----
+0
+
+# the table-wide form advances every index
+statement ok
+PRAGMA ngram_refresh('two');
+
+query II
+SELECT (SELECT hwm_rowid FROM ngram_main_two.meta_a), (SELECT hwm_rowid FROM ngram_main_two.meta_b);
+----
+1	1
+
+query I
+SELECT count(*) FROM ngram_candidates('two', 'b', 'second');
+----
+1
+
+statement ok
+PRAGMA ngram_compact('two', col = 'b');
+
+statement error
+PRAGMA ngram_refresh('two', col = 'nope');
+----
+no ngram index exists on two.nope
+
+#===----------------------------------------------------------------------===#
+# transaction-local rows are never indexed
+#
+# a local rowid is reassigned at commit, so recording one would leave a posting
+# pointing at a rowid that never exists
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE local_rows(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO local_rows VALUES (1, 'committed tent');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO local_rows VALUES (2, 'uncommitted tent');
+
+statement ok con1
+PRAGMA create_ngram_index('local_rows', 's');
+
+# the index stops at the last committed rowid; the uncommitted row is found by
+# the tail scan
+query I con1
+SELECT hwm_rowid FROM ngram_main_local_rows.meta_s;
+----
+0
+
+query I con1
+SELECT id FROM ngram_search('local_rows', 'tent') ORDER BY id;
+----
+1
+2
+
+statement ok con1
+PRAGMA ngram_refresh('local_rows');
+
+query I con1
+SELECT hwm_rowid FROM ngram_main_local_rows.meta_s;
+----
+0
+
+statement ok con1
+COMMIT;
+
+# after the commit the row has a real rowid past the mark, and a refresh picks
+# it up (before the transaction-local filter this scenario recorded a posting
+# for a vanished local rowid and crashed the fetch)
+query I
+SELECT id FROM ngram_search('local_rows', 'tent') ORDER BY id;
+----
+1
+2
+
+statement ok
+PRAGMA ngram_refresh('local_rows');
+
+query II
+SELECT (SELECT hwm_rowid FROM ngram_main_local_rows.meta_s), (SELECT count(*) FROM ngram_candidates('local_rows', 's', 'tent'));
+----
+1	2
+
+#===----------------------------------------------------------------------===#
+# a refresh is one transaction, whoever owns it
+#
+# The pragma expands to several statements, which the preprocessor wraps in
+# BEGIN/COMMIT of its own when there is no user transaction; inside one, the
+# statements simply join it. Either way the segment append and the high-water
+# mark move together.
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE atomic(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO atomic VALUES (1, 'a tent');
+
+statement ok
+PRAGMA create_ngram_index('atomic', 's');
+
+statement ok
+INSERT INTO atomic VALUES (2, 'another tent');
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA ngram_refresh('atomic');
+
+query II
+SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_atomic.segments_s) FROM ngram_main_atomic.meta_s;
+----
+1	14
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_atomic.segments_s) FROM ngram_main_atomic.meta_s;
+----
+0	4
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA ngram_refresh('atomic');
+
+statement ok
+COMMIT;
+
+query II
+SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_atomic.segments_s) FROM ngram_main_atomic.meta_s;
+----
+1	14
+
+query I
+SELECT count(*) FROM ngram_candidates('atomic', 's', 'tent');
+----
+2
+
+#===----------------------------------------------------------------------===#
+# refusals: what maintenance will not do
+#===----------------------------------------------------------------------===#
+
+statement error
+PRAGMA ngram_refresh('docs', col = NULL);
+----
+cannot be NULL
+
+statement ok
+CREATE TABLE unindexed(s VARCHAR);
+
+statement error
+PRAGMA ngram_refresh('unindexed');
+----
+no ngram index exists
+
+statement error
+PRAGMA ngram_compact('unindexed');
+----
+no ngram index exists
+
+statement error
+PRAGMA ngram_refresh('does_not_exist');
+----
+does not exist
+
+# an index whose meta was written by a different format version is never
+# guessed at
+statement ok
+CREATE TABLE versioned(s VARCHAR);
+
+statement ok
+INSERT INTO versioned VALUES ('a tent');
+
+statement ok
+PRAGMA create_ngram_index('versioned', 's');
+
+statement ok
+UPDATE ngram_main_versioned.meta_s SET format_version = 1;
+
+statement error
+SELECT * FROM ngram_search('versioned', 'tent');
+----
+format_version
+
+statement error
+PRAGMA ngram_refresh('versioned');
+----
+format_version
+
+statement error
+PRAGMA ngram_compact('versioned');
+----
+format_version
+
+statement error
+PRAGMA ngram_index_stats('versioned');
+----
+format_version
+
+# the transparent path declines instead of failing the user's query
+statement ok
+SET ngram_auto_accelerate = true;
+
+query I
+SELECT count(*) FROM versioned WHERE s LIKE '%tent%';
+----
+1
+
+query II
+EXPLAIN SELECT count(*) FROM versioned WHERE s LIKE '%tent%';
+----
+physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+
+statement ok
+SET ngram_auto_accelerate = false;
+
+statement ok
+UPDATE ngram_main_versioned.meta_s SET format_version = 2;
+
+statement ok
+PRAGMA ngram_refresh('versioned');
+
+#===----------------------------------------------------------------------===#
+# shape changes while the table's identity is proven
+#
+# Same instance, same attach incarnation, same catalog entry: the table cannot
+# have been re-created, so ALTERs to other columns say nothing about the index
+# and only the indexed column's own shape matters. The mirror case — the same
+# shape change with identity unproven, where it is the only recreation signal
+# there is — lives in ngram_maintenance_identity.test.
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE shaped(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO shaped VALUES (1, 'a tent'), (2, 'no match');
+
+statement ok
+PRAGMA create_ngram_index('shaped', 's');
+
+# a column appended at the end keeps every recorded column in place and
+# preserves rowids: the index stays usable and refreshable
+statement ok
+ALTER TABLE shaped ADD COLUMN extra INTEGER;
+
+query I
+SELECT count(*) FROM ngram_search('shaped', 'tent');
+----
+1
+
+statement ok
+PRAGMA ngram_refresh('shaped');
+
+# dropping another column preserves every rowid and every indexed value
+statement ok
+ALTER TABLE shaped DROP COLUMN id;
+
+query I
+SELECT count(*) FROM ngram_search('shaped', 'tent');
+----
+1
+
+statement ok
+PRAGMA ngram_refresh('shaped');
+
+# the indexed column is the exception: retyping it away from VARCHAR leaves
+# nothing the index can describe
+statement error
+ALTER TABLE shaped ALTER COLUMN s TYPE INTEGER;
+----
+<REGEX>:.*(Conversion|Cast|convert).*
+
+statement ok
+ALTER TABLE shaped RENAME COLUMN s TO renamed;
+
+statement error
+SELECT count(*) FROM ngram_search('shaped', 'tent');
+----
+which no longer exists
+
+statement ok
+ALTER TABLE shaped RENAME COLUMN renamed TO s;
+
+query I
+SELECT count(*) FROM ngram_search('shaped', 'tent');
+----
+1
+
+#===----------------------------------------------------------------------===#
+# ownership: maintenance never runs through a shadow schema it does not own
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE SCHEMA a;
+
+statement ok
+CREATE TABLE a.b_c(s VARCHAR);
+
+statement ok
+INSERT INTO a.b_c VALUES ('a tent');
+
+statement ok
+CREATE SCHEMA a_b;
+
+statement ok
+CREATE TABLE a_b.c(s VARCHAR);
+
+statement ok
+INSERT INTO a_b.c VALUES ('another tent');
+
+statement ok
+PRAGMA create_ngram_index('a.b_c', 's');
+
+statement error
+PRAGMA ngram_refresh('a_b.c');
+----
+shadow schema collision
+
+statement error
+PRAGMA ngram_compact('a_b.c');
+----
+shadow schema collision
+
+#===----------------------------------------------------------------------===#
+# evil identifiers survive generated SQL
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE "my.table"("sträße select" VARCHAR, "it's" INTEGER);
+
+statement ok
+INSERT INTO "my.table" VALUES ('a tent', 1);
+
+statement ok
+PRAGMA create_ngram_index('"my.table"', 'sträße select');
+
+statement ok
+INSERT INTO "my.table" VALUES ('another tent', 2);
+
+statement ok
+PRAGMA ngram_refresh('"my.table"');
+
+statement ok
+PRAGMA ngram_compact('"my.table"');
+
+query I
+SELECT count(*) FROM ngram_candidates('"my.table"', 'sträße select', 'tent');
+----
+2
+
+query I
+SELECT count(*) FROM ngram_search('"my.table"', 'tent');
+----
+2
+
+statement ok
+PRAGMA drop_ngram_index('"my.table"', 'sträße select');

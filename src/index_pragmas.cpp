@@ -7,7 +7,12 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "ngram/index_pragmas.hpp"
+#include "ngram/maintenance.hpp"
+#include "ngram/search_core.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 namespace ngram {
@@ -33,11 +38,11 @@ string StatsTableName(const string &column) {
 	return "stats_" + column;
 }
 
-static string Ident(const string &name) {
+string Ident(const string &name) {
 	return KeywordHelper::WriteOptionallyQuoted(name);
 }
 
-static string Lit(const string &value) {
+string Lit(const string &value) {
 	return KeywordHelper::WriteQuoted(value);
 }
 
@@ -115,18 +120,31 @@ static string MetaMismatchCondition(const ResolvedTarget &target) {
 	       Lit(target.table_name);
 }
 
-//! SQL expression raising the collision error, naming both tables
-static string CollisionErrorCall(const ResolvedTarget &target) {
+//! SQL scalar counting the meta rows that name target as their owner. The
+//! guards compare it against 1: a meta table that is empty, holds several
+//! rows, or names someone else is equally unusable.
+static string OwnedMetaRowCount(const ResolvedTarget &target, const string &meta_qualified) {
+	return "(SELECT count(*) FROM " + meta_qualified + " WHERE NOT (" + MetaMismatchCondition(target) + "))";
+}
+
+//! SQL expression raising the collision error, naming both tables. Reads the
+//! owner back out of the meta table, so it works from a statement that has no
+//! FROM clause of its own.
+static string CollisionErrorCall(const ResolvedTarget &target, const string &meta_qualified) {
 	return "error('ngram shadow schema collision: ' || " + Lit(target.shadow_schema) +
-	       " || ' belongs to the index on ' || coalesce(schema_name, '?') || '.' || coalesce(table_name, '?') || "
-	       "', not to ' || " +
+	       " || ' belongs to the index on ' || coalesce((SELECT coalesce(schema_name, '?') || '.' || "
+	       "coalesce(table_name, '?') FROM " +
+	       meta_qualified + " LIMIT 1), '(no owner recorded)') || ', not to ' || " +
 	       Lit(target.schema_name + "." + target.table_name) + ")";
 }
 
-//! Statement raising the collision error iff the meta table records a foreign owner
-static string OwnershipGuard(const ResolvedTarget &target, const string &meta_qualified) {
-	return "SELECT CASE WHEN " + MetaMismatchCondition(target) + " THEN " + CollisionErrorCall(target) +
-	       " END AS ngram_ownership_check FROM " + meta_qualified + ";\n";
+//! Statement raising the collision error unless the meta table holds exactly
+//! one row naming target as its owner. Evaluating a scalar subquery rather
+//! than a per-row CASE keeps the guard from passing vacuously on an empty
+//! meta table.
+string OwnershipGuard(const ResolvedTarget &target, const string &meta_qualified) {
+	return "SELECT CASE WHEN " + OwnedMetaRowCount(target, meta_qualified) + " <> 1 THEN " +
+	       CollisionErrorCall(target, meta_qualified) + " END AS ngram_ownership_check;\n";
 }
 
 vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &target) {
@@ -168,6 +186,11 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	}
 
 	auto target = ResolveTarget(context, table_input, column_name, true);
+	if (!target.entry->IsDuckTable()) {
+		// the index reads rowids and row storage directly; a table living in a
+		// foreign catalog (sqlite, postgres, ...) has neither
+		throw BinderException("create_ngram_index: %s is not a DuckDB base table", table_input);
+	}
 	// generated names and the meta row must use the catalog's spelling
 	column_name = target.column_name;
 
@@ -202,29 +225,42 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	for (auto &meta_name : ExistingMetaTables(context, target)) {
 		auto meta_qualified = shadow + "." + Ident(meta_name);
 		if (meta_name == MetaTableName(column_name)) {
-			script += "SELECT CASE WHEN " + MetaMismatchCondition(target) + " THEN " + CollisionErrorCall(target) +
-			          " ELSE error(" +
+			script += "SELECT CASE WHEN " + OwnedMetaRowCount(target, meta_qualified) + " <> 1 THEN " +
+			          CollisionErrorCall(target, meta_qualified) + " ELSE error(" +
 			          Lit("An ngram index already exists on " + target.table_name + "." + column_name + " (" +
 			              target.shadow_schema + "); use drop_ngram_index first") +
-			          ") END AS ngram_ownership_check FROM " + meta_qualified + ";\n";
+			          ") END AS ngram_ownership_check;\n";
 		} else {
 			script += OwnershipGuard(target, meta_qualified);
 		}
 	}
+	// Only committed rows are indexed. A transaction-local rowid is reassigned
+	// at commit, so recording one would leave the index pointing at a rowid
+	// that never exists (and, before this filter, made ngram_search fetch a
+	// vanished local row and take the database down with an internal error).
+	// Uncommitted rows are found by the tail scan instead, and land past the
+	// high-water mark when they commit.
+	auto committed_only = "rowid < " + to_string(LOCAL_ROWID_START);
+	auto fingerprint = ComputeTableFingerprint(context, *target.entry);
+	// witnesses are drawn over the rowids the build is about to index; the
+	// callback runs before it, so the bound is the table's committed end
+	auto row_samples = BuildRowSampleDigest(context, *target.entry, column_name, fingerprint.total_rows - 1);
 	script += "CREATE SCHEMA IF NOT EXISTS " + shadow + ";\n";
-	script += "CREATE TABLE " + meta +
-	          " AS SELECT "
-	          "1 AS format_version, " +
+	script += "CREATE TABLE " + meta + " AS SELECT " + to_string(NGRAM_FORMAT_VERSION) + " AS format_version, " +
 	          Lit(target.schema_name) + " AS schema_name, " + Lit(target.table_name) + " AS table_name, " +
 	          Lit(column_name) + " AS column_name, " + gram_str + " AS gram_size, " + ci_str +
 	          " AS case_insensitive, "
 	          "(SELECT coalesce(max(rowid), -1) FROM " +
-	          base + ") AS hwm_rowid;\n";
+	          base + " WHERE " + committed_only + ") AS hwm_rowid, " + Lit(fingerprint.schema_fingerprint) +
+	          " AS schema_fingerprint, " + Lit(fingerprint.ColumnType(column_name)) + " AS column_type, " +
+	          to_string(fingerprint.table_oid) + "::BIGINT AS table_oid, " + to_string(fingerprint.catalog_oid) +
+	          "::BIGINT AS catalog_oid, " + Lit(fingerprint.instance_id) + " AS instance_id, " + Lit(row_samples) +
+	          " AS row_samples;\n";
 	script += "CREATE OR REPLACE TEMP TABLE " + pairs +
 	          " AS "
 	          "SELECT rowid AS r, rowid >> " +
 	          to_string(SEGMENT_SHIFT) + " AS segment_no, unnest(trigrams(" + column + ", " + gram_str + ", " + ci_str +
-	          ")) AS gram FROM " + base + " WHERE " + column + " IS NOT NULL;\n";
+	          ")) AS gram FROM " + base + " WHERE " + committed_only + " AND " + column + " IS NOT NULL;\n";
 	// The sorted-stream packer holds one (gram, segment_no) run per thread instead
 	// of every group at once. The sort feeding it spills, but external sorting
 	// costs roughly 12-15 MB of overhead per thread, so the build's memory floor
@@ -272,9 +308,15 @@ static string DropNgramIndexQuery(ClientContext &context, const FunctionParamete
 	idx_t other_entries = 0;
 	for (auto scan_type : SCHEMA_ENTRY_TYPES) {
 		schema_entry->Scan(context, scan_type, [&](CatalogEntry &entry) {
-			bool own_table = entry.type == CatalogType::TABLE_ENTRY && (entry.name == MetaTableName(column_name) ||
-			                                                            entry.name == SegmentsTableName(column_name) ||
-			                                                            entry.name == StatsTableName(column_name));
+			// identifiers match case-insensitively, and column_name carries the
+			// user's spelling whenever the column is gone from the base table
+			// (dropping an orphaned index): comparing case-sensitively would
+			// count this index's own tables as foreign and leave the shadow
+			// schema behind, empty
+			bool own_table = entry.type == CatalogType::TABLE_ENTRY &&
+			                 (StringUtil::CIEquals(entry.name, MetaTableName(column_name)) ||
+			                  StringUtil::CIEquals(entry.name, SegmentsTableName(column_name)) ||
+			                  StringUtil::CIEquals(entry.name, StatsTableName(column_name)));
 			if (!own_table) {
 				other_entries++;
 			}
@@ -300,6 +342,9 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 	auto table_input = parameters.values[0].ToString();
 
 	auto target = ResolveTarget(context, table_input, string(), false);
+	if (!target.entry->IsDuckTable()) {
+		throw BinderException("ngram_index_stats: %s is not a DuckDB base table", table_input);
+	}
 	auto schema_entry =
 	    Catalog::GetSchema(context, target.catalog_name, target.shadow_schema, OnEntryNotFound::RETURN_NULL);
 	if (!schema_entry) {
@@ -317,31 +362,60 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 		throw CatalogException("No ngram indexes exist on %s", target.table_name);
 	}
 
+	// A stats run is also the place a user looks to decide whether to refresh
+	// or compact, so it reports the table facts the maintenance pragmas
+	// compare against: how far the index lags the table, how fragmented the
+	// segments are, and whether a detector already knows the index is dead.
+	// The staleness verdict and the table's rowid count are read here, in the
+	// pragma callback, and embedded as literals.
+	auto fingerprint = ComputeTableFingerprint(context, *target.entry);
+	auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
+
 	auto shadow = Ident(target.catalog_name) + "." + Ident(target.shadow_schema);
 	string query;
+	std::sort(columns.begin(), columns.end());
 	for (auto &indexed_column : columns) {
 		auto meta = shadow + "." + Ident(MetaTableName(indexed_column));
 		auto segments = shadow + "." + Ident(SegmentsTableName(indexed_column));
 		auto stats = shadow + "." + Ident(StatsTableName(indexed_column));
+		string staleness;
+		{
+			auto &meta_entry = ResolveExistingTable(context, target.catalog_name, target.shadow_schema,
+			                                        MetaTableName(indexed_column), "ngram index meta table");
+			ShadowTarget shadow_target {target.schema_name, target.table_name, indexed_column, target.shadow_schema};
+			// ReadMeta raises the collision error itself when this meta row
+			// names a different base table, which is what the pragma should do
+			// rather than silently reporting nothing
+			auto info = ReadMeta(context, transaction, meta_entry, shadow_target);
+			staleness = CertainStaleReason(info, fingerprint);
+			if (staleness.empty()) {
+				staleness = SampleStaleReason(context, *target.entry, info);
+			}
+		}
 		if (!query.empty()) {
 			query += "UNION ALL ";
 		}
-		query += "SELECT column_name, gram_size, case_insensitive, hwm_rowid, "
-		         "(SELECT count(*) FROM " +
+		query += "SELECT column_name, gram_size, case_insensitive, hwm_rowid, " +
+		         to_string(fingerprint.total_rows - 1) +
+		         "::BIGINT AS table_max_rowid, "
+		         "(SELECT count(DISTINCT gram) FROM " +
 		         stats +
 		         ") AS distinct_grams, "
 		         "(SELECT count(*) FROM " +
 		         segments +
 		         ") AS segments, "
+		         "(SELECT count(*) FROM (SELECT gram, segment_no FROM " +
+		         segments +
+		         " GROUP BY gram, segment_no HAVING count(*) > 1)) AS fragmented_keys, "
+		         "(SELECT count(DISTINCT generation) FROM " +
+		         segments +
+		         ") AS generations, "
 		         "(SELECT coalesce(sum(rowid_count), 0) FROM " +
 		         segments +
 		         ") AS posting_entries, "
 		         "(SELECT coalesce(sum(octet_length(postings)), 0) FROM " +
-		         segments + ") AS postings_bytes FROM " + meta +
-		         // the shadow-schema name can collide across base tables; report
-		         // only columns whose meta records this table as the owner
-		         " WHERE schema_name IS NOT DISTINCT FROM " + Lit(target.schema_name) +
-		         " AND table_name IS NOT DISTINCT FROM " + Lit(target.table_name) + " ";
+		         segments + ") AS postings_bytes, " + (staleness.empty() ? string("NULL::VARCHAR") : Lit(staleness)) +
+		         " AS stale_reason FROM " + meta + " ";
 	}
 	query += "ORDER BY column_name;";
 	return query;

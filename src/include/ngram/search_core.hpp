@@ -54,7 +54,23 @@ struct ShadowTarget {
 
 struct MetaInfo {
 	GramOptions options;
+	//! Highest committed rowid the index covers; rows past it are found by a
+	//! brute-force tail scan.
 	int64_t hwm_rowid = -1;
+	//! The indexed column, as the meta row records it.
+	string column_name;
+	//! Table facts recorded at build/refresh, compared against the table's
+	//! current facts to detect staleness the index cannot repair (see
+	//! ngram/maintenance.hpp).
+	string schema_fingerprint;
+	//! The indexed column's own type, checked when the table's identity is
+	//! proven and the full column list therefore says nothing about it.
+	string column_type;
+	int64_t table_oid = 0;
+	int64_t catalog_oid = 0;
+	string instance_id;
+	//! (rowid, value hash) witnesses of where the postings point.
+	string row_samples;
 };
 
 //! Read and validate the single meta row of an index (format version,

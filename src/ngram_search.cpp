@@ -16,6 +16,7 @@
 #include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/index_pragmas.hpp"
+#include "ngram/maintenance.hpp"
 #include "ngram/ngram_search.hpp"
 #include "ngram/postings_codec.hpp"
 #include "ngram/search_core.hpp"
@@ -155,20 +156,31 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 //! transaction-local rows are found by a brute-force tail scan, deleted rows
 //! are filtered by transaction visibility, and every candidate is rechecked
 //! against the real string. Recheck makes false positives impossible in every
-//! scenario. Known Phase 3 staleness limits, all Phase 5 concerns and all
-//! misses-only: (a) an in-place UPDATE that introduces the needle into an
-//! already-indexed row (DuckDB updates rows in place unless an ART index
-//! forces delete+insert); (b) checkpoint vacuum after DELETEs of indexed
-//! rows, which merges row groups and moves surviving rowids out from under
-//! the index's postings — and shrinks the table's end, so even rows inserted
-//! after such a vacuum can land below the recorded high-water mark and be
-//! missed until refresh (the shared vacuum lock held for the duration of each
-//! query means this can only happen between queries, never mid-query);
+//! scenario.
+//!
+//! The staleness contract, in full:
+//! (a) An in-place UPDATE of a row at or below the high-water mark is missed
+//!     until the index is rebuilt. duckdb v1.5.5 updates rows in place (unless
+//!     an ART index forces delete+insert) and offers no trigger or change feed
+//!     naming the updated rows — CREATE TRIGGER is a parser error — so there
+//!     is no sound way to find them incrementally; PRAGMA ngram_refresh
+//!     therefore covers appends only, and updated rows need drop + create.
+//! (b) Checkpoint vacuum after DELETEs of indexed rows merges row groups and
+//!     moves surviving rowids out from under the index's postings. The shared
+//!     vacuum lock held for the duration of every query means this can only
+//!     happen between queries, never mid-query. Where the table is left
+//!     shorter than the recorded high-water mark this is detected here and
+//!     raised as an error; a vacuum whose row loss is masked by later appends
+//!     before anything looks is not detectable on v1.5.5 (see
+//!     ngram/maintenance.hpp) and stays a misses-only gap.
 //! (c) DROP TABLE + re-CREATE under the same name: the shadow schema survives
-//! the drop and the name-based ownership guard matches the new incarnation,
-//! so searches bind the dead index (stale postings and high-water mark) —
-//! v1.5.5 offers no stable cross-restart table identity token or DDL hook to
-//! detect this, so recreation detection belongs to Phase 5.
+//!     the drop and the name-based ownership guard matches the new
+//!     incarnation. Detected — and refused here — whenever the recreation
+//!     happened in the running database instance (catalog oids are handed out
+//!     per process, so a recorded oid is comparable only within the instance
+//!     that wrote it) or changed the table's column list. A same-shape
+//!     recreation in an earlier session is not detectable: v1.5.5 persists no
+//!     table identity token, and catalog dependencies are in-memory only.
 static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<QueryBindData>();
@@ -299,17 +311,13 @@ static void ScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTab
 	}
 }
 
-MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry, const ShadowTarget &bind) {
-	vector<StorageIndex> column_ids;
-	vector<LogicalType> types;
-	AddShadowColumn(meta_entry, "format_version", LogicalTypeId::INTEGER, column_ids, types);
-	AddShadowColumn(meta_entry, "schema_name", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "table_name", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "gram_size", LogicalTypeId::INTEGER, column_ids, types);
-	AddShadowColumn(meta_entry, "case_insensitive", LogicalTypeId::BOOLEAN, column_ids, types);
-	AddShadowColumn(meta_entry, "hwm_rowid", LogicalTypeId::BIGINT, column_ids, types);
-
-	MetaInfo info;
+//! Read the single meta row through `projection`, validating that there is
+//! exactly one and that no value is NULL. Runs once per column group so that
+//! the format version can be checked before columns that only exist in some
+//! versions are touched.
+static void ScanMetaRow(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
+                        const ShadowTarget &bind, const vector<StorageIndex> &column_ids,
+                        const vector<LogicalType> &types, const std::function<void(DataChunk &, idx_t)> &read_row) {
 	idx_t rows = 0;
 	ScanShadowTable(context, tx, meta_entry.GetStorage(), column_ids, types, nullptr, [&](DataChunk &chunk) {
 		for (idx_t r = 0; r < chunk.size(); r++) {
@@ -324,6 +332,26 @@ MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &m
 					                            bind.table_name, bind.column_name);
 				}
 			}
+			read_row(chunk, r);
+		}
+	});
+	if (rows == 0) {
+		throw CatalogException("ngram: meta table for %s.%s is empty; the index is malformed", bind.table_name,
+		                       bind.column_name);
+	}
+}
+
+MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry, const ShadowTarget &bind) {
+	MetaInfo info;
+	{
+		// columns every format version has: ownership and the version itself,
+		// checked before reading anything version-specific
+		vector<StorageIndex> column_ids;
+		vector<LogicalType> types;
+		AddShadowColumn(meta_entry, "format_version", LogicalTypeId::INTEGER, column_ids, types);
+		AddShadowColumn(meta_entry, "schema_name", LogicalTypeId::VARCHAR, column_ids, types);
+		AddShadowColumn(meta_entry, "table_name", LogicalTypeId::VARCHAR, column_ids, types);
+		ScanMetaRow(context, tx, meta_entry, bind, column_ids, types, [&](DataChunk &chunk, idx_t r) {
 			// the shadow schema name is not injective across base tables; refuse
 			// to answer through a shadow schema owned by someone else
 			auto owner_schema = StringValue::Get(chunk.GetValue(1, r));
@@ -335,27 +363,64 @@ MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &m
 				                       bind.table_name);
 			}
 			auto format_version = chunk.GetValue(0, r).GetValue<int64_t>();
-			if (format_version != 1) {
-				throw InvalidInputException("ngram: index format_version %lld is not supported by this version of the "
-				                            "extension",
-				                            format_version);
+			if (format_version != NGRAM_FORMAT_VERSION) {
+				// never guess at another version's column layout
+				throw InvalidInputException(
+				    "ngram: the index on %s.%s uses meta format_version %lld, but this version of the extension "
+				    "writes and reads format_version %lld; drop and rebuild the index",
+				    bind.table_name, bind.column_name, format_version, NGRAM_FORMAT_VERSION);
 			}
-			auto gram_size = chunk.GetValue(3, r).GetValue<int64_t>();
-			if (gram_size < 1) {
-				throw InvalidInputException("ngram: meta table for %s.%s records gram_size %lld; the index is "
-				                            "malformed",
-				                            bind.table_name, bind.column_name, gram_size);
-			}
-			info.options.gram_size = static_cast<idx_t>(gram_size);
-			info.options.case_insensitive = chunk.GetValue(4, r).GetValue<bool>();
-			info.hwm_rowid = chunk.GetValue(5, r).GetValue<int64_t>();
-		}
-	});
-	if (rows == 0) {
-		throw CatalogException("ngram: meta table for %s.%s is empty; the index is malformed", bind.table_name,
-		                       bind.column_name);
+		});
 	}
+	vector<StorageIndex> column_ids;
+	vector<LogicalType> types;
+	AddShadowColumn(meta_entry, "gram_size", LogicalTypeId::INTEGER, column_ids, types);
+	AddShadowColumn(meta_entry, "case_insensitive", LogicalTypeId::BOOLEAN, column_ids, types);
+	AddShadowColumn(meta_entry, "hwm_rowid", LogicalTypeId::BIGINT, column_ids, types);
+	AddShadowColumn(meta_entry, "schema_fingerprint", LogicalTypeId::VARCHAR, column_ids, types);
+	AddShadowColumn(meta_entry, "table_oid", LogicalTypeId::BIGINT, column_ids, types);
+	AddShadowColumn(meta_entry, "instance_id", LogicalTypeId::VARCHAR, column_ids, types);
+	AddShadowColumn(meta_entry, "row_samples", LogicalTypeId::VARCHAR, column_ids, types);
+	AddShadowColumn(meta_entry, "column_name", LogicalTypeId::VARCHAR, column_ids, types);
+	AddShadowColumn(meta_entry, "catalog_oid", LogicalTypeId::BIGINT, column_ids, types);
+	AddShadowColumn(meta_entry, "column_type", LogicalTypeId::VARCHAR, column_ids, types);
+	ScanMetaRow(context, tx, meta_entry, bind, column_ids, types, [&](DataChunk &chunk, idx_t r) {
+		auto gram_size = chunk.GetValue(0, r).GetValue<int64_t>();
+		if (gram_size < 1) {
+			throw InvalidInputException("ngram: meta table for %s.%s records gram_size %lld; the index is "
+			                            "malformed",
+			                            bind.table_name, bind.column_name, gram_size);
+		}
+		info.options.gram_size = static_cast<idx_t>(gram_size);
+		info.options.case_insensitive = chunk.GetValue(1, r).GetValue<bool>();
+		info.hwm_rowid = chunk.GetValue(2, r).GetValue<int64_t>();
+		info.schema_fingerprint = StringValue::Get(chunk.GetValue(3, r));
+		info.table_oid = chunk.GetValue(4, r).GetValue<int64_t>();
+		info.instance_id = StringValue::Get(chunk.GetValue(5, r));
+		info.row_samples = StringValue::Get(chunk.GetValue(6, r));
+		info.column_name = StringValue::Get(chunk.GetValue(7, r));
+		info.catalog_oid = chunk.GetValue(8, r).GetValue<int64_t>();
+		info.column_type = StringValue::Get(chunk.GetValue(9, r));
+	});
 	return info;
+}
+
+//! The explicit path answers with the index or not at all: when a detector
+//! proves the index no longer describes the table, returning the rows it can
+//! still find would be a silent, unbounded miss, so the query fails with the
+//! repair instead. Costs one O(1) read of the table's rowid count plus its
+//! column list; the row-group layout check is left to the maintenance
+//! pragmas, where walking every row group is affordable.
+static void ThrowIfCertainlyStale(ClientContext &context, DuckTableEntry &base, const MetaInfo &info,
+                                  const QueryBindData &bind, const char *fn) {
+	auto reason = CertainStaleReason(info, ComputeTableFingerprint(context, base));
+	if (reason.empty()) {
+		return;
+	}
+	throw InvalidInputException("%s: the ngram index on %s.%s is stale and cannot be used: %s. Rebuild it: PRAGMA "
+	                            "drop_ngram_index('%s', '%s') then PRAGMA create_ngram_index('%s', '%s')",
+	                            fn, bind.table_name, bind.column_name, reason, bind.table_name, bind.column_name,
+	                            bind.table_name, bind.column_name);
 }
 
 //===----------------------------------------------------------------------===//
@@ -616,6 +681,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.shadow_schema, MetaTableName(bind.column_name),
 	                                  "ngram index meta table");
 	auto info = ReadMeta(context, *state->tx, meta, bind.Target());
+	ThrowIfCertainlyStale(context, base, info, bind, "ngram_search");
 	state->hwm = info.hwm_rowid;
 	state->recheck.options = info.options;
 	state->search_column_idx = bind.search_column_idx;
@@ -774,6 +840,7 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.shadow_schema, MetaTableName(bind.column_name),
 	                                  "ngram index meta table");
 	auto info = ReadMeta(context, *state->tx, meta, bind.Target());
+	ThrowIfCertainlyStale(context, base, info, bind, "ngram_candidates");
 	state->hwm = info.hwm_rowid;
 
 	auto decomposition = DecomposeNeedle(bind.needle.data(), bind.needle.size(), info.options);

@@ -1,0 +1,242 @@
+# name: test/sql/ngram_maintenance_identity.test
+# description: when a table's identity is proven, and what follows from it
+# group: [sql]
+
+# The index records the table's catalog oid, the oid of the attached database
+# it lives in, and a token for the running instance. Together they say "this is
+# the very object the index was built from" — but only inside the instance and
+# the attach incarnation that minted them: ATTACH mints fresh oids for
+# everything it loads, so a DETACH + re-ATTACH renumbers a healthy table just
+# as a DROP + re-CREATE does.
+
+load __TEST_DIR__/ngram_identity.db
+
+require ngram
+
+statement ok
+CREATE TABLE t(id INTEGER, s VARCHAR, other INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1, 'a tent', 10), (2, 'nothing', 20);
+
+statement ok
+PRAGMA create_ngram_index('t', 's');
+
+#===----------------------------------------------------------------------===#
+# identity proven: ALTERs to other columns leave the index alone
+#
+# They preserve every rowid and every value of the indexed column, and the
+# table cannot have been re-created because its catalog entry is the recorded
+# one. Only the indexed column's own shape still matters.
+#===----------------------------------------------------------------------===#
+
+statement ok
+ALTER TABLE t RENAME COLUMN other TO other2;
+
+query I
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+1
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+statement ok
+ALTER TABLE t ALTER COLUMN other2 TYPE BIGINT;
+
+query I
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+1
+
+statement ok
+ALTER TABLE t DROP COLUMN id;
+
+query I
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+1
+
+# and nothing reports the index as stale
+query IIIIIIIIIIII
+PRAGMA ngram_index_stats('t');
+----
+s	3	true	1	1	9	9	0	1	9	27	NULL
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+statement ok
+PRAGMA ngram_compact('t');
+
+# the indexed column itself is a different matter: renaming it away leaves the
+# index pointing at a column that no longer exists
+statement ok
+ALTER TABLE t RENAME COLUMN s TO s_renamed;
+
+statement error
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+which no longer exists
+
+statement error
+PRAGMA ngram_refresh('t');
+----
+which no longer exists
+
+statement ok
+ALTER TABLE t RENAME COLUMN s_renamed TO s;
+
+query I
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+1
+
+# a case-only rename is not a rename at all: identifiers match
+# case-insensitively and every value stays where it was
+statement ok
+ALTER TABLE t RENAME COLUMN s TO S;
+
+query I
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+1
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+statement ok
+ALTER TABLE t RENAME COLUMN S TO s;
+
+#===----------------------------------------------------------------------===#
+# DETACH + re-ATTACH is not a re-creation
+#
+# Both the database and the table are handed new oids, so the recorded pair
+# stops proving anything — but proving nothing must read as "healthy", not as
+# "re-created".
+#===----------------------------------------------------------------------===#
+
+# (the pragmas take a catalog-qualified name in full three-part form: a
+# two-part name is read as schema.table, as everywhere else in this extension)
+statement ok
+ATTACH '__TEST_DIR__/ngram_identity_attached.db' AS side;
+
+statement ok
+CREATE TABLE side.docs(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO side.docs VALUES (1, 'a tent'), (2, 'nothing');
+
+statement ok
+PRAGMA create_ngram_index('side.main.docs', 's');
+
+query I
+SELECT count(*) FROM ngram_search('side.main.docs', 'tent');
+----
+1
+
+statement ok
+DETACH side;
+
+statement ok
+ATTACH '__TEST_DIR__/ngram_identity_attached.db' AS side;
+
+query I
+SELECT count(*) FROM ngram_search('side.main.docs', 'tent');
+----
+1
+
+query I
+SELECT count(*) FROM ngram_candidates('side.main.docs', 's', 'tent');
+----
+1
+
+statement ok
+PRAGMA ngram_refresh('side.main.docs');
+
+statement ok
+PRAGMA ngram_compact('side.main.docs');
+
+# a pragma cannot be wrapped in a subquery, so the row is pinned whole; the
+# last column is the staleness verdict
+query IIIIIIIIIIII
+PRAGMA ngram_index_stats('side.main.docs');
+----
+s	3	true	1	1	9	9	0	1	9	27	NULL
+
+# a real re-creation inside the new incarnation is still proof: the refresh
+# above re-recorded the identity, so the oids are comparable again
+statement ok
+DROP TABLE side.docs;
+
+statement ok
+CREATE TABLE side.docs(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO side.docs VALUES (1, 'a tent');
+
+statement error
+SELECT count(*) FROM ngram_search('side.main.docs', 'tent');
+----
+dropped and re-created
+
+statement ok
+PRAGMA drop_ngram_index('side.main.docs', 's');
+
+statement ok
+DETACH side;
+
+#===----------------------------------------------------------------------===#
+# without identity proof the column list is the only recreation signal
+#
+# After a restart the oids mean nothing, so a changed column list has to be
+# treated as "a different table now carries this name" — the conservative
+# reading, and the reason the check is relaxed only when identity is proven.
+#===----------------------------------------------------------------------===#
+
+restart
+
+# an untouched reopen is healthy
+query I
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+1
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+statement ok
+ALTER TABLE t ADD COLUMN appended VARCHAR;
+
+# appended columns keep every recorded column in place: still healthy
+query I
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+1
+
+restart
+
+statement ok
+ALTER TABLE t RENAME COLUMN other2 TO other3;
+
+statement error
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+column list changed
+
+statement error
+PRAGMA ngram_refresh('t');
+----
+column list changed
+
+# and the repair the error names works
+statement ok
+PRAGMA drop_ngram_index('t', 's');
+
+statement ok
+PRAGMA create_ngram_index('t', 's');
+
+query I
+SELECT count(*) FROM ngram_search('t', 'tent');
+----
+1

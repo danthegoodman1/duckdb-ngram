@@ -204,13 +204,21 @@ def transparent_checks(patterns, subset_only=False):
     return statements
 
 
-def run_duckdb(db_path, script):
+#! Phase 5 detectors turn a vacuum that shrank the table below the index's
+#! high-water mark into an error instead of a silent subset; a phase that
+#! deliberately provokes one accepts that as the better outcome.
+STALE_MARKER = "is stale and cannot be used"
+
+
+def run_duckdb(db_path, script, allow_stale=False):
     proc = subprocess.run(
         [DUCKDB, db_path],
         input=".headers off\n.mode csv\n" + script,
         capture_output=True, text=True, timeout=600,
     )
     if proc.returncode != 0:
+        if allow_stale and STALE_MARKER in proc.stderr:
+            return proc.stdout
         raise RuntimeError("duckdb failed:\n%s" % proc.stderr[-4000:])
     return proc.stdout
 
@@ -315,9 +323,10 @@ def one_trial(trial, rng, rows, transparent):
         checks += check_output(run_duckdb(db_path, "\n".join(deleted)), "deleted", failures)
 
         # phase 5: after close+reopen the deletes above have been vacuumed and
-        # surviving rowids may have moved. The index can now legitimately miss
-        # moved rows (the Phase 5 refresh contract), but recheck must still
-        # guarantee zero false positives: search results ⊆ brute force, always.
+        # surviving rowids may have moved. Either the Phase 5 detectors prove
+        # it — in which case the query refuses and there is nothing to compare
+        # — or the index answers, and recheck must still guarantee zero false
+        # positives: search results ⊆ brute force, always.
         if transparent:
             subset = session_settings + transparent_checks(patterns, subset_only=True)
         else:
@@ -332,7 +341,8 @@ def one_trial(trial, rng, rows, transparent):
                     "SELECT 'diff', %s, count(*) FROM "
                     "(SELECT * FROM ngram_search('corpus', %s) EXCEPT SELECT * FROM corpus WHERE %s);"
                     % (q, q, pred))
-        checks += check_output(run_duckdb(db_path, "\n".join(subset)), "post-vacuum-subset", failures)
+        checks += check_output(run_duckdb(db_path, "\n".join(subset), allow_stale=True),
+                               "post-vacuum-subset", failures)
 
     return checks, failures
 

@@ -93,6 +93,36 @@ submodule tag `research-e500d778` for the main-only references flagged below.
   non-compacting vacuum for any non-ART index (`row_group_collection.cpp:28-39`,
   `:1359-1369`; main's `KEEP_ROW_IDS` naming does not exist on v1.5.5), and raises
   `MissingExtensionException` on write when the extension is absent (`index_binder.cpp:27`).
+- **No triggers, no change feed, no persistent table identity** (all verified on v1.5.5
+  during Phase 5): `CREATE TRIGGER` is a parser error; catalog ownership dependencies
+  (`ALTER SEQUENCE ... OWNED BY tbl`, which does cascade a DROP TABLE onto the sequence)
+  are in-memory only and are gone after a reopen; `DataTableInfo` carries no persisted
+  table id; catalog oids (`duckdb_tables().table_oid`) are stable across ADD/DROP/RENAME
+  COLUMN, ALTER TYPE, RENAME TABLE and CREATE INDEX, change on DROP+CREATE and CREATE OR
+  REPLACE, and are renumbered on reopen. They come from one process-wide counter
+  (`DatabaseManager::NextOid`) and ATTACH mints fresh ones for everything it loads, so a
+  DETACH + re-ATTACH renumbers a healthy table exactly as a DROP + re-CREATE does — an oid
+  is proof of identity only within the instance *and* the attach incarnation that handed
+  it out, which is why the index records the attached database's oid alongside the
+  table's.
+- **A vacuum's row motion can be perfectly masked by later appends**: with 3 row groups of
+  2048 rows, deleting the middle group and checkpointing merges to 2 groups and moves
+  surviving rowids (the row with id 4096 lands at rowid 2048); re-inserting 2048 rows
+  restores the row-group layout, the row count and the max rowid to their pre-delete
+  values while the moved rows stay moved. Row counts, `pragma_storage_info` layout and
+  the column's block layout are therefore all unsound as "no motion" oracles; only the
+  *contents* of recorded rowids distinguish the two states, which is what the Phase 5 row
+  witnesses read. Related: row-group merges also happen with no deletes at all (adjacent
+  partial groups), and those preserve rowids — so a changed layout is not evidence of
+  motion either.
+- **`pragma_storage_info`'s `start` is relative to the row group**, not an absolute rowid;
+  the absolute (start, count) layout comes from `DataTable::GetPartitionStats`, and
+  `count` there includes rows deleted but not yet vacuumed. Cost is metadata-only: 2 ms
+  over a 20M-row / 163-row-group table.
+- **The sqllogictest runner sets `checkpoint_wal_size = 0`** (`test/helpers/test_helpers.cpp`
+  `GetTestConfig`), so every statement checkpoints and any DELETE is vacuumed
+  immediately. Tests that need an un-vacuumed delete must raise `checkpoint_threshold`
+  themselves.
 - **Ecosystem**: no trigram/ngram/substring index exists among ~290 community extensions;
   duckdb/duckdb discussion #16071 (trigram tokenizer) is open, unanswered. duckdb-fts main
   branch is adding a token-level trigram sidecar (not general `LIKE '%x%'` over raw
@@ -115,8 +145,11 @@ SELECT * FROM ngram_search('logs', 'connection reset');           -- rows, reche
 SELECT rowid FROM ngram_candidates('logs', 'message', 'needle');  -- lossy candidates
 
 -- maintenance / observability
-PRAGMA ngram_refresh('logs');   PRAGMA ngram_compact('logs');
-SELECT * FROM ngram_index_stats('logs');
+PRAGMA ngram_refresh('logs');            -- index the tail past the high-water mark
+PRAGMA ngram_refresh('logs', col := 'message');
+PRAGMA ngram_compact('logs');            -- merge fragmented segments, drop dead postings
+PRAGMA ngram_compact('logs', purge := true);
+PRAGMA ngram_index_stats('logs');        -- incl. fragmentation and a staleness verdict
 
 SET ngram_auto_accelerate = true;
 SET ngram_max_candidate_fraction = 0.05;
@@ -266,7 +299,7 @@ Status ledger:
 | Complete | Gate | Differential identity vs brute force under concurrency | 5 sqllogictest files, 525 new assertions (`make test`: 1456 across 13 files, green). scripts/differential_search.py property harness (randomized alphabet/gram/case/rows corpora; substring, splice-trap, case-flipped, absent, short, and empty needles; committed → tail → in-transaction → deleted → post-vacuum-subset phases; deterministic per seed, PYTHONHASHSEED-independent): recorded runs seed 1026533771 = 6458 checks, seed 555000 (3 trials) = 2370, seed 7 = 1520 — 0 failures, counts reproduced across independent runs. Concurrency: test/sql/ngram_search_concurrent.test, 6 threads × 4 rounds of INSERT/UPDATE/DELETE/CHECKPOINT racing snapshot-atomic differential queries plus searches inside uncommitted writing transactions (269 assertions). |
 | Complete | Test | Property-based differential suite | scripts/differential_search.py (bounded, seed-reporting, exit-code gated) + CI-bounded test/sql/ngram_search_differential.test and ngram_search_scale.test (multi-segment corpus across the 2^20 boundary). |
 | Complete | Risk | Rowid instability during vacuum if lock scope wrong | During a query: excluded by the shared vacuum lock (see 3B). Between queries: real and pinned by test — see the staleness row below. Race coverage: concurrent CHECKPOINTs against searches with deletes in flight (ngram_search_concurrent.test) and a deterministic post-vacuum check (ngram_search_scale.test). |
-| Complete | Doc | Phase 3 staleness contract: misses-only, false positives never | Recheck + visibility make false positives impossible in every scenario (post-vacuum subset phase of the harness + scale test assert this against a genuinely compacted table: 916k of 917k rowids moved, results stayed ⊆ truth). Three misses-only gaps remain until Phase 5, documented on SearchBind and pinned in tests: (a) in-place UPDATE introducing the needle into a row <= hwm (v1.5.5 updates in place unless an ART index forces delete+insert, table_catalog_entry.cpp:327-336); (b) DELETE of indexed rows followed by checkpoint vacuum, which merges row groups, moves surviving rowids (invalidating postings) and shrinks the table end so even later INSERTs can land below the stale hwm; (c) DROP TABLE + re-CREATE under the same name binds the dead index (see the Phase 5 recreation-detection bullet). |
+| Complete | Doc | Phase 3 staleness contract: misses-only, false positives never | Recheck + visibility make false positives impossible in every scenario (post-vacuum subset phase of the harness + scale test assert this against a genuinely compacted table: 916k of 917k rowids moved, results stayed ⊆ truth). Three misses-only gaps were documented on SearchBind and pinned in tests: (a) in-place UPDATE introducing the needle into a row <= hwm (v1.5.5 updates in place unless an ART index forces delete+insert, table_catalog_entry.cpp:327-336); (b) DELETE of indexed rows followed by checkpoint vacuum, which merges row groups, moves surviving rowids (invalidating postings) and shrinks the table end so even later INSERTs can land below the stale hwm; (c) DROP TABLE + re-CREATE under the same name binds the dead index. Phase 5 turned (b) and (c) into detected errors/refusals in every state it can prove, and (a) whenever a recorded row witness is hit; the residuals it cannot prove are listed in the Phase 5 ledger. |
 | Complete | Work | 10GB latency benchmark (rare/moderate/dense needle vs brute scan) | gate10gb.db (51M rows / 10.05GB hex, 4864 grams, 9.74B postings), read-only, threads=16, warm cache (fits in RAM), median of 3 after 1 warmup; result counts identical between paths for all three needles (doubles as an at-scale differential check). Rare '4e732ced3463' (10 grams, K=8 probed, 2 candidates → 2 rows): search 0.168s vs brute 0.696s = 4.1x. Moderate 'abcd' (217,076 candidates → 135,887 rows, 0.27%): 0.368s vs 0.701s = 1.9x. Dense 'abc' (2,191,010 candidates ≡ matches, 4.3%): 2.868s vs 0.730s — search loses 3.9x. Crossover ≈ 0.55M candidates (~1.1% of rows) at the measured ~1.3µs/candidate fetch+recheck: the Phase 3 driver is single-threaded (user≈real), so the dense case is one core against a 16-thread scan that holds ~0.70-0.73s flat; parallel fetch/recheck (Phase 4/6) is the lever. Probe-only times: 0.185s rare (8 dense hex gram lists decoded — hex is the probe's worst case), 0.064s moderate, 0.023s dense. Cold-ish first touches: 0.302s first search, 2.948s first brute scan. |
 
 ## Phase 4: Transparent Optimizer Rewrite
@@ -303,7 +336,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Scope | Transparent acceleration with safe fallback | src/ngram_rewrite.cpp (+ ngram/ngram_rewrite.hpp, shared Phase 3 core exposed via ngram/search_core.hpp): post-optimize `OptimizerExtension` swaps qualifying `LogicalGet(seq_scan)` nodes for `NGRAM_INDEX_SCAN`. `ngram_auto_accelerate` defaults to **false** (opt-in): the transparent path inherits the Phase 3 misses-only staleness gaps (pinned in test/sql/ngram_rewrite.test with a live in-place-UPDATE miss), and silently rewriting standard `LIKE` into a path that can miss rows is not an acceptable default until Phase 5 maintenance; revisit then. |
+| Complete | Scope | Transparent acceleration with safe fallback | src/ngram_rewrite.cpp (+ ngram/ngram_rewrite.hpp, shared Phase 3 core exposed via ngram/search_core.hpp): post-optimize `OptimizerExtension` swaps qualifying `LogicalGet(seq_scan)` nodes for `NGRAM_INDEX_SCAN`. `ngram_auto_accelerate` defaults to **false** (opt-in): the transparent path inherits the misses-only staleness gaps (pinned in test/sql/ngram_rewrite.test with a live in-place-UPDATE miss), and silently rewriting standard `LIKE` into a path that can miss rows is not an acceptable default. Revisited and confirmed in Phase 5: the in-place-UPDATE gap cannot be closed on v1.5.5 (no triggers, no change feed), so the default stands for v1; Phase 5 did make the path decline instead of answering whenever a detector proves the index stale. |
 | Complete | Work | 4A: OptimizerExtension matcher + scan swap | Matches `contains`/`~~`/`~~*` `ExpressionFilter`s inside `get.table_filters` (incl. inside ConjunctionAndFilter); swaps only `get.function`/`get.bind_data`, leaving table_index, returned types/names, column_ids, projection_ids, and the filters untouched, so column bindings survive verification unchanged. Execution reuses the Phase 3 pipeline (probe → batched `DataTable::Fetch` → recheck → `rowid > hwm` tail scan incl. transaction-local rows, `SharedVacuumLock` held probe-to-end). Recheck evaluates the pushed filters themselves via `TableFilter::ToExpression` (optional filters skipped per their contract), so query semantics never depend on index normalization and composite filters/dynamic join filters are enforced exactly; tail/fallback storage scans apply the same filters natively. Non-qualifying shapes decline the swap: `_`/escape patterns, prefix/suffix/anchored rewrites (those keep `~~` in a residual FILTER), OR-of-predicates, expressions over the column, generated-column tables, TABLESAMPLE, virtual/struct-child columns. RowGroupPruner ordering hints are dropped at swap (ordering-only when filters exist). |
 | Complete | Work | 4B: ILIKE + multi-pattern LIKE handling | Case matrix enforced at both plan and init time: contains/LIKE probe either index flavor (CI folding is superset-preserving; recheck applies the CS predicate — pinned: 'TENT SHOUTING' not matched by `LIKE '%tent%'` over a CI index); ILIKE probes CI indexes only, never CS (needles carry `requires_ci`). Multi-pattern `LIKE '%a%b%'` decomposes into literal segments; one intersection over the union of all needles' grams equals the per-segment intersection; the original pattern is rechecked (segment order pinned: '%tail%tent%' vs '%tent%tail%'). Conservative bail on `_` and escape. |
 | Complete | Work | 4C: Selectivity gate + settings + EXPLAIN rendering | `ngram_max_candidate_fraction` (double, default **0.05**; Phase 3 anchor: warm-cache crossover ≈1.1% of rows on the 16-thread 10 GB box, cold-cache far higher — 0.05 splits the difference toward not regressing cold scans; tune in Phase 6). Gate runs in init_global after the probe: candidates > fraction × `GetTotalRows()` → full storage scan inside the same table function (filters applied natively, still exhaustive, no re-planning). EXPLAIN renders `NGRAM_INDEX_SCAN` + needles via `to_string`; EXPLAIN ANALYZE renders the runtime decision via `dynamic_to_string` ("index (N candidates)" / "full scan fallback: <reason>"). Kill switches tested: `ngram_auto_accelerate=false`, `SET disabled_optimizers='extension'`. |
@@ -317,27 +350,44 @@ Goal:
 The index tracks a changing table with bounded staleness cost and no correctness impact.
 
 Scope:
-- `PRAGMA ngram_refresh`: index rows between HWM and current max rowid into a new segment
-  generation; advance HWM transactionally with the segment write.
-- `PRAGMA ngram_compact`: LSM-style merge of segment generations; purge tombstoned rowids.
+- `PRAGMA ngram_refresh(table[, col])`: index the committed rows between the HWM and the
+  table's last committed rowid into a new segment generation; advance the HWM
+  transactionally with the segment write.
+- `PRAGMA ngram_compact(table[, col][, purge])`: merge the segment rows that share a
+  (gram, segment_no) — parallel-build splits and refresh generations — back into one row
+  per key, and drop postings whose rowid no longer exists.
 - Delete handling: stale candidates are eliminated by fetch/recheck until a checkpoint
   vacuums the deletes; vacuum merges row groups and MOVES surviving rowids
   (`row_group_collection.cpp` VacuumState: any table without native indexes has
   `can_change_row_ids = true`), stranding postings and leaving the recorded HWM above the
   table's new end, so refresh must detect row motion (or rebuild) — recheck keeps this
-  misses-only, never false positives. Update handling: v1.5.5 updates rows IN PLACE
-  (same rowid) unless the updated column is covered by an ART index
-  (`table_catalog_entry.cpp:327-336`), so an update that introduces a match into an
-  indexed row is invisible until refresh — refresh must re-index updated rows, not just
-  the HWM tail; optional `maintenance := 'incremental'` trigger mode (evaluate DuckDB
-  trigger maturity; duckdb-fts main uses this pattern).
+  misses-only, never false positives.
+- Update handling: v1.5.5 updates rows IN PLACE (same rowid) unless the updated column is
+  covered by an ART index (`table_catalog_entry.cpp:327-336`), and the engine offers no
+  way to enumerate the rows an UPDATE touched: `CREATE TRIGGER` is a parser error and
+  there is no change feed. There is therefore no sound incremental way to re-index
+  updated rows — refresh covers the HWM tail only, and an in-place update below the HWM
+  is repaired by drop + create, not by refresh. Decision 5C (`maintenance :=
+  'incremental'` trigger mode) is resolved as unavailable on v1.5.5; revisit on an engine
+  upgrade that adds triggers or a change feed.
 - Recreation detection: DROP TABLE leaves the shadow schema behind, and the name-based
   ownership guard matches a recreated table of the same name, so queries silently use the
-  dead index (misses-only; pinned in test/sql/ngram_search_visibility.test). v1.5.5 has no
-  stable cross-restart table identity token (catalog OIDs are per-process) and no DDL
-  hooks. Store a schema fingerprint (column names + types) in meta to catch recreations
-  that change shape; a same-shape recreation stays a documented gap unless a stronger
-  token turns up.
+  dead index (pinned in test/sql/ngram_search_visibility.test). v1.5.5 has no persistent
+  table identity token (catalog OIDs are per-process, and catalog ownership dependencies
+  are in-memory only — verified). Store a schema fingerprint (ordered column names +
+  types) plus the table's catalog oid, its database's catalog oid and an instance token in
+  meta. When instance and database oid both match, the table oid is comparable: a changed
+  one is proof of re-creation, and an unchanged one is proof the table was never
+  re-created — which in turn makes ALTERs to other columns provably harmless, so only the
+  indexed column's own shape is checked. When identity cannot be proven (another session,
+  another attach incarnation) the full column list is the only recreation signal left and
+  is enforced strictly. A same-shape re-creation performed in an earlier session stays a
+  documented gap.
+- Staleness detection generally: every verdict must be *proof*, because it gates errors
+  and refusals. Metadata-only checks (O(1) rowid count, catalog oid, column list) run on
+  every query; the maintenance pragmas additionally re-read a handful of recorded row
+  witnesses, which is what catches a vacuum whose row motion later appends have papered
+  over.
 
 Out of scope:
 - Automatic background scheduling (user/cron-driven).
@@ -355,13 +405,21 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Scope | Refresh + compaction lifecycle | Missing: implementation. |
-| Incomplete | Work | 5A: HWM refresh with transactional segment publish | Missing: implementation + crash test. |
-| Incomplete | Work | 5B: Segment compaction + tombstone purge | Missing: implementation + tests. |
-| Incomplete | Work | 5C: Update/delete semantics + optional trigger mode decision | Missing: trigger-maturity evaluation + doc. |
-| Incomplete | Gate | Churn test green; refresh cost ∝ tail | Missing: harness + timing evidence. |
-| Incomplete | Test | Crash-interruption recovery tests | Missing: test files. |
-| Incomplete | Decision | Ship trigger-based incremental mode in v1? | Missing: evaluation vs duckdb-fts trigger approach. |
+| Complete | Scope | Refresh + compaction lifecycle | src/ngram_maintenance.cpp (+ ngram/maintenance.hpp): `PRAGMA ngram_refresh(t[, col=...])`, `PRAGMA ngram_compact(t[, col=...][, purge=...])`, the staleness detectors, and the `ngram_unpack_postings` in-out function compaction needs (src/pack_postings.cpp). Meta is format_version 2 (schema_fingerprint, table_oid, instance_id, row_samples); every reader rejects other versions with a rebuild-required error (test/sql/ngram_maintenance.test pins search/refresh/compact/stats all erroring on a v1 meta row). |
+| Complete | Work | 5A: HWM refresh with transactional segment publish | Tail rows (`rowid > hwm AND rowid < MAX_ROW_ID`) are packed and APPENDED as a new generation — the segments schema already tolerates several rows per (gram, segment_no) and readers union them, so no schema change was needed — then the HWM advances in the same multi-statement pragma expansion, which the preprocessor wraps in one BEGIN/COMMIT (`statement_preprocessor.cpp`: >1 statement and not already in a transaction; the has_select exemption applies to MULTI_STATEMENT, not to pragma expansion). Stats gets per-gram delta rows, which the probe already sums. A concurrency guard fails the script if the meta row changed between the callback reading it and the script running. |
+| Complete | Work | 5B: Segment compaction + tombstone purge | Fragmented keys are decoded (`ngram_unpack_postings`), anti-joined against the table's live rowids, and re-packed through the existing streaming packer, then swapped in; stats is rebuilt exactly from the merged segments. `purge = true` widens the rewrite from fragmented keys to every key, so dead postings are dropped everywhere rather than only where a merge was rewriting the blob anyway. A posting is dropped only when the base table has no such row in the compacting transaction's snapshot, and MVCC keeps older readers on the pre-compact segment rows. test/sql/ngram_maintenance.test: merge, one-row-per-key, stats agreement, idempotence, purge, and a differential check after each. The packer is parallel, so in principle a key whose run straddles two packing threads can come back as two rows (readers union them, and the next compaction merges them); not observed in practice — the 700k-row crash-test corpus compacts 492 segment rows to exactly 164, one per key. |
+| Complete | Work | 5C: Update/delete semantics + optional trigger mode decision | Resolved as unavailable: `CREATE TRIGGER trg AFTER INSERT ON t ...` → `Parser Error: syntax error at or near "TRIGGER"` on v1.5.5, and there is no change feed, so no sound incremental way to find in-place-updated rows exists. Refresh covers appends; updates need drop + create. Recorded in the scope text above, on `SearchBind`'s contract comment (src/ngram_search.cpp), and pinned in test/sql/ngram_search_visibility.test. DELETE without a vacuum stays refreshable (pinned) — deletes leave surviving rowids in place and recheck hides the dead postings. |
+| Complete | Work | 5D: Staleness detection (row motion, re-creation, shape) | Detectors in src/ngram_maintenance.cpp, wired into both probe paths (error on the explicit path, decline on the transparent one) and into refresh/compact/stats (refuse/report). Query-time cost is O(1) + O(columns): allocated rowid count vs HWM, the identity triple (instance token, database oid, table oid), and the column-list check. The pragmas add the row witnesses. Measured: `pragma_storage_info` over a 20M-row/163-row-group table is 2 ms, but per query at TB scale it is not affordable, so the deep check is pragma-only. Identity is scoped to the attach incarnation because ATTACH renumbers oids: an earlier version compared table oids on the instance token alone and called a healthy index re-created after a DETACH + re-ATTACH (reviewer finding; regression-tested in ngram_maintenance_identity.test). Proven identity also relaxes the shape check to the indexed column's own name and type, so renaming, dropping or retyping any other column no longer forces an hours-scale rebuild; without proof the full column list stays strict. |
+| Complete | Gate | Churn test green; refresh cost ∝ tail | scripts/churn_maintenance.py (INSERT/DELETE/UPDATE/CHECKPOINT/refresh/compact, a fresh duckdb process per step so every step reopens the database, small ROW_GROUP_SIZE so deletes trigger real vacuum merges): seed 90210 (120 rounds, 6000 rows) 1920 checks / 0 failures / 30 un-maintainable states, all 30 surfaced by a detector; seed 7 (120 rounds, 3000 rows) 1920 checks / 0 failures / 23 states, 19 surfaced; seed 20260809 (60 rounds, 5000 rows) 960 checks / 0 failures / 8 states, 7 surfaced; seed 20260810 (40 rounds) 640 checks / 0 failures / 13 states, 12 surfaced. The remainder are in-place updates that missed every witness — the documented gap; the harness rebuilds on the contract's advice and requires exhaustive results again afterwards. The harness also has a false-alarm gate (`--no-stale-expected`): only operations that keep an index valid (append, refresh, compact, checkpoint) run, and *any* detector verdict fails the run — seed 616 (40 rounds) 640 checks / 0 failures / 0 verdicts; seed 4711 (30 rounds) 480 checks / 0 failures / 0 verdicts. It is not vacuous: allowing deletes and updates back into the same strict run turns it into 3 failures naming the detector that fired. Refresh cost ∝ tail: the same 5000-row tail refreshes in 0.062 s on a 1M-row table and 0.065 s on an 8M-row table (whose build takes 5.3 s vs 56.1 s), and `EXPLAIN ANALYZE` of the generated tail scan over 8,005,000 rows reads 5,000 rows with `Filters: rowid>7999999 AND rowid<36028797018960000` in 0.014 s. An empty refresh is 0.025-0.032 s, essentially process start-up plus the witness reads. |
+| Complete | Test | Crash-interruption recovery tests | scripts/crash_maintenance.py: runs the pragma in a child duckdb process, SIGKILLs it at offsets spread across the measured duration, reopens, and requires the recorded state to be exactly the pre- or post-operation one plus differential identity. Recorded runs: seed 555, 400k rows + 150k tail, 16 kills across a 0.99 s refresh and 16 across a 2.12 s compact (22 of the 32 landed before the commit) — 32/32 reopened clean, every state pre or post, 0 differential mismatches; seed 909 at 150k rows + 60k tail, 16 kills, 0 failures; seed 31337 at 40k rows, 16 kills, 0 failures. Local-only by nature (the kill offsets are timing-dependent); the deterministic part of the story is the single-transaction expansion. |
+| Complete | Decision | Ship trigger-based incremental mode in v1? | No: v1.5.5 has no triggers (parser error, verified) and no change feed. duckdb-fts's trigger pattern is not available on the pinned engine. Revisit on an engine upgrade. |
+| Complete | Decision | `ngram_auto_accelerate` stays default-false in v1 | The in-place-UPDATE gap survives Phase 5 (5C), so silently rewriting a plain `LIKE` into a path that can miss rows is still not an acceptable default. Phase 6 revisits the documentation, not the default. |
+| Complete | Work | Deferred Phase 1-4 fix-ups folded in | (a) Orphaned-index drop with mismatched casing left an empty shadow schema — own-table recognition is now case-insensitive (pinned in create_index.test). (b) The ownership guard was vacuous on an empty meta table — it now compares a scalar row count, so an empty or foreign meta row fails every guard (pinned). (c) `ngram_index_stats` reported nothing through a colliding shadow schema — it now raises the collision error like the other pragmas (create_index.test flipped). |
+| Complete | Risk | Building an index inside a transaction with uncommitted rows recorded transaction-local rowids | Found while verifying refresh semantics: `PRAGMA create_ngram_index` inside a transaction that had inserted rows recorded `hwm_rowid = 36028797018960000` (MAX_ROW_ID) and postings for local rowids; after COMMIT, `ngram_search` fetched one and duckdb raised `INTERNAL Error: LocalStorage::FetchChunk - local storage not found`, invalidating the database. Build and refresh now index committed rows only (`rowid < MAX_ROW_ID`); uncommitted rows are covered by the tail scan and picked up by a later refresh once they have real rowids. Pinned in test/sql/ngram_maintenance.test. |
+| Complete | Test | Phase 3/4 differential harnesses still green | scripts/differential_search.py explicit seed 555000 6150 checks / 0 failures; `--transparent` seed 902147 3496 checks / 0 failures (reviewer-verified counts, identical to pre-fix runs — the stale-refusal change truncated nothing). Its post-vacuum phase learned the new outcome: where a vacuum leaves the table shorter than the high-water mark the explicit path now refuses instead of returning a subset, which the harness accepts as the better answer (the subset property is still enforced whenever the index does answer). |
+| Complete | Test | Maintenance sqllogictests | test/sql/ngram_maintenance.test (164 assertions): refresh indexes the tail (candidates prove it, not just the tail scan), no-op refresh, refresh after an un-vacuumed DELETE, compaction merge/stats/idempotence/purge, two columns refreshed independently via `col =`, transaction-local rows never indexed, format_version mismatch on every reader, transparent-path decline via EXPLAIN, shape changes (appended columns tolerated; dropping another column stays healthy under proven identity; retyping the indexed column refused), ownership refusals, evil identifiers, and refresh atomicity inside a user transaction (visible inside, fully rolled back on ROLLBACK, durable on COMMIT). test/sql/ngram_maintenance_identity.test (72 assertions): benign ALTERs (rename, retype, drop of other columns) stay healthy while identity is proven, the indexed column's own rename does not, DETACH + re-ATTACH is healthy for search/candidates/refresh/compact/stats, a re-creation inside the new incarnation is still caught, and after a restart the strict column-list rule applies again. test/sql/unpack_postings.test (38 assertions): `ngram_unpack_postings` happy path, pack/unpack round trip, empty and multi-chunk blobs, malformed/truncated/garbage blobs, NULLs in any column, and wrong input schemas. Plus the flips in ngram_search_visibility.test and ngram_search_scale.test below. `make test`: 18 files, 2034 assertions. |
+| Complete | Risk | New code paths hide memory or verification faults | DEBUG build (`GEN=ninja make debug`, AddressSanitizer + per-pass plan verification): full sqllogictest suite green (18 files, 2034 assertions), plus the churn harness against the DEBUG binary in both modes (seed 1234, 20 rounds, 320 checks / 0 failures; `--no-stale-expected` seed 4711, 15 rounds, 240 checks / 0 failures / 0 detector verdicts) — the witness fetches, the unpack/pack pipeline and the maintenance scripts all run clean under ASAN. |
+| Complete | Doc | Phase 5 staleness contract: what is detected and what is not | Detected, and therefore an error on the explicit path / a decline on the transparent one / a refusal in the pragmas: a table shorter than the recorded HWM; a re-creation inside the instance and attach incarnation that recorded the identity (table oids survive every ALTER but are handed out afresh by CREATE — verified for ADD/DROP/RENAME COLUMN, ALTER TYPE, RENAME TABLE, CREATE OR REPLACE); the indexed column losing its name or type while identity is proven; a column list that is no longer a prefix of the recorded one when identity cannot be proven; and, in the maintenance pragmas, a recorded row witness whose value changed. Not detected, documented, misses-only: an in-place UPDATE that misses every witness; a checkpoint vacuum whose motion left every witness holding an equal value; and — where identity is proven, so the column list is not compared — dropping and re-adding the indexed column with the same name and type, which the query paths read as healthy while the witnesses still catch it in the maintenance pragmas and stats. Never affected: false positives, which recheck makes impossible in every state. |
 
 ## Phase 6: Scale Validation, Hardening, Release
 

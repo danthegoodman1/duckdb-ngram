@@ -126,12 +126,102 @@ static OperatorFinalizeResultType PackPostingsFinal(ExecutionContext &context, T
 	return OperatorFinalizeResultType::FINISHED;
 }
 
+//! ngram_unpack_postings((SELECT gram, segment_no, postings FROM segments)) is
+//! the inverse of the packer: it streams one (gram, segment_no, rowid) row per
+//! posting. Compaction pipes it back into ngram_pack_postings to merge the
+//! rows that share a key. It emits at most one output chunk per call and
+//! resumes where it stopped, so a single blob holding more rowids than fit in
+//! a chunk is spread over several calls rather than buffered.
+
+struct UnpackPostingsLocalState : LocalTableFunctionState {
+	//! resume position inside the current input chunk
+	idx_t input_offset = 0;
+	//! decoded postings of the row at input_offset, and how many were emitted
+	vector<int64_t> rowids;
+	idx_t rowid_offset = 0;
+	bool row_decoded = false;
+};
+
+static unique_ptr<FunctionData> UnpackPostingsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto &types = input.input_table_types;
+	if (types.size() != 3 || types[0].id() != LogicalTypeId::VARCHAR || types[1].id() != LogicalTypeId::BIGINT ||
+	    types[2].id() != LogicalTypeId::BLOB) {
+		throw BinderException(
+		    "ngram_unpack_postings expects a table of (gram VARCHAR, segment_no BIGINT, postings BLOB)");
+	}
+	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
+	names = {"gram", "segment_no", "r"};
+	return make_uniq<TableFunctionData>();
+}
+
+static unique_ptr<LocalTableFunctionState> UnpackPostingsInitLocal(ExecutionContext &context,
+                                                                   TableFunctionInitInput &input,
+                                                                   GlobalTableFunctionState *global_state) {
+	return make_uniq<UnpackPostingsLocalState>();
+}
+
+static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, TableFunctionInput &data_p,
+                                                 DataChunk &input, DataChunk &output) {
+	auto &state = data_p.local_state->Cast<UnpackPostingsLocalState>();
+
+	UnifiedVectorFormat gram_format, segment_format, blob_format;
+	input.data[0].ToUnifiedFormat(input.size(), gram_format);
+	input.data[1].ToUnifiedFormat(input.size(), segment_format);
+	input.data[2].ToUnifiedFormat(input.size(), blob_format);
+	auto grams = UnifiedVectorFormat::GetData<string_t>(gram_format);
+	auto segments = UnifiedVectorFormat::GetData<int64_t>(segment_format);
+	auto blobs = UnifiedVectorFormat::GetData<string_t>(blob_format);
+
+	auto out_gram = FlatVector::GetData<string_t>(output.data[0]);
+	auto out_segment = FlatVector::GetData<int64_t>(output.data[1]);
+	auto out_rowid = FlatVector::GetData<int64_t>(output.data[2]);
+
+	idx_t out_count = 0;
+	while (state.input_offset < input.size()) {
+		auto row = state.input_offset;
+		auto gram_idx = gram_format.sel->get_index(row);
+		auto segment_idx = segment_format.sel->get_index(row);
+		auto blob_idx = blob_format.sel->get_index(row);
+		if (!gram_format.validity.RowIsValid(gram_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
+		    !blob_format.validity.RowIsValid(blob_idx)) {
+			throw InvalidInputException("ngram_unpack_postings: input must not contain NULLs");
+		}
+		if (!state.row_decoded) {
+			state.rowids.clear();
+			state.rowid_offset = 0;
+			DecodePostings(blobs[blob_idx].GetData(), blobs[blob_idx].GetSize(), state.rowids);
+			state.row_decoded = true;
+		}
+		while (state.rowid_offset < state.rowids.size()) {
+			if (out_count >= STANDARD_VECTOR_SIZE) {
+				output.SetCardinality(out_count);
+				return OperatorResultType::HAVE_MORE_OUTPUT;
+			}
+			out_gram[out_count] = StringVector::AddString(output.data[0], grams[gram_idx]);
+			out_segment[out_count] = segments[segment_idx];
+			out_rowid[out_count] = state.rowids[state.rowid_offset++];
+			out_count++;
+		}
+		state.row_decoded = false;
+		state.input_offset++;
+	}
+	state.input_offset = 0;
+	output.SetCardinality(out_count);
+	return OperatorResultType::NEED_MORE_INPUT;
+}
+
 void RegisterPackPostings(ExtensionLoader &loader) {
 	TableFunction pack("ngram_pack_postings", {LogicalType::TABLE}, nullptr, PackPostingsBind, PackPostingsInitGlobal,
 	                   PackPostingsInitLocal);
 	pack.in_out_function = PackPostingsFunction;
 	pack.in_out_function_final = PackPostingsFinal;
 	loader.RegisterFunction(pack);
+
+	TableFunction unpack("ngram_unpack_postings", {LogicalType::TABLE}, nullptr, UnpackPostingsBind,
+	                     PackPostingsInitGlobal, UnpackPostingsInitLocal);
+	unpack.in_out_function = UnpackPostingsFunction;
+	loader.RegisterFunction(unpack);
 }
 
 } // namespace ngram

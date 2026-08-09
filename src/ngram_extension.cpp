@@ -3,6 +3,7 @@
 #include "ngram_extension.hpp"
 #include "duckdb.hpp"
 #include "ngram/index_pragmas.hpp"
+#include "ngram/maintenance.hpp"
 #include "ngram/ngram_rewrite.hpp"
 #include "ngram/ngram_search.hpp"
 #include "ngram/postings_codec.hpp"
@@ -15,6 +16,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ngram::RegisterPostingsCodec(loader);
 	ngram::RegisterPackPostings(loader);
 	ngram::RegisterIndexPragmas(loader);
+	ngram::RegisterMaintenance(loader);
 	ngram::RegisterSearchFunctions(loader);
 	ngram::RegisterRewrite(loader);
 }

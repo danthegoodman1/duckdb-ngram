@@ -56,6 +56,19 @@ bool ShadowTableExists(ClientContext &context, const ResolvedTarget &target, con
 //! Names of meta_* tables currently present in the target's shadow schema.
 vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &target);
 
+//! Quote an identifier / a string literal for generated SQL.
+string Ident(const string &name);
+string Lit(const string &value);
+
+//! A statement that raises the shadow-schema collision error unless the meta
+//! table holds exactly one row naming `target` as its owner. Pragma callbacks
+//! cannot run queries, so every generated script guards itself this way.
+string OwnershipGuard(const ResolvedTarget &target, const string &meta_qualified);
+
+//! Rowids at or above this value are transaction-local: they are reassigned at
+//! commit, so the index must never record them (duckdb MAX_ROW_ID).
+constexpr int64_t LOCAL_ROWID_START = 36028797018960000LL;
+
 void RegisterIndexPragmas(ExtensionLoader &loader);
 
 } // namespace ngram

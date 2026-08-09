@@ -13,10 +13,12 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/index_pragmas.hpp"
 #include "ngram/ngram_search.hpp"
 #include "ngram/postings_codec.hpp"
+#include "ngram/search_core.hpp"
 #include "ngram/trigram.hpp"
 
 #include <algorithm>
@@ -46,7 +48,7 @@ namespace ngram {
 
 static constexpr idx_t DEFAULT_MAX_GRAMS_PER_QUERY = 8;
 
-static idx_t MaxGramsPerQuery(ClientContext &context) {
+idx_t MaxGramsPerQuery(ClientContext &context) {
 	Value value;
 	if (context.TryGetCurrentSetting("ngram_max_grams_per_query", value) && !value.IsNull()) {
 		auto k = value.GetValue<int64_t>();
@@ -76,6 +78,10 @@ struct QueryBindData : public TableFunctionData {
 	vector<string> names;
 	vector<LogicalType> types;
 	idx_t search_column_idx = 0;
+
+	ShadowTarget Target() const {
+		return ShadowTarget {schema_name, table_name, column_name, shadow_schema};
+	}
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<QueryBindData>(*this);
@@ -232,8 +238,8 @@ static unique_ptr<FunctionData> CandidatesBind(ClientContext &context, TableFunc
 // Execution-time shadow-table access
 //===----------------------------------------------------------------------===//
 
-static DuckTableEntry &ResolveExistingTable(ClientContext &context, const string &catalog, const string &schema,
-                                            const string &name, const char *what) {
+DuckTableEntry &ResolveExistingTable(ClientContext &context, const string &catalog, const string &schema,
+                                     const string &name, const char *what) {
 	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, name);
 	auto entry = Catalog::GetEntry(context, catalog, schema, lookup, OnEntryNotFound::RETURN_NULL);
 	if (!entry || entry->type != CatalogType::TABLE_ENTRY || !entry->Cast<TableCatalogEntry>().IsDuckTable()) {
@@ -260,13 +266,27 @@ static void AddShadowColumn(DuckTableEntry &entry, const string &column_name, Lo
 	types.push_back(col.Type());
 }
 
+void InitializeExhaustiveScan(ClientContext &context, DuckTransaction &tx, DataTable &storage, TableScanState &state,
+                              const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> filters) {
+	if (storage.GetTotalRows() == 0) {
+		// no committed row groups (a table created inside this transaction):
+		// initialize only the transaction-local phase; the committed phase
+		// then scans nothing. Going through DataTable::InitializeScan instead
+		// trips a DEBUG-build assertion on the empty row-group collection.
+		state.Initialize(column_ids, context, filters);
+		LocalStorage::Get(tx).InitializeScan(storage, state.local_state, filters);
+		return;
+	}
+	storage.InitializeScan(context, tx, state, column_ids, filters);
+}
+
 //! Scan an entire table (committed storage plus this transaction's local rows)
 //! through the caller's transaction, invoking fn per non-empty chunk.
 static void ScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
                             const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
                             optional_ptr<TableFilterSet> filters, const std::function<void(DataChunk &)> &fn) {
 	TableScanState state;
-	storage.InitializeScan(context, tx, state, column_ids, filters);
+	InitializeExhaustiveScan(context, tx, storage, state, column_ids, filters);
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), types);
 	while (true) {
@@ -279,13 +299,7 @@ static void ScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTab
 	}
 }
 
-struct MetaInfo {
-	GramOptions options;
-	int64_t hwm_rowid = -1;
-};
-
-static MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
-                         const QueryBindData &bind) {
+MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry, const ShadowTarget &bind) {
 	vector<StorageIndex> column_ids;
 	vector<LogicalType> types;
 	AddShadowColumn(meta_entry, "format_version", LogicalTypeId::INTEGER, column_ids, types);
@@ -353,8 +367,8 @@ static MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableE
 //! Every narrowing here is superset-preserving: probing fewer grams can only
 //! grow the intersection, and a gram with no postings proves no indexed row
 //! contains the needle.
-static vector<row_t> ProbeIndex(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
-                                DuckTableEntry &stats_entry, const vector<string> &grams, idx_t max_grams) {
+vector<row_t> ProbeIndex(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
+                         DuckTableEntry &stats_entry, const vector<string> &grams, idx_t max_grams) {
 	D_ASSERT(!grams.empty());
 
 	// posting counts per needle gram (rarest-first selection). Counts may be
@@ -601,7 +615,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 
 	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.shadow_schema, MetaTableName(bind.column_name),
 	                                  "ngram index meta table");
-	auto info = ReadMeta(context, *state->tx, meta, bind);
+	auto info = ReadMeta(context, *state->tx, meta, bind.Target());
 	state->hwm = info.hwm_rowid;
 	state->recheck.options = info.options;
 	state->search_column_idx = bind.search_column_idx;
@@ -655,8 +669,8 @@ static void InitializeTailScan(ClientContext &context, SearchGlobalState &state)
 		    ColumnIndex(state.base_types.size()),
 		    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHAN, Value::BIGINT(state.hwm)));
 	}
-	state.storage->InitializeScan(context, *state.tx, state.tail_state, state.tail_column_ids,
-	                              state.tail_filters.get());
+	InitializeExhaustiveScan(context, *state.tx, *state.storage, state.tail_state, state.tail_column_ids,
+	                         state.tail_filters.get());
 	state.tail_chunk.Initialize(Allocator::Get(context), tail_types);
 	state.tail_initialized = true;
 }
@@ -759,7 +773,7 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 
 	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.shadow_schema, MetaTableName(bind.column_name),
 	                                  "ngram index meta table");
-	auto info = ReadMeta(context, *state->tx, meta, bind);
+	auto info = ReadMeta(context, *state->tx, meta, bind.Target());
 	state->hwm = info.hwm_rowid;
 
 	auto decomposition = DecomposeNeedle(bind.needle.data(), bind.needle.size(), info.options);
@@ -790,7 +804,8 @@ static void CandidatesFunction(ClientContext &context, TableFunctionInput &data,
 			state.scan_filters->PushFilter(
 			    ColumnIndex(0),
 			    make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::BIGINT(state.hwm)));
-			state.storage->InitializeScan(context, *state.tx, state.scan_state, column_ids, state.scan_filters.get());
+			InitializeExhaustiveScan(context, *state.tx, *state.storage, state.scan_state, column_ids,
+			                         state.scan_filters.get());
 			state.scan_chunk.Initialize(Allocator::Get(context), {LogicalType::ROW_TYPE});
 			state.scan_initialized = true;
 		}

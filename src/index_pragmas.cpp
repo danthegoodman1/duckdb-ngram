@@ -17,7 +17,7 @@ namespace ngram {
 //! references extension functions, so a database opened without the extension
 //! reads and writes normally and the index schema is inert.
 
-static string ShadowSchemaName(const string &schema, const string &table) {
+string ShadowSchemaName(const string &schema, const string &table) {
 	return "ngram_" + schema + "_" + table;
 }
 

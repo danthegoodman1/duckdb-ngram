@@ -23,6 +23,9 @@ namespace ngram {
 //! Build and query must agree on this constant.
 constexpr int64_t SEGMENT_SHIFT = 20;
 
+//! The schema holding a base table's shadow tables (ngram_<schema>_<table>)
+string ShadowSchemaName(const string &schema, const string &table);
+
 //! Per-column shadow tables inside the shadow schema (ngram_<schema>_<table>)
 string MetaTableName(const string &column);
 string SegmentsTableName(const string &column);

@@ -138,13 +138,23 @@ static string CollisionErrorCall(const ResolvedTarget &target, const string &met
 	       Lit(target.schema_name + "." + target.table_name) + ")";
 }
 
+//! Wrap a guard expression in a statement that produces no result set. A bare
+//! `SELECT <guard>` works but prints a NULL row per guard, which is what a
+//! user of these pragmas actually sees; `SET VARIABLE` evaluates the same
+//! expression, raises the same error, and returns nothing. The statement count
+//! is unchanged, so the preprocessor still wraps the expansion in one
+//! transaction exactly as before.
+string SilentGuard(const string &guard_expression) {
+	return "SET VARIABLE " + string(NGRAM_GUARD_VARIABLE) + " = (SELECT " + guard_expression + ");\n";
+}
+
 //! Statement raising the collision error unless the meta table holds exactly
 //! one row naming target as its owner. Evaluating a scalar subquery rather
 //! than a per-row CASE keeps the guard from passing vacuously on an empty
 //! meta table.
 string OwnershipGuard(const ResolvedTarget &target, const string &meta_qualified) {
-	return "SELECT CASE WHEN " + OwnedMetaRowCount(target, meta_qualified) + " <> 1 THEN " +
-	       CollisionErrorCall(target, meta_qualified) + " END AS ngram_ownership_check;\n";
+	return SilentGuard("CASE WHEN " + OwnedMetaRowCount(target, meta_qualified) + " <> 1 THEN " +
+	                   CollisionErrorCall(target, meta_qualified) + " END");
 }
 
 vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &target) {
@@ -225,11 +235,11 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	for (auto &meta_name : ExistingMetaTables(context, target)) {
 		auto meta_qualified = shadow + "." + Ident(meta_name);
 		if (meta_name == MetaTableName(column_name)) {
-			script += "SELECT CASE WHEN " + OwnedMetaRowCount(target, meta_qualified) + " <> 1 THEN " +
-			          CollisionErrorCall(target, meta_qualified) + " ELSE error(" +
-			          Lit("An ngram index already exists on " + target.table_name + "." + column_name + " (" +
-			              target.shadow_schema + "); use drop_ngram_index first") +
-			          ") END AS ngram_ownership_check;\n";
+			script += SilentGuard("CASE WHEN " + OwnedMetaRowCount(target, meta_qualified) + " <> 1 THEN " +
+			                      CollisionErrorCall(target, meta_qualified) + " ELSE error(" +
+			                      Lit("An ngram index already exists on " + target.table_name + "." + column_name +
+			                          " (" + target.shadow_schema + "); use drop_ngram_index first") +
+			                      ") END");
 		} else {
 			script += OwnershipGuard(target, meta_qualified);
 		}

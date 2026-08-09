@@ -349,3 +349,42 @@ a_b	c
 
 statement ok
 PRAGMA drop_ngram_index('a_b.c', 's');
+
+# The generated scripts guard themselves with statements that must not show up
+# in a pragma's output: a bare SELECT guard printed a NULL ngram_ownership_check
+# / ngram_meta_guard row per pragma call. The guard is now an assignment to a
+# session variable, which evaluates the same expression and returns nothing.
+
+statement ok
+CREATE TABLE guard_output AS SELECT i AS id, 'row ' || i AS s FROM range(100) t(i);
+
+query I
+PRAGMA create_ngram_index('guard_output', 's');
+----
+
+statement ok
+INSERT INTO guard_output VALUES (1000, 'row tail');
+
+query I
+PRAGMA ngram_refresh('guard_output');
+----
+
+query I
+PRAGMA ngram_compact('guard_output');
+----
+
+# the guard did run; its value is always NULL, only the evaluation matters
+query I
+SELECT getvariable('__ngram_guard') IS NULL;
+----
+true
+
+# and it still fires: a second create is refused by the same guard expression
+statement error
+PRAGMA create_ngram_index('guard_output', 's');
+----
+An ngram index already exists on guard_output.s
+
+query I
+PRAGMA drop_ngram_index('guard_output', 's');
+----

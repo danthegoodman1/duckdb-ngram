@@ -123,10 +123,22 @@ submodule tag `research-e500d778` for the main-only references flagged below.
   `GetTestConfig`), so every statement checkpoints and any DELETE is vacuumed
   immediately. Tests that need an un-vacuumed delete must raise `checkpoint_threshold`
   themselves.
-- **Ecosystem**: no trigram/ngram/substring index exists among ~290 community extensions;
-  duckdb/duckdb discussion #16071 (trigram tokenizer) is open, unanswered. duckdb-fts main
-  branch is adding a token-level trigram sidecar (not general `LIKE '%x%'` over raw
-  strings) — monitor for scope collision.
+- **Ecosystem** (rechecked 2026-08-08, Phase 6): still no trigram/ngram/substring index
+  among the 306 community extensions, and the name `ngram` is unclaimed (no core
+  extension uses it either). The nearest neighbours are scalar matchers or prefix
+  structures, not substring indexes: `fuzzycomplete`, `rapidfuzz`, `splink_udfs`
+  (an `ngrams()` list function), `marisa` (prefix trie), `lsh`. duckdb/duckdb discussion
+  #16071 (trigram tokenizer) is still open and unanswered. duckdb-fts merged its trigram
+  work to main on 2026-08-04 (PR #52, "Add indexed wildcard and regex search") and has not
+  released it — the repo has no tags and no releases, and its last version bump predates
+  the merge, so `INSTALL fts` on v1.5.5 does not include it. What it does is
+  dictionary-level: trigrams over the deduplicated *term* dictionary (`term_grams`,
+  `raw_term_grams` keyed by termid), used to expand a whole-token wildcard/regex query
+  term before BM25 scoring; its own README says the sidecars "grow with the term
+  dictionary rather than with the document corpus" and that patterns are matched "as one
+  whole-token pattern ... against the normalized raw-term dictionary". That is a different
+  structure and a different guarantee from a character-trigram index over raw strings that
+  matches across token boundaries and scales with the corpus. No scope collision.
 
 ## Public API (target surface)
 
@@ -182,7 +194,9 @@ SET ngram_max_grams_per_query = 8;   -- probe only the K rarest trigrams of the 
 - Concurrency tests: index probes racing inserts/deletes/updates and checkpoints;
   uncommitted-row visibility inside a writing transaction.
 - Scale benchmark tracked per release: index build time, index size ratio, and query
-  latency percentiles on a ≥100 GB corpus (TB-scale spot checks before release).
+  latency percentiles on a ≥100 GB corpus, plus a measured scaling curve (1/10/100 GB)
+  supporting an explicit TB extrapolation. True-TB validation needs hardware this project
+  does not have (see the Phase 6 gate) and is deferred until it does.
 
 ## Phase 1: Scaffold and Trigram Primitives
 
@@ -292,7 +306,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Scope | Exhaustive explicit search path | src/ngram_search.cpp: `ngram_search(table, needle[, col := ...])` + `ngram_candidates(table, column, needle)` table functions, `ngram_max_grams_per_query` setting (default 8). Named parameter is `col` because `column` is a reserved keyword. |
+| Complete | Scope | Exhaustive explicit search path | src/ngram_search.cpp: `ngram_search(table, needle[, col := ...])` + `ngram_candidates(table, column, needle)` table functions, `ngram_max_grams_per_query` setting (default 3 since Phase 6 measured the curve; 8 as shipped in Phase 3). Named parameter is `col` because `column` is a reserved keyword. |
 | Complete | Work | 3A: Rarest-first selection + intersection (`ngram_candidates`) | Stats scan supplies posting counts; K rarest probed via per-gram segment scans with an equality TableFilter (zone-map pruned, postings blobs of non-matching rows never read); sorted linear-merge intersection with live-segment and min/max-overlap pruning; a needle gram absent from the index short-circuits to empty. Short needle → "all indexed rowids" fallback. test/sql/ngram_search.test (superset + exact-content assertions). |
 | Complete | Work | 3B: Fetch driver + recheck + vacuum lock (`ngram_search`) | Batched `DataTable::Fetch` in STANDARD_VECTOR_SIZE slices (driver modeled on table_scan.cpp:102-265 incl. the TASK_EXECUTOR HAVE_MORE_OUTPUT caveat); recheck folds through the shared `NormalizeString` (CI index) or raw bytes (CS index). `SharedVacuumLock` held unconditionally from before meta/segments reads until end of query; on v1.5.5 every rowid-moving checkpoint takes the exclusive vacuum lock or degrades to a concurrent (non-moving) checkpoint (storage_manager.cpp:672-683), so mid-query row motion is impossible by construction. |
 | Complete | Work | 3C: HWM tail-scan union + transaction-local phase | One storage scan with a `rowid > hwm` ConstantFilter (rowid zone maps prune indexed row groups, RowGroup::CheckRowIdFilter) covers both the committed tail and transaction-local rows (local rowids >= MAX_ROW_ID always pass); shadow-table reads run through the caller's transaction, so an index created inside a still-open transaction is searchable there. test/sql/ngram_search_visibility.test. |
@@ -339,7 +353,7 @@ Status ledger:
 | Complete | Scope | Transparent acceleration with safe fallback | src/ngram_rewrite.cpp (+ ngram/ngram_rewrite.hpp, shared Phase 3 core exposed via ngram/search_core.hpp): post-optimize `OptimizerExtension` swaps qualifying `LogicalGet(seq_scan)` nodes for `NGRAM_INDEX_SCAN`. `ngram_auto_accelerate` defaults to **false** (opt-in): the transparent path inherits the misses-only staleness gaps (pinned in test/sql/ngram_rewrite.test with a live in-place-UPDATE miss), and silently rewriting standard `LIKE` into a path that can miss rows is not an acceptable default. Revisited and confirmed in Phase 5: the in-place-UPDATE gap cannot be closed on v1.5.5 (no triggers, no change feed), so the default stands for v1; Phase 5 did make the path decline instead of answering whenever a detector proves the index stale. |
 | Complete | Work | 4A: OptimizerExtension matcher + scan swap | Matches `contains`/`~~`/`~~*` `ExpressionFilter`s inside `get.table_filters` (incl. inside ConjunctionAndFilter); swaps only `get.function`/`get.bind_data`, leaving table_index, returned types/names, column_ids, projection_ids, and the filters untouched, so column bindings survive verification unchanged. Execution reuses the Phase 3 pipeline (probe → batched `DataTable::Fetch` → recheck → `rowid > hwm` tail scan incl. transaction-local rows, `SharedVacuumLock` held probe-to-end). Recheck evaluates the pushed filters themselves via `TableFilter::ToExpression` (optional filters skipped per their contract), so query semantics never depend on index normalization and composite filters/dynamic join filters are enforced exactly; tail/fallback storage scans apply the same filters natively. Non-qualifying shapes decline the swap: `_`/escape patterns, prefix/suffix/anchored rewrites (those keep `~~` in a residual FILTER), OR-of-predicates, expressions over the column, generated-column tables, TABLESAMPLE, virtual/struct-child columns. RowGroupPruner ordering hints are dropped at swap (ordering-only when filters exist). |
 | Complete | Work | 4B: ILIKE + multi-pattern LIKE handling | Case matrix enforced at both plan and init time: contains/LIKE probe either index flavor (CI folding is superset-preserving; recheck applies the CS predicate — pinned: 'TENT SHOUTING' not matched by `LIKE '%tent%'` over a CI index); ILIKE probes CI indexes only, never CS (needles carry `requires_ci`). Multi-pattern `LIKE '%a%b%'` decomposes into literal segments; one intersection over the union of all needles' grams equals the per-segment intersection; the original pattern is rechecked (segment order pinned: '%tail%tent%' vs '%tent%tail%'). Conservative bail on `_` and escape. |
-| Complete | Work | 4C: Selectivity gate + settings + EXPLAIN rendering | `ngram_max_candidate_fraction` (double, default **0.05**; Phase 3 anchor: warm-cache crossover ≈1.1% of rows on the 16-thread 10 GB box, cold-cache far higher — 0.05 splits the difference toward not regressing cold scans; tune in Phase 6). Gate runs in init_global after the probe: candidates > fraction × `GetTotalRows()` → full storage scan inside the same table function (filters applied natively, still exhaustive, no re-planning). EXPLAIN renders `NGRAM_INDEX_SCAN` + needles via `to_string`; EXPLAIN ANALYZE renders the runtime decision via `dynamic_to_string` ("index (N candidates)" / "full scan fallback: <reason>"). Kill switches tested: `ngram_auto_accelerate=false`, `SET disabled_optimizers='extension'`. |
+| Complete | Work | 4C: Selectivity gate + settings + EXPLAIN rendering | `ngram_max_candidate_fraction` (double, default **0.01** since Phase 6 re-anchored it on measurement; **0.05** as shipped in Phase 3, when fetch was single-threaded and the anchor was a warm-cache crossover of ≈1.1% of rows hedged against cold scans). Gate runs in init_global after the probe: candidates > fraction × `GetTotalRows()` → full storage scan inside the same table function (filters applied natively, still exhaustive, no re-planning). EXPLAIN renders `NGRAM_INDEX_SCAN` + needles via `to_string`; EXPLAIN ANALYZE renders the runtime decision via `dynamic_to_string` ("index (N candidates)" / "full scan fallback: <reason>"). Kill switches tested: `ngram_auto_accelerate=false`, `SET disabled_optimizers='extension'`. |
 | Complete | Gate | Differential + plan-shape suites green with rewrite on | scripts/differential_search.py `--transparent` mode: plain LIKE/contains/ILIKE (incl. synthesized `%`-multi-segment and `_` patterns) with `ngram_auto_accelerate=true` vs `disabled_optimizers='extension'` execution, phases committed/tail/in-txn/deleted + post-vacuum subset, plus a per-trial EXPLAIN assertion that the rewrite fires (no vacuous green). Recorded release runs: seed 902147 (8 trials) = 3496 checks / 0 failures; explicit-path seed 555000 (8 trials) = 6150 checks / 0 failures (explicit functions untouched). `make test` release: 1695 assertions / 15 files green. |
 | Complete | Test | Composite-predicate and join plan tests | test/sql/ngram_rewrite_plan.test (88 assertions): EXPLAIN per accelerated shape (LIKE, contains, ILIKE, multi-pattern, regexp-literal, CS-index LIKE, composite AND, double-needle, projection-exclusion, rowid, count(*), join, both ORDER BY...LIMIT shapes incl. late materialization) and per fallback (short needle, `_`, ESCAPE, NOT LIKE, prefix/suffix, anchored, no index, wrong column, ILIKE-on-CS, OR, lower(col), '%%', TABLESAMPLE, both kill switches) + EXPLAIN ANALYZE mode strings. test/sql/ngram_rewrite.test (151 assertions, under `PRAGMA enable_verification` — every query also differentially checked against the unoptimized plan): correctness for all shapes, txn-local visibility, in-txn index build, DML (UPDATE/DELETE driven by accelerated scans), prepared statements across index drop/rebuild and setting flips, staleness pin. |
 | Complete | Risk | Plan verifier rejects rewritten bindings | DEBUG build (`GEN=ninja make debug`) runs per-pass `ColumnBindingResolver::Verify` + AddressSanitizer: full sqllogictest suite (15 files, 1695 assertions) and a `--transparent` differential run (seed 31337, 4 trials, 1740 checks / 0 failures) green against the DEBUG build. The DEBUG runs earned their keep, catching two release-silent bugs: (1) ASAN stack-use-after-scope — a temporary string passed to `EntryLookupInfo`, which stores a reference (fixed in TryRewriteGet); (2) a D_ASSERT in `RowGroupCollection::InitializeScan` when scanning a table with no committed row groups, i.e. shadow tables created inside the current transaction — latent since Phase 3, fixed for both query paths via the shared `InitializeExhaustiveScan` helper (initializes only the transaction-local phase for committed-empty tables). `verify_serialization=false` on the injected function (never serialized; DEBUG serialization verification skips it). |
@@ -428,41 +442,185 @@ Meet the performance target at scale and ship as an installable community extens
 
 Scope:
 - Benchmark suite: build time, index size ratio, p50/p95 query latency vs corpus size
-  (100 GB sustained, TB spot check); memory behavior under `SET memory_limit`.
+  (100 GB sustained, built incrementally); memory behavior under `SET memory_limit`.
 - Tuning defaults from measurement (`ngram_max_grams_per_query`,
-  `ngram_max_candidate_fraction`, segment size, compression choice).
-- Index size reduction, targets from the Phase 2 ratio measurements (real text ≈
+  `ngram_max_candidate_fraction`, gram size, segment size, compression choice).
+- Parallel fetch/recheck: Phase 3 measured the dense-needle case losing 3.9× to a
+  16-thread scan with single-threaded fetch as the only cause.
+- Index size reduction, measure-first against the Phase 2 ratio measurements (real text ≈
   0.87–1.01× corpus on disk): postings encoding beyond LEB128 deltas (bit-packing /
   roaring-style for dense grams), segment granularity, per-run overhead amortization.
+  Implement only on a ≥20% measured on-disk win.
 - Community-extensions packaging, versioned against a DuckDB release; docs with the
-  staleness/maintenance contract and fallback semantics; monitor duckdb-fts trigram
+  staleness/maintenance contract and fallback semantics; recheck the duckdb-fts trigram
   sidecar for overlap before submission.
 
 Out of scope:
 - Native custom-index backend (future work if core fixes buffer pinning / hardens WAL
   replay — revisit `fixed_size_buffer.hpp` FIXME and the `KEEP_ROW_IDS` vacuum gate).
+- Opening the community-extensions pull request. Everything is prepared and validated
+  locally (`packaging/`); submitting is the maintainer's call.
 
-Completion gate:
-Selective substring query ≤ hundreds of ms p95 on the TB spot-check corpus with cold-ish
-cache; extension installs via `INSTALL ngram FROM community` in a stock DuckDB build.
+Completion gate (revised in Phase 6 — the original "TB spot check" is hardware-bounded):
+A monolithic TB build is impossible on the development machine — a 10 GB monolithic build
+already needs ~600 GB of sort spill at `memory_limit='32GB'`, so a TB corpus plus its
+~1× index does not fit at all on 1.7 TB of free NVMe. The gate is therefore:
+(a) a 100 GB sustained benchmark built INCREMENTALLY (initial build on one chunk, then
+append + `ngram_refresh` per chunk, with `ngram_compact` measured at the end), which
+doubles as a real-workload validation of Phase 5;
+(b) a measured scaling curve at 1/10/100 GB — build/refresh cost, index size, p50/p95
+latency per needle-selectivity class, warm and cold — supporting an explicit TB
+extrapolation with its assumptions stated;
+(c) selective substring query ≤ hundreds of ms p95 at 100 GB with a cold cache;
+(d) the extension installs and runs in a STOCK DuckDB build from an extension repository.
+True-TB validation requires bigger hardware; whether to provision it is the user's call.
 
 Testing plan:
 - Reproducible benchmark scripts + recorded results per release.
-- Full test matrix (Phases 1–5 suites) against the pinned DuckDB release build.
+- Full test matrix (Phases 1–5 suites) against the pinned DuckDB release build, and
+  against a DEBUG + AddressSanitizer build.
+- Parallelization must change nothing about results: differential (explicit and
+  transparent), churn, and crash harnesses re-run with fresh seeds.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Scope | Scale benchmarks + tuned defaults | Missing: benchmark suite + results. |
-| Incomplete | Work | 6A: 100 GB / TB benchmark harness + corpus | Missing: scripts + corpus source. |
-| Incomplete | Work | 6B: Default tuning from measurements | Missing: recorded sweeps. |
-| Incomplete | Work | 6C: Community-extension packaging + docs | Missing: PR to community-extensions. |
-| Incomplete | Gate | p95 target met at TB spot check; community install works | Missing: benchmark evidence + install run. |
-| Incomplete | Risk | duckdb-fts trigram sidecar overlaps scope | Missing: recheck of duckdb-fts state before submission. |
-| Incomplete | Doc | User docs: maintenance contract, fallbacks, settings | Missing: docs. |
+| Complete | Decision | The plan's "TB spot check" is hardware-bounded; deliver 100 GB sustained + a measured scaling curve + an explicit TB extrapolation | A 10 GB monolithic build needs ~600 GB of sort spill at `memory_limit='32GB'`, so a TB corpus plus its ~1× index cannot fit on 1.7 TB of free NVMe, and a monolithic TB build cannot run at all. Gate text above rewritten accordingly. True-TB validation is deferred until bigger hardware exists; the user decides whether to provision it. |
+| Complete | Scope | Scale benchmarks + tuned defaults | benchmarks/ holds the corpus generator, build/latency/sweep/encoding harnesses, a `run_all.sh` that reproduces every recorded number in order (scaled by `NGRAM_REPLICAS`), and RESULTS.md with the tables. Two defaults changed on measurement, three settings confirmed unchanged. |
+| Complete | Work | 6A: 100 GB benchmark harness + corpus | Corpus is replicated-with-perturbation enwik9 (seed 20260809): replica r of source line i keeps the line but rewrites three characters at a seeded position with seeded letters, so gram distribution stays enwik9's while no two rows are byte-identical. It makes the index measurably *harder*, not easier — 788,596 distinct grams against enwik9's own 605,513, blob ratio 0.922 against 0.867. Plus the duckdb source tree as a code corpus (1,055,570 lines / 0.051 GiB) for the ratio table. **Built incrementally, 100 single-replica steps**: one `create_ngram_index` (208.0 s) and 99 `ngram_refresh` (median 210.3 s, min 206.7, max 267.7), total 5.95 h, spill 24.6-27.4 GB per step, peak RSS 52.4 GB. Final: 92.225 GiB of text, 1,092,042,300 rows, 72,434,741,725 postings, 85.289 GiB of blobs, 258,732,511 segment rows, 172.538 GiB database. Chunk size was itself measured: a 5-replica chunk costs 612 s per replica against 208 s for a 1-replica chunk, and 278 GB of spill against 25 GB, because the external sort starts needing multiple merge passes — extrapolating the 5-replica point to 100 GB gives ~3.4 TB of scratch, more than the machine has. |
+| Complete | Gate | 100 GB sustained build, spot verification exact, detectors quiet, disk returned | Verification at 100 GB is exact on three grams spanning the frequency range: `ìa)` 98 = 98, `人ak` 5 = 5, `␠␠␠` 276,151,351 = 276,151,351 (decoded distinct vs brute-force `contains` over the indexed range). `ngram_index_stats` reported `stale_reason = NULL` before and after compaction at every scale — no false staleness after 100 appends and refreshes. Compaction at 100 GB: 9433.5 s, 53.3 GB RSS, 311.6 GB spill, postings byte-identical before and after (72,434,741,725), segment rows 258,732,511 → 248,445,026. The latency runs double as an at-scale differential check: every index/scan and explicit/brute-force pair returned identical counts, up to 37,102,213 matching rows. Bench artifacts removed afterwards; disk back to baseline. |
+| Partial | Gate | Selective query ≤ hundreds of ms p95 at 100 GB, cold cache | **Met warm, missed cold — recorded, not rounded into a pass.** At the shipped defaults the rare needle (`supercalifragilistic`, 9.2 × 10⁻⁷ of 1.09 billion rows) is **0.641 s p50 / 0.643 s p95 warm** at 100 GB, inside "hundreds of milliseconds" at the top of the range, against 4.266 s for the parallel scan it replaces (6.66× faster). Cold, with the page cache evicted before every sample, it is 3.217 s against 17.625 s — a 5.5× win but an order of magnitude past the target. 10 GB meets both comfortably (0.073 s warm p95, 0.157 s cold). The cold gap is disk, not CPU: the 100 GB database is 182 GB against 125 GB of RAM, so a cold probe reads posting lists from NVMe. The residual cost is the probe itself — 0.564 s of the warm 0.641 s — which is single-threaded and costs Θ(corpus × K) however selective the needle is; a needle matching 88 rows in 1.09 billion still decodes three corpus-scale posting lists. Retuning K from 8 to 3 took this row from a clear miss (1.762 s warm / 7.653 s cold) to a warm pass, and is the whole of the improvement available from tuning; going further needs a structural change to the probe, which belongs to the throughput and incremental-refresh phases.
+| Complete | Gate | Community install works in a stock DuckDB build | Proven against duckdb_cli-linux-amd64 v1.5.5 (`d8cdaa33fd`), not this repo's build, via a local extension repository in DuckDB's own layout — see the 6C row. The `INSTALL ngram FROM community` form itself waits on the submission, which is the maintainer's to open. |
+| Complete | Work | 6B: Default tuning from measurements | Two changed, three confirmed, every sweep output in benchmarks/RESULTS.md §3 and the `*.sweep.json` files. **`ngram_max_grams_per_query` 8 → 3**: total query time against K is a shallow floor at 2-4 with a steep right arm — at 100 GB a rare needle costs 0.465 s at K=2, 0.640 s at K=3, 1.750 s at K=8, 5.211 s at K=16, measured identically at 10 GB and on a deliberately dense-gram (bigram) index. Re-measuring the full latency suite at the new default confirms it end to end: the rare needle goes 0.033/0.110/1.762 s → **0.026/0.059/0.641 s** at 1/10/100 GB and the moderate one 0.045/0.366/5.279 s → **0.031/0.125/1.770 s**, i.e. 2.7× and 3.0× at 100 GB, which is what turned the latency gate from a miss into a warm pass. Three rather than the measured-optimal two because K=2 leaves 0.89% of rows as candidates on the dense-gram index against K=3's 0.28%, close enough to the selectivity gate to risk abandoning the index entirely. Match counts were identical at every K, as the superset invariant requires. **`ngram_max_candidate_fraction` 0.05 → 0.01**: the gate runs after the probe, so its only job is fetch-versus-scan for the remaining work; measured fetch cost is 228/252/279 ns per candidate at 1/10/100 GB against parallel scans of 0.046/0.427/4.623 s, putting break-even at 1.6%/1.3%/1.1% of rows. Verified against a 21-needle ladder at both 10 and 100 GB: 0.01 leaves the index alone where the index is cheaper (`Wikipedia:` 5.36 s index vs 7.42 s fallback) and fires where it is not. **Confirmed unchanged**: gram size 3 (gram 2 is 37% smaller but yields 5,823 candidates instead of 8 for the same rare needle; gram 4 costs 37% more space and 5.6× the probe for one fewer candidate), `SEGMENT_SHIFT` 20, and the postings encoding. |
+| Complete | Doc | The candidate ladder is not monotonic in selectivity | Worth recording because it bounds what any selectivity gate can do. `Ethelred` matches 1.5 × 10⁻⁵ of rows and costs 3.2× a scan, while `philosophy` matches 70× more rows and roughly ties. The difference is the grams: `Ethelred` has only six, so all of them are probed including `the` (196 million postings), whereas `photosynthesis` has twelve and rarest-first can drop the dense ones. Cost tracks the densest gram probed, not the rarity of the needle, and it is all spent before the gate is reached. |
+| Complete | Work | 6D: Parallel fetch + recheck for `ngram_search` and `NGRAM_INDEX_SCAN` | src/ngram_search.cpp + src/ngram_rewrite.cpp: both scans gained `init_local`, a per-thread local state (fetch chunk, `ColumnFetchState`, `TableScanState`, recheck executor / fold scratch, selection vector), an atomic candidate-block cursor, and `DataTable::InitializeParallelScan`/`NextParallelScan` for the tail (which also covers the transaction-local rows, so exhaustiveness is untouched — the same rows are visited, once each). `MaxThreads()` reports the work actually available (candidate blocks + row groups past the high-water mark, or the whole table in fallback mode), so a two-candidate query still runs on two threads. The design stayed contained: the vacuum lock stays a single shared key in the global state (v1.5.5's own index scan does exactly this, `table_scan.cpp:127`), the `rowid > hwm` tail filter is unchanged, and the HAVE_MORE_OUTPUT protocol is unchanged. `get_partition_data` was added so output order survives: fetch blocks carry their block number, storage batches follow them, and ordered sinks reassemble the single-threaded order. Without it `UseBatchIndex` is false, DuckDB picks a non-parallel result collector, and `MaxThreads()` would have had no effect at all for a top-level SELECT (`physical_result_collector.cpp:30-51`). |
+| Complete | Test | Parallelization changes nothing about results | test/sql/ngram_parallel.test (43 assertions): a 600k-row corpus where dense needles fill many fetch blocks; explicit and transparent paths compared to brute force in both directions; output-position equality against a rowid-ordered brute force (pinning the batch-index ordering contract); committed tail rows and this transaction's uncommitted rows under `PRAGMA verify_parallelism` (one work unit per vector); the in-scan full-scan fallback; `SET debug_physical_table_scan_execution_strategy='SYNCHRONOUS'`; ordered sinks (`CREATE TABLE AS`, `LIMIT`). `TASK_EXECUTOR_BUT_FORCE_SYNC_CHECKS` is deliberately not covered — DuckDB's own validator calls it "expected to throw on non-trivial workflows" and v1.5.5's built-in table scan violates it identically (`physical_table_scan.cpp:126-128`, `table_scan.cpp:212-216`). |
+| Complete | Decision | Postings encoding: measure first, change only on a ≥20% on-disk win | Rejected on measurement. benchmarks/analyze_encoding.py reconstructs the posting stream through the codec's own inverse and re-derives the encoded size from first principles, matching the real blob total to 0.0000% on both corpora — then evaluates alternatives on exactly those postings. Delta widths are 77.1% one byte / 21.4% two / 1.5% three (enwik9 1 GB), per-segment headers are 1.6% of the total, so there is no per-run overhead or wide-delta tail to attack. Best alternative (per-block choice of bit-packed vs varint, B=32): **+7.8% on enwik9, +11.8% on code** — under half the bar, for a format flag, two decode paths, a format-version bump and full re-validation. Plain bit-packing peaks at +5.8%; roaring-style is 53.7% *worse* (lists are far too sparse per 2^16 chunk for bitmaps and a 2-byte array entry loses to a 1.26-byte varint). `format_version` stays 2; no migration code needed. |
+| Complete | Decision | Segment granularity (`SEGMENT_SHIFT`) stays 20 | Same analysis, all shifts costed exactly on the 1 GB posting stream: shift 16 costs +3.88%, 18 +1.09%, 22 −0.43%, 24/26 −0.59%. Coarser buckets buy at most 0.6% of bytes while giving the probe's live-segment and min/max pruning less to work with; finer buckets cost real space. |
+| Complete | Decision | Build-time `preserve_insertion_order=false` rejected | Matched pair at 1 replica (both 12 threads / 24 GB, same background load): order preserved 364.3 s / 2,549,366 segment rows / 913,035,911 blob bytes; order relaxed 484.8 s / 2,601,819 segment rows / 913,367,136 bytes. 33% slower and slightly larger — the packer wants one ordered pass. Postings were identical either way and spot verification was exact, so the option is safe, just not useful. |
+| Complete | Risk | duckdb-fts trigram sidecar overlaps scope | Resolved: no collision. duckdb-fts merged PR #52 ("Add indexed wildcard and regex search") to main on 2026-08-04 and has **not released it** — no tags, no releases, last version bump 2026-02-16 — so `INSTALL fts` on v1.5.5 does not contain it. What it builds is a *dictionary* trigram sidecar (`term_grams`/`raw_term_grams`, keyed by termid) used to expand a whole-token wildcard or regex query term before BM25 scoring; its README states the sidecars "grow with the term dictionary rather than with the document corpus" and that a pattern is matched "as one whole-token pattern ... against the normalized raw-term dictionary". Character-level substring search across token boundaries over raw strings is a different structure with a different cost model. duckdb/duckdb #16071 (a real trigram *tokenizer*) is still open and unanswered; the only implementation of that idea is `tkys/duckdb-fts-trigram`, an unaffiliated single-author repo with 0 stars, one push, and no distribution. Registry survey: 306 community extensions, zero hits for trigram/ngram/substring/inverted index; the name `ngram` is unclaimed and no core extension uses it. Recorded in Key Research Facts. |
+| Complete | Work | 6C: Community-extension packaging (prepared and validated, PR not opened) | packaging/community-extensions/extensions/ngram/description.yml is the exact single file a submission consists of; packaging/SUBMISSION.md carries the format research, the blocking checklist, the local validation transcript and the drafted PR text. community-extensions pins DuckDB centrally (`build.yml`: `DUCKDB_LATEST_STABLE: 'v1.5.5'`, ci_tools `v1.5-variegata`) — there is no `duckdb_version` field — so this repo's v1.5.5 pin is exactly right, and with no external dependencies neither `vcpkg_commit` nor `requires_toolchains` is needed. **Installability proven against a STOCK binary**, not this repo's build: duckdb_cli-linux-amd64 v1.5.5 (`d8cdaa33fd`) + a local repository in DuckDB's own layout (`<repo>/v1.5.5/linux_amd64/ngram.duckdb_extension.gz`) + `SET custom_extension_repository`; `INSTALL ngram; LOAD ngram;` reports `install_mode = REPOSITORY`, then build/search/refresh/stats all work, the database reopens fully usable in the same stock binary with the extension *absent* (reads 5000 rows, inserts a 5001st, reads the shadow tables, and `ngram_search` is a clean catalog error), and reopening with the extension finds both the indexed row and the row written while it was gone. Blocking on the maintainer: the repo is private, and the full CI matrix (Phase 9) has to be green before `excluded_platforms` can be filled in and a release SHA pinned. |
+| Complete | Doc | User docs: maintenance contract, fallbacks, settings | README.md rewritten from the extension template into user documentation: install, quick start, the correctness contract (superset + recheck, tail scan, transaction-local phase, case semantics), the full staleness contract as two tables in user language (detected → refused; not detected → misses only, with the repair for each) copied from the Phase 5 ledger, maintenance guidance (when to refresh, when to compact, when only a rebuild will do) and a column-by-column reading of `ngram_index_stats`, an API reference including which query shapes the transparent path accepts and declines, a settings table with defaults and the reason for each, performance expectations by selectivity class, limitations (including the pragma-in-a-batch caveat and the `current_transaction_invalidation_policy` reset), and platform support. Measured numbers live in benchmarks/RESULTS.md, which the README links. |
+| Complete | Test | Parallel fetch/recheck measured before and after | `threads=1` reproduces the pre-parallel pipeline exactly (it ran on one thread whatever the thread setting was), compared against the same 24-thread scan both versions raced. Dense worst case: 10.016 s → 3.138 s at 10 GB (3.19×) and **218.887 s → 34.367 s at 100 GB (6.37×)**; moderate 23.082 s → 5.279 s at 100 GB (4.37×); rare 1.08× (it is all probe, and the probe was never the parallel part). Against the scan it races, the dense case went from 47.4× slower to 7.43× at 100 GB. In gate terms: fetch fell from ~2,970 ns to ~279 ns per candidate at 100 GB, moving the fetch-versus-scan crossover from 0.14% to 1.1% of rows — the band of selectivities where the index is the right choice is about eight times wider. The packet's predicted "~0.2 s worst case" did not materialise and is corrected in RESULTS.md: fetching tens of millions of rows is expensive on any thread count, and the gate, not parallelism, is what keeps the default path off that number. The in-scan fallback also stopped being a single-threaded crawl — it is now a parallel scan, measured at 1.3-4.3× a plain scan with nearly all the excess being the already-paid probe. |
+| Complete | Test | Phase 1-5 harnesses re-run with fresh seeds after the Phase 6 code changes | Release build: `make test` 19 files / 2081 assertions green (2074 before test/sql/ngram_parallel.test was strengthened to 43 assertions); scripts/differential_search.py explicit seed 20260901 = 6281 checks / 0 failures, `--transparent` seed 20260902 = 3472 checks / 0 failures; churn seed 20260903 (60 rounds, 5000 rows) = 960 checks / 0 failures / 9 un-maintainable states (8 detector-reported, 1 the documented in-place-update gap), churn `--no-stale-expected` seed 20260904 (30 rounds) = 480 checks / 0 failures / 0 detector verdicts; crash seed 20260905 (400k rows + 150k tail, 16 kills across a 0.84 s refresh and 16 across a 1.79 s purging compact) and seed 20260906 (150k + 60k) = 0 failures, every reopen landing on exactly the pre- or post-operation state. DEBUG + AddressSanitizer build: full suite 19 files / 2081 assertions green, churn seed 20260907 (20 rounds) = 320 checks / 0 failures, churn strict seed 20260908 (15 rounds) = 240 checks / 0 failures / 0 verdicts, `--transparent` differential seed 20260909 (4 trials) = 1732 checks / 0 failures. |
+| Open | Risk | Two unreproduced full-suite failures under heavy load | Twice during Phase 6 a full-suite run reported one failed assertion where every isolated and every captured re-run passed. Both happened while the machine was running two or three other heavy jobs (the 10 GB or 100 GB corpus build, plus another suite), both were piped through `tail`, so neither preserved the assertion text, and `test/sql/ngram_parallel.test` was the last file the progress line named in one of them. It passed in isolation against the same DEBUG binary immediately afterwards, twice, and a captured full-suite re-run of the same tree passed with 2081 assertions. Closing evidence: on the quiet machine, with the shipped defaults, **13 consecutive captured full-suite runs — 10 release and 3 DEBUG + AddressSanitizer — all "All tests passed (2081 assertions in 19 test cases)"**, each written to its own file rather than a pipe. The state is therefore: unexplained, load-correlated, never reproduced when isolated, and never named. Not claimed as fixed. If it recurs, the run must be captured whole — a `tail` pipe is what cost the diagnosis both times. |
+| Complete | Doc | Deferred cosmetics: pragma outputs surfaced internal guard rows | Closed. The generated scripts guarded themselves with `SELECT CASE WHEN ... END AS ngram_ownership_check` / `ngram_meta_guard`, and the CLI printed one NULL row per guard for every create/drop/refresh/compact. The guard is now `SET VARIABLE __ngram_guard = (SELECT <same expression>)`, which evaluates the expression, raises the same errors, and returns no rows. Statement count is unchanged, so the preprocessor still wraps the expansion in exactly one transaction — no transaction semantics were traded for cosmetics. Pinned in test/sql/create_index.test: each pragma returns zero rows, the guard variable exists and is NULL, and a duplicate create still fails with the same message. |
 
-## Phase 7: Restore Full Platform CI Matrix
+## Phase 7: Build, Refresh, and Probe Throughput
+
+Goal:
+Index construction, refresh, and the query-side probe run at a speed the hardware
+justifies. The Phase 6 build baseline is ~208 s per 1 GB refresh chunk (~5 MB/s of
+corpus) with the box neither CPU-saturated (24 threads available, well under full
+utilization) nor disk-saturated (~250 MB/s against multi-GB/s NVMe): the single global
+`ORDER BY gram, segment_no` feeding the packer is the bottleneck. Target ≥3× measured
+improvement, aiming for 5–10×. Phase 6 also measured the probe as the remaining query
+latency lever: posting-list decode + intersect is single-threaded and Θ(corpus × K)
+regardless of selectivity — 0.564 s of a 0.641 s rare-needle query at 100 GB warm, and
+the reason the Phase 6 latency gate closed Partial (3.217 s cold against a
+hundreds-of-ms target). This phase owns that lever (user decision, 2026-08-09).
+
+Scope:
+- Partition the (gram, segment_no, rowid) pair stream by gram hash into N independent
+  partitions; sort and pack each partition independently and in parallel. Gram-hash
+  partitioning keeps every gram wholly inside one partition, so the segments table still
+  receives one row per (gram, segment_no) per generation — the on-disk format and
+  `format_version` are untouched, and postings must come out byte-identical to the
+  current pipeline's.
+- Apply the same restructuring to all three consumers of the sorted-pairs shape: initial
+  build, refresh, and compact's decode→union→re-encode pass.
+- Re-measure the memory ladder: per-partition sorts are smaller, so tight memory limits
+  should stop OOMing — report whether the 10 GB monolithic build now completes at
+  `memory_limit='8GB'` (the Phase 2 gate's open finding).
+- Re-measure build/refresh/compact cost at the 1/10 GB scale points, refresh-chunk cost
+  at 100 GB scale if a re-run is affordable, and update benchmarks/RESULTS.md and the
+  README's maintenance-cost guidance with the new numbers.
+- Parallelize the probe: decode + intersect posting lists across parallel work units
+  (segment rows are independent decode units; the probe already prunes by live-segment
+  bounds). The probe's output — the candidate rowid set — must be identical; only its
+  latency changes. Target: 100 GB rare-needle cold p95 inside the Phase 6 gate's
+  "hundreds of ms", or a measured statement of the remaining floor and its cause (e.g.
+  cold-IO bound). Re-measure warm and cold at 1/10/100 GB, update the RESULTS.md latency
+  tables, and annotate the Phase 6 Partial gate row with a pointer to the new numbers.
+  A 100 GB re-measure needs a rebuilt corpus — affordable once the build speedup lands
+  (~1 h at target throughput), so sequence the probe re-measurement after the build work.
+
+Out of scope:
+- Postings encoding changes (measured and rejected in Phase 6, +7.8–11.8% vs a ≥20% bar).
+- `preserve_insertion_order=false` (measured in Phase 6: 33% slower — the packer wants
+  ordered passes; partitioning must not resurrect this).
+- Changes to query results or semantics: the probe work is a latency change only —
+  identical candidates, identical output, exhaustiveness contract untouched. On-disk
+  format untouched; `format_version` stays 2.
+
+Completion gate:
+Refresh throughput improved ≥3× at the 10 GB scale point; postings byte-identical to the
+unpartitioned pipeline on a differential corpus; probe latency re-measured at 100 GB
+cold with the parallel probe — inside the hundreds-of-ms target or the measured floor
+recorded with its cause; full differential (explicit + transparent), churn, and crash
+suites green with fresh seeds; release and DEBUG/ASAN suites green; the memory-limit
+ladder re-measured and recorded.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 7A: Gram-hash partitioned sort+pack for initial build | Missing: implementation + identity evidence. |
+| Incomplete | Work | 7B: Same restructuring for refresh and compact | Missing: implementation + identity evidence. |
+| Incomplete | Work | 7C: Parallel probe (decode + intersect), identical candidate sets | Missing: implementation + identity evidence. |
+| Incomplete | Test | Postings byte-identical to the unpartitioned pipeline; probe candidates identical; all Phase 1–6 suites re-run (release + DEBUG/ASAN, fresh seeds) | Missing: runs. |
+| Incomplete | Bench | Before/after build throughput at 1/10 GB + memory-limit ladder incl. the 8 GB monolithic-build retry; probe latency at 1/10/100 GB warm+cold post-change; RESULTS.md and README updated; Phase 6 Partial gate row annotated | Missing: measurements. |
+| Incomplete | Gate | ≥3× refresh throughput at 10 GB with identity and suites green; 100 GB cold rare-needle re-measured (target met or floor recorded) | Missing: evidence. |
+
+## Phase 8: Bounded Incremental Refresh
+
+Goal:
+A large write burst never turns catch-up into a single monster transaction. Refresh
+gains a bound: one invocation indexes at most a caller-chosen amount of tail and commits
+that progress durably, so a crash during catch-up loses only the current increment —
+today it rolls the entire refresh back to the starting high-water mark. Combined with
+Phase 7 throughput, a 50 GB ingest burst becomes tens of minutes of catch-up committed
+in minute-scale steps instead of one multi-hour all-or-nothing transaction.
+
+Scope:
+- `PRAGMA ngram_refresh(table, max_rows)` (optional second argument): index at most
+  ~max_rows of committed tail in rowid order, advance the high-water mark to the highest
+  indexed rowid, commit. Callers loop until stats report the tail empty. Exactness holds
+  at every intermediate state: rows past the new high-water mark are simply still tail,
+  covered by every query's tail scan.
+- One invocation stays one transaction. The statement-preprocessor auto-wrap is what
+  gives refresh its crash atomicity; an in-pragma loop would need multiple transactions
+  inside one expansion, which that wrap forbids. The loop lives in the caller.
+- The bound must land on a rowid boundary that preserves the invariant "every committed
+  row ≤ hwm is indexed" after each increment (deletes leave rowid gaps, so max_rows is
+  an approximate count; the boundary itself is exact).
+- Stats: expose remaining-tail rows so callers can drive the loop and report progress.
+- Staleness detectors unchanged: a bounded refresh refuses on detected row motion or
+  recreation exactly as an unbounded one does.
+
+Out of scope:
+- Bounding `ngram_compact` (whole-index by nature; revisit only on concrete need).
+- Background/automatic scheduling (the Phase 5 decision stands — callers drive the loop).
+- Query-semantics or on-disk format changes; `format_version` stays 2.
+
+Completion gate:
+A bounded-refresh loop over a large tail yields an index identical to one unbounded
+refresh (differential + postings comparison); kill -9 between and during increments
+resumes from the last committed high-water mark, never from zero, with correctness
+intact at every reopen; churn harness extended with bounded-refresh steps; release and
+DEBUG/ASAN suites green with fresh seeds.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 8A: `max_rows` bound on refresh with the exact hwm-boundary invariant | Missing: implementation. |
+| Incomplete | Work | 8B: Remaining-tail exposure in `ngram_index_stats` | Missing: implementation. |
+| Incomplete | Test | Loop-vs-unbounded identity; crash-resume from the last committed increment; detector refusals under a bound; bound larger than tail; evil identifiers; churn with bounded steps; full suites (release + DEBUG/ASAN) fresh seeds | Missing: runs. |
+| Incomplete | Gate | Identity + crash-resume + suites green | Missing: evidence. |
+
+## Phase 9: Restore Full Platform CI Matrix
 
 Goal:
 This repo's CI builds and tests the extension on every distribution platform, macOS
@@ -485,6 +643,6 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 7A: Re-enable macOS archs in CI | Missing: workflow change + green run. |
-| Incomplete | Work | 7B: Re-enable Windows + Wasm archs | Missing: workflow change + green run. |
+| Incomplete | Work | 9A: Re-enable macOS archs in CI | Missing: workflow change + green run. |
+| Incomplete | Work | 9B: Re-enable Windows + Wasm archs | Missing: workflow change + green run. |
 | Incomplete | Gate | Full matrix green incl. macOS | Missing: CI evidence. |

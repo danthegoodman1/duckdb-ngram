@@ -1,5 +1,6 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -39,15 +40,35 @@ namespace ngram {
 // must handle rows past the high-water mark themselves.
 //
 // ngram_search(table, needle[, column := ...]) returns exactly the rows a
-// brute-force scan would return: candidates are fetched in batches through
+// brute-force scan would return: candidates are fetched through
 // DataTable::Fetch and rechecked against the real predicate, then a tail scan
 // (rowid > high-water mark, which also covers transaction-local rows) unions
 // in every row the index has never seen. A shared vacuum lock is held from
 // index probe through the last fetch so checkpoint vacuum cannot move rowids
 // mid-query.
+//
+// Both phases run on as many threads as there is work for. The probe happens
+// once, in init_global; after it the candidate list is immutable and threads
+// claim disjoint STANDARD_VECTOR_SIZE blocks of it through an atomic counter,
+// while the tail scan hands out one row group at a time through DuckDB's own
+// parallel cursor (which covers the transaction-local rows after the
+// committed ones). The same rows are visited, once each; output order is
+// preserved for ordered sinks by the batch index the scan reports.
 //===----------------------------------------------------------------------===//
 
-static constexpr idx_t DEFAULT_MAX_GRAMS_PER_QUERY = 8;
+//! Probing more of the needle's grams shrinks the candidate set but costs one
+//! more posting-list decode each time, and rarest-first means every additional
+//! gram is denser than the last. Measured across four indexes (1/10/100 GB of
+//! natural language, plus a bigram index whose grams are deliberately dense),
+//! total query time is a shallow U with its floor at 2-4 and a steep right
+//! arm: at 100 GB a rare needle costs 0.465 s at K=2, 0.640 s at K=3 and
+//! 1.750 s at K=8. Three sits at the floor everywhere while keeping a genuine
+//! three-way intersection, which K=2 does not: on the dense-gram index K=2
+//! leaves 0.89% of rows as candidates against K=3's 0.28%, close enough to
+//! ngram_max_candidate_fraction to risk giving up the index entirely.
+//! Lowering K is always safe for correctness — fewer grams can only widen the
+//! candidate set, never drop a match (benchmarks/RESULTS.md).
+static constexpr idx_t DEFAULT_MAX_GRAMS_PER_QUERY = 3;
 
 idx_t MaxGramsPerQuery(ClientContext &context) {
 	Value value;
@@ -619,33 +640,67 @@ struct RecheckState {
 
 enum class SearchPhase { FETCH, TAIL, DONE };
 
+//! Everything the scan's threads share. Immutable once init_global returns,
+//! except `next_fetch_block` (atomic) and `parallel_scan` (which hands out row
+//! groups under its own mutex).
 struct SearchGlobalState : public GlobalTableFunctionState {
 	DataTable *storage = nullptr;
 	DuckTransaction *tx = nullptr;
 	//! Held from before the index probe until this state dies (after the last
 	//! fetch): checkpoint vacuum must not move rowids while we hold candidate
-	//! rowids. Unconditional, the safe superset of v1.5.5's built-in gate.
+	//! rowids. Unconditional, the safe superset of v1.5.5's built-in gate; a
+	//! shared lock has no thread affinity, so one key covers every thread.
 	unique_ptr<StorageLockKey> vacuum_lock;
 	int64_t hwm = -1;
-	RecheckState recheck;
+	//! The needle in comparison form plus the index's options; each thread
+	//! copies these into its own RecheckState, which carries fold scratch.
+	string needle_cmp;
+	GramOptions options;
 	idx_t search_column_idx = 0;
 	vector<LogicalType> base_types;
 	vector<StorageIndex> column_ids;
 
-	SearchPhase phase = SearchPhase::FETCH;
-	//! Candidate rowids (sorted); empty in full-scan fallback mode.
+	//! Candidate rowids (sorted); empty in full-scan fallback mode. Threads
+	//! claim STANDARD_VECTOR_SIZE-sized blocks of it by index.
 	vector<row_t> candidates;
-	idx_t fetch_offset = 0;
+	atomic<idx_t> next_fetch_block {0};
+	idx_t fetch_block_count = 0;
+
+	//! The tail scan (rowid > hwm, which also covers transaction-local rows),
+	//! handed out one row group at a time.
+	vector<StorageIndex> tail_column_ids;
+	vector<LogicalType> tail_types;
+	unique_ptr<TableFilterSet> tail_filters;
+	ParallelTableScanState parallel_scan;
+
+	idx_t max_threads = 1;
+
+	idx_t MaxThreads() const override {
+		return max_threads;
+	}
+};
+
+//! Per-thread scan state. Nothing here may be shared: DataTable::Fetch writes
+//! through its ColumnFetchState, a TableScanState owns per-thread filter
+//! state, and the recheck fold reuses a scratch buffer.
+struct SearchLocalState : public LocalTableFunctionState {
+	SearchPhase phase = SearchPhase::FETCH;
+
 	DataChunk fetch_chunk;
 	ColumnFetchState fetch_state;
 
-	bool tail_initialized = false;
-	vector<StorageIndex> tail_column_ids;
-	unique_ptr<TableFilterSet> tail_filters;
 	TableScanState tail_state;
 	DataChunk tail_chunk;
+	//! Whether tail_state currently holds a row group claimed from the
+	//! parallel cursor.
+	bool tail_unit_active = false;
 
+	RecheckState recheck;
 	SelectionVector sel;
+
+	//! Batch index of the chunk this thread emitted last; ordered sinks
+	//! reassemble the output by it.
+	idx_t batch_index = 0;
 };
 
 static DuckTableEntry &ResolveSearchBase(ClientContext &context, const QueryBindData &bind) {
@@ -668,6 +723,23 @@ static DuckTableEntry &ResolveSearchBase(ClientContext &context, const QueryBind
 	return base;
 }
 
+//! An upper bound on the row groups the tail scan can hand out, so the
+//! executor spawns threads in proportion to the work. A negative high-water
+//! mark means the tail scan is a full scan (short needle, or an index built on
+//! an empty table). Always at least one, for the transaction-local rows.
+static idx_t TailScanUnits(ClientContext &context, DataTable &storage, const SearchGlobalState &state) {
+	if (state.hwm < 0) {
+		return storage.MaxThreads(context);
+	}
+	idx_t units = 1;
+	auto total_rows = storage.GetTotalRows();
+	auto indexed = static_cast<idx_t>(state.hwm) + 1;
+	if (total_rows > indexed) {
+		units += (total_rows - indexed) / storage.GetRowGroupSize() + 1;
+	}
+	return units;
+}
+
 static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<QueryBindData>();
 	auto state = make_uniq<SearchGlobalState>();
@@ -683,7 +755,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	auto info = ReadMeta(context, *state->tx, meta, bind.Target());
 	ThrowIfCertainlyStale(context, base, info, bind, "ngram_search");
 	state->hwm = info.hwm_rowid;
-	state->recheck.options = info.options;
+	state->options = info.options;
 	state->search_column_idx = bind.search_column_idx;
 	state->base_types = bind.types;
 	for (auto &col : base.GetColumns().Logical()) {
@@ -692,9 +764,9 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 
 	if (info.options.case_insensitive) {
 		vector<idx_t> offsets;
-		NormalizeString(bind.needle.data(), bind.needle.size(), info.options, state->recheck.needle_cmp, offsets);
+		NormalizeString(bind.needle.data(), bind.needle.size(), info.options, state->needle_cmp, offsets);
 	} else {
-		state->recheck.needle_cmp = bind.needle;
+		state->needle_cmp = bind.needle;
 	}
 
 	auto decomposition = DecomposeNeedle(bind.needle.data(), bind.needle.size(), info.options);
@@ -716,76 +788,116 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 		    std::upper_bound(state->candidates.begin(), state->candidates.end(), static_cast<row_t>(state->hwm)),
 		    state->candidates.end());
 	}
+	state->fetch_block_count = (state->candidates.size() + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
 
-	state->fetch_chunk.Initialize(Allocator::Get(context), state->base_types);
+	// the tail scan reads one extra trailing rowid column so the hwm filter
+	// has something to apply to
+	state->tail_column_ids = state->column_ids;
+	state->tail_column_ids.push_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
+	state->tail_types = state->base_types;
+	state->tail_types.push_back(LogicalType::ROW_TYPE);
+	if (state->hwm >= 0) {
+		// rowid > hwm: zone maps skip fully-indexed row groups, and
+		// transaction-local rows (rowid >= MAX_ROW_ID) always pass
+		state->tail_filters = make_uniq<TableFilterSet>();
+		state->tail_filters->PushFilter(
+		    ColumnIndex(state->base_types.size()),
+		    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHAN, Value::BIGINT(state->hwm)));
+	}
+	// The parallel cursor needs no empty-table special case: an empty row-group
+	// collection leaves it with no current row group and the transaction-local
+	// side is null-guarded, so the first claim reports "nothing left".
+	static const vector<ColumnIndex> NO_COLUMN_INDEXES;
+	storage.InitializeParallelScan(context, state->parallel_scan, NO_COLUMN_INDEXES);
+	state->max_threads = state->fetch_block_count + TailScanUnits(context, storage, *state);
+	return std::move(state);
+}
+
+static unique_ptr<LocalTableFunctionState> SearchInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                           GlobalTableFunctionState *global_state) {
+	auto &gstate = global_state->Cast<SearchGlobalState>();
+	auto state = make_uniq<SearchLocalState>();
+	state->phase = gstate.fetch_block_count > 0 ? SearchPhase::FETCH : SearchPhase::TAIL;
+	state->recheck.options = gstate.options;
+	state->recheck.needle_cmp = gstate.needle_cmp;
+	state->fetch_chunk.Initialize(Allocator::Get(context.client), gstate.base_types);
+	state->tail_state.Initialize(gstate.tail_column_ids, &context.client, gstate.tail_filters.get());
+	state->tail_chunk.Initialize(Allocator::Get(context.client), gstate.tail_types);
 	state->sel.Initialize(STANDARD_VECTOR_SIZE);
 	return std::move(state);
 }
 
-static void InitializeTailScan(ClientContext &context, SearchGlobalState &state) {
-	state.tail_column_ids = state.column_ids;
-	state.tail_column_ids.push_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
-	auto tail_types = state.base_types;
-	tail_types.push_back(LogicalType::ROW_TYPE);
-	if (state.hwm >= 0) {
-		// rowid > hwm: zone maps skip fully-indexed row groups, and
-		// transaction-local rows (rowid >= MAX_ROW_ID) always pass
-		state.tail_filters = make_uniq<TableFilterSet>();
-		state.tail_filters->PushFilter(
-		    ColumnIndex(state.base_types.size()),
-		    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHAN, Value::BIGINT(state.hwm)));
+//! Signal "I made progress but produced nothing; call me again". Under the
+//! synchronous debug strategy an empty HAVE_MORE_OUTPUT is rejected, so there
+//! the caller loops instead.
+static bool YieldEmpty(TableFunctionInput &data) {
+	if (data.results_execution_mode != AsyncResultsExecutionMode::TASK_EXECUTOR) {
+		return false;
 	}
-	InitializeExhaustiveScan(context, *state.tx, *state.storage, state.tail_state, state.tail_column_ids,
-	                         state.tail_filters.get());
-	state.tail_chunk.Initialize(Allocator::Get(context), tail_types);
-	state.tail_initialized = true;
+	data.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+	return true;
 }
 
 static void SearchFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<SearchGlobalState>();
+	auto &lstate = data.local_state->Cast<SearchLocalState>();
 	while (true) {
-		switch (state.phase) {
+		switch (lstate.phase) {
 		case SearchPhase::FETCH: {
-			if (state.fetch_offset >= state.candidates.size()) {
-				state.phase = SearchPhase::TAIL;
+			// claim the next block of candidate rowids; blocks are disjoint,
+			// so the fetched rows partition the candidate set exactly once
+			auto block = state.next_fetch_block++;
+			if (block >= state.fetch_block_count) {
+				lstate.phase = SearchPhase::TAIL;
 				continue;
 			}
-			auto remaining = state.candidates.size() - state.fetch_offset;
-			idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
-			auto row_id_data = reinterpret_cast<data_ptr_t>(state.candidates.data() + state.fetch_offset);
+			auto offset = block * STANDARD_VECTOR_SIZE;
+			idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.candidates.size() - offset);
+			lstate.batch_index = block;
+			auto row_id_data = reinterpret_cast<data_ptr_t>(state.candidates.data() + offset);
 			Vector row_ids(LogicalType::ROW_TYPE, row_id_data);
-			state.fetch_offset += count;
 
-			state.fetch_chunk.Reset();
-			state.storage->Fetch(*state.tx, state.fetch_chunk, state.column_ids, row_ids, count, state.fetch_state);
+			lstate.fetch_chunk.Reset();
+			state.storage->Fetch(*state.tx, lstate.fetch_chunk, state.column_ids, row_ids, count, lstate.fetch_state);
 			idx_t hits = 0;
-			if (state.fetch_chunk.size() != 0) {
-				hits = state.recheck.Recheck(state.fetch_chunk, state.search_column_idx, state.sel);
+			if (lstate.fetch_chunk.size() != 0) {
+				hits = lstate.recheck.Recheck(lstate.fetch_chunk, state.search_column_idx, lstate.sel);
 			}
 			if (hits == 0) {
-				if (data.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
-					data.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+				if (YieldEmpty(data)) {
 					return;
 				}
 				continue;
 			}
-			output.Slice(state.fetch_chunk, state.sel, hits);
+			output.Slice(lstate.fetch_chunk, lstate.sel, hits);
 			return;
 		}
 		case SearchPhase::TAIL: {
-			if (!state.tail_initialized) {
-				InitializeTailScan(context, state);
+			if (!lstate.tail_unit_active) {
+				if (state.storage->NextParallelScan(context, state.parallel_scan, lstate.tail_state) == 0) {
+					lstate.phase = SearchPhase::DONE;
+					continue;
+				}
+				lstate.tail_unit_active = true;
 			}
-			state.tail_chunk.Reset();
-			state.storage->Scan(*state.tx, state.tail_chunk, state.tail_state);
-			if (state.tail_chunk.size() == 0) {
-				state.phase = SearchPhase::DONE;
-				return;
+			lstate.tail_chunk.Reset();
+			state.storage->Scan(*state.tx, lstate.tail_chunk, lstate.tail_state);
+			if (lstate.tail_chunk.size() == 0) {
+				// this row group is done; the next call claims another
+				lstate.tail_unit_active = false;
+				if (YieldEmpty(data)) {
+					return;
+				}
+				continue;
 			}
-			idx_t hits = state.recheck.Recheck(state.tail_chunk, state.search_column_idx, state.sel);
+			// committed row groups are numbered from 1 and the local-storage
+			// numbering resumes past the committed total, so tail batches
+			// always sort after every fetch block
+			lstate.batch_index = state.fetch_block_count + lstate.tail_state.table_state.batch_index +
+			                     lstate.tail_state.local_state.batch_index;
+			idx_t hits = lstate.recheck.Recheck(lstate.tail_chunk, state.search_column_idx, lstate.sel);
 			if (hits == 0) {
-				if (data.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
-					data.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+				if (YieldEmpty(data)) {
 					return;
 				}
 				continue;
@@ -793,15 +905,25 @@ static void SearchFunction(ClientContext &context, TableFunctionInput &data, Dat
 			// the tail chunk carries the filtered rowid as a trailing extra
 			// column; emit only the base columns
 			for (idx_t c = 0; c < output.ColumnCount(); c++) {
-				output.data[c].Slice(state.tail_chunk.data[c], state.sel, hits);
+				output.data[c].Slice(lstate.tail_chunk.data[c], lstate.sel, hits);
 			}
 			output.SetCardinality(hits);
 			return;
 		}
 		case SearchPhase::DONE:
+			// this thread is retired; the others carry on independently
 			return;
 		}
 	}
+}
+
+//! Ordered sinks reassemble a parallel scan's output by batch index. Fetch
+//! blocks carry their block number and tail batches follow them, so the
+//! reassembled order is the one the single-threaded scan produced: candidate
+//! rowids ascending, then the tail in storage order.
+static OperatorPartitionData SearchGetPartitionData(ClientContext &context, TableFunctionGetPartitionInput &input) {
+	auto &lstate = input.local_state->Cast<SearchLocalState>();
+	return OperatorPartitionData(lstate.batch_index);
 }
 
 //===----------------------------------------------------------------------===//
@@ -910,7 +1032,8 @@ void RegisterSearchFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(candidates);
 
 	TableFunction search("ngram_search", {LogicalType::VARCHAR, LogicalType::VARCHAR}, SearchFunction, SearchBind,
-	                     SearchInitGlobal);
+	                     SearchInitGlobal, SearchInitLocal);
+	search.get_partition_data = SearchGetPartitionData;
 	search.named_parameters["col"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(search);
 }

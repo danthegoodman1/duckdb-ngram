@@ -1,0 +1,222 @@
+# name: test/sql/ngram_parallel.test
+# description: parallel fetch/recheck must change nothing about the results
+# group: [sql]
+
+require ngram
+
+load __TEST_DIR__/ngram_parallel.db
+
+statement ok
+SET threads=8;
+
+# 600k rows: dense needles produce far more than STANDARD_VECTOR_SIZE
+# candidates, so the fetch phase is split into many blocks and handed to
+# several threads at once
+statement ok
+CREATE TABLE big AS SELECT i AS id, ('row ' || i::VARCHAR || ' payload')::VARCHAR AS s FROM range(600000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('big', 's');
+
+# --- explicit path: identical to brute force, in both directions ---
+
+foreach needle 12345 ow 4 999 payload row_
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('big', '${needle}') EXCEPT ALL SELECT * FROM big WHERE contains(s, '${needle}'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, '${needle}') EXCEPT ALL SELECT * FROM ngram_search('big', '${needle}'))
+);
+----
+0
+
+endloop
+
+# A parallel scan must still emit rows in the order the sequential one did:
+# candidate rowids ascending, then the tail. Ordered sinks reassemble by the
+# batch index the scan hands out, so comparing positions catches a wrong one.
+query I
+SELECT count(*) FROM (
+	SELECT row_number() OVER () AS pos, id FROM ngram_search('big', '4321')
+) s JOIN (
+	SELECT row_number() OVER () AS pos, id FROM (SELECT id FROM big WHERE contains(s, '4321') ORDER BY id)
+) b USING (pos) WHERE s.id IS DISTINCT FROM b.id;
+----
+0
+
+# --- the same with the async yield protocol turned off ---
+# (TASK_EXECUTOR_BUT_FORCE_SYNC_CHECKS is deliberately not covered: DuckDB's
+# own validator calls it "expected to throw on non-trivial workflows", and
+# v1.5.5's built-in table scan violates it the same way, by yielding
+# HAVE_MORE_OUTPUT after an exhausted work unit)
+
+statement ok
+SET debug_physical_table_scan_execution_strategy='SYNCHRONOUS';
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('big', '567') EXCEPT ALL SELECT * FROM big WHERE contains(s, '567'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, '567') EXCEPT ALL SELECT * FROM ngram_search('big', '567'))
+);
+----
+0
+
+statement ok
+RESET debug_physical_table_scan_execution_strategy;
+
+# one work unit per vector instead of per row group: every row group is split
+# across threads, which is the harshest partitioning the storage scan allows
+statement ok
+PRAGMA verify_parallelism;
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('big', '8765') EXCEPT ALL SELECT * FROM big WHERE contains(s, '8765'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, '8765') EXCEPT ALL SELECT * FROM ngram_search('big', '8765'))
+);
+----
+0
+
+statement ok
+PRAGMA disable_verify_parallelism;
+
+# --- exhaustiveness: tail rows and transaction-local rows ---
+
+statement ok
+INSERT INTO big SELECT i, 'tail ' || i::VARCHAR || ' payload' FROM range(600000, 640000) t(i);
+
+query I
+SELECT count(*) FROM ngram_search('big', 'tail ');
+----
+40000
+
+# both stretches of the tail at once, split as finely as the storage scan
+# allows: committed rows past the high-water mark, and this transaction's own
+# uncommitted rows, which the parallel cursor visits after the committed ones
+statement ok
+PRAGMA verify_parallelism;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO big SELECT i, 'uncommitted ' || i::VARCHAR || ' payload' FROM range(640000, 645000) t(i);
+
+query I
+SELECT count(*) FROM ngram_search('big', 'uncommitted');
+----
+5000
+
+query I
+SELECT count(*) FROM ngram_search('big', 'tail ');
+----
+40000
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('big', 'payload') EXCEPT ALL SELECT * FROM big WHERE contains(s, 'payload'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, 'payload') EXCEPT ALL SELECT * FROM ngram_search('big', 'payload'))
+);
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+PRAGMA disable_verify_parallelism;
+
+# --- transparent path ---
+
+statement ok
+SET ngram_auto_accelerate=true;
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM big WHERE s LIKE '%3456%' EXCEPT ALL SELECT * FROM big WHERE contains(s, '3456'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, '3456') EXCEPT ALL SELECT * FROM big WHERE s LIKE '%3456%')
+);
+----
+0
+
+query II
+EXPLAIN SELECT count(*) FROM big WHERE s LIKE '%3456%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+# the in-scan full-scan fallback is a parallel scan too, not a one-thread
+# crawl: with the gate at zero every accelerated query takes it
+statement ok
+SET ngram_max_candidate_fraction=0.0;
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM big WHERE s LIKE '%3456%' EXCEPT ALL SELECT * FROM big WHERE contains(s, '3456'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, '3456') EXCEPT ALL SELECT * FROM big WHERE s LIKE '%3456%')
+);
+----
+0
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM big WHERE s LIKE '%3456%';
+----
+analyzed_plan	<REGEX>:.*full scan fallback.*
+
+statement ok
+RESET ngram_max_candidate_fraction;
+
+# ordering through the transparent path, against the same query with the
+# rewrite disabled
+query I
+SELECT count(*) FROM (
+	SELECT row_number() OVER () AS pos, id FROM (SELECT id FROM big WHERE s LIKE '%54321%')
+) a JOIN (
+	SELECT row_number() OVER () AS pos, id FROM (SELECT id FROM big WHERE s LIKE '%54321%' ORDER BY id)
+) b USING (pos) WHERE a.id IS DISTINCT FROM b.id;
+----
+0
+
+statement ok
+PRAGMA verify_parallelism;
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM big WHERE s ILIKE '%PAYLOAD%' EXCEPT ALL SELECT * FROM big WHERE contains(lower(s), 'payload'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(lower(s), 'payload') EXCEPT ALL SELECT * FROM big WHERE s ILIKE '%PAYLOAD%')
+);
+----
+0
+
+statement ok
+PRAGMA disable_verify_parallelism;
+
+# --- ordered sinks: a parallel scan feeding CREATE TABLE AS and LIMIT ---
+
+statement ok
+CREATE TABLE copied AS SELECT * FROM ngram_search('big', '13579');
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM copied EXCEPT ALL SELECT * FROM big WHERE contains(s, '13579'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, '13579') EXCEPT ALL SELECT * FROM copied)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM ngram_search('big', '2468') LIMIT 7);
+----
+7
+
+query I
+SELECT count(*) FROM (SELECT * FROM big WHERE s LIKE '%2468%' ORDER BY id LIMIT 9);
+----
+9

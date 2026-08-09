@@ -1,5 +1,6 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -45,19 +46,30 @@ namespace ngram {
 // bindings and EXPLAIN filter rendering are unchanged.
 //
 // NGRAM_INDEX_SCAN reuses the Phase 3 pipeline: probe the index for candidate
-// rowids, fetch them in batches through DataTable::Fetch, recheck every
-// fetched row against ALL pushed filters (evaluated exactly, via
+// rowids, fetch them through DataTable::Fetch, recheck every fetched row
+// against ALL pushed filters (evaluated exactly, via
 // TableFilter::ToExpression — the original query predicate, so query
 // semantics never depend on index normalization), then run a storage tail
 // scan (rowid > high-water mark, covering unindexed and transaction-local
 // rows) with the same filters applied natively by the storage scan. A shared
 // vacuum lock is held from before the probe until the scan state dies.
 //
+// Both phases run on as many threads as there is work for. The probe happens
+// once, in init_global; after it the candidate list is immutable and threads
+// claim disjoint STANDARD_VECTOR_SIZE blocks of it through an atomic counter,
+// while the storage scan hands out one row group at a time through DuckDB's
+// own parallel cursor (which covers the transaction-local rows after the
+// committed ones). Nothing about exhaustiveness changes: the same rows are
+// visited, once each. Output order is preserved for ordered sinks by the
+// batch index the scan reports, so a parallel run returns rows in the order
+// the single-threaded one did.
+//
 // Fallbacks never re-plan: when the index cannot be used at execution time
 // (dropped index, changed options, selectivity gate) the same table function
-// degrades to a full storage scan with the filters applied natively, which is
-// exactly a single-threaded seq scan. The rewrite itself is skipped (leaving
-// the native seq scan) for every non-qualifying shape; see TryRewriteGet.
+// degrades to a full storage scan with the filters applied natively — a
+// parallel scan over every row group, i.e. what the seq scan it replaced
+// would have cost. The rewrite itself is skipped (leaving the native seq
+// scan) for every non-qualifying shape; see TryRewriteGet.
 //
 // Case semantics (superset invariant): contains/LIKE are case-sensitive and
 // may probe both case-sensitive and case-insensitive indexes (folding merges
@@ -78,7 +90,17 @@ namespace ngram {
 // false positives impossible.
 //===----------------------------------------------------------------------===//
 
-static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.05;
+//! The gate runs after the probe, so it cannot recover probe cost; its only
+//! job is choosing between fetching candidates and scanning the table for the
+//! work that remains. Measured fetch cost is ~250-300 ns per candidate at
+//! every scale, and a parallel scan of the whole table costs ~0.04 s at 1 GB,
+//! ~0.35 s at 10 GB and ~3.5 s at 100 GB, which puts the break-even at 1.6%,
+//! 1.3% and 1.1% of rows respectively. One percent is that crossover, rounded
+//! toward scanning. The previous 0.05 was set before fetch was parallel and is
+//! four to five times too permissive: at 100 GB it let a 6.3%-selectivity
+//! needle spend 34.4 s on the index path where the fallback needs 20.1 s and a
+//! plain scan 4.6 s (benchmarks/RESULTS.md).
+static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.01;
 
 static bool AutoAccelerateEnabled(ClientContext &context) {
 	Value value;
@@ -267,11 +289,16 @@ enum class NgramScanMode : uint8_t {
 
 enum class NgramScanPhase : uint8_t { FETCH, SCAN, DONE };
 
+//! Everything shared by the scan's threads. Immutable once init_global
+//! returns, except `next_fetch_block` (atomic) and `parallel_scan` (which
+//! hands out row groups under its own mutex).
 struct NgramScanGlobalState final : public GlobalTableFunctionState {
 	DataTable *storage = nullptr;
 	DuckTransaction *tx = nullptr;
 	//! Held from before the index probe until this state dies: checkpoint
-	//! vacuum must not move rowids while we hold candidate rowids.
+	//! vacuum must not move rowids while we hold candidate rowids. A shared
+	//! lock has no thread affinity, so one key covers every scanning thread
+	//! (the pattern v1.5.5's own index scan uses, table_scan.cpp:127).
 	unique_ptr<StorageLockKey> vacuum_lock;
 	int64_t hwm = -1;
 
@@ -287,31 +314,57 @@ struct NgramScanGlobalState final : public GlobalTableFunctionState {
 	bool remove_columns = false;
 
 	//! The conjunction of every non-optional pushed filter, evaluated on
-	//! fetched candidate chunks (DataTable::Fetch applies no filters).
+	//! fetched candidate chunks (DataTable::Fetch applies no filters). Shared
+	//! read-only; each thread builds its own executor over it, because an
+	//! ExpressionExecutor carries per-evaluation state.
 	unique_ptr<Expression> recheck_expr;
-	unique_ptr<ExpressionExecutor> recheck_executor;
-	SelectionVector sel;
 
-	NgramScanPhase phase = NgramScanPhase::FETCH;
-	//! Candidate rowids (sorted, clamped to hwm); INDEX mode only.
+	//! Candidate rowids (sorted, clamped to hwm); INDEX mode only. Threads
+	//! claim STANDARD_VECTOR_SIZE-sized blocks of it by index.
 	vector<row_t> candidates;
-	idx_t fetch_offset = 0;
-	DataChunk fetch_chunk;
-	ColumnFetchState fetch_state;
+	atomic<idx_t> next_fetch_block {0};
+	idx_t fetch_block_count = 0;
 
 	//! The storage scan: the tail (rowid > hwm) in INDEX mode, the whole
-	//! table in FULL_SCAN mode. Filters are applied by the storage scan.
-	bool scan_initialized = false;
+	//! table in FULL_SCAN mode. Filters are applied by the storage scan; the
+	//! parallel cursor hands each thread one row group at a time and covers
+	//! the transaction-local rows after the committed ones, so the scan stays
+	//! exactly as exhaustive as the single-threaded version was.
 	vector<StorageIndex> scan_column_ids;
+	vector<LogicalType> scan_types;
 	unique_ptr<TableFilterSet> scan_filters;
-	TableScanState scan_state;
-	DataChunk scan_chunk;
+	ParallelTableScanState parallel_scan;
 	//! Rowid appended past the projected columns for the tail filter.
 	bool scan_has_extra_rowid = false;
 
+	idx_t max_threads = 1;
+
 	idx_t MaxThreads() const override {
-		return 1;
+		return max_threads;
 	}
+};
+
+//! Per-thread scan state: output buffers, fetch/scan cursors and the recheck
+//! executor. Nothing here may be shared — DataTable::Fetch writes through its
+//! ColumnFetchState, and a TableScanState owns per-thread filter state.
+struct NgramScanLocalState final : public LocalTableFunctionState {
+	NgramScanPhase phase = NgramScanPhase::FETCH;
+
+	DataChunk fetch_chunk;
+	ColumnFetchState fetch_state;
+
+	TableScanState scan_state;
+	DataChunk scan_chunk;
+	//! Whether scan_state currently holds a row group claimed from the
+	//! parallel cursor.
+	bool scan_unit_active = false;
+
+	unique_ptr<ExpressionExecutor> recheck_executor;
+	SelectionVector sel;
+
+	//! Batch index of the chunk this thread emitted last; ordered sinks
+	//! reassemble the output by it (see NgramScanGetPartitionData).
+	idx_t batch_index = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -440,6 +493,23 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 	return true;
 }
 
+//! An upper bound on the row groups the storage scan can hand out, so the
+//! executor spawns threads in proportion to the work: the whole table in
+//! FULL_SCAN mode, the rows past the high-water mark in INDEX mode. Always at
+//! least one, for the transaction-local rows the tail scan must still visit.
+static idx_t TailScanUnits(ClientContext &context, DataTable &storage, const NgramScanGlobalState &state) {
+	if (state.mode == NgramScanMode::FULL_SCAN || state.hwm < 0) {
+		return storage.MaxThreads(context);
+	}
+	idx_t units = 1;
+	auto total_rows = storage.GetTotalRows();
+	auto indexed = static_cast<idx_t>(state.hwm) + 1;
+	if (total_rows > indexed) {
+		units += (total_rows - indexed) / storage.GetRowGroupSize() + 1;
+	}
+	return units;
+}
+
 static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<NgramScanBindData>();
 	auto state = make_uniq<NgramScanGlobalState>();
@@ -467,24 +537,18 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 	state->remove_columns = input.CanRemoveFilterColumns();
 
 	state->recheck_expr = BuildRecheckExpression(input.filters, state->scanned_types);
-	if (state->recheck_expr) {
-		state->recheck_executor = make_uniq<ExpressionExecutor>(context, *state->recheck_expr);
-	}
-	state->sel.Initialize(STANDARD_VECTOR_SIZE);
 
 	if (TryProbeIndex(context, bind, *state)) {
 		state->mode = NgramScanMode::INDEX;
-		state->phase = NgramScanPhase::FETCH;
-		state->fetch_chunk.Initialize(Allocator::Get(context), state->scanned_types);
+		state->fetch_block_count = (state->candidates.size() + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
 	} else {
 		state->mode = NgramScanMode::FULL_SCAN;
-		state->phase = NgramScanPhase::SCAN;
 	}
 
 	// the storage scan: tail (rowid > hwm) in INDEX mode, whole table in
 	// FULL_SCAN mode; the pushed filters are applied natively either way
 	state->scan_column_ids = state->column_ids;
-	auto scan_types = state->scanned_types;
+	state->scan_types = state->scanned_types;
 	state->scan_filters = make_uniq<TableFilterSet>();
 	if (input.filters) {
 		for (auto &entry : input.filters->filters) {
@@ -502,7 +566,7 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 		if (!rowid_position.IsValid()) {
 			rowid_position = state->scan_column_ids.size();
 			state->scan_column_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
-			scan_types.emplace_back(LogicalType::ROW_TYPE);
+			state->scan_types.emplace_back(LogicalType::ROW_TYPE);
 			state->scan_has_extra_rowid = true;
 		}
 		// rowid > hwm: zone maps skip fully-indexed row groups, and
@@ -511,11 +575,33 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 		    ColumnIndex(rowid_position.GetIndex()),
 		    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHAN, Value::BIGINT(state->hwm)));
 	}
-	InitializeExhaustiveScan(context, *state->tx, storage, state->scan_state, state->scan_column_ids,
-	                         state->scan_filters->filters.empty() ? nullptr : state->scan_filters.get());
-	state->scan_chunk.Initialize(Allocator::Get(context), scan_types);
-	state->scan_initialized = true;
+	// The parallel cursor needs no empty-table special case: an empty row-group
+	// collection leaves it with no current row group, and the transaction-local
+	// side is null-guarded, so the first claim simply reports "nothing left".
+	// (DataTable::InitializeScan asserts instead, which is why the sequential
+	// helper exists.)
+	static const vector<ColumnIndex> NO_COLUMN_INDEXES;
+	storage.InitializeParallelScan(context, state->parallel_scan, NO_COLUMN_INDEXES);
+	state->max_threads = state->fetch_block_count + TailScanUnits(context, storage, *state);
 
+	return std::move(state);
+}
+
+static unique_ptr<LocalTableFunctionState> NgramScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                              GlobalTableFunctionState *global_state) {
+	auto &gstate = global_state->Cast<NgramScanGlobalState>();
+	auto state = make_uniq<NgramScanLocalState>();
+	state->phase = gstate.mode == NgramScanMode::INDEX ? NgramScanPhase::FETCH : NgramScanPhase::SCAN;
+	if (gstate.mode == NgramScanMode::INDEX) {
+		state->fetch_chunk.Initialize(Allocator::Get(context.client), gstate.scanned_types);
+	}
+	state->scan_state.Initialize(gstate.scan_column_ids, &context.client,
+	                             gstate.scan_filters->filters.empty() ? nullptr : gstate.scan_filters.get());
+	state->scan_chunk.Initialize(Allocator::Get(context.client), gstate.scan_types);
+	if (gstate.recheck_expr) {
+		state->recheck_executor = make_uniq<ExpressionExecutor>(context.client, *gstate.recheck_expr);
+	}
+	state->sel.Initialize(STANDARD_VECTOR_SIZE);
 	return std::move(state);
 }
 
@@ -524,87 +610,128 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 //===----------------------------------------------------------------------===//
 
 //! Rows of `chunk` passing every non-optional pushed filter, selected into
-//! state.sel. Storage-scan chunks are already filtered natively; re-running
-//! the executor there is an idempotent belt-and-braces pass over survivors.
-static idx_t RecheckChunk(NgramScanGlobalState &state, DataChunk &chunk) {
-	if (!state.recheck_executor) {
+//! the thread's selection vector. Storage-scan chunks are already filtered
+//! natively; re-running the executor there is an idempotent belt-and-braces
+//! pass over survivors.
+static idx_t RecheckChunk(NgramScanLocalState &lstate, DataChunk &chunk) {
+	if (!lstate.recheck_executor) {
 		for (idx_t r = 0; r < chunk.size(); r++) {
-			state.sel.set_index(r, r);
+			lstate.sel.set_index(r, r);
 		}
 		return chunk.size();
 	}
-	return state.recheck_executor->SelectExpression(chunk, state.sel);
+	return lstate.recheck_executor->SelectExpression(chunk, lstate.sel);
 }
 
 //! Emit the selected rows of `src` into `output`, honoring the scan's
 //! projection. `src` may carry the extra tail rowid column at the end; both
 //! projection_ids and output.ColumnCount() only reference columns before it.
-static void EmitSelected(NgramScanGlobalState &state, DataChunk &src, idx_t hits, DataChunk &output) {
+static void EmitSelected(NgramScanGlobalState &state, NgramScanLocalState &lstate, DataChunk &src, idx_t hits,
+                         DataChunk &output) {
 	if (state.remove_columns) {
 		for (idx_t i = 0; i < state.projection_ids.size(); i++) {
-			output.data[i].Slice(src.data[state.projection_ids[i]], state.sel, hits);
+			output.data[i].Slice(src.data[state.projection_ids[i]], lstate.sel, hits);
 		}
 	} else {
 		for (idx_t c = 0; c < output.ColumnCount(); c++) {
-			output.data[c].Slice(src.data[c], state.sel, hits);
+			output.data[c].Slice(src.data[c], lstate.sel, hits);
 		}
 	}
 	output.SetCardinality(hits);
 }
 
+//! Signal "I made progress but produced nothing; call me again". Under the
+//! synchronous debug strategy an empty HAVE_MORE_OUTPUT is rejected, so there
+//! the caller loops instead.
+static bool YieldEmpty(TableFunctionInput &data) {
+	if (data.results_execution_mode != AsyncResultsExecutionMode::TASK_EXECUTOR) {
+		return false;
+	}
+	data.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+	return true;
+}
+
 static void NgramScanFunc(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<NgramScanGlobalState>();
+	auto &lstate = data.local_state->Cast<NgramScanLocalState>();
 	while (true) {
-		switch (state.phase) {
+		switch (lstate.phase) {
 		case NgramScanPhase::FETCH: {
-			if (state.fetch_offset >= state.candidates.size()) {
-				state.phase = NgramScanPhase::SCAN;
+			// claim the next block of candidate rowids; blocks are disjoint,
+			// so the fetched rows partition the candidate set exactly once
+			auto block = state.next_fetch_block++;
+			if (block >= state.fetch_block_count) {
+				lstate.phase = NgramScanPhase::SCAN;
 				continue;
 			}
-			auto remaining = state.candidates.size() - state.fetch_offset;
-			idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
-			auto row_id_data = reinterpret_cast<data_ptr_t>(state.candidates.data() + state.fetch_offset);
+			auto offset = block * STANDARD_VECTOR_SIZE;
+			idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.candidates.size() - offset);
+			lstate.batch_index = block;
+			auto row_id_data = reinterpret_cast<data_ptr_t>(state.candidates.data() + offset);
 			Vector row_ids(LogicalType::ROW_TYPE, row_id_data);
-			state.fetch_offset += count;
 
-			state.fetch_chunk.Reset();
-			state.storage->Fetch(*state.tx, state.fetch_chunk, state.column_ids, row_ids, count, state.fetch_state);
+			lstate.fetch_chunk.Reset();
+			state.storage->Fetch(*state.tx, lstate.fetch_chunk, state.column_ids, row_ids, count, lstate.fetch_state);
 			idx_t hits = 0;
-			if (state.fetch_chunk.size() != 0) {
-				hits = RecheckChunk(state, state.fetch_chunk);
+			if (lstate.fetch_chunk.size() != 0) {
+				hits = RecheckChunk(lstate, lstate.fetch_chunk);
 			}
 			if (hits == 0) {
-				if (data.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
-					data.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+				if (YieldEmpty(data)) {
 					return;
 				}
 				continue;
 			}
-			EmitSelected(state, state.fetch_chunk, hits, output);
+			EmitSelected(state, lstate, lstate.fetch_chunk, hits, output);
 			return;
 		}
 		case NgramScanPhase::SCAN: {
-			state.scan_chunk.Reset();
-			state.storage->Scan(*state.tx, state.scan_chunk, state.scan_state);
-			if (state.scan_chunk.size() == 0) {
-				state.phase = NgramScanPhase::DONE;
-				return;
+			if (!lstate.scan_unit_active) {
+				if (state.storage->NextParallelScan(context, state.parallel_scan, lstate.scan_state) == 0) {
+					lstate.phase = NgramScanPhase::DONE;
+					continue;
+				}
+				lstate.scan_unit_active = true;
 			}
-			idx_t hits = RecheckChunk(state, state.scan_chunk);
-			if (hits == 0) {
-				if (data.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
-					data.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+			lstate.scan_chunk.Reset();
+			state.storage->Scan(*state.tx, lstate.scan_chunk, lstate.scan_state);
+			if (lstate.scan_chunk.size() == 0) {
+				// this row group is done; the next call claims another
+				lstate.scan_unit_active = false;
+				if (YieldEmpty(data)) {
 					return;
 				}
 				continue;
 			}
-			EmitSelected(state, state.scan_chunk, hits, output);
+			// committed row groups are numbered from 1 and the local-storage
+			// numbering resumes past the committed total, so scan batches
+			// always sort after every fetch block
+			lstate.batch_index = state.fetch_block_count + lstate.scan_state.table_state.batch_index +
+			                     lstate.scan_state.local_state.batch_index;
+			idx_t hits = RecheckChunk(lstate, lstate.scan_chunk);
+			if (hits == 0) {
+				if (YieldEmpty(data)) {
+					return;
+				}
+				continue;
+			}
+			EmitSelected(state, lstate, lstate.scan_chunk, hits, output);
 			return;
 		}
 		case NgramScanPhase::DONE:
+			// this thread is retired; the others carry on independently
 			return;
 		}
 	}
+}
+
+//! Ordered sinks reassemble a parallel scan's output by batch index. Fetch
+//! blocks carry their block number and storage batches follow them, so the
+//! reassembled order is the one the single-threaded scan produced: candidate
+//! rowids ascending, then the tail in storage order.
+static OperatorPartitionData NgramScanGetPartitionData(ClientContext &context, TableFunctionGetPartitionInput &input) {
+	auto &lstate = input.local_state->Cast<NgramScanLocalState>();
+	return OperatorPartitionData(lstate.batch_index);
 }
 
 //===----------------------------------------------------------------------===//
@@ -649,6 +776,8 @@ static void NgramScanDependency(LogicalDependencyList &dependencies, const Funct
 static TableFunction NgramIndexScanFunction() {
 	TableFunction function("ngram_index_scan", {}, NgramScanFunc);
 	function.init_global = NgramScanInitGlobal;
+	function.init_local = NgramScanInitLocal;
+	function.get_partition_data = NgramScanGetPartitionData;
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
 	function.filter_prune = true;

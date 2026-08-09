@@ -1,0 +1,86 @@
+extension:
+  name: ngram
+  description: Durable trigram index for exhaustive substring search — LIKE '%needle%' over large text columns, every matching row, always
+  version: 0.1.0
+  language: C++
+  build: cmake
+  license: MIT
+  maintainers:
+    - danthegoodman1
+  # Fill from a green full-matrix run of this repo's MainDistributionPipeline
+  # before submitting; see packaging/SUBMISSION.md. Leaving it unset asks
+  # community CI to build every platform, which is what we want once the
+  # matrix is known to pass.
+  # excluded_platforms: ""
+
+repo:
+  github: danthegoodman1/duckdb-ngram
+  # Must be a ref that exists on the PUBLIC repo. Convention across the
+  # registry is a full 40-character commit SHA; a tag also works.
+  ref: 0000000000000000000000000000000000000000
+
+docs:
+  hello_world: |
+    -- Index a text column, then search it exhaustively.
+    CREATE TABLE logs AS
+      SELECT i AS id, 'connection reset by peer #' || i AS message FROM range(100000) t(i);
+
+    PRAGMA create_ngram_index('logs', 'message');
+
+    -- Explicit search: exact and complete, every candidate rechecked. This is
+    -- substring matching, so it finds #4242 and #42420..#42429 — 11 rows.
+    SELECT * FROM ngram_search('logs', 'reset by peer #4242');
+
+    -- Or let plain SQL use the index (opt-in).
+    SET ngram_auto_accelerate = true;
+    SELECT count(*) FROM logs WHERE message LIKE '%peer #99%';
+
+    -- Fold newly appended rows into the index; cost is proportional to the tail.
+    INSERT INTO logs VALUES (100000, 'connection reset by peer #100000');
+    PRAGMA ngram_refresh('logs');
+
+    PRAGMA ngram_index_stats('logs');
+  extended_description: |
+    `ngram` accelerates substring search — `LIKE '%needle%'`, `contains()`,
+    `ILIKE`, and literal `regexp_matches` — over large `VARCHAR` columns, and
+    returns **every** matching row.
+
+    A row containing the needle contains every trigram of the needle, so
+    intersecting posting lists yields a superset of the true matches; each
+    candidate is then fetched and rechecked against the original predicate.
+    Consequences: false positives are impossible in every state the index can
+    be in, and the index is an optimization rather than a correctness
+    dependency. Rows appended since the last refresh are covered by a
+    brute-force tail scan, and rows your own open transaction has inserted are
+    found too.
+
+    Postings live in ordinary DuckDB tables, so the index is durable, recovered
+    by the WAL, buffer-managed, and completely inert when the extension is not
+    loaded — a database with an ngram index reads and writes normally in a
+    stock DuckDB build.
+
+    Surface:
+
+    * `PRAGMA create_ngram_index(table, column[, gram, case_insensitive])`,
+      `PRAGMA drop_ngram_index(table, column)`
+    * `ngram_search(table, needle[, col])` — rows, exact and complete
+    * `ngram_candidates(table, column, needle)` — the raw superset, for
+      building your own pipelines
+    * `PRAGMA ngram_refresh(table[, col])` — index the rows appended since the
+      last build, at a cost proportional to that tail
+    * `PRAGMA ngram_compact(table[, col, purge])`,
+      `PRAGMA ngram_index_stats(table)`
+    * `SET ngram_auto_accelerate = true` — rewrite plain `LIKE`/`contains`/
+      `ILIKE` into index scans, with an automatic fall back to a sequential
+      scan when the needle is not selective enough to be worth it
+
+    Transparent acceleration is opt-in: DuckDB v1.5.5 has no triggers and no
+    change feed, so an in-place `UPDATE` of an already-indexed row cannot be
+    found incrementally and needs a rebuild. Every state the extension can
+    *prove* stale is refused (on the explicit path) or declined (on the
+    transparent one) rather than answered.
+
+    Expect the index to be roughly the size of the text it indexes, which is
+    the usual range for an exhaustive trigram index. Not a fuzzy-matching or
+    ranking extension; for scored full-text search over tokenized documents,
+    use `fts`.

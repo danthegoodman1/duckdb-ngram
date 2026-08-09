@@ -400,13 +400,13 @@ static vector<MaintenanceColumn> ResolveMaintenanceColumns(ClientContext &contex
 //! writing a stale hwm the script stops and asks for a retry.
 static string MetaUnchangedGuard(const ResolvedTarget &target, const string &meta_qualified, const string &column_name,
                                  int64_t hwm, const char *fn) {
-	return "SELECT CASE WHEN (SELECT count(*) FROM " + meta_qualified +
-	       " WHERE format_version = " + to_string(NGRAM_FORMAT_VERSION) + " AND schema_name IS NOT DISTINCT FROM " +
-	       Lit(target.schema_name) + " AND table_name IS NOT DISTINCT FROM " + Lit(target.table_name) +
-	       " AND hwm_rowid = " + to_string(hwm) + ") <> 1 THEN error(" +
-	       Lit(string(fn) + ": the index on " + target.table_name + "." + column_name +
-	           " changed while the statement was being prepared; run it again") +
-	       ") END AS ngram_meta_guard;\n";
+	return SilentGuard("CASE WHEN (SELECT count(*) FROM " + meta_qualified + " WHERE format_version = " +
+	                   to_string(NGRAM_FORMAT_VERSION) + " AND schema_name IS NOT DISTINCT FROM " +
+	                   Lit(target.schema_name) + " AND table_name IS NOT DISTINCT FROM " + Lit(target.table_name) +
+	                   " AND hwm_rowid = " + to_string(hwm) + ") <> 1 THEN error(" +
+	                   Lit(string(fn) + ": the index on " + target.table_name + "." + column_name +
+	                       " changed while the statement was being prepared; run it again") +
+	                   ") END");
 }
 
 //! Re-record the table facts the detectors compare against. Written as

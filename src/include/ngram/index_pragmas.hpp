@@ -60,6 +60,14 @@ vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &
 string Ident(const string &name);
 string Lit(const string &value);
 
+//! Session variable the generated guard statements assign to. Its value is
+//! always NULL; only the act of evaluating the guard matters.
+constexpr const char *NGRAM_GUARD_VARIABLE = "__ngram_guard";
+
+//! Wrap a guard expression in a statement that raises when the guard fires and
+//! produces no result rows otherwise, so a pragma's output is the pragma's own.
+string SilentGuard(const string &guard_expression);
+
 //! A statement that raises the shadow-schema collision error unless the meta
 //! table holds exactly one row naming `target` as its owner. Pragma callbacks
 //! cannot run queries, so every generated script guards itself this way.

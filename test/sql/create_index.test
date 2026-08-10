@@ -117,11 +117,11 @@ SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
 ----
 6
 
-query IIIIIIIIIIII
+query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-s	3	true	5	5	44	44	0	1	48	136	NULL
-t	2	false	5	5	12	12	0	1	72	96	NULL
+s	3	true	5	5	0	44	44	0	1	48	136	NULL
+t	2	false	5	5	0	12	12	0	1	72	96	NULL
 
 # dropping one column's index leaves the other intact
 statement ok
@@ -132,10 +132,10 @@ SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
 ----
 3
 
-query IIIIIIIIIIII
+query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-t	2	false	5	5	12	12	0	1	72	96	NULL
+t	2	false	5	5	0	12	12	0	1	72	96	NULL
 
 # dropping the last index removes the shadow schema
 statement ok
@@ -271,11 +271,11 @@ PRAGMA create_ngram_index('"my.table"', 'select');
 statement ok
 PRAGMA create_ngram_index('"my.table"', 'sträße');
 
-query IIIIIIIIIIII
+query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('"my.table"');
 ----
-select	3	true	0	0	9	9	0	1	9	27	NULL
-sträße	3	true	0	0	7	7	0	1	7	21	NULL
+select	3	true	0	0	0	9	9	0	1	9	27	NULL
+sträße	3	true	0	0	0	7	7	0	1	7	21	NULL
 
 statement ok
 PRAGMA drop_ngram_index('"my.table"', 'select');
@@ -330,10 +330,10 @@ PRAGMA ngram_index_stats('a_b.c');
 shadow schema collision
 
 # the failed create and refused drop left the owner's index untouched
-query IIIIIIIIIIII
+query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('a.b_c');
 ----
-s	3	true	0	0	9	9	0	1	9	27	NULL
+s	3	true	0	0	0	9	9	0	1	9	27	NULL
 
 # once the owner drops its index, the schema name is free for the other table
 statement ok

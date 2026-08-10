@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/function/function_set.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -186,6 +187,9 @@ static bool ReadRowHash(ClientContext &context, DuckTableEntry &table, const Col
 }
 
 //! The rowids to witness: evenly spread over [0, max_rowid], ends included.
+//! `max_rowid` is the end of the range the caller is recording coverage of, not
+//! the end of the table: a witness past the high-water mark would describe a row
+//! the index holds no postings for (see SampleStaleReason).
 static vector<int64_t> SampleRowids(int64_t max_rowid) {
 	vector<int64_t> result;
 	if (max_rowid < 0) {
@@ -242,6 +246,22 @@ string SampleStaleReason(ClientContext &context, TableCatalogEntry &table, const
 		} catch (std::exception &) {
 			throw InvalidInputException("ngram: index records malformed row samples (%s); the index is malformed",
 			                            meta.row_samples);
+		}
+		if (rowid > meta.hwm_rowid) {
+			// Past the high-water mark the index holds no postings at all, so
+			// whatever this row says now, it says nothing about where the
+			// index's postings point — the tail scan reads that row live on
+			// every query. The state the witnesses exist to catch is a vacuum
+			// that shifted indexed rows, and a vacuum can only move a row at or
+			// below the mark when a deleted gap sits at or below the mark, which
+			// disturbs the witnesses there. So ignoring these costs no detection
+			// and removes a whole class of false refusals: a bounded refresh
+			// leaves a tail behind by design, and an ordinary UPDATE or a
+			// vacuumed DELETE in that tail must not make the index
+			// unmaintainable. It also disarms witnesses written above the mark
+			// by an earlier version of this extension, which the recording side
+			// can no longer retract.
+			continue;
 		}
 		uint64_t current = 0;
 		if (!ReadRowHash(context, duck_table, column_def, rowid, current)) {
@@ -430,18 +450,82 @@ static string FingerprintAssignments(const TableFingerprint &fingerprint, const 
 // Cost is proportional to that tail: the rowid filter is a constant, so row
 // groups below the mark are skipped by their zone maps.
 //
+// With a max_rows bound the call stops partway instead, commits that progress,
+// and reports it (see BoundedRefreshEnd and the summary row below); the caller
+// loops until remaining_tail is 0. One call is still one transaction — the
+// statement preprocessor's auto-wrap is what makes a refresh crash-atomic, and
+// it wraps a whole expansion or nothing — so the loop cannot live in here.
+//
 // Rows updated in place below the mark are NOT re-indexed. duckdb v1.5.5
 // updates rows in place and offers no trigger or change-feed to find them
 // (CREATE TRIGGER is a parser error), so there is no sound incremental way to
 // know which rows changed; that gap is closed by a rebuild, not by refresh.
 //===----------------------------------------------------------------------===//
 
+//! The highest rowid a bounded refresh starting from `hwm` may cover.
+//!
+//! max_rows is spent as a rowid span rather than as a live-row count, and the
+//! span is then snapped down to a segment boundary. Three reasons:
+//!
+//! * A live-row count could only be evaluated when the script runs, so every
+//!   partition range would have to be written against a session variable
+//!   instead of a literal — and literal rowid ranges are exactly what lets a
+//!   partition's scan skip row groups by their zone maps (see the partitioning
+//!   note in ngram/index_pragmas.hpp).
+//! * A span bounds the work in the safe direction: deletes leave rowid gaps, so
+//!   the rows actually indexed are at most max_rows, never more.
+//! * segment_no = rowid >> SEGMENT_SHIFT, so an end at a segment boundary means
+//!   every (gram, segment_no) of the tail is produced whole by exactly one call
+//!   of the loop. The loop then writes the same segment rows, byte for byte,
+//!   that one unbounded refresh would have written; only their generation
+//!   numbers differ. Snapping down never spends more than max_rows.
+//!
+//! Bounds smaller than the remainder of the mark's own segment are honoured as
+//! given rather than rounded up to it: a segment is 2^SEGMENT_SHIFT rowids, and
+//! on long rows one segment can be more text than the caller is willing to put
+//! in a single transaction, which is the very thing the bound exists to avoid.
+//! Such an increment ends mid-segment and splits that segment's keys across two
+//! generations — fragmentation a later ngram_compact merges away.
+static int64_t BoundedRefreshEnd(int64_t hwm, int64_t max_rows) {
+	if (max_rows >= LOCAL_ROWID_START || hwm > LOCAL_ROWID_START - 1 - max_rows) {
+		// the requested span runs past the committed rowid space; there is
+		// nothing left to bound
+		return LOCAL_ROWID_START - 1;
+	}
+	auto target = hwm + max_rows;
+	auto aligned = (((target + 1) >> SEGMENT_SHIFT) << SEGMENT_SHIFT) - 1;
+	return aligned > hwm ? aligned : target;
+}
+
+static int64_t RequireRowBound(const Value &value) {
+	if (value.IsNull()) {
+		throw BinderException("ngram_refresh: parameter max_rows cannot be NULL");
+	}
+	auto rows = value.GetValue<int64_t>();
+	if (rows < 1) {
+		throw InvalidInputException("ngram_refresh: max_rows must be at least 1, got %lld", rows);
+	}
+	return rows;
+}
+
 static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto table_input = parameters.values[0].ToString();
 	string only_column;
+	bool bounded = false;
+	int64_t max_rows = 0;
+	if (parameters.values.size() > 1) {
+		max_rows = RequireRowBound(parameters.values[1]);
+		bounded = true;
+	}
 	for (auto &entry : parameters.named_parameters) {
 		if (entry.first == "col") {
 			only_column = RequireStringParam(entry.second, "ngram_refresh", "col");
+		} else if (entry.first == "max_rows") {
+			if (bounded) {
+				throw BinderException("ngram_refresh: max_rows was given twice, positionally and by name");
+			}
+			max_rows = RequireRowBound(entry.second);
+			bounded = true;
 		} else {
 			throw BinderException("ngram_refresh: unknown named parameter %s", entry.first);
 		}
@@ -459,6 +543,7 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 	auto local_start = to_string(LOCAL_ROWID_START);
 
 	string script;
+	vector<string> summary_rows;
 	for (auto &column : columns) {
 		auto meta = shadow + "." + Ident(MetaTableName(column.column_name));
 		auto segments = shadow + "." + Ident(SegmentsTableName(column.column_name));
@@ -473,17 +558,25 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		// rows: their rowids are reassigned at commit, so indexing them would
 		// record postings for rowids that never exist
 		auto tail_predicate = "rowid > " + hwm + " AND rowid < " + local_start;
+		// A bound only changes anything while it stops short of the table's
+		// committed end; a bound that covers the whole tail generates the
+		// unbounded script, so "loop until remaining_tail is 0" costs exactly
+		// one call when the tail already fits.
+		auto bound_end = bounded ? BoundedRefreshEnd(column.meta.hwm_rowid, max_rows) : LOCAL_ROWID_START - 1;
+		auto stops_short = bound_end < fingerprint.total_rows - 1;
+		auto range_end = stops_short ? bound_end : fingerprint.total_rows - 1;
 
 		script += OwnershipGuard(target, meta);
 		script += MetaUnchangedGuard(target, meta, column.column_name, column.meta.hwm_rowid, "ngram_refresh");
-		// One statement per rowid-range partition of the tail. The ranges cover
-		// exactly what tail_predicate covers, including rows committed between
-		// this script being generated and being run, so the high-water mark the
-		// UPDATE below records never runs ahead of what was indexed.
-		auto partitions = BuildPartitionCount(
-		    context, EstimateGramCount(context, *target.entry, column.column_name, column.meta.hwm_rowid + 1,
-		                               fingerprint.total_rows - 1, column.meta.options.gram_size));
-		auto ranges = SegmentAlignedRanges(column.meta.hwm_rowid + 1, fingerprint.total_rows - 1, partitions);
+		// One statement per rowid-range partition of the tail. Unbounded, the
+		// ranges cover exactly what tail_predicate covers, including rows
+		// committed between this script being generated and being run, so the
+		// high-water mark the UPDATE below records never runs ahead of what was
+		// indexed. Bounded, they stop at bound_end and so does the mark.
+		auto partitions = BuildPartitionCount(context, EstimateGramCount(context, *target.entry, column.column_name,
+		                                                                 column.meta.hwm_rowid + 1, range_end,
+		                                                                 column.meta.options.gram_size));
+		auto ranges = SegmentAlignedRanges(column.meta.hwm_rowid + 1, range_end, partitions, !stops_short);
 		for (idx_t i = 0; i < ranges.size(); i++) {
 			script += PackPartitionStatement(
 			    packed, i == 0,
@@ -503,11 +596,94 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		// enough; compaction folds them back into one row per gram
 		script += "INSERT INTO " + stats + " SELECT gram, sum(rowid_count)::BIGINT, count(*)::BIGINT FROM " + packed +
 		          " GROUP BY gram;\n";
-		auto row_samples = BuildRowSampleDigest(context, *target.entry, column.column_name, fingerprint.total_rows - 1);
-		script += "UPDATE " + meta + " SET hwm_rowid = coalesce((SELECT max(rowid) FROM " + base + " WHERE " +
-		          tail_predicate + "), hwm_rowid), " +
+		// Witnesses are drawn over the range this call records coverage of, not
+		// over the whole table: past the mark the index holds no postings, so a
+		// witness there would report an ordinary tail UPDATE — or a vacuumed
+		// tail DELETE — as an index that cannot be maintained, which is the one
+		// state a bounded refresh is in by design. Unbounded this is the same
+		// value it always was, so that path is untouched.
+		//
+		// range_end is an upper bound on the mark rather than the mark itself,
+		// which is only known when the UPDATE below runs. The two differ only in
+		// the fallback branch, and only over rowids that hold no visible row
+		// when the script commits, so a witness lands in the gap solely when a
+		// row was visible to this callback and deleted before the script's
+		// snapshot. SampleStaleReason ignores witnesses past the recorded mark,
+		// which closes that race and every other way one could get there.
+		auto row_samples = BuildRowSampleDigest(context, *target.entry, column.column_name, range_end);
+		// Unbounded, the new mark is the highest committed rowid the partitions
+		// just covered. Bounded, it is bound_end itself — but only once some
+		// committed row past bound_end proves the rowid slots at or below it are
+		// settled.
+		//
+		// Why that proof is needed, and why it is enough: rowids are handed out
+		// to a transaction's appended rows while it commits, under the table's
+		// append lock (DataTable::AppendLock, src/storage/data_table.cpp, sets
+		// row_start from the table's current row count), reached through
+		// LocalStorage::Commit -> LocalStorage::Flush. On a database with a WAL
+		// that runs inside DuckTransaction::WriteToWAL, which
+		// DuckTransactionManager::CommitTransaction calls with the transaction
+		// lock released and the WAL lock held; info.commit_id is taken after it
+		// returns, still inside that same WAL-lock critical section, which ends
+		// only once the commit is finished. On a database without a WAL
+		// (in-memory, or NO_WAL_WRITES) the allocation happens instead in
+		// DuckTransaction::Commit, under the transaction lock that already
+		// covers the commit id. Either way one lock serializes both events for
+		// every committing transaction, and ShouldWriteToWAL is a per-database
+		// property, so a database never mixes the two regimes. Commit-id order
+		// and rowid order are therefore one and the same order. So a rowid slot
+		// in the gap between the highest
+		// row this transaction can see and the table's allocated end may still
+		// belong to an append that commits after us — recording a mark over it
+		// would bury rows that no later refresh would ever look at again. But if
+		// we can see any row past bound_end, its committer's commit id is below
+		// our snapshot, hence so is that of every transaction holding a lower
+		// slot: everything at or below bound_end is visible-or-deleted, and the
+		// partitions above indexed all of it.
+		//
+		// When nothing is visible past bound_end the mark falls back to the
+		// unbounded rule restricted to this increment, which is conservative;
+		// the tail is then empty afterwards either way, so the loop still ends.
+		// Advancing over an increment whose rows were all deleted is what keeps
+		// that loop from spinning on a mark that never moves.
+		string new_hwm;
+		if (stops_short) {
+			auto bound_str = to_string(bound_end);
+			new_hwm = "CASE WHEN EXISTS (SELECT 1 FROM " + base + " WHERE rowid > " + bound_str + " AND rowid < " +
+			          local_start + ") THEN " + bound_str + " ELSE coalesce((SELECT max(rowid) FROM " + base +
+			          " WHERE " + tail_predicate + " AND rowid <= " + bound_str + "), hwm_rowid) END";
+		} else {
+			new_hwm = "coalesce((SELECT max(rowid) FROM " + base + " WHERE " + tail_predicate + "), hwm_rowid)";
+		}
+		script += "UPDATE " + meta + " SET hwm_rowid = " + new_hwm + ", " +
 		          FingerprintAssignments(fingerprint, column.column_name, row_samples) + ";\n";
 		script += "DROP TABLE " + packed + ";\n";
+
+		if (bounded) {
+			// Progress, read back from what this transaction just committed:
+			// rows_indexed counts the committed rows the mark newly covers
+			// (rows whose value is NULL included — they are covered, they just
+			// contribute no grams), and remaining_tail counts what a query is
+			// still answering with a tail scan. Both are counted in the same
+			// transaction, and so in the same snapshot, as the packing pass, so
+			// they reconcile with what was indexed exactly. The old mark is a
+			// literal: MetaUnchangedGuard above has already refused the whole
+			// script if the meta row no longer held it.
+			auto recorded = "(SELECT hwm_rowid FROM " + meta + ")";
+			summary_rows.push_back("SELECT " + Lit(column.column_name) + " AS column_name, (SELECT count(*) FROM " +
+			                       base + " WHERE rowid > " + hwm + " AND rowid <= " + recorded +
+			                       ") AS rows_indexed, " + recorded + " AS hwm_rowid, (SELECT count(*) FROM " + base +
+			                       " WHERE rowid > " + recorded + " AND rowid < " + local_start +
+			                       ") AS remaining_tail");
+		}
+	}
+	if (!summary_rows.empty()) {
+		// The pragma's only output row (guards assign to a session variable and
+		// the rest of the script returns counts, not results), and the last
+		// statement of an expansion that is still several statements long, so
+		// the preprocessor's BEGIN/COMMIT — the crash atomicity this pragma
+		// rests on — is untouched.
+		script += StringUtil::Join(summary_rows, " UNION ALL ") + " ORDER BY column_name;\n";
 	}
 	return script;
 }
@@ -614,9 +790,18 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 }
 
 void RegisterMaintenance(ExtensionLoader &loader) {
-	auto refresh = PragmaFunction::PragmaCall("ngram_refresh", RefreshNgramIndexQuery, {LogicalType::VARCHAR});
-	refresh.named_parameters["col"] = LogicalType::VARCHAR;
-	loader.RegisterFunction(refresh);
+	// two overloads so the bound can be written either way: positionally,
+	// PRAGMA ngram_refresh('t', 100000), or by name, max_rows = 100000 (pragma
+	// named parameters take =, not :=)
+	PragmaFunctionSet refresh_set("ngram_refresh");
+	for (auto &arguments :
+	     vector<vector<LogicalType>> {{LogicalType::VARCHAR}, {LogicalType::VARCHAR, LogicalType::BIGINT}}) {
+		auto refresh = PragmaFunction::PragmaCall("ngram_refresh", RefreshNgramIndexQuery, arguments);
+		refresh.named_parameters["col"] = LogicalType::VARCHAR;
+		refresh.named_parameters["max_rows"] = LogicalType::BIGINT;
+		refresh_set.AddFunction(std::move(refresh));
+	}
+	loader.RegisterFunction(std::move(refresh_set));
 
 	auto compact = PragmaFunction::PragmaCall("ngram_compact", CompactNgramIndexQuery, {LogicalType::VARCHAR});
 	compact.named_parameters["col"] = LogicalType::VARCHAR;

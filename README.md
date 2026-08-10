@@ -188,6 +188,70 @@ Skipping it is safe: unindexed rows are found by the tail scan. That scan is a
 brute-force read of the tail, so queries get gradually slower as the tail grows.
 Refresh when the tail is a meaningful fraction of the table.
 
+### Catching up on a large tail, one bounded step at a time
+
+A refresh is one transaction. After a very large ingest that means one very long
+transaction, and a crash partway through it rolls the whole catch-up back to
+where it started. Pass a row bound to break the catch-up into committed steps:
+
+```sql
+-- indexes at most ~1,000,000 rows of tail, commits, and reports progress
+PRAGMA ngram_refresh('logs', 1000000);
+-- ┌─────────────┬──────────────┬───────────┬────────────────┐
+-- │ column_name │ rows_indexed │ hwm_rowid │ remaining_tail │
+-- ├─────────────┼──────────────┼───────────┼────────────────┤
+-- │ message     │      1000000 │   1000099 │        2100000 │
+-- └─────────────┴──────────────┴───────────┴────────────────┘
+```
+
+Each call commits durably before returning, so a crash costs the increment in
+flight and nothing already committed — the next call picks up from the last
+committed high-water mark. Queries stay exact at every step in between: rows
+past the mark are simply still tail.
+
+The loop lives in your code, and it ends when `remaining_tail` reaches 0:
+
+```python
+while True:
+    row = con.execute("PRAGMA ngram_refresh('logs', 1000000)").fetchone()
+    print(f"indexed {row[1]} rows, mark now {row[2]}, {row[3]} to go")
+    if row[3] == 0:
+        break
+```
+
+One row comes back per indexed column of the table — one row for the usual
+single-index table, and `col = 'message'` narrows it to one index as always.
+Calling it again on a caught-up index is a cheap no-op that reports
+`remaining_tail = 0`, so the loop is safe to run one extra time. A bound wider
+than the tail does exactly what the unbounded form does, in one call, and still
+reports progress — which is the way to get a summary out of a full catch-up.
+
+The bound is approximate in one direction only: it is spent as a span of rowids,
+so deletes and gaps mean a call may index **fewer** rows than asked, never more.
+A bound of 100,000 rows on a tail whose rowids are half deleted indexes ~50,000
+rows and advances the mark 100,000 rowids. Bounds large enough to cross one of
+the index's 2²⁰-rowid segment boundaries are snapped back to it, because an
+increment that ends on a boundary writes exactly the segment rows one unbounded
+refresh would have written; smaller bounds are honoured as given and leave one
+segment split across two generations, which the next `ngram_compact` merges.
+
+**Pick a bound of a whole number of 2²⁰-rowid segments if you can** — 1048576,
+2097152, and so on. Because the snap rounds down, a bound just short of a
+segment boundary alternates between a full increment and a tiny one: at
+`max_rows = 1048575` the loop reports 1,048,575 rows, then 1 row, then
+1,048,575, then 1. Every call is correct and the loop still terminates in the
+same number of rows, but half of them are near-empty transactions. A mark that
+does not start on a boundary has the same effect once, on the first call.
+
+A long run of deleted rowids costs one no-op call per bound: crossing a gap of
+1,000 deleted rowids at `max_rows = 100` takes ten calls that each report
+`rows_indexed = 0` before the loop reaches live rows again. They are cheap —
+there is nothing to index, so the call is a mark update — but if a catch-up
+crawls, a wider bound walks the gap in fewer steps.
+
+Without a bound, `ngram_refresh` behaves exactly as it always has and returns no
+rows.
+
 ### When to compact
 
 `PRAGMA ngram_compact('logs')` merges the posting-list rows that share a key.
@@ -235,6 +299,7 @@ PRAGMA ngram_index_stats('logs');
 | `column_name`, `gram_size`, `case_insensitive` | the options the index was built with |
 | `hwm_rowid` | the highest rowid the index covers |
 | `table_max_rowid` | the table's current highest rowid — the gap is what the tail scan reads on every query |
+| `remaining_tail` | committed rows past `hwm_rowid`: what the tail scan actually reads, and what a refresh would index (the rowid gap counts deleted rows, this does not) |
 | `distinct_grams` | size of the index's gram dictionary |
 | `segments` | posting-list rows |
 | `fragmented_keys` | keys stored as more than one row; the compaction target |
@@ -261,6 +326,30 @@ accept shorter needles but propose far more candidates.
 Indexes are supported on `VARCHAR` columns of DuckDB base tables. Views,
 temporary tables, tables in foreign catalogs (SQLite, Postgres, …), tables with
 generated columns, and tables with a user column named `rowid` are rejected.
+
+### Maintenance
+
+```sql
+PRAGMA ngram_refresh('table');                        -- index the whole tail, returns nothing
+PRAGMA ngram_refresh('table', 1000000);               -- at most ~1e6 rows, returns a progress row
+PRAGMA ngram_refresh('table', max_rows = 1000000);    -- same, named
+PRAGMA ngram_refresh('table', 1000000, col = 'c');    -- one index of a multi-index table
+PRAGMA ngram_compact('table');
+PRAGMA ngram_compact('table', col = 'c', purge = true);
+PRAGMA ngram_index_stats('table');
+```
+
+Pragma named parameters take `=`, not `:=`. Each call is one transaction,
+whether or not it is bounded; `max_rows` must be at least 1.
+
+The bounded form returns one row per index it advanced:
+
+| Column | Meaning |
+| --- | --- |
+| `column_name` | the indexed column this row is about |
+| `rows_indexed` | committed rows this call brought under the mark (rows whose value is `NULL` included: they are covered, they just hold no grams) |
+| `hwm_rowid` | the high-water mark the call committed |
+| `remaining_tail` | committed rows still past it — loop until this is 0 |
 
 ### Querying
 
@@ -417,7 +506,10 @@ Building incrementally — load a chunk, `create_ngram_index`, then append and
 `ngram_refresh` per chunk — is still the recommendation for a very large
 corpus, because a single statement has to hold its whole packed output before
 writing it. `benchmarks/bench_build.py` does exactly this and is the reference
-for how.
+for how. When the rows arrive faster than that, or already have,
+`PRAGMA ngram_refresh('t', max_rows)` in a loop bounds the same work from the
+other end: each call is its own transaction and its own bounded packing pass,
+so peak memory and crash exposure both follow the bound rather than the tail.
 
 ---
 

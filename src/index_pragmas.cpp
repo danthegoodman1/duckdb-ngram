@@ -186,11 +186,12 @@ constexpr idx_t GRAM_ESTIMATE_SAMPLES = 512;
 //! the memory limit is simply too small for the corpus.
 constexpr idx_t MAX_BUILD_PARTITIONS = 4096;
 
-vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_t partitions) {
+vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_t partitions, bool open_ended) {
 	vector<pair<int64_t, int64_t>> result;
 	// the open end keeps the pair stream in step with the high-water mark the
-	// script records: both cover everything committed when the script runs
-	auto open_end = LOCAL_ROWID_START - 1;
+	// script records: both cover everything committed when the script runs. A
+	// bounded refresh closes it at hi and records a mark no higher.
+	auto open_end = open_ended ? LOCAL_ROWID_START - 1 : hi;
 	if (hi < lo || partitions <= 1) {
 		result.emplace_back(lo, open_end);
 		return result;
@@ -512,6 +513,7 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 	auto fingerprint = ComputeTableFingerprint(context, *target.entry);
 	auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
 
+	auto base = Ident(target.catalog_name) + "." + Ident(target.schema_name) + "." + Ident(target.table_name);
 	auto shadow = Ident(target.catalog_name) + "." + Ident(target.shadow_schema);
 	string query;
 	std::sort(columns.begin(), columns.end());
@@ -536,9 +538,17 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 		if (!query.empty()) {
 			query += "UNION ALL ";
 		}
-		query += "SELECT column_name, gram_size, case_insensitive, hwm_rowid, " +
+		// remaining_tail is what a bounded-refresh loop watches from outside the
+		// call: the committed rows the index does not cover yet, which every
+		// query is currently answering with a tail scan. Counted against the
+		// meta row's own mark, so it is exact rather than derived from
+		// table_max_rowid (deletes leave rowid gaps).
+		query += "SELECT m.column_name, m.gram_size, m.case_insensitive, m.hwm_rowid, " +
 		         to_string(fingerprint.total_rows - 1) +
 		         "::BIGINT AS table_max_rowid, "
+		         "(SELECT count(*) FROM " +
+		         base + " WHERE rowid > m.hwm_rowid AND rowid < " + to_string(LOCAL_ROWID_START) +
+		         ") AS remaining_tail, "
 		         "(SELECT count(DISTINCT gram) FROM " +
 		         stats +
 		         ") AS distinct_grams, "
@@ -556,7 +566,7 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 		         ") AS posting_entries, "
 		         "(SELECT coalesce(sum(octet_length(postings)), 0) FROM " +
 		         segments + ") AS postings_bytes, " + (staleness.empty() ? string("NULL::VARCHAR") : Lit(staleness)) +
-		         " AS stale_reason FROM " + meta + " ";
+		         " AS stale_reason FROM " + meta + " m ";
 	}
 	query += "ORDER BY column_name;";
 	return query;

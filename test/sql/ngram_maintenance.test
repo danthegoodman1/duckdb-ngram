@@ -210,13 +210,15 @@ SELECT count(*) FROM (
 statement ok
 INSERT INTO docs VALUES (9, 'tent for the stats');
 
-# hwm behind table_max_rowid is the signal that a refresh has work to do;
+# hwm behind table_max_rowid is the signal that a refresh has work to do, and
+# remaining_tail counts what that refresh would index (one row here, since the
+# rowid the deleted row left behind is a gap rather than work);
 # fragmented_keys and generations are the signal for compaction. A pragma
 # cannot be wrapped in a subquery, so the row is pinned whole.
-query IIIIIIIIIIII
+query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-s	3	true	7	8	39	39	0	1	48	126	NULL
+s	3	true	7	8	1	39	39	0	1	48	126	NULL
 
 #===----------------------------------------------------------------------===#
 # two indexed columns refresh independently

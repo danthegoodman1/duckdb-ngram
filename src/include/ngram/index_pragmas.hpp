@@ -96,11 +96,14 @@ constexpr int64_t LOCAL_ROWID_START = 36028797018960000LL;
 //===----------------------------------------------------------------------===//
 
 //! Rowid ranges (inclusive) splitting [lo, hi] into at most `partitions`
-//! segment-aligned pieces. Always returns at least one range; the last one runs
-//! to LOCAL_ROWID_START - 1 so that rows committed between the pragma callback
-//! and the statement are still indexed, which keeps the recorded high-water
-//! mark exact.
-vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_t partitions);
+//! segment-aligned pieces. Always returns at least one range.
+//!
+//! With `open_ended` (the default) the last range runs to LOCAL_ROWID_START - 1
+//! so that rows committed between the pragma callback and the statement are
+//! still indexed, which keeps the recorded high-water mark exact. A bounded
+//! refresh passes false instead: its whole point is to stop at `hi`, and the
+//! mark it records stops there with it.
+vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_t partitions, bool open_ended = true);
 
 //! One statement filling `packed` (gram, segment_no, postings, rowid_count,
 //! min_rowid, max_rowid) from `pair_source`, a SELECT of (gram, segment_no, r).

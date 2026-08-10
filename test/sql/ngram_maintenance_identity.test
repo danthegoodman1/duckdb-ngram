@@ -58,10 +58,10 @@ SELECT count(*) FROM ngram_search('t', 'tent');
 1
 
 # and nothing reports the index as stale
-query IIIIIIIIIIII
+query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('t');
 ----
-s	3	true	1	1	9	9	0	1	9	27	NULL
+s	3	true	1	1	0	9	9	0	1	9	27	NULL
 
 statement ok
 PRAGMA ngram_refresh('t');
@@ -159,10 +159,10 @@ PRAGMA ngram_compact('side.main.docs');
 
 # a pragma cannot be wrapped in a subquery, so the row is pinned whole; the
 # last column is the staleness verdict
-query IIIIIIIIIIII
+query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('side.main.docs');
 ----
-s	3	true	1	1	9	9	0	1	9	27	NULL
+s	3	true	1	1	0	9	9	0	1	9	27	NULL
 
 # a real re-creation inside the new incarnation is still proof: the refresh
 # above re-recorded the identity, so the oids are comparable again

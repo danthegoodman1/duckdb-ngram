@@ -15,12 +15,22 @@ duration, reopens the database, and verifies that
   * ngram_search still equals brute force for every needle, whichever state
     survived.
 
+The bounded scenario is the same question asked of a catch-up loop: a child
+process runs a sequence of PRAGMA ngram_refresh(table, max_rows) calls and is
+killed part-way through it. There the surviving state must be one of the
+increment boundaries the uninterrupted loop passes through — never a partial
+one, and never behind the increment before the kill — and resuming the loop
+afterwards must land on exactly the index the uninterrupted loop produced,
+postings and all. That is what "a crash costs one increment" means, measured
+rather than asserted.
+
 Each kill runs against a fresh copy of the same pristine database, so the
 offsets are comparable and a failure is reproducible from the printed offset.
 The timing of a kill is inherently not deterministic — the point of the sweep
 is to hit many different phases of the operation, not the same one twice.
 
-Usage: python3 scripts/crash_maintenance.py [--kills N] [--rows N] [--seed S]
+Usage: python3 scripts/crash_maintenance.py [--kills N] [--rows N] [--tail N]
+                                            [--bound N] [--seed S]
                                             [--duckdb PATH] [--keep]
 Exit code 0 iff every reopened database passed.
 """
@@ -81,6 +91,16 @@ def index_state(db):
     return line[-1] if line else None
 
 
+def postings_digest(db):
+    """The decoded index itself: every (gram, rowid) posting, summarised so two
+    databases can be compared without materialising both."""
+    _, out, _ = run(db, "SELECT count(*), coalesce(sum(hash(gram || ':' || r))::VARCHAR, '0') "
+                        "FROM ngram_unpack_postings("
+                        "(SELECT gram, segment_no, postings FROM ngram_main_corpus.segments_s));")
+    line = [l for l in out.strip().splitlines() if l]
+    return line[-1] if line else None
+
+
 def differential(db):
     """Rows the index path and brute force disagree on, both directions."""
     script = []
@@ -119,12 +139,93 @@ def kill_during(db, pragma, delay):
     return killed
 
 
+def bounded_scenario(tmp, rng, args, failures):
+    """Kill a bounded catch-up loop part-way through and make it account for
+    what it lost: the surviving state must be one the uninterrupted loop passes
+    through, and resuming must reach the very index the uninterrupted loop
+    reached."""
+    pristine = os.path.join(tmp, "bounded_pristine.db")
+    for suffix in ("", ".wal"):
+        if os.path.exists(pristine + suffix):
+            os.remove(pristine + suffix)
+    build_corpus(pristine, rng, args.rows)
+    append_tail(pristine, rng, args.rows, args.tail)
+    # two extra calls so the loop provably ends with an empty tail, the way a
+    # caller looping on remaining_tail would
+    calls = (args.tail + args.bound - 1) // args.bound + 2
+    script = "PRAGMA ngram_refresh('corpus', %d);\n" % args.bound * calls
+
+    # every state the uninterrupted loop passes through, increment by increment
+    ref = os.path.join(tmp, "bounded_ref.db")
+    shutil.copyfile(pristine, ref)
+    states = [index_state(ref)]
+    for _ in range(calls):
+        run(ref, "PRAGMA ngram_refresh('corpus', %d);" % args.bound)
+        state = index_state(ref)
+        if state != states[-1]:
+            states.append(state)
+    final_state = states[-1]
+    final_digest = postings_digest(ref)
+
+    # and the wall time of that loop run inside one process, to spread the kills
+    timing_db = os.path.join(tmp, "bounded_timing.db")
+    shutil.copyfile(pristine, timing_db)
+    duration = timed_pragma(timing_db, script)
+    print("bounded loop (max_rows=%d, %d calls): uninterrupted %.3fs, %d distinct states"
+          % (args.bound, calls, duration, len(states)), flush=True)
+    if len(states) < 3:
+        failures.append("the bounded loop passes through %d states; the crash test would be vacuous" % len(states))
+        return
+
+    for i in range(args.kills):
+        delay = duration * (i + 1) / max(args.kills - 2, 1)
+        work = os.path.join(tmp, "bkill_%d.db" % i)
+        shutil.copyfile(pristine, work)
+        killed = kill_during(work, script, delay)
+        code, out, err = run(work, "SELECT 1;", allow_error=True)
+        if code != 0:
+            failures.append("bounded kill@%.3fs: database does not reopen: %s" % (delay, err[-300:]))
+            continue
+        state = index_state(work)
+        where = states.index(state) if state in states else None
+        if where is None:
+            failures.append("bounded kill@%.3fs: index state %s is not an increment boundary of the loop (%s)"
+                            % (delay, state, states))
+        mismatches, error = differential(work)
+        if error is not None:
+            failures.append("bounded kill@%.3fs: search failed after reopen: %s" % (delay, error))
+        elif mismatches:
+            failures.append("bounded kill@%.3fs: %d rows differ from brute force after reopen" % (delay, mismatches))
+        # resume the loop from wherever the crash left it
+        run(work, script)
+        resumed, resumed_digest = index_state(work), postings_digest(work)
+        if resumed != final_state:
+            failures.append("bounded kill@%.3fs: resumed loop ends at %s, not at %s"
+                            % (delay, resumed, final_state))
+        if resumed_digest != final_digest:
+            failures.append("bounded kill@%.3fs: resumed postings %s differ from uninterrupted %s"
+                            % (delay, resumed_digest, final_digest))
+        after_mismatches, after_error = differential(work)
+        if after_error is not None or after_mismatches:
+            failures.append("bounded kill@%.3fs: after resuming, %s"
+                            % (delay, after_error or ("%d rows differ from brute force" % after_mismatches)))
+        print("  kill@%.3fs killed=%s survived at increment %s/%d -> resumed %s" %
+              (delay, killed, "?" if where is None else where, len(states) - 1,
+               "ok" if resumed == final_state and resumed_digest == final_digest else "FAILED"), flush=True)
+        if not args.keep:
+            for suffix in ("", ".wal"):
+                if os.path.exists(work + suffix):
+                    os.remove(work + suffix)
+
+
 def main():
     global DUCKDB
     ap = argparse.ArgumentParser()
     ap.add_argument("--kills", type=int, default=12)
     ap.add_argument("--rows", type=int, default=60000)
     ap.add_argument("--tail", type=int, default=20000)
+    ap.add_argument("--bound", type=int, default=2000,
+                    help="max_rows for the bounded catch-up loop scenario")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--duckdb", default=DUCKDB)
     ap.add_argument("--keep", action="store_true", help="keep the working directory")
@@ -191,6 +292,7 @@ def main():
                     for suffix in ("", ".wal"):
                         if os.path.exists(work + suffix):
                             os.remove(work + suffix)
+        bounded_scenario(tmp, rng, args, failures)
     finally:
         if not args.keep:
             shutil.rmtree(tmp, ignore_errors=True)

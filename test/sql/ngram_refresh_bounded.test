@@ -1,0 +1,805 @@
+# name: test/sql/ngram_refresh_bounded.test
+# description: PRAGMA ngram_refresh(table, max_rows) — bounded increments and the progress row
+# group: [sql]
+
+require ngram
+
+# A bound makes catch-up interruptible: one call indexes at most max_rows of
+# committed tail, commits that progress, and reports it, so a crash during a
+# large catch-up loses one increment instead of all of it. The loop lives in
+# the caller — one invocation is still one transaction — and it ends when the
+# reported remaining_tail reaches 0.
+
+statement ok
+CREATE TABLE docs(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO docs SELECT i, 'row ' || i || ' tent' FROM range(10) t(i);
+
+statement ok
+PRAGMA create_ngram_index('docs', 's');
+
+statement ok
+INSERT INTO docs SELECT i, 'row ' || i || ' tent tail' FROM range(10, 30) t(i);
+
+#===----------------------------------------------------------------------===#
+# the progress row: column, rows indexed, the new mark, what is left
+#===----------------------------------------------------------------------===#
+
+# positional bound. The mark was 9 and the bound is spent as a rowid span, so
+# this call covers rowids 10..13 and leaves 16 of the 20 tail rows behind.
+query IIII
+PRAGMA ngram_refresh('docs', 4);
+----
+s	4	13	16
+
+# named form of the same bound (pragma named parameters take =, not :=)
+query IIII
+PRAGMA ngram_refresh('docs', max_rows = 4);
+----
+s	4	17	12
+
+# the reported mark is the recorded mark, and the reported tail is real
+query II
+SELECT (SELECT hwm_rowid FROM ngram_main_docs.meta_s), (SELECT count(*) FROM docs WHERE rowid > 17);
+----
+17	12
+
+# exactness holds at this intermediate state: rows past the mark are simply
+# still tail, and every query scans it
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('docs', 'tail') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'tail'))
+	UNION ALL
+	(SELECT * FROM docs WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('docs', 'tail'))
+);
+----
+0
+
+# the index itself covers exactly the rows the mark claims
+query II
+SELECT count(*), max(rowid) FROM ngram_candidates('docs', 's', 'tail');
+----
+8	17
+
+#===----------------------------------------------------------------------===#
+# looping until the tail is empty
+#===----------------------------------------------------------------------===#
+
+query IIII
+PRAGMA ngram_refresh('docs', 5);
+----
+s	5	22	7
+
+query IIII
+PRAGMA ngram_refresh('docs', 5);
+----
+s	5	27	2
+
+query IIII
+PRAGMA ngram_refresh('docs', 5);
+----
+s	2	29	0
+
+# a call with nothing left to do reports the same mark and no work, which is
+# what makes "loop until remaining_tail = 0" safe to run one extra time
+query IIII
+PRAGMA ngram_refresh('docs', 5);
+----
+s	0	29	0
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('docs', 'tail') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'tail'))
+	UNION ALL
+	(SELECT * FROM docs WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('docs', 'tail'))
+);
+----
+0
+
+#===----------------------------------------------------------------------===#
+# a bound wider than the tail is one call, and behaves as the unbounded form
+#===----------------------------------------------------------------------===#
+
+statement ok
+INSERT INTO docs SELECT i, 'row ' || i || ' tent wide' FROM range(30, 40) t(i);
+
+query IIII
+PRAGMA ngram_refresh('docs', 1000000000);
+----
+s	10	39	0
+
+# the widest bound expressible is still just a bound that covers everything
+statement ok
+INSERT INTO docs SELECT i, 'row ' || i || ' tent widest' FROM range(40, 45) t(i);
+
+query IIII
+PRAGMA ngram_refresh('docs', 9223372036854775807);
+----
+s	5	44	0
+
+# the unbounded form is unchanged: it returns no rows at all
+query I
+PRAGMA ngram_refresh('docs');
+----
+
+# and the guard statements still print nothing of their own
+query I
+SELECT getvariable('__ngram_guard') IS NULL;
+----
+true
+
+#===----------------------------------------------------------------------===#
+# an increment is one transaction, whoever owns it
+#
+# The expansion is several statements plus the progress select, which the
+# preprocessor still wraps in a BEGIN/COMMIT of its own; inside a user's
+# transaction the statements simply join it, and the increment goes away with
+# a ROLLBACK exactly as the whole refresh does.
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE owned(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO owned SELECT i, 'row ' || i || ' tent' FROM range(4) t(i);
+
+statement ok
+PRAGMA create_ngram_index('owned', 's');
+
+statement ok
+INSERT INTO owned SELECT i, 'row ' || i || ' tail' FROM range(4, 12) t(i);
+
+statement ok
+BEGIN;
+
+query IIII
+PRAGMA ngram_refresh('owned', 3);
+----
+s	3	6	5
+
+query II
+SELECT hwm_rowid, (SELECT count(*) > 0 FROM ngram_candidates('owned', 's', 'tail')) FROM ngram_main_owned.meta_s;
+----
+6	true
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT hwm_rowid, (SELECT count(*) FROM ngram_candidates('owned', 's', 'tail')) FROM ngram_main_owned.meta_s;
+----
+3	0
+
+statement ok
+BEGIN;
+
+query IIII
+PRAGMA ngram_refresh('owned', 3);
+----
+s	3	6	5
+
+statement ok
+COMMIT;
+
+query II
+SELECT hwm_rowid, (SELECT count(*) FROM ngram_candidates('owned', 's', 'tail')) FROM ngram_main_owned.meta_s;
+----
+6	3
+
+#===----------------------------------------------------------------------===#
+# deletes in the tail: max_rows is approximate, the boundary and the report are
+# exact, and an increment of nothing but deleted rows still makes progress
+#===----------------------------------------------------------------------===#
+
+# the harness checkpoints after every statement, which would vacuum the deleted
+# rows away and move rowids out from under the index
+statement ok
+SET checkpoint_threshold = '1GB';
+
+statement ok
+CREATE TABLE gappy(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO gappy SELECT i, 'row ' || i || ' tent' FROM range(10) t(i);
+
+statement ok
+PRAGMA create_ngram_index('gappy', 's');
+
+statement ok
+INSERT INTO gappy SELECT i, 'row ' || i || ' tent tail' FROM range(10, 60) t(i);
+
+# rowids 10..29 are gone, so the first two increments index nothing at all —
+# but the mark still advances over them, or the loop would never end
+statement ok
+DELETE FROM gappy WHERE id >= 10 AND id < 30;
+
+query IIII
+PRAGMA ngram_refresh('gappy', 10);
+----
+s	0	19	30
+
+query IIII
+PRAGMA ngram_refresh('gappy', 10);
+----
+s	0	29	30
+
+query IIII
+PRAGMA ngram_refresh('gappy', 10);
+----
+s	10	39	20
+
+# a partly deleted increment: the span is 10 rowids, 5 of them still live
+statement ok
+DELETE FROM gappy WHERE id >= 40 AND id < 45;
+
+query IIII
+PRAGMA ngram_refresh('gappy', 10);
+----
+s	5	49	10
+
+query IIII
+PRAGMA ngram_refresh('gappy', 100);
+----
+s	10	59	0
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('gappy', 'tail') EXCEPT SELECT * FROM gappy WHERE contains(lower(s), 'tail'))
+	UNION ALL
+	(SELECT * FROM gappy WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('gappy', 'tail'))
+);
+----
+0
+
+# a tail that is entirely deleted rows: nothing to index, nothing left, and the
+# mark stays where the last committed row is (the unbounded rule)
+statement ok
+INSERT INTO gappy SELECT i, 'row ' || i || ' tent doomed' FROM range(60, 70) t(i);
+
+statement ok
+DELETE FROM gappy WHERE id >= 60;
+
+query IIII
+PRAGMA ngram_refresh('gappy', 4);
+----
+s	0	59	0
+
+#===----------------------------------------------------------------------===#
+# a loop produces the same postings as one unbounded refresh
+#
+# Same corpus, same starting mark: one table caught up in a single call, the
+# other in eleven bounded ones. The decoded postings must match exactly in both
+# directions — that is the whole contract of the bound.
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE twin_a(id INTEGER, s VARCHAR);
+
+statement ok
+CREATE TABLE twin_b(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO twin_a SELECT i, 'seed ' || i || ' tent often entered' FROM range(50) t(i);
+
+statement ok
+INSERT INTO twin_b SELECT i, 'seed ' || i || ' tent often entered' FROM range(50) t(i);
+
+statement ok
+PRAGMA create_ngram_index('twin_a', 's');
+
+statement ok
+PRAGMA create_ngram_index('twin_b', 's');
+
+statement ok
+INSERT INTO twin_a SELECT i, 'tail ' || i || ' content connection needle' FROM range(50, 1050) t(i);
+
+statement ok
+INSERT INTO twin_b SELECT i, 'tail ' || i || ' content connection needle' FROM range(50, 1050) t(i);
+
+statement ok
+DELETE FROM twin_a WHERE id % 9 = 4;
+
+statement ok
+DELETE FROM twin_b WHERE id % 9 = 4;
+
+statement ok
+PRAGMA ngram_refresh('twin_a');
+
+loop i 0 11
+
+statement ok
+PRAGMA ngram_refresh('twin_b', 100);
+
+endloop
+
+query II
+SELECT (SELECT hwm_rowid FROM ngram_main_twin_a.meta_s), (SELECT hwm_rowid FROM ngram_main_twin_b.meta_s);
+----
+1049	1049
+
+query I
+SELECT count(*) FROM (
+	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM ngram_main_twin_a.segments_s))
+	 EXCEPT
+	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM ngram_main_twin_b.segments_s)))
+	UNION ALL
+	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM ngram_main_twin_b.segments_s))
+	 EXCEPT
+	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM ngram_main_twin_a.segments_s)))
+);
+----
+0
+
+# no rowid is recorded twice, whichever way the tail was indexed
+query II
+SELECT
+	(SELECT count(*) FROM (SELECT gram, r FROM ngram_unpack_postings(
+		(SELECT gram, segment_no, postings FROM ngram_main_twin_a.segments_s)) GROUP BY ALL HAVING count(*) > 1)),
+	(SELECT count(*) FROM (SELECT gram, r FROM ngram_unpack_postings(
+		(SELECT gram, segment_no, postings FROM ngram_main_twin_b.segments_s)) GROUP BY ALL HAVING count(*) > 1));
+----
+0	0
+
+# the loop wrote one generation per call and so fragmented the keys it touched
+# twice (a bound smaller than a segment ends mid-segment); a compaction folds
+# the two indexes back into the same rows, byte for byte
+query I
+SELECT (SELECT count(*) FROM ngram_main_twin_b.segments_s) > (SELECT count(*) FROM ngram_main_twin_a.segments_s);
+----
+true
+
+statement ok
+PRAGMA ngram_compact('twin_a', purge = true);
+
+statement ok
+PRAGMA ngram_compact('twin_b', purge = true);
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_main_twin_a.segments_s EXCEPT ALL SELECT * FROM ngram_main_twin_b.segments_s)
+	UNION ALL
+	(SELECT * FROM ngram_main_twin_b.segments_s EXCEPT ALL SELECT * FROM ngram_main_twin_a.segments_s)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_main_twin_a.stats_s EXCEPT ALL SELECT * FROM ngram_main_twin_b.stats_s)
+	UNION ALL
+	(SELECT * FROM ngram_main_twin_b.stats_s EXCEPT ALL SELECT * FROM ngram_main_twin_a.stats_s)
+);
+----
+0
+
+#===----------------------------------------------------------------------===#
+# a bound wide enough to cross a segment boundary is snapped down to it
+#
+# Postings are bucketed by rowid range (segment_no = rowid >> 20), so an
+# increment that ends on a segment boundary produces each (gram, segment_no)
+# whole. That is what keeps a loop from fragmenting the index beyond what one
+# unbounded refresh would leave: below, every key above segment 0 has exactly
+# one row, and only segment 0 — which the build and the first increment share,
+# bound or no bound — holds two.
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE crossing(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO crossing SELECT i, 'row ' || i || ' tent' FROM range(100) t(i);
+
+statement ok
+PRAGMA create_ngram_index('crossing', 's');
+
+statement ok
+INSERT INTO crossing SELECT i, 'row ' || i || ' tail' FROM range(100, 1200000) t(i);
+
+# asked for 1,100,000 rows from a mark of 99: the span would have ended at
+# 1,100,099, and it is snapped back to the last rowid of segment 0
+query IIII
+PRAGMA ngram_refresh('crossing', 1100000);
+----
+s	1048476	1048575	151424
+
+query IIII
+PRAGMA ngram_refresh('crossing', 1100000);
+----
+s	151424	1199999	0
+
+query II
+SELECT
+	(SELECT count(*) FROM (SELECT gram, segment_no FROM ngram_main_crossing.segments_s
+		WHERE segment_no > 0 GROUP BY ALL HAVING count(*) > 1)),
+	(SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM ngram_main_crossing.segments_s
+		WHERE segment_no = 0 GROUP BY ALL HAVING count(*) > 1));
+----
+0	true
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('crossing', 'tail') EXCEPT SELECT * FROM crossing WHERE contains(lower(s), 'tail'))
+	UNION ALL
+	(SELECT * FROM crossing WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('crossing', 'tail'))
+);
+----
+0
+
+#===----------------------------------------------------------------------===#
+# ngram_index_stats reports the same remaining tail from outside a refresh call
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE watched(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO watched SELECT i, 'row ' || i || ' tent' FROM range(10) t(i);
+
+statement ok
+PRAGMA create_ngram_index('watched', 's');
+
+statement ok
+INSERT INTO watched SELECT i, 'row ' || i || ' tent tail' FROM range(10, 25) t(i);
+
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('watched');
+----
+s	3	true	9	24	15	35	35	0	1	80	150	NULL
+
+query IIII
+PRAGMA ngram_refresh('watched', 5);
+----
+s	5	14	10
+
+# the same tail, seen from outside the call. A pragma cannot be wrapped in a
+# subquery, so the row is pinned whole.
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('watched');
+----
+s	3	true	14	24	10	50	61	11	2	150	272	NULL
+
+#===----------------------------------------------------------------------===#
+# arguments the bound refuses
+#===----------------------------------------------------------------------===#
+
+statement error
+PRAGMA ngram_refresh('docs', 0);
+----
+max_rows must be at least 1
+
+statement error
+PRAGMA ngram_refresh('docs', -5);
+----
+max_rows must be at least 1
+
+statement error
+PRAGMA ngram_refresh('docs', max_rows = 0);
+----
+max_rows must be at least 1
+
+statement error
+PRAGMA ngram_refresh('docs', NULL);
+----
+max_rows cannot be NULL
+
+statement error
+PRAGMA ngram_refresh('docs', max_rows = NULL);
+----
+max_rows cannot be NULL
+
+statement error
+PRAGMA ngram_refresh('docs', 10, max_rows = 10);
+----
+max_rows was given twice
+
+statement error
+PRAGMA ngram_refresh('docs', 10, rows = 10);
+----
+Invalid named parameter "rows" for function ngram_refresh
+
+#===----------------------------------------------------------------------===#
+# a bound changes nothing about what refresh refuses
+#===----------------------------------------------------------------------===#
+
+statement error
+PRAGMA ngram_refresh('docs', 10, col = 'nope');
+----
+no ngram index exists on docs.nope
+
+statement ok
+CREATE TABLE reborn(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO reborn VALUES (1, 'a tent');
+
+statement ok
+PRAGMA create_ngram_index('reborn', 's');
+
+statement ok
+DROP TABLE reborn;
+
+statement ok
+CREATE TABLE reborn(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO reborn VALUES (1, 'a tent'), (2, 'another tent');
+
+statement error
+PRAGMA ngram_refresh('reborn', 1);
+----
+dropped and re-created
+
+statement error
+PRAGMA ngram_refresh('reborn');
+----
+dropped and re-created
+
+statement ok
+PRAGMA drop_ngram_index('reborn', 's');
+
+#===----------------------------------------------------------------------===#
+# two indexed columns: one progress row each, and col = bounds just that one
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE two(id INTEGER, a VARCHAR, b VARCHAR);
+
+statement ok
+INSERT INTO two VALUES (1, 'alpha tent', 'beta tent');
+
+statement ok
+PRAGMA create_ngram_index('two', 'a');
+
+statement ok
+PRAGMA create_ngram_index('two', 'b');
+
+statement ok
+INSERT INTO two SELECT i, 'alpha tail ' || i, 'beta tail ' || i FROM range(2, 12) t(i);
+
+query IIII
+PRAGMA ngram_refresh('two', max_rows = 4, col = 'b');
+----
+b	4	4	6
+
+query IIII
+PRAGMA ngram_refresh('two', 4);
+----
+a	4	4	6
+b	4	8	2
+
+#===----------------------------------------------------------------------===#
+# a bounded refresh's staleness witnesses stop at its own mark
+#
+# The index records (rowid, value hash) witnesses so that maintenance can catch
+# a checkpoint vacuum that moved rows out from under its postings. Past the
+# mark there are no postings and every query reads the row live, so a witness
+# there proves nothing and can only produce false refusals — and a bounded
+# refresh leaves a tail behind by design. Recording witnesses over the whole
+# table (which is what an unbounded refresh, ending at the table's last row,
+# amounts to) made an ordinary tail UPDATE, or a vacuumed tail DELETE, refuse
+# every later increment and demand a rebuild.
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE witnessed(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO witnessed SELECT i, 'row ' || i || ' tent' FROM range(100) t(i);
+
+statement ok
+PRAGMA create_ngram_index('witnessed', 's');
+
+statement ok
+INSERT INTO witnessed SELECT i, 'row ' || i || ' tail tent' FROM range(100, 1000) t(i);
+
+query IIII
+PRAGMA ngram_refresh('witnessed', 50);
+----
+s	50	149	850
+
+# the mark, the highest rowid witnessed, and how many witnesses there are: all
+# 32 land inside the range this call covers
+query III
+SELECT (SELECT hwm_rowid FROM ngram_main_witnessed.meta_s),
+	(SELECT max(CAST(split_part(x, ':', 1) AS BIGINT))
+		FROM (SELECT unnest(str_split(row_samples, ',')) AS x FROM ngram_main_witnessed.meta_s)),
+	(SELECT count(*) FROM (SELECT unnest(str_split(row_samples, ',')) FROM ngram_main_witnessed.meta_s));
+----
+149	149	32
+
+statement ok
+UPDATE witnessed SET s = 'mutated in the tail' WHERE rowid = 999;
+
+# nothing to report: the row is tail, the tail scan reads it live
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('witnessed');
+----
+s	3	true	149	999	850	280	341	61	2	1640	2368	NULL
+
+# and the loop keeps going
+query IIII
+PRAGMA ngram_refresh('witnessed', 50);
+----
+s	50	199	800
+
+# an in-place UPDATE below the mark is still caught: there the index does hold
+# postings, and they now describe a row that no longer exists
+statement ok
+UPDATE witnessed SET s = 'mutated below the mark' WHERE rowid = 96;
+
+statement error
+PRAGMA ngram_refresh('witnessed', 50);
+----
+row id 96 no longer holds the value the index recorded for it
+
+statement error
+PRAGMA ngram_compact('witnessed');
+----
+row id 96 no longer holds the value the index recorded for it
+
+#===----------------------------------------------------------------------===#
+# the same, for the state that reaches this by accident: a plain DELETE in the
+# tail that the next checkpoint vacuums
+#
+# The vacuum rewrites row groups and renumbers the rows above the hole. Every
+# rowid it moved is past the mark, so the index still describes its own range
+# exactly, and maintenance must carry on. Small row groups so a few thousand
+# rows span enough of them for the vacuum to actually compact.
+#===----------------------------------------------------------------------===#
+
+statement ok
+ATTACH '__TEST_DIR__/ngram_bounded_vacuum.db' AS vac (ROW_GROUP_SIZE 2048);
+
+statement ok
+CREATE TABLE vac.t(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO vac.t SELECT i, 'row ' || i || ' tent' FROM range(20000) r(i);
+
+statement ok
+PRAGMA create_ngram_index('vac.main.t', 's');
+
+statement ok
+INSERT INTO vac.t SELECT i, 'row ' || i || ' tail tent' FROM range(20000, 60000) r(i);
+
+query IIII
+PRAGMA ngram_refresh('vac.main.t', 5000);
+----
+s	5000	24999	35000
+
+statement ok
+DELETE FROM vac.t WHERE id >= 40000 AND id < 50000;
+
+statement ok
+CHECKPOINT vac;
+
+# the vacuum really did move rows: the table's last rowid dropped by the size of
+# the hole, and all of that motion is past the mark
+query III
+SELECT (SELECT max(rowid) FROM vac.t),
+	(SELECT hwm_rowid FROM vac.ngram_main_t.meta_s),
+	(SELECT max(CAST(split_part(x, ':', 1) AS BIGINT))
+		FROM (SELECT unnest(str_split(row_samples, ',')) AS x FROM vac.ngram_main_t.meta_s));
+----
+51807	24999	24999
+
+query IIII
+PRAGMA ngram_refresh('vac.main.t', 5000);
+----
+s	5000	29999	20000
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('vac.main.t', 'tail') EXCEPT SELECT * FROM vac.t WHERE contains(lower(s), 'tail'))
+	UNION ALL
+	(SELECT * FROM vac.t WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('vac.main.t', 'tail'))
+);
+----
+0
+
+statement ok
+DETACH vac;
+
+#===----------------------------------------------------------------------===#
+# an index built on an empty table starts at a mark of -1
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE from_empty(s VARCHAR);
+
+statement ok
+PRAGMA create_ngram_index('from_empty', 's');
+
+query IIII
+PRAGMA ngram_refresh('from_empty', 5);
+----
+s	0	-1	0
+
+statement ok
+INSERT INTO from_empty SELECT 'row ' || i || ' tent' FROM range(5) t(i);
+
+query IIII
+PRAGMA ngram_refresh('from_empty', 2);
+----
+s	2	1	3
+
+query IIII
+PRAGMA ngram_refresh('from_empty', 2);
+----
+s	2	3	1
+
+query IIII
+PRAGMA ngram_refresh('from_empty', 2);
+----
+s	1	4	0
+
+query I
+SELECT count(*) FROM ngram_candidates('from_empty', 's', 'tent');
+----
+5
+
+#===----------------------------------------------------------------------===#
+# a table in an attached database, named all three ways
+#===----------------------------------------------------------------------===#
+
+statement ok
+ATTACH '__TEST_DIR__/ngram_bounded_side.db' AS side;
+
+statement ok
+CREATE TABLE side.docs(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO side.docs SELECT i, 'row ' || i || ' tent' FROM range(4) t(i);
+
+statement ok
+PRAGMA create_ngram_index('side.main.docs', 's');
+
+statement ok
+INSERT INTO side.docs SELECT i, 'row ' || i || ' tail' FROM range(4, 12) t(i);
+
+query IIII
+PRAGMA ngram_refresh('side.main.docs', 3);
+----
+s	3	6	5
+
+query IIII
+PRAGMA ngram_refresh('side.main.docs', max_rows = 100);
+----
+s	5	11	0
+
+query I
+SELECT count(*) FROM ngram_search('side.main.docs', 'tail');
+----
+8
+
+#===----------------------------------------------------------------------===#
+# identifiers that need quoting, bounded
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE "my.table"(id INTEGER, "s p" VARCHAR);
+
+statement ok
+INSERT INTO "my.table" VALUES (1, 'a tent');
+
+statement ok
+PRAGMA create_ngram_index('"my.table"', 's p');
+
+statement ok
+INSERT INTO "my.table" SELECT i, 'tail tent ' || i FROM range(2, 8) t(i);
+
+query IIII
+PRAGMA ngram_refresh('"my.table"', 3);
+----
+s p	3	3	3
+
+query IIII
+PRAGMA ngram_refresh('"my.table"', max_rows = 100);
+----
+s p	3	6	0
+
+query I
+SELECT count(*) FROM ngram_candidates('"my.table"', 's p', 'tent');
+----
+7

@@ -15,10 +15,10 @@ INSERT INTO docs VALUES ('Hello world'), ('hello DUCK'), (NULL), ('connection re
 statement ok
 PRAGMA create_ngram_index('docs', 's');
 
-query IIIIIIIIIIII
+query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-s	3	true	3	3	35	35	0	1	39	109	NULL
+s	3	true	3	3	0	35	35	0	1	39	109	NULL
 
 restart
 
@@ -34,10 +34,10 @@ SELECT count(*) FROM (
 ----
 0
 
-query IIIIIIIIIIII
+query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-s	3	true	3	3	35	35	0	1	39	109	NULL
+s	3	true	3	3	0	35	35	0	1	39	109	NULL
 
 # the base table stays fully usable alongside the index
 statement ok

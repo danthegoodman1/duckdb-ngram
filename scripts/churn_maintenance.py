@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Churn harness for ngram index maintenance.
 
-Interleaves INSERT / DELETE / UPDATE / CHECKPOINT / PRAGMA ngram_refresh /
-PRAGMA ngram_compact against a live index, reopening the database between
-every step (each step runs in its own duckdb process), and verifies the
-maintenance contract after every step:
+Interleaves INSERT / DELETE / UPDATE / CHECKPOINT / PRAGMA ngram_refresh
+(bounded and unbounded) / PRAGMA ngram_compact against a live index, reopening
+the database between every step (each step runs in its own duckdb process), and
+verifies the maintenance contract after every step:
 
   I1  no false positives, ever: ngram_search results are a subset of the
       brute-force answer in every state, however stale the index is. A
@@ -27,13 +27,16 @@ The corpus is created with a small row-group size so that a few thousand rows
 span many row groups: that is what makes deletes trigger real vacuum merges,
 and what gives the row-group and column-storage detectors something to see.
 
---no-stale-expected turns the harness into a false-alarm gate instead: it
-drops the operations that legitimately invalidate an index (deletes, which the
-next checkpoint vacuums, and in-place updates) and then FAILS on any detector
-verdict at all — a refusal, a query error, or a stale_reason in the stats
-pragma. Appending, refreshing and compacting must never make a detector fire,
-and the ordinary mode cannot notice if they start to, because it treats every
-verdict as legitimate and rebuilds.
+--no-stale-expected turns the harness into a false-alarm gate instead. It drops
+the operations that legitimately invalidate an index — deletes, which the next
+checkpoint vacuums out from under the index's postings once refresh has carried
+the mark past them, and in-place updates below the mark — but keeps an in-place
+update confined to rows past the mark, which cannot invalidate anything. Then
+it FAILS on any detector verdict at all: a refusal, a query error, or a
+stale_reason in the stats pragma. Appending, refreshing, compacting, and
+mutating rows the index does not cover must never make a detector fire, and the
+ordinary mode cannot notice if they start to, because it treats every verdict
+as legitimate and rebuilds.
 
 Usage: python3 scripts/churn_maintenance.py [--rounds N] [--rows N] [--seed S]
                                             [--duckdb PATH] [--no-stale-expected]
@@ -161,6 +164,27 @@ class Churn:
             # closes the database), and an in-place update is unrepairable:
             # both legitimately invalidate the index
             ops += ["delete", "update"]
+        else:
+            # An in-place UPDATE confined to rows past the high-water mark.
+            # Those rows are not indexed — every query reads them by scanning —
+            # and v1.5.5 updates in place (verified: row count, max rowid and
+            # the updated row's own rowid are unchanged across the update and
+            # the checkpoint after it), so this leaves no gap for a vacuum to
+            # close and cannot invalidate anything. Any detector verdict after
+            # it is a false alarm. Without it, strict mode drops mutation
+            # entirely and structurally cannot reach the state where a false
+            # alarm lives, which is how a bounded refresh recording witnesses
+            # over tail rows got past this harness once already.
+            #
+            # A tail-confined DELETE is deliberately NOT here: refresh advances
+            # the mark over deleted rowids on purpose (otherwise an increment of
+            # nothing but deleted rows would stall a bounded loop), so the gap
+            # ends up below the mark, and the next checkpoint's vacuum then
+            # shifts indexed rows down out from under the index's postings.
+            # That is genuine staleness — the documented "rebuild after a
+            # checkpoint has vacuumed deleted rows" case — and it belongs in the
+            # ordinary mode, where it already is.
+            ops += ["tail_update"]
         op = self.rng.choice(sorted(ops))
         self.ops[op] = self.ops.get(op, 0) + 1
         if op == "insert":
@@ -175,11 +199,32 @@ class Churn:
             self.db.run("UPDATE corpus SET s = s || ' %s' WHERE id %% %d = %d;"
                         % (MARKER, modulus, self.rng.randrange(modulus)))
             self.updated_in_place = True
+        elif op == "tail_update":
+            modulus = self.rng.randint(7, 23)
+            self.db.run("UPDATE corpus SET s = s || ' %s' "
+                        "WHERE rowid > (SELECT hwm_rowid FROM ngram_main_corpus.meta_s) AND id %% %d = %d;"
+                        % (MARKER, modulus, self.rng.randrange(modulus)))
         elif op == "checkpoint":
             self.db.run("CHECKPOINT;")
         elif op == "refresh":
-            if self.rng.random() < 0.3:
+            roll = self.rng.random()
+            if roll < 0.25:
                 self.maintenance("PRAGMA ngram_refresh('corpus', col = 's');")
+            elif roll < 0.65:
+                # A bounded refresh, deliberately stopped part-way: one to three
+                # increments of a bound too small to swallow the tail. The
+                # invariants do not move — rows past the mark are tail, and the
+                # tail scan is what makes a half-caught-up index exact — so an
+                # interrupted catch-up is exactly as answerable as a finished
+                # one, which is the claim worth churning.
+                bound = self.rng.choice([1, 3, 17, 200])
+                calls = self.rng.randint(1, 3)
+                named = self.rng.random() < 0.5
+                for _ in range(calls):
+                    if named:
+                        self.maintenance("PRAGMA ngram_refresh('corpus', max_rows = %d);" % bound)
+                    else:
+                        self.maintenance("PRAGMA ngram_refresh('corpus', %d);" % bound)
             else:
                 self.maintenance("PRAGMA ngram_refresh('corpus');")
         elif op == "compact":
@@ -198,9 +243,9 @@ class Churn:
             return False
         stale = []
         for row in csv.reader(out.splitlines()):
-            if len(row) == 12 and row[11] not in ("", "NULL"):
-                stale.append(row[11])
-                self.reasons[row[11][:60]] = self.reasons.get(row[11][:60], 0) + 1
+            if len(row) == 13 and row[12] not in ("", "NULL"):
+                stale.append(row[12])
+                self.reasons[row[12][:60]] = self.reasons.get(row[12][:60], 0) + 1
         if stale:
             if self.strict:
                 self.failures.append("false alarm: ngram_index_stats reports %r on an index nothing invalidated"

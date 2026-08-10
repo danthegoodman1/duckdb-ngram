@@ -185,6 +185,40 @@ recommendation, but for a different and smaller reason — a monolithic build
 must hold its packed output before writing it, so its temp-space needs scale
 with the index rather than with a chunk of it.
 
+### Bounded catch-up after a burst (Phase 8)
+
+`PRAGMA ngram_refresh(t, max_rows)` splits a catch-up into committed steps. What
+that costs, measured on a 1 GB indexed base with ten more enwik9 replicas
+appended and never refreshed — 120,124,653 rows / 10.89 GB of text, a **9.90 GB
+tail of 109,204,230 rows** — caught up twice from the same starting state:
+
+| Catch-up | Calls | Wall | Exposed to a crash |
+| --- | --- | --- | --- |
+| One unbounded `ngram_refresh` | 1 | 93.9 s | the whole 93.9 s |
+| Loop at `max_rows` = tail/10 | 11 | **88.6 s** (8.3–8.9 s each, last 3.7 s) | **one ~8.5 s increment** |
+
+Bounding is free: eleven transactions total slightly less than the one they
+replace. The mark moved exactly ten 2²⁰-rowid segments per call (20,971,519 →
+31,457,279 → …), because a bound is snapped down to a segment boundary — the
+first call spent 10,051,097 of its 10,920,423-row bound to land on one, every
+later call spent 10,485,760.
+
+The two indexes are the same index:
+
+| | Unbounded | Bounded loop |
+| --- | --- | --- |
+| High-water mark | 120,124,652 | 120,124,652 |
+| Segment rows | 27,495,963 | 27,495,963 |
+| Segment rows differing (ignoring `generation`) | **0** | **0** |
+| Postings / postings bytes | 7,967,815,476 / 10,048,422,528 | identical |
+| Per-gram stats sums differing | **0** | **0** |
+| Candidates for a spot-checked needle | 13,652 | 13,652 |
+
+The one difference is the stats table's shape before compaction: the loop
+appended eleven delta generations, 8,965,994 rows against 2,468,943, summing to
+the same per-gram values the probe reads. `ngram_compact` folds those back to
+one row per gram, as it does for any sequence of refreshes.
+
 ### Why the sort had to go
 
 The Phase 6 baseline was not spill-bound, which is what made the obvious fix

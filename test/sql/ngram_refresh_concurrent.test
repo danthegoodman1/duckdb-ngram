@@ -1,0 +1,176 @@
+# name: test/sql/ngram_refresh_concurrent.test
+# description: bounded refresh racing concurrent writers — nothing the mark covers is ever unindexed
+# group: [sql]
+
+require ngram
+
+load __TEST_DIR__/ngram_refresh_concurrent.db
+
+# A bounded refresh records a mark it did not read a row for: it stops at the
+# rowid the bound picked, not at the last row it saw. That is only sound if no
+# rowid at or below that mark can still belong to an append this transaction
+# cannot see — a row committing later at a covered rowid would be indexed by
+# nobody, since every future refresh starts above the mark.
+#
+# It is sound because rowids are handed out to a transaction's rows while it
+# commits, under the table's append lock (DataTable::AppendLock in
+# src/storage/data_table.cpp takes row_start from the table's current row
+# count), reached through LocalStorage::Commit -> LocalStorage::Flush. On a
+# database with a WAL that happens inside DuckTransaction::WriteToWAL, which
+# DuckTransactionManager::CommitTransaction calls with the transaction lock
+# released and the WAL lock held; the commit id is taken after it returns,
+# inside that same WAL-lock critical section. Without a WAL (in-memory, or
+# NO_WAL_WRITES) the allocation happens in DuckTransaction::Commit instead,
+# under the transaction lock that already covers the commit id. Either way one
+# lock serializes both events, and ShouldWriteToWAL is per-database so the two
+# regimes never mix. Commit-id order and rowid
+# order are one order, so seeing any row past the bound proves every rowid
+# below it belongs to a transaction that committed before this one started.
+# The generated UPDATE only advances the mark to the bound when it can see such
+# a row, and falls back to the highest rowid it actually indexed otherwise.
+#
+# This file pins the observable half of that argument: whatever a concurrent
+# writer is doing, a row that the mark covers is a row the index holds.
+
+statement ok
+CREATE TABLE conc(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO conc SELECT i, 'row ' || i || ' tent' FROM range(20) t(i);
+
+statement ok
+PRAGMA create_ngram_index('conc', 's');
+
+#===----------------------------------------------------------------------===#
+# an uncommitted append cannot be buried by a bound that reaches past it
+#===----------------------------------------------------------------------===#
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO conc SELECT i, 'row ' || i || ' tent held' FROM range(20, 40) t(i);
+
+# con1's rows hold transaction-local rowids until it commits, and the bound is
+# far wider than the committed table, so this call has nothing to do and leaves
+# the mark on the last committed row
+query IIII con2
+PRAGMA ngram_refresh('conc', 1000000);
+----
+s	0	19	0
+
+statement ok con1
+COMMIT;
+
+# the rows arrive past the mark, where the tail scan finds them
+query I
+SELECT count(*) FROM conc WHERE contains(lower(s), 'held');
+----
+20
+
+query I
+SELECT count(*) FROM ngram_search('conc', 'held');
+----
+20
+
+# and the next bounded call indexes them rather than skipping them
+query IIII
+PRAGMA ngram_refresh('conc', 1000000);
+----
+s	20	39	0
+
+query I
+SELECT count(*) FROM ngram_candidates('conc', 's', 'held');
+----
+20
+
+#===----------------------------------------------------------------------===#
+# bounded refreshes racing appends from several connections
+#
+# Every thread appends and then tries to catch the index up with a bound. Two
+# refreshes that overlap are not both allowed to commit — the meta guard fails
+# the second one, or the engine reports the write conflict — and either way the
+# invariant below has to hold at the end: nothing the mark covers is missing
+# from the index.
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE race(id BIGINT, s VARCHAR);
+
+statement ok
+INSERT INTO race SELECT i, 'seed ' || i || ' tent' FROM range(500) t(i);
+
+statement ok
+PRAGMA create_ngram_index('race', 's');
+
+concurrentloop c 0 4
+
+loop i 0 6
+
+statement ok
+INSERT INTO race
+SELECT 1000000 + ${c} * 100000 + ${i} * 1000 + j,
+	CASE WHEN j % 3 = 0 THEN 'racing tent ' || j ELSE 'other text ' || j END
+FROM range(200) r(j);
+
+statement maybe
+PRAGMA ngram_refresh('race', 137);
+----
+<REGEX>:[\s\S]*(changed while the statement was being prepared|onflict)[\s\S]*
+
+endloop
+
+endloop
+
+# the state reached here is genuinely mid-catch-up, whatever the interleaving:
+# 24 calls of at most 137 rowids each cannot cover the 4,800 rows the threads
+# appended, so the mark is behind the table and ahead of where it started
+query I
+SELECT hwm_rowid > 499 AND hwm_rowid < (SELECT max(rowid) FROM race) FROM ngram_main_race.meta_s;
+----
+true
+
+# the invariant the mark exists for: every committed row the index claims to
+# cover and that matches the needle is a candidate the index produced
+query I
+SELECT count(*) FROM (
+	SELECT rowid FROM race
+	WHERE rowid <= (SELECT hwm_rowid FROM ngram_main_race.meta_s) AND contains(lower(s), 'tent')
+	EXCEPT
+	SELECT rowid FROM ngram_candidates('race', 's', 'tent')
+);
+----
+0
+
+# and the tail scan covers the rest, so results are exact mid-catch-up
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('race', 'tent') EXCEPT SELECT * FROM race WHERE contains(lower(s), 'tent'))
+	UNION ALL
+	(SELECT * FROM race WHERE contains(lower(s), 'tent') EXCEPT SELECT * FROM ngram_search('race', 'tent'))
+);
+----
+0
+
+# finish the catch-up; the same two checks must still hold
+statement ok
+PRAGMA ngram_refresh('race');
+
+query II
+SELECT
+	(SELECT count(*) FROM (
+		SELECT rowid FROM race
+		WHERE rowid <= (SELECT hwm_rowid FROM ngram_main_race.meta_s) AND contains(lower(s), 'tent')
+		EXCEPT
+		SELECT rowid FROM ngram_candidates('race', 's', 'tent'))),
+	(SELECT count(*) FROM (
+		(SELECT * FROM ngram_search('race', 'tent') EXCEPT SELECT * FROM race WHERE contains(lower(s), 'tent'))
+		UNION ALL
+		(SELECT * FROM race WHERE contains(lower(s), 'tent') EXCEPT SELECT * FROM ngram_search('race', 'tent'))));
+----
+0	0
+
+query I
+SELECT hwm_rowid = (SELECT max(rowid) FROM race) FROM ngram_main_race.meta_s;
+----
+true

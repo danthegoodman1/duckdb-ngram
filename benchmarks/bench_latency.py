@@ -191,7 +191,11 @@ def main():
 
         if args.cold:
             cold = {}
-            for variant in ("transparent_index", "transparent_scan"):
+            # probe_only and explicit_search are measured cold as well as the
+            # two transparent variants: when a cold query misses the target, the
+            # answer to "what is the floor made of" is the split between reading
+            # posting blobs (probe) and fetching the rows they point at.
+            for variant in ("transparent_index", "transparent_scan", "explicit_search", "probe_only"):
                 sql, variant_settings = variants[variant]
                 samples = []
                 for _ in range(args.cold_repeats):

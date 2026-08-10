@@ -47,9 +47,128 @@ true
 statement ok
 PRAGMA drop_ngram_index('big', 's');
 
-# memory-limited build smoke: the sort spills but keeps a per-thread memory
-# floor, so cap threads along with memory (each test file runs in its own
-# database, but RESET below restores this connection for later blocks)
+#===----------------------------------------------------------------------===#
+# Partitioning changes nothing about the index
+#
+# The build feeds the packing aggregate one rowid-range partition at a time so
+# its states fit the memory limit. Partitions are cut on segment boundaries, so
+# every (gram, segment_no) is grouped inside exactly one of them and the
+# segment rows must come out identical however many there are — and identical
+# on one thread, which is the crash-harness and CI-runner configuration.
+#===----------------------------------------------------------------------===#
+
+# 3 * 2^20 rows: three segments, so a partition count above one has real
+# boundaries to cut on
+statement ok
+CREATE TABLE parts AS SELECT i::VARCHAR AS s FROM range(3145728) t(i);
+
+statement ok
+SET ngram_build_partitions = 1;
+
+statement ok
+PRAGMA create_ngram_index('parts', 's');
+
+statement ok
+CREATE TABLE snapshot_one AS SELECT * FROM ngram_main_parts.segments_s;
+
+query I
+SELECT count(DISTINCT segment_no) FROM snapshot_one;
+----
+3
+
+statement ok
+PRAGMA drop_ngram_index('parts', 's');
+
+statement ok
+SET ngram_build_partitions = 3;
+
+statement ok
+PRAGMA create_ngram_index('parts', 's');
+
+statement ok
+CREATE TABLE snapshot_three AS SELECT * FROM ngram_main_parts.segments_s;
+
+# every column of every segment row, both directions: three partitions produce
+# the same bytes as one
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM snapshot_one EXCEPT SELECT * FROM snapshot_three)
+	UNION ALL
+	(SELECT * FROM snapshot_three EXCEPT SELECT * FROM snapshot_one));
+----
+0
+
+# one row per key, not one per partition
+query I
+SELECT count(*) = count(DISTINCT (gram, segment_no)) FROM snapshot_three;
+----
+true
+
+# the segments table is written in gram order whatever the partitioning: that
+# is what lets the probe's `gram = ?` filter skip row groups by zone map
+query I
+SELECT count(*) FROM (
+	SELECT gram < lag(gram) OVER (ORDER BY rowid) AS out_of_order FROM ngram_main_parts.segments_s)
+WHERE out_of_order;
+----
+0
+
+statement ok
+PRAGMA drop_ngram_index('parts', 's');
+
+statement ok
+SET threads = 1;
+
+statement ok
+PRAGMA create_ngram_index('parts', 's');
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM snapshot_one EXCEPT SELECT * FROM ngram_main_parts.segments_s)
+	UNION ALL
+	(SELECT * FROM ngram_main_parts.segments_s EXCEPT SELECT * FROM snapshot_one));
+----
+0
+
+statement ok
+RESET threads
+
+statement ok
+RESET ngram_build_partitions
+
+statement ok
+PRAGMA drop_ngram_index('parts', 's')
+
+statement ok
+DROP TABLE parts
+
+statement ok
+DROP TABLE snapshot_one
+
+statement ok
+DROP TABLE snapshot_three
+
+# a negative partition count is refused rather than silently treated as auto
+statement ok
+CREATE TABLE neg AS SELECT 'abc' AS s
+
+statement ok
+SET ngram_build_partitions = -1
+
+statement error
+PRAGMA create_ngram_index('neg', 's');
+----
+cannot be negative
+
+statement ok
+RESET ngram_build_partitions
+
+statement ok
+DROP TABLE neg
+
+# memory-limited build smoke: cap threads along with memory (each test file
+# runs in its own database, but RESET below restores this connection for later
+# blocks)
 statement ok
 SET threads = 4;
 

@@ -121,48 +121,252 @@ real space. **Decision: `SEGMENT_SHIFT` stays at 20.**
 
 ## 2. Scale
 
-### Why the corpus is built incrementally
-
-A monolithic build sorts every (gram, rowid) pair at once. Measured here, that
-cost is strongly superlinear in the chunk size, because past a certain point
-the external sort needs several merge passes:
-
-| Chunk indexed in one statement | Wall | Peak RSS | Spill | Per replica |
-| --- | --- | --- | --- | --- |
-| 1 replica (0.92 GiB text) | 208 s | 48.3 GB | 24.3 GB | 208 s |
-| 5 replicas (4.61 GiB text) | 3058 s | 54.1 GB | 278.4 GB | 612 s |
-
-Five times the data costs fifteen times the time and eleven times the scratch.
-Extrapolating the 5-replica point to 100 GB gives ~3.4 TB of spill — more than
-the machine has — while the 1-replica point gives 24 GB of spill per step at a
-flat 208 s. The 100 GB corpus below is therefore built in 100 single-replica
-steps: one `create_ngram_index` and 99 `ngram_refresh` calls.
-
-That is not a benchmark artifact; it is the advice in the README, and it is
-also a real-workload exercise of Phase 5's refresh path.
-
 ### Build and refresh cost
 
-| Corpus | Step | Wall | Peak RSS | Spill |
-| --- | --- | --- | --- | --- |
-| 1 GB | `create_ngram_index`, 1 replica | 208.2 s | 48.3 GB | 24.3 GB |
-| 10 GB | `create_ngram_index`, 5 replicas | 3058.4 s | 54.1 GB | 278.4 GB |
-| 10 GB | `ngram_refresh`, 5-replica tail | 3062.4 s | 57.8 GB | 282.7 GB |
-| 10 GB | `ngram_compact` | 15.8 s | 20.0 GB | 0 |
-| 100 GB | `create_ngram_index`, 1 replica | 208.0 s | 48.1 GB | 24.9 GB |
-| 100 GB | 99 × `ngram_refresh`, 1-replica tail | median **210.3 s** (min 206.7, max 267.7) | median 51.2 GB | median 26.5 GB |
-| 100 GB | 100 steps, total | 21,436 s = **5.95 h** | 52.4 GB peak | 27.4 GB peak |
-| 100 GB | `ngram_compact` | 9433.5 s = 2 h 37 m | 53.3 GB | 311.6 GB |
+The build, refresh and compact pipelines all turn a stream of
+`(gram, segment_no, rowid)` pairs into one segment row per `(gram, segment_no)`.
+Through Phase 6 they did it by sorting the whole stream — `ORDER BY gram,
+segment_no` feeding a streaming packer that emitted a row per run. Phase 7
+replaced that with a grouped aggregate, `ngram_pack_segment` under `GROUP BY
+gram, segment_no`, fed one segment-aligned rowid-range partition at a time.
+Postings come out byte-identical (see [Identity](#identity-old-pipeline-vs-new));
+nothing else about it is the same:
 
-**Refresh cost tracks the tail, not the table** — and it does so over two
-orders of magnitude of index size. The first five refreshes into a nearly
-empty index took 208.0, 208.4, 209.2, 210.1, 208.6 s; the last five, folding
-the same 0.92 GiB into an index already covering 91 GiB, took 211.1, 208.7,
-208.3, 207.6, 210.8 s. No drift, and spill stayed between 24.6 and 27.4 GB
-throughout. The 10 GB pair says the same thing at a coarser grain: folding 5
-replicas into an index that already covered 5 cost 3062 s, within 0.2 % of the
-3058 s the same 5 replicas cost as an initial build on an empty table. Loading
-the rows themselves is negligible either way (0.7–1.3 s per replica).
+| Corpus | Step | Before | After | |
+| --- | --- | --- | --- | --- |
+| 1 GB | `create_ngram_index`, 1 replica | 206.2 s / 50.3 GB RSS / 25.2 GB spill | **8.1 s** / 15.9 GB / **0** | **25×** |
+| 10 GB | `create_ngram_index`, 5 replicas | 3058.4 s / 54.1 GB / 278.4 GB | **38.7 s** / 31.8 GB / **0** | **79×** |
+| 10 GB | `ngram_refresh`, 5-replica tail | 3062.4 s / 57.8 GB / 282.7 GB | **49.0 s** / 31.9 GB / **0** | **62×** |
+| 10 GB | `ngram_refresh`, 1-replica tail | 210.3 s median | **8.9 s** median | **24×** |
+| 10 GB | `ngram_compact` | 15.8 s / 20.0 GB | **8.9 s** / 17.9 GB | 1.8× |
+| 10 GB | `ngram_compact(purge = true)` | 3599.6 s / 310.9 GB spill | **413.4 s** / **0** | **8.7×** |
+| 10 GB | monolithic build, `memory_limit='32GB'` | 6540 s / ~600 GB spill | **97.8 s** / **0** | **67×** |
+| 100 GB | `create_ngram_index`, 1 replica | 208.0 s / 48.1 GB / 24.9 GB | **8.4 s** / 15.5 GB / **0** | **25×** |
+| 100 GB | 99 × `ngram_refresh`, 1-replica tail | median 210.3 s (206.7–267.7) | median **9.3 s** (8.7–15.6) | **23×** |
+| 100 GB | 100 index steps, total | 21,436 s = **5.95 h** | **945 s = 15.8 min** / **0** | **23×** |
+| 100 GB | `ngram_compact` | 9433.5 s = 2 h 37 m / 311.6 GB spill | **584.5 s = 9.7 min** / **0** | **16×** |
+
+Every "before" figure is the Phase 6 ledger's, produced by this same harness at
+the same settings, except the 1 GB one, which was re-measured on the
+pre-Phase-7 tree to confirm the comparison is like-for-like: 206.2 s against
+the 208.2 s Phase 6 recorded.
+
+**The 100 GB corpus was rebuilt from the recorded seeds under the identical
+protocol** (`--replicas 100 --chunk 1 --compact --verify 3 --stats-every 10`),
+and it is the same index: 72,434,741,725 postings, 248,445,026 segment rows,
+4,509,928 distinct grams, 85.25 GiB of blobs — every figure equal to Phase 6's.
+Spot verification at that scale is exact too, 276,151,351 decoded rowids for
+`␠␠␠` against the same count from a brute-force scan. Indexing and compacting
+92 GiB of text went from **8.6 hours to 25 minutes**, with peak RSS 47.5 GB and
+**not one byte of spill** against Phase 6's 27.4 GB per chunk and 311.6 GB for
+the compaction.
+
+Refresh is flat across two orders of magnitude of index size: the first five
+1-replica refreshes into a nearly empty index took 8.98, 8.73, 8.97, 8.75 and
+9.06 s, and the last five, folding the same 0.92 GiB into an index already
+covering 91 GiB, took 9.69, 9.53, 9.80, 9.92 and 9.78 s. The p95 over all 99 is
+10.6 s.
+
+**Refresh still tracks the tail, not the table.** Ten consecutive 0.92 GiB
+chunks folded into an index growing from empty to 8.3 GiB took 8.3, 8.8, 8.5,
+8.9, 10.1, 10.2, 8.5, 8.8, 9.0 and 9.0 s — the same flatness Phase 6 measured
+over two orders of magnitude, at a twenty-fourth of the cost.
+
+**Nothing spills any more.** Not the 1 GB build, not the 10 GB build, not the
+monolithic 10 GB build at a 32 GB memory limit that previously wrote ~600 GB of
+scratch. The sort was the only thing that spilled, and there is no sort.
+
+**A monolithic build is no longer superlinear.** Phase 6 measured 5 replicas in
+one statement at 15× the cost of one replica and 11× the scratch, which is why
+the 100 GB corpus was built in 100 single-replica steps. That penalty came from
+the external sort's extra merge passes and is gone: the whole 10 GB corpus now
+indexes in one statement in 78 s. Building incrementally is still the
+recommendation, but for a different and smaller reason — a monolithic build
+must hold its packed output before writing it, so its temp-space needs scale
+with the index rather than with a chunk of it.
+
+### Why the sort had to go
+
+The Phase 6 baseline was not spill-bound, which is what made the obvious fix
+the wrong one. Measured on the 1 GB corpus at `threads=24`:
+
+| Stage of the old pipeline | Wall | CPU | Threads busy |
+| --- | --- | --- | --- |
+| Materialize 966,229,188 pairs into a temp table | 2.98 s | 49.5 s | 16.6 |
+| Sort them and pack the sorted stream | 118.91 s | 686.8 s | 5.8 |
+
+Operator CPU inside the second statement: `ORDER_BY` 616.6 s, the packer 34.4 s,
+the scan 34.2 s, the table sink 1.6 s. **The packer was 5 % of the cost and the
+sort was 90 %**, and the sort could not be made to use the machine. A thread
+ladder over one eighth of the pair stream shows where each stage stops scaling:
+
+| Threads | Extract only | Extract + sort | Extract + sort + pack |
+| --- | --- | --- | --- |
+| 1 | 23.5 s | 34.2 s | 54.3 s |
+| 2 | 11.5 s | 18.4 s | 36.0 s |
+| 4 | 6.0 s | 10.9 s | 25.8 s |
+| 8 | 3.1 s | 7.1 s | 20.9 s |
+| 16 | 1.8 s | 5.5 s | 19.2 s |
+| 24 | **1.6 s (14.7×)** | 5.3 s (6.5×) | **18.6 s (2.9×)** |
+
+Extraction scales almost perfectly; the packing pipeline is flat past eight
+threads. Two candidate fixes were measured and rejected before the grouped
+aggregate:
+
+- **Partitioning the sort.** Splitting the stream into eight gram-hash
+  partitions and sorting each independently removed **100 % of the spill**
+  (22.5 GB → 0, peak RSS 53.0 → 9.5 GB) and was byte-identical — and ran
+  **slower**, 149.3 s against 121.9 s, because per-row throughput never moved
+  (8.1M → 6.5M pairs/s) and each partition re-read the corpus. Spill was not
+  the bottleneck.
+- **A cheaper sort key.** Sorting the same 966M rows on a fixed-width 64-bit
+  key instead of the VARCHAR gram costs 17.4 s against 31.7 s (no sort at all:
+  1.2 s). Dictionary-encoding the gram could therefore save ~14 s of a 206 s
+  pragma — real, and nowhere near enough.
+
+The grouped aggregate runs the same work on DuckDB's radix-partitioned hash
+aggregate and reaches **2111 % CPU**: 7.0 s for what the sort did in 118.9 s.
+
+**One more thing the old shape was hiding.** A pragma expansion runs inside a
+single transaction (the statement preprocessor wraps it), and the old pipeline
+was much slower there than in autocommit — 126.2 s → 205.9 s, which is the
+entire gap between hand-run SQL and the 206.2 s pragma. The new shape does not
+care: 7.6 s → 8.3 s. Every figure in the table above is pragma-to-pragma.
+
+### Partitions: why rowid ranges, not gram hashes
+
+Aggregate states cannot spill, so the pair stream is fed to the aggregate one
+partition at a time and each partition's states are sized against
+`memory_limit`. Any partitioning that keeps a whole `(gram, segment_no)` inside
+one partition gives byte-identical output; the choice is about what each
+partition has to read. Because `segment_no = rowid >> SEGMENT_SHIFT`, a rowid
+range aligned to that boundary holds every rowid of every key it touches — and
+unlike a gram hash, it prunes row groups by zone map, so the corpus is read once
+in total rather than once per partition:
+
+| Partitions | Rowid ranges | Gram hash |
+| --- | --- | --- |
+| 1 | 7.0 s / 26.4 GB RSS | — |
+| 2 | — | 8.0 s / 11.3 GB |
+| 4 | **6.9 s** / 9.3 GB | 10.8 s / 6.6 GB |
+| 8 | **7.2 s** / 7.3 GB | 17.1 s / 5.6 GB |
+| 16 | **8.6 s** / 7.8 GB | — |
+
+Gram-hash cost grows linearly in the partition count; rowid ranges are nearly
+flat. The difference matters most at small memory limits, which is exactly
+where the partition count gets large.
+
+The count is chosen from `memory_limit` and an estimate of the pair stream's
+size (a 512-row sample of the range being indexed, using byte lengths and
+counting deleted rows, so it errs high), budgeting 32 bytes per pair against
+half the limit. `SET ngram_build_partitions = N` overrides it.
+
+### The memory limit
+
+Phase 2 left open whether a 10 GB monolithic build could run under a tight
+limit; it OOMed at 8 GB and needed 109 minutes at 32 GB. Re-measured, one
+`create_ngram_index` over the whole 9.22 GiB corpus:
+
+| `memory_limit` | Wall | Peak RSS | Result |
+| --- | --- | --- | --- |
+| 48 GB | 78.0 s | 47.0 GB | ok |
+| 32 GB | 97.8 s | 31.7 GB | ok |
+| 16 GB | 91.2 s | 18.3 GB | ok |
+| 8 GB | 136.6 s | 10.2 GB | **ok** |
+| 4 GB | — | 7.7 GB | out of memory after 121.2 s |
+| 2 GB | — | 2.8 GB | out of memory after 1.1 s |
+
+Every successful rung produced the identical index: 24,914,936 segment rows,
+7,243,473,657 postings, 9,134,609,210 blob bytes, same digest. **The 8 GB build
+that Phase 2 could not complete now takes 136.6 s.** Below that the floor is
+structural rather than incidental: one segment is 2²⁰ rowids and cannot be
+split further, so ~92 MB of text (~92 M pairs, ~3 GB of aggregate state) is the
+smallest unit the packer can group. Failure is clean — an `Out of Memory Error`
+rolls the pragma's transaction back, and the reopened database has no shadow
+schema and an intact base table.
+
+### Identity: old pipeline vs new
+
+Postings are compared, not summarised. The pre-Phase-7 binary was rebuilt from
+the same tree and run through the whole maintenance sequence on the same corpus
+as the new one; every column of every segment row was then compared in both
+directions, `generation` included.
+
+| Stage | Rows (old / new) | Mismatched rows |
+| --- | --- | --- |
+| `create_ngram_index` | 657,843 / 657,843 | **0** |
+| `ngram_refresh` (tail crossing a segment boundary mid-segment) | 1,001,250 / 1,001,250 | **0** |
+| `ngram_compact` (65,303 fragmented keys merged) | 935,947 / 935,947 | **0** |
+| `ngram_compact(purge = true)` after deleting 1 row in 17 | 912,324 / 912,324 | **0** |
+| `stats` table, final | — | **0** |
+
+The refresh boundary is deliberately not segment-aligned: with an aligned one the
+tail lands in fresh segments, nothing shares a key, and the compaction stage
+proves nothing. Here compaction had 65,303 genuinely fragmented keys to merge.
+
+Two more identity checks at the 10 GB scale:
+
+- The 1 GB index built by the old pipeline and by the new one differ in **0**
+  rows out of 2,549,366 across `postings`, `rowid_count`, `min_rowid`,
+  `max_rowid` and `generation`, and their stats tables are equal.
+- **A chunked build equals a monolithic one.** The 10 GB index produced by
+  `create_ngram_index` + `ngram_refresh` + `ngram_compact(purge = true)` over
+  two 5-replica chunks and the one produced by a single `create_ngram_index`
+  over the whole corpus are the same 24,914,936 rows with **0** mismatches.
+  Refresh and compaction are not approximations of a build; they reproduce it.
+
+### The probe is unchanged
+
+Partitioned grouping emits rows in rowid order, and the segments table's
+physical gram order is what lets the probe's `gram = ?` filter skip row groups
+by zone map — so every write into it is explicitly `ORDER BY gram, segment_no`.
+Measured on the two 1 GB indexes above, built by the two pipelines and queried
+back to back:
+
+| Needle class | Variant | Old-pipeline index | New-pipeline index |
+| --- | --- | --- | --- |
+| rare | probe only | 0.027 s | 0.026 s |
+| rare | `ngram_search` | 0.027 s | 0.026 s |
+| moderate | probe only | 0.023 s | 0.022 s |
+| moderate | `ngram_search` | 0.033 s | 0.030 s |
+| dense | probe only | 0.071 s | 0.070 s |
+| dense | `ngram_search` | 0.272 s | 0.274 s |
+
+Identical within noise, candidate sets identical, neither table has a single
+row whose gram precedes its predecessor's, and the new index occupies slightly
+fewer row groups (21 against 23).
+
+At 10 GB, against Phase 6's recorded numbers for an index built identically
+(`--replicas 10 --chunk 5 --compact`), two passes over the same database:
+
+| Needle class | Variant | Phase 6 | Phase 7 pass a | Phase 7 pass b |
+| --- | --- | --- | --- | --- |
+| rare | probe only | 0.050 s | 0.049 s | 0.049 s |
+| rare | `ngram_search` | 0.058 s | 0.058 s | 0.057 s |
+| moderate | probe only | 0.056 s | 0.054 s | 0.055 s |
+| moderate | `ngram_search` | 0.128 s | 0.131 s | 0.128 s |
+| dense | probe only | 0.746 s | 0.766 s | 0.758 s |
+| dense | `ngram_search` | 2.600 s | 2.897 s | 2.864 s |
+| dense | brute-force scan | 0.836 s | — | 0.846 s |
+
+**The probe matches; the dense fetch path reads 10 % high and is not explained
+by anything in this change.** Probe-only — the part gram-clustering governs —
+is within 3 % at every class, and the brute-force scans it races are within
+1 %. The dense `ngram_search` figure, which is probe plus fetching and
+rechecking 6.8 million individual rows, comes in at 2.86–2.90 s against 2.60 s,
+consistently across both passes. Nothing in the build change touches fetch, the
+candidate sets are identical, and the controlled comparison — the two 1 GB
+indexes above, built by the two pipelines and queried back to back in one
+session — shows parity on that same path (0.272 s vs 0.274 s). The most likely
+cause is buffer-pool state for 6.8 million scattered row fetches differing
+between sessions. Recorded rather than explained away.
+
+**Read the first measurement of a large index with suspicion.** A pass taken
+before these two — after a memory-limit ladder and a sanitizer build had
+churned the page cache — reported 0.058 / 0.074 / 1.386 s for the three probe
+classes, up to 1.9× the numbers above, with identical candidate sets.
+`bench_latency.py` does one warmup and then nine timed runs, which is enough to
+warm a 1 GB index and not enough to warm a 9 GB one from cold.
 
 **Compaction has almost nothing to do on an append-only workload.** Each
 refresh generation lands in a fresh rowid range, so generations barely share
@@ -179,7 +383,8 @@ way).
 The practical reading, which the README repeats: **compaction is for
 delete-heavy or interleaved workloads, not routine post-ingest hygiene.** After
 a pure append-and-refresh sequence it costs hours to reclaim single-digit
-percentages. The one thing worth having from it — a stats table with one row
+percentages — minutes rather than the hours it took before Phase 7, but still
+disproportionate to what it reclaims. The one thing worth having from it — a stats table with one row
 per gram instead of one per gram per generation — is a small part of the work
 it does.
 
@@ -188,12 +393,12 @@ The compacted database file is *larger* than the pre-compaction one
 free inside the file rather than returning them to the filesystem. Plan for
 that headroom before running it.
 
-`purge := true` widens the rewrite from fragmented keys to every key, so that
+`purge = true` widens the rewrite from fragmented keys to every key, so that
 postings pointing at deleted rows are dropped everywhere rather than only where
-a merge was rewriting the blob anyway. At 10 GB that is **3599.6 s** (60 min,
-52.5 GB peak RSS, 310.9 GB spill) against 15.8 s for the plain variant — 228×
-the cost, on a corpus with no deletes to purge. Reach for it after a large
-`DELETE`, not otherwise.
+a merge was rewriting the blob anyway. At 10 GB that is **413.4 s** against
+8.9 s for the plain variant — 46× the cost, on a corpus with no deletes to
+purge (Phase 6 measured the same pair at 3599.6 s and 15.8 s). Reach for it
+after a large `DELETE`, not otherwise.
 
 ### Index size
 
@@ -264,7 +469,10 @@ matching rows.
   by the differential harnesses and `ngram_parallel.test`). A faster
   wrong-count answer fails the run;
 * cold-cache runs evict the page cache (`sync` + `drop_caches`) before each
-  sample.
+  sample. Phase 7 widened the cold set from the two transparent variants to
+  four, adding `explicit_search` and `probe_only`, so that a cold query's cost
+  can be split between reading posting blobs and fetching the rows they point
+  at rather than attributed by argument.
 
 Three pairs per needle:
 
@@ -299,51 +507,85 @@ actually measured rather than falling back. `index` and `scan` are the same
 `LIKE` query one setting apart; `probe` is the index probe and intersection
 alone.
 
+Both columns come from the same databases and the same needles; "serial
+probe" is the code as of the build half of Phase 7, "parallel probe" is what
+ships. Candidate counts are identical in every cell — the probe was
+parallelized, not changed.
+
 **Rare — `supercalifragilistic`, ~9.2 × 10⁻⁷ of rows**
 
-| Corpus | candidates | index p50/p95 | scan p50/p95 | probe p50 | index vs scan |
-| --- | --- | --- | --- | --- | --- |
-| 1 GB | 10 | 0.026 / 0.036 | 0.042 / 0.043 | 0.025 | **1.62× faster** |
-| 10 GB | 105 | 0.059 / 0.073 | 0.386 / 0.392 | 0.050 | **6.54× faster** |
-| 100 GB | 1,001 | **0.641 / 0.643** | 4.266 / 4.274 | 0.564 | **6.66× faster** |
+| Corpus | candidates | probe, serial | probe, **parallel** | query, serial | query, **parallel** | scan | vs scan |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 GB | 10 | 0.025 | **0.009** | 0.026 | **0.011** | 0.043 | **3.9×** |
+| 10 GB | 105 | 0.050 | **0.013** | 0.059 | **0.021** | 0.389 | **18.5×** |
+| 100 GB | 1,001 | 0.564 | **0.045** | 0.641 | **0.125** | 4.173 | **33.4×** |
 
 **Moderate — `Wikipedia:`, ~2.1 × 10⁻³ of rows**
 
-| Corpus | candidates | index p50/p95 | scan p50/p95 | probe p50 | index vs scan |
-| --- | --- | --- | --- | --- | --- |
-| 1 GB | 23,266 | 0.031 / 0.034 | 0.028 / 0.029 | 0.023 | 0.90× |
-| 10 GB | 233,627 | 0.125 / 0.136 | 0.255 / 0.257 | 0.056 | **2.04× faster** |
-| 100 GB | 2,335,591 | 1.770 / 1.841 | 2.906 / 2.918 | 0.802 | **1.64× faster** |
+| Corpus | candidates | probe, serial | probe, **parallel** | query, serial | query, **parallel** | scan | vs scan |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 GB | 23,266 | 0.023 | **0.010** | 0.031 | **0.016** | 0.028 | 1.8× |
+| 10 GB | 233,627 | 0.056 | **0.021** | 0.125 | **0.092** | 0.250 | **2.7×** |
+| 100 GB | 2,335,591 | 0.802 | **0.067** | 1.770 | **1.010** | 2.858 | **2.8×** |
 
 **Dense — `and t`, ~6.3 × 10⁻² of rows** (the gate keeps the default path off
 these numbers; they are what the index path costs if you disable it)
 
-| Corpus | candidates | index p50/p95 | scan p50/p95 | probe p50 | index vs scan |
-| --- | --- | --- | --- | --- | --- |
-| 1 GB | 685,489 | 0.233 / 0.245 | 0.046 / 0.047 | 0.071 | 0.20× |
-| 10 GB | 6,855,652 | 2.443 / 2.467 | 0.431 / 0.434 | 0.746 | 0.18× |
-| 100 GB | 68,555,361 | 35.040 / 35.227 | 4.636 / 4.682 | 15.245 | 0.13× |
+| Corpus | candidates | probe, serial | probe, **parallel** | query, serial | query, **parallel** | scan | vs scan |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 GB | 685,489 | 0.071 | **0.035** | 0.233 | **0.221** | 0.046 | 0.21× |
+| 10 GB | 6,855,652 | 0.746 | **0.285** | 2.443 | **2.323** | 0.430 | 0.19× |
+| 100 GB | 68,555,361 | 15.245 | **1.464** | 35.040 | **24.102** | 4.596 | 0.19× |
 
-Cold cache (page cache evicted before every sample), p50:
+**The probe went from the dominant cost of a selective query to a rounding
+error.** At 100 GB a rare needle spent 0.564 s of its 0.641 s in the probe;
+it now spends 0.045 s of 0.125 s. The dense probe — Θ(corpus × K) regardless of
+selectivity, and the reason `ngram_max_grams_per_query` matters — fell 10.4×,
+from 15.245 s to 1.464 s.
+
+Cold cache (page cache evicted before every sample), p50 seconds:
 
 | Corpus | rare index / scan | moderate index / scan | dense index / scan |
 | --- | --- | --- | --- |
-| 1 GB | 0.073 / 0.198 | 0.324 / 0.193 | 0.324 / 0.197 |
-| 10 GB | **0.157 / 1.757** | 1.760 / 1.726 | 2.721 / 1.761 |
-| 100 GB | **3.217 / 17.625** | 18.840 / 17.096 | 37.486 / 17.303 |
+| 1 GB | **0.051** / 0.198 | 0.317 / 0.199 | 0.305 / 0.201 |
+| 10 GB | **0.110** / 1.765 | 1.690 / 1.749 | 2.495 / 1.766 |
+| 100 GB | **0.714** / 16.387 | 15.354 / 16.261 | 23.488 / 16.970 |
+
+Phase 6 measured the same three rare cells at 0.073, 0.157 and 3.217 s. The
+100 GB cold rare query is **4.5× faster and 21× faster than the cold scan it
+replaces**, where Phase 6 had it at 5.5×.
+
+**What the remaining cold floor is made of.** The cold probe and the cold fetch
+are now measured separately, which is what lets the floor be attributed rather
+than guessed:
+
+| 100 GB, rare, cold | p50 | p95 |
+| --- | --- | --- |
+| probe only | 0.296 s | 0.300 s |
+| `ngram_search` (probe + fetch + recheck) | 0.761 s | 0.771 s |
+| `LIKE` through the rewrite | **0.714 s** | **0.816 s** |
+| the scan it replaces | 16.387 s | 16.481 s |
+
+So of a 0.71 s cold query, **0.30 s is the probe reading posting blobs off disk
+and ~0.46 s is fetching the 1,001 candidate rows** — roughly 0.46 ms per row,
+which is what a random read from a 182 GiB file costs on this NVMe. Both halves
+are cold IO, and both scale with the number of candidates rather than with the
+corpus: warm, the same query is 0.125 s. Nothing left in the floor is CPU.
 
 Every pair returned identical row counts, at every scale, in both the
 transparent and the explicit comparison — up to 37,102,213 matching rows.
 
 ### What the shape says
 
-**The probe, not the fetch, is the cost for a selective needle.** At 100 GB,
-0.564 s of the rare needle's 0.641 s is the probe, and the probe is
-single-threaded (user/real ≈ 1.0 in every rare measurement, against ≈ 23 for
-the parallel scan it is racing). Its cost is Σ(posting-list length) over the
-grams it examines, and those lists grow with the corpus however selective the
-needle is: `supercalifragilistic` matches 88 rows out of 1.09 billion and still
-decodes three corpus-scale posting lists.
+**The fetch, not the probe, is now the cost for a selective needle.** Through
+Phase 6 it was the other way round: 0.564 s of the rare needle's 0.641 s was
+the probe, single-threaded, user/real ≈ 1.0 against ≈ 23 for the scan it was
+racing. The probe's cost is Σ(posting-list length) over the grams it examines,
+and those lists grow with the corpus however selective the needle is —
+`supercalifragilistic` matches 88 rows out of 1.09 billion and still decodes
+three corpus-scale posting lists. That work is unchanged; it is now spread over
+the machine (user/real 19.0) and no longer sorted, so it costs 0.045 s of a
+0.125 s query and the remaining 0.080 s is fetch and recheck.
 
 This is why `ngram_max_grams_per_query` turned out to matter more than anything
 else measured here. The same tables at the old default of 8 read 0.033 / 0.110
@@ -353,12 +595,19 @@ the moderate one**, and it is what turns the rare-needle curve from "peaks at
 10 GB and falls back" into one that holds its ratio as the corpus grows
 (1.6× → 6.5× → 6.7×).
 
-**The design target: met warm, missed cold.** The plan asks for "hundreds of
-milliseconds p95 for a selective needle". At 100 GB that is 0.643 s warm — met,
-at the top of the range — and 3.217 s cold, which is not. At 10 GB both hold
-comfortably (0.073 s warm, 0.157 s cold). The cold gap is disk, not CPU: the
-100 GB database is 182 GB against 125 GB of RAM, so a cold probe reads posting
-lists from NVMe. Recorded honestly in the gate row rather than rounded into a
+**The design target: met warm at every scale, and cold everywhere below
+100 GB.** The plan asks for "hundreds of milliseconds p95 for a selective
+needle". Warm at 100 GB that is now **0.133 s p95**, an order of magnitude
+inside the target rather than at the top of it. Cold it is **0.816 s p95** —
+inside a second, 4.5× better than Phase 6's 3.217 s and 20× better than the
+cold scan, but above a few hundred milliseconds. At 1 GB and 10 GB cold is
+0.051 s and 0.110 s, comfortably inside.
+
+The remaining 100 GB cold floor is disk, and it is now measured rather than
+inferred: 0.30 s of it is the probe reading posting blobs and ~0.46 s is 1,001
+random row fetches from a 182 GiB file against 125 GB of RAM. Neither is CPU,
+and neither responds to more threads — the fix would be fewer or cheaper cold
+reads, not faster ones. Recorded as a measured floor rather than rounded into a
 pass.
 
 ---
@@ -496,7 +745,42 @@ Covered in section 1 (encoding, segment granularity) and section 2
 
 ---
 
-## 4. Parallel fetch and recheck
+## 4. Parallelism: fetch, recheck, and the probe
+
+### The probe (Phase 7)
+
+The probe decodes the posting lists of the rarest grams and intersects them.
+Phase 6 left it single-threaded and it dominated every selective query. Phase 7
+spread it across the scheduler's threads — but the larger win was removing work
+rather than dividing it.
+
+The old code decoded every blob of a gram into one flat vector and sorted it:
+up to ~200 million elements on one thread for a dense gram at 100 GB. That sort
+was never necessary. The codec writes each blob sorted and deduplicated, and
+every rowid of a `(gram, segment_no)` blob lies inside that segment's 2²⁰
+window, so two segments cannot overlap — concatenating them in segment order is
+already globally sorted. Only a key carrying more than one blob (a refresh
+generation, or a partial segment from an index an older version built) needs
+merging at all. The intersection follows the same structure: a segment's slice
+of the candidate list is a contiguous range found by binary search, so segments
+intersect independently and concatenate.
+
+| Corpus | class | probe, serial | probe, parallel | |
+| --- | --- | --- | --- | --- |
+| 1 GB | rare / moderate / dense | 0.025 / 0.023 / 0.071 | **0.009 / 0.010 / 0.035** | 2.0–2.8× |
+| 10 GB | rare / moderate / dense | 0.050 / 0.056 / 0.746 | **0.013 / 0.021 / 0.285** | 2.6–3.8× |
+| 100 GB | rare / moderate / dense | 0.564 / 0.802 / 15.245 | **0.045 / 0.067 / 1.464** | 10.4–12.5× |
+
+The speedup grows with the corpus because the removed sort was superlinear in
+the posting count while the concatenation is linear. Candidate sets are
+identical in every cell, at every thread count — the output is the per-segment
+lists concatenated in segment order, each a deterministic function of that
+segment's blobs, so neither thread count nor row-group claim order can reach
+it. test/sql/ngram_parallel.test pins that at threads 1/2/3/8/24 on both query
+paths, including after a refresh has added a second generation.
+
+### Fetch and recheck (Phase 6)
+
 
 Phase 3 measured the dense-needle case losing 3.9× to a 16-thread scan, with
 single-threaded fetch as the only cause. Both query paths now run fetch,

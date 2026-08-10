@@ -1,12 +1,16 @@
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "ngram/index_pragmas.hpp"
 #include "ngram/maintenance.hpp"
@@ -157,6 +161,131 @@ string OwnershipGuard(const ResolvedTarget &target, const string &meta_qualified
 	                   CollisionErrorCall(target, meta_qualified) + " END");
 }
 
+//===----------------------------------------------------------------------===//
+// Partitioned packing (see ngram/index_pragmas.hpp for the design)
+//===----------------------------------------------------------------------===//
+
+//! Aggregate-state bytes one pair costs while its partition is being grouped:
+//! eight for the rowid plus block slack and the copy each thread keeps of a
+//! group before the hash tables are combined. Measured at ~28 B/pair (26.4 GB
+//! peak RSS grouping 966 M pairs on 24 threads); rounded up for headroom.
+constexpr int64_t PAIR_STATE_BYTES = 32;
+
+//! Share of `memory_limit` the grouping pass may claim. The rest goes to the
+//! scan and unnest feeding it, the hash table itself, and the packed output.
+constexpr double PARTITION_MEMORY_FRACTION = 0.5;
+
+//! Assumed memory budget when the session has no limit configured.
+constexpr int64_t DEFAULT_PARTITION_BUDGET_BYTES = 8LL * 1024 * 1024 * 1024;
+
+//! Rows read to estimate the average gram yield of a rowid range.
+constexpr idx_t GRAM_ESTIMATE_SAMPLES = 512;
+
+//! An index built on a machine where the estimate is far too low still has to
+//! terminate: past this many partitions the estimate is not to be trusted and
+//! the memory limit is simply too small for the corpus.
+constexpr idx_t MAX_BUILD_PARTITIONS = 4096;
+
+vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_t partitions) {
+	vector<pair<int64_t, int64_t>> result;
+	// the open end keeps the pair stream in step with the high-water mark the
+	// script records: both cover everything committed when the script runs
+	auto open_end = LOCAL_ROWID_START - 1;
+	if (hi < lo || partitions <= 1) {
+		result.emplace_back(lo, open_end);
+		return result;
+	}
+	auto first_segment = lo >> SEGMENT_SHIFT;
+	auto last_segment = hi >> SEGMENT_SHIFT;
+	auto segments = last_segment - first_segment + 1;
+	// rounded down, so a request that does not divide the segment count evenly
+	// yields more and smaller partitions rather than fewer and larger ones: one
+	// segment is the finest partition there is, and overshooting the memory
+	// budget is the only failure mode worth avoiding
+	auto per_partition = MaxValue<int64_t>(segments / NumericCast<int64_t>(partitions), 1);
+	for (int64_t segment = first_segment; segment <= last_segment; segment += per_partition) {
+		auto start = segment == first_segment ? lo : segment << SEGMENT_SHIFT;
+		auto end_segment = segment + per_partition - 1;
+		auto end = end_segment >= last_segment ? open_end : ((end_segment + 1) << SEGMENT_SHIFT) - 1;
+		result.emplace_back(start, end);
+	}
+	return result;
+}
+
+string PackPartitionStatement(const string &packed, bool first, const string &pair_source) {
+	string statement = first ? "CREATE OR REPLACE TEMP TABLE " + packed + " AS " : "INSERT INTO " + packed + " ";
+	return statement +
+	       "SELECT gram, segment_no, struct_extract(segment, 'postings') AS postings, "
+	       "struct_extract(segment, 'rowid_count') AS rowid_count, "
+	       "struct_extract(segment, 'min_rowid') AS min_rowid, "
+	       "struct_extract(segment, 'max_rowid') AS max_rowid FROM ("
+	       "SELECT gram, segment_no, ngram_pack_segment(r) AS segment FROM (" +
+	       pair_source + ") GROUP BY gram, segment_no);\n";
+}
+
+idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs) {
+	Value value;
+	if (context.TryGetCurrentSetting("ngram_build_partitions", value) && !value.IsNull()) {
+		auto configured = value.GetValue<int64_t>();
+		if (configured < 0) {
+			throw InvalidInputException("ngram_build_partitions cannot be negative, got %lld", configured);
+		}
+		if (configured > 0) {
+			return NumericCast<idx_t>(MinValue<int64_t>(configured, NumericCast<int64_t>(MAX_BUILD_PARTITIONS)));
+		}
+	}
+	auto limit = NumericCast<int64_t>(DBConfig::GetConfig(context).options.maximum_memory);
+	if (limit <= 0) {
+		limit = DEFAULT_PARTITION_BUDGET_BYTES;
+	}
+	auto pairs_per_partition =
+	    MaxValue<int64_t>(LossyNumericCast<int64_t>(double(limit) * PARTITION_MEMORY_FRACTION) / PAIR_STATE_BYTES, 1);
+	auto partitions = (MaxValue<int64_t>(estimated_pairs, 0) + pairs_per_partition - 1) / pairs_per_partition;
+	return NumericCast<idx_t>(MinValue<int64_t>(MaxValue<int64_t>(partitions, 1), MAX_BUILD_PARTITIONS));
+}
+
+int64_t EstimateGramCount(ClientContext &context, TableCatalogEntry &table, const string &column, int64_t min_rowid,
+                          int64_t max_rowid, idx_t gram_size) {
+	if (min_rowid < 0 || max_rowid < min_rowid || !table.ColumnExists(column)) {
+		return 0;
+	}
+	auto rowid_span = max_rowid - min_rowid + 1;
+	auto samples = NumericCast<idx_t>(MinValue<int64_t>(NumericCast<int64_t>(GRAM_ESTIMATE_SAMPLES), rowid_span));
+	auto &duck_table = table.Cast<DuckTableEntry>();
+	auto &column_def = table.GetColumn(column);
+	auto &transaction = DuckTransaction::Get(context, table.ParentCatalog());
+	vector<StorageIndex> column_ids {duck_table.GetStorageIndex(ColumnIndex(column_def.Logical().index))};
+
+	Vector row_ids(LogicalType::ROW_TYPE, samples);
+	auto ids = FlatVector::GetData<row_t>(row_ids);
+	for (idx_t i = 0; i < samples; i++) {
+		auto offset = samples == 1 ? 0 : (rowid_span - 1) * NumericCast<int64_t>(i) / NumericCast<int64_t>(samples - 1);
+		ids[i] = NumericCast<row_t>(min_rowid + offset);
+	}
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(context), vector<LogicalType> {column_def.Type()});
+	ColumnFetchState fetch_state;
+	duck_table.GetStorage().Fetch(transaction, chunk, column_ids, row_ids, samples, fetch_state);
+	if (chunk.size() == 0) {
+		return 0;
+	}
+	int64_t sampled_grams = 0;
+	for (idx_t r = 0; r < chunk.size(); r++) {
+		auto value = chunk.GetValue(0, r);
+		if (value.IsNull()) {
+			continue;
+		}
+		// byte length rather than character length: a row of multi-byte text
+		// yields fewer grams than it has bytes, and overestimating only costs
+		// partitions
+		auto length = NumericCast<int64_t>(StringValue::Get(value).size());
+		sampled_grams += MaxValue<int64_t>(length - NumericCast<int64_t>(gram_size) + 1, 0);
+	}
+	// rows deleted since they were written drop out of the fetch but still
+	// count in the span, which biases the estimate upwards again
+	return LossyNumericCast<int64_t>(double(sampled_grams) / double(chunk.size()) * double(rowid_span));
+}
+
 vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &target) {
 	vector<string> result;
 	auto schema_entry =
@@ -217,17 +346,18 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	// pragma expansion in a transaction itself (statement_preprocessor.cpp).
 	//
 	// The build runs through DuckDB's own engine so it is parallel and can spill.
-	// It materializes (rowid, gram) pairs into a temp table first: feeding an
-	// aggregate directly from the unnest pipeline OOMs under a memory limit
-	// (duckdb 1.5.5), while the temp-table CTAS streams and the later aggregate
-	// scans spill. Segments are bucketed by rowid range (not count) to keep the
-	// build a plain GROUP BY and to give Phase 5 merges a natural key. Duplicate
-	// (gram, rowid) instances survive until the codec, which sorts and dedupes.
+	// One statement per rowid-range partition groups that partition's (gram,
+	// segment_no, rowid) pairs into segment rows with the ngram_pack_segment
+	// aggregate; the partitions land in a temp table, which is then written to
+	// the segments table in gram order. Segments are bucketed by rowid range
+	// (not count), which is what lets a rowid-range partition hold whole keys.
+	// Duplicate (gram, rowid) instances survive until the codec, which sorts and
+	// dedupes.
 	string script;
 	// __ngram_ is this extension's reserved temp-table namespace; suffixing the
 	// shadow schema and column keeps concurrent builds of different targets from
 	// sharing one scratch table
-	string pairs = Ident("__ngram_build_pairs_" + target.shadow_schema + "_" + column_name);
+	string packed = Ident("__ngram_build_packed_" + target.shadow_schema + "_" + column_name);
 	// Ownership guards run first: each existing meta table must name this base
 	// table. The guard on this column's own meta also converts a matching meta
 	// into the "already exists" error; if that meta is somehow empty, the
@@ -266,29 +396,30 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	          to_string(fingerprint.table_oid) + "::BIGINT AS table_oid, " + to_string(fingerprint.catalog_oid) +
 	          "::BIGINT AS catalog_oid, " + Lit(fingerprint.instance_id) + " AS instance_id, " + Lit(row_samples) +
 	          " AS row_samples;\n";
-	script += "CREATE OR REPLACE TEMP TABLE " + pairs +
-	          " AS "
-	          "SELECT rowid AS r, rowid >> " +
-	          to_string(SEGMENT_SHIFT) + " AS segment_no, unnest(trigrams(" + column + ", " + gram_str + ", " + ci_str +
-	          ")) AS gram FROM " + base + " WHERE " + committed_only + " AND " + column + " IS NOT NULL;\n";
-	// The sorted-stream packer holds one (gram, segment_no) run per thread instead
-	// of every group at once. The sort feeding it spills, but external sorting
-	// costs roughly 12-15 MB of overhead per thread, so the build's memory floor
-	// scales with the thread count (a 12 MB corpus OOMs near 150-200 MB with 24
-	// threads yet passes at 150 MB with 8). Parallel packing can split a key into
-	// per-thread partial segments, which readers union; duplicate (gram, rowid)
-	// instances straddling a thread boundary can inflate stats row_count by that
-	// split count, which only biases rarest-first gram selection, never results.
+	auto partitions =
+	    BuildPartitionCount(context, EstimateGramCount(context, *target.entry, column_name, 0,
+	                                                   fingerprint.total_rows - 1, NumericCast<idx_t>(gram_size)));
+	auto ranges = SegmentAlignedRanges(0, fingerprint.total_rows - 1, partitions);
+	for (idx_t i = 0; i < ranges.size(); i++) {
+		script += PackPartitionStatement(
+		    packed, i == 0,
+		    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, unnest(trigrams(" + column +
+		        ", " + gram_str + ", " + ci_str + ")) AS gram FROM " + base +
+		        " WHERE rowid >= " + to_string(ranges[i].first) + " AND rowid <= " + to_string(ranges[i].second) +
+		        " AND " + column + " IS NOT NULL");
+	}
+	// gram order is what makes the probe's `gram = ?` filter prune row groups by
+	// zone map, so the segments table is written sorted even though the
+	// partitions produced their rows in rowid order
 	script += "CREATE TABLE " + segments +
 	          " AS "
-	          "SELECT gram, segment_no, 0 AS generation, postings, rowid_count, min_rowid, max_rowid "
-	          "FROM ngram_pack_postings((SELECT gram, segment_no, r FROM " +
-	          pairs + " ORDER BY gram, segment_no));\n";
+	          "SELECT gram, segment_no, 0 AS generation, postings, rowid_count, min_rowid, max_rowid FROM " +
+	          packed + " ORDER BY gram, segment_no;\n";
 	script += "CREATE TABLE " + stats +
 	          " AS "
 	          "SELECT gram, sum(rowid_count)::BIGINT AS row_count, count(*)::BIGINT AS segment_count FROM " +
 	          segments + " GROUP BY gram;\n";
-	script += "DROP TABLE " + pairs + ";\n";
+	script += "DROP TABLE " + packed + ";\n";
 	return script;
 }
 
@@ -432,6 +563,12 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 }
 
 void RegisterIndexPragmas(ExtensionLoader &loader) {
+	DBConfig::GetConfig(loader.GetDatabaseInstance())
+	    .AddExtensionOption("ngram_build_partitions",
+	                        "how many rowid-range partitions index build, refresh and compact split their packing "
+	                        "pass into; 0 sizes it from memory_limit",
+	                        LogicalType::BIGINT, Value::BIGINT(0));
+
 	auto create_fun = PragmaFunction::PragmaCall("create_ngram_index", CreateNgramIndexQuery,
 	                                             {LogicalType::VARCHAR, LogicalType::VARCHAR});
 	create_fun.named_parameters["gram"] = LogicalType::INTEGER;

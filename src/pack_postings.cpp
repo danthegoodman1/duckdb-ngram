@@ -1,137 +1,18 @@
 #include "duckdb/common/exception.hpp"
+#include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/storage/arena_allocator.hpp"
 #include "ngram/postings_codec.hpp"
 
 namespace duckdb {
 namespace ngram {
 
-//! ngram_pack_postings((SELECT gram, segment_no, rowid ... ORDER BY gram, segment_no))
-//! streams key-ordered (gram, segment_no, rowid) rows and emits one postings row per
-//! (gram, segment_no) run, holding only the current run in memory. This replaces a
-//! grouped list() aggregate, which cannot run under a memory limit at scale (the
-//! sort feeding this function spills; list() states do not). The operator runs in
-//! parallel: each thread packs the runs of its own slice of the sorted stream, so a
-//! key can yield one partial segment per thread. Readers must union all segments of
-//! a gram, which the query path does anyway; rowids within a run need no ordering
-//! (the codec sorts), only the (gram, segment_no) run structure matters.
-
-struct PackPostingsLocalState : LocalTableFunctionState {
-	bool has_current = false;
-	string current_gram;
-	int64_t current_segment = 0;
-	vector<int64_t> rowids;
-	//! resume position inside the current input chunk after a full output chunk
-	idx_t input_offset = 0;
-};
-
-static unique_ptr<FunctionData> PackPostingsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
-	auto &types = input.input_table_types;
-	if (types.size() != 3 || types[0].id() != LogicalTypeId::VARCHAR || types[1].id() != LogicalTypeId::BIGINT ||
-	    types[2].id() != LogicalTypeId::BIGINT) {
-		throw BinderException("ngram_pack_postings expects a table of (gram VARCHAR, segment_no BIGINT, rowid BIGINT)");
-	}
-	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BLOB,
-	                LogicalType::BIGINT,  LogicalType::BIGINT, LogicalType::BIGINT};
-	names = {"gram", "segment_no", "postings", "rowid_count", "min_rowid", "max_rowid"};
-	return make_uniq<TableFunctionData>();
-}
-
-static unique_ptr<GlobalTableFunctionState> PackPostingsInitGlobal(ClientContext &context,
-                                                                   TableFunctionInitInput &input) {
-	return make_uniq<GlobalTableFunctionState>();
-}
-
-static unique_ptr<LocalTableFunctionState> PackPostingsInitLocal(ExecutionContext &context,
-                                                                 TableFunctionInitInput &input,
-                                                                 GlobalTableFunctionState *global_state) {
-	return make_uniq<PackPostingsLocalState>();
-}
-
-static void EmitRun(PackPostingsLocalState &state, DataChunk &output, idx_t out_idx) {
-	// EncodePostings sorts and dedupes state.rowids in place, so count/min/max are
-	// read after encoding
-	auto blob = EncodePostings(state.rowids);
-	FlatVector::GetData<string_t>(output.data[0])[out_idx] =
-	    StringVector::AddString(output.data[0], state.current_gram);
-	FlatVector::GetData<int64_t>(output.data[1])[out_idx] = state.current_segment;
-	FlatVector::GetData<string_t>(output.data[2])[out_idx] = StringVector::AddStringOrBlob(output.data[2], blob);
-	FlatVector::GetData<int64_t>(output.data[3])[out_idx] = static_cast<int64_t>(state.rowids.size());
-	FlatVector::GetData<int64_t>(output.data[4])[out_idx] = state.rowids.front();
-	FlatVector::GetData<int64_t>(output.data[5])[out_idx] = state.rowids.back();
-}
-
-static OperatorResultType PackPostingsFunction(ExecutionContext &context, TableFunctionInput &data_p, DataChunk &input,
-                                               DataChunk &output) {
-	auto &state = data_p.local_state->Cast<PackPostingsLocalState>();
-
-	UnifiedVectorFormat gram_format, segment_format, rowid_format;
-	input.data[0].ToUnifiedFormat(input.size(), gram_format);
-	input.data[1].ToUnifiedFormat(input.size(), segment_format);
-	input.data[2].ToUnifiedFormat(input.size(), rowid_format);
-	auto grams = UnifiedVectorFormat::GetData<string_t>(gram_format);
-	auto segments = UnifiedVectorFormat::GetData<int64_t>(segment_format);
-	auto rowids = UnifiedVectorFormat::GetData<int64_t>(rowid_format);
-
-	idx_t out_count = 0;
-	while (state.input_offset < input.size()) {
-		auto row = state.input_offset;
-		auto gram_idx = gram_format.sel->get_index(row);
-		auto segment_idx = segment_format.sel->get_index(row);
-		auto rowid_idx = rowid_format.sel->get_index(row);
-		if (!gram_format.validity.RowIsValid(gram_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
-		    !rowid_format.validity.RowIsValid(rowid_idx)) {
-			throw InvalidInputException("ngram_pack_postings: input must not contain NULLs");
-		}
-		auto &gram = grams[gram_idx];
-		auto segment_no = segments[segment_idx];
-
-		bool boundary = !state.has_current || segment_no != state.current_segment ||
-		                gram != string_t(state.current_gram.data(), state.current_gram.size());
-		if (boundary) {
-			if (state.has_current) {
-				if (out_count >= STANDARD_VECTOR_SIZE) {
-					// Defensive only: a call emits at most one run per input row, so
-					// while the output chunk's capacity is >= the input chunk's this
-					// path cannot be reached (and no test exercises it). Kept so a
-					// future capacity change degrades to resumption, not corruption.
-					output.SetCardinality(out_count);
-					return OperatorResultType::HAVE_MORE_OUTPUT;
-				}
-				EmitRun(state, output, out_count++);
-			}
-			state.has_current = true;
-			state.current_gram.assign(gram.GetData(), gram.GetSize());
-			state.current_segment = segment_no;
-			state.rowids.clear();
-		}
-		state.rowids.push_back(rowids[rowid_idx]);
-		state.input_offset++;
-	}
-	state.input_offset = 0;
-	output.SetCardinality(out_count);
-	return OperatorResultType::NEED_MORE_INPUT;
-}
-
-static OperatorFinalizeResultType PackPostingsFinal(ExecutionContext &context, TableFunctionInput &data_p,
-                                                    DataChunk &output) {
-	auto &state = data_p.local_state->Cast<PackPostingsLocalState>();
-	idx_t out_count = 0;
-	if (state.has_current) {
-		EmitRun(state, output, out_count++);
-		state.has_current = false;
-		state.rowids.clear();
-	}
-	output.SetCardinality(out_count);
-	return OperatorFinalizeResultType::FINISHED;
-}
-
-//! ngram_unpack_postings((SELECT gram, segment_no, postings FROM segments)) is
-//! the inverse of the packer: it streams one (gram, segment_no, rowid) row per
-//! posting. Compaction pipes it back into ngram_pack_postings to merge the
-//! rows that share a key. It emits at most one output chunk per call and
-//! resumes where it stopped, so a single blob holding more rowids than fit in
-//! a chunk is spread over several calls rather than buffered.
+//! ngram_unpack_postings((SELECT gram, segment_no, postings FROM segments))
+//! reverses the packing: it streams one (gram, segment_no, rowid) row per
+//! posting. Compaction groups its output back through ngram_pack_segment to
+//! merge the segment rows that share a key. It emits at most one output chunk
+//! per call and resumes where it stopped, so a single blob holding more rowids
+//! than fit in a chunk is spread over several calls rather than buffered.
 
 struct UnpackPostingsLocalState : LocalTableFunctionState {
 	//! resume position inside the current input chunk
@@ -153,6 +34,11 @@ static unique_ptr<FunctionData> UnpackPostingsBind(ClientContext &context, Table
 	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
 	names = {"gram", "segment_no", "r"};
 	return make_uniq<TableFunctionData>();
+}
+
+static unique_ptr<GlobalTableFunctionState> UnpackPostingsInitGlobal(ClientContext &context,
+                                                                     TableFunctionInitInput &input) {
+	return make_uniq<GlobalTableFunctionState>();
 }
 
 static unique_ptr<LocalTableFunctionState> UnpackPostingsInitLocal(ExecutionContext &context,
@@ -211,17 +97,191 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
-void RegisterPackPostings(ExtensionLoader &loader) {
-	TableFunction pack("ngram_pack_postings", {LogicalType::TABLE}, nullptr, PackPostingsBind, PackPostingsInitGlobal,
-	                   PackPostingsInitLocal);
-	pack.in_out_function = PackPostingsFunction;
-	pack.in_out_function_final = PackPostingsFinal;
-	loader.RegisterFunction(pack);
+//! ngram_pack_segment(rowid) turns the rowids of one (gram, segment_no) group
+//! into that key's segment row: the encoded postings blob and the count, min
+//! and max the probe prunes with. Build, refresh and compact all run it under a
+//! plain GROUP BY, which puts the work on DuckDB's radix-partitioned hash
+//! aggregate — the only shape measured to use the whole machine. A global
+//! `ORDER BY gram, segment_no` feeding a streaming packer instead saturates at
+//! ~5 of 24 threads and is flat past 8, spill or no spill, partitioned or not
+//! (benchmarks/RESULTS.md §2).
+//!
+//! The payload is a function of the group's rowid set alone, because
+//! EncodePostings sorts and deduplicates before encoding: arrival order and
+//! repeated rowids cannot change a byte of it.
+//!
+//! Rowids accumulate in a linked list of blocks taken from the aggregate's
+//! arena, which is buffer-manager backed, so the memory is accounted and a
+//! partition too large for `memory_limit` raises OutOfMemory rather than taking
+//! the process down. Aggregate states cannot spill at all, which is why the
+//! callers feed this one rowid-range partition at a time (see
+//! ngram/index_pragmas.hpp).
 
+namespace {
+
+//! One block of a state's rowid buffer. Header and payload come from a single
+//! arena allocation, so appending a block is one bump.
+struct RowidBlock {
+	RowidBlock *next;
+	idx_t count;
+	idx_t capacity;
+	int64_t *data;
+};
+
+struct EncodePostingsState {
+	RowidBlock *first;
+	RowidBlock *last;
+	idx_t total;
+};
+
+//! Block sizes grow geometrically so that the millions of tiny groups (a rare
+//! gram in one segment) waste a few entries while a dense gram pays a handful
+//! of allocations, and are capped so the largest groups do not reserve far
+//! past what they use. Unused capacity is bounded by the data itself.
+constexpr idx_t FIRST_BLOCK_ROWIDS = 16;
+constexpr idx_t MAX_BLOCK_ROWIDS = 65536;
+
+struct EncodePostingsOp {
+	template <class STATE>
+	static void Initialize(STATE &state) {
+		state.first = nullptr;
+		state.last = nullptr;
+		state.total = 0;
+	}
+};
+
+void AppendRowid(ArenaAllocator &allocator, EncodePostingsState &state, int64_t rowid) {
+	if (!state.last || state.last->count == state.last->capacity) {
+		auto capacity =
+		    state.last ? MinValue<idx_t>(state.last->capacity * 2, MAX_BLOCK_ROWIDS) : idx_t(FIRST_BLOCK_ROWIDS);
+		auto memory = allocator.AllocateAligned(sizeof(RowidBlock) + capacity * sizeof(int64_t));
+		auto block = reinterpret_cast<RowidBlock *>(memory);
+		block->next = nullptr;
+		block->count = 0;
+		block->capacity = capacity;
+		block->data = reinterpret_cast<int64_t *>(memory + sizeof(RowidBlock));
+		(state.last ? state.last->next : state.first) = block;
+		state.last = block;
+	}
+	state.last->data[state.last->count++] = rowid;
+	state.total++;
+}
+
+void EncodePostingsUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &state_vector,
+                          idx_t count) {
+	D_ASSERT(input_count == 1);
+	UnifiedVectorFormat rowid_format;
+	inputs[0].ToUnifiedFormat(count, rowid_format);
+	auto rowids = UnifiedVectorFormat::GetData<int64_t>(rowid_format);
+
+	UnifiedVectorFormat states_format;
+	state_vector.ToUnifiedFormat(count, states_format);
+	auto states = UnifiedVectorFormat::GetData<EncodePostingsState *>(states_format);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto rowid_idx = rowid_format.sel->get_index(i);
+		if (!rowid_format.validity.RowIsValid(rowid_idx)) {
+			throw InvalidInputException("ngram_pack_segment: input must not contain NULLs");
+		}
+		AppendRowid(aggr_input_data.allocator, *states[states_format.sel->get_index(i)], rowids[rowid_idx]);
+	}
+}
+
+void EncodePostingsCombine(Vector &state_vector, Vector &combined, AggregateInputData &aggr_input_data, idx_t count) {
+	UnifiedVectorFormat states_format;
+	state_vector.ToUnifiedFormat(count, states_format);
+	auto states = UnifiedVectorFormat::GetData<EncodePostingsState *>(states_format);
+	auto targets = FlatVector::GetData<EncodePostingsState *>(combined);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto &source = *states[states_format.sel->get_index(i)];
+		auto &target = *targets[i];
+		if (source.total == 0) {
+			continue;
+		}
+		if (aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE) {
+			// the source's blocks live in an arena the hash table keeps alive, so
+			// the target adopts them whole; the source is emptied so that a later
+			// combine or finalize of it cannot count them twice
+			(target.last ? target.last->next : target.first) = source.first;
+			target.last = source.last;
+			target.total += source.total;
+			EncodePostingsOp::Initialize(source);
+			continue;
+		}
+		for (auto block = source.first; block; block = block->next) {
+			for (idx_t r = 0; r < block->count; r++) {
+				AppendRowid(aggr_input_data.allocator, target, block->data[r]);
+			}
+		}
+	}
+}
+
+void EncodePostingsFinalize(Vector &state_vector, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
+                            idx_t offset) {
+	UnifiedVectorFormat states_format;
+	state_vector.ToUnifiedFormat(count, states_format);
+	auto states = UnifiedVectorFormat::GetData<EncodePostingsState *>(states_format);
+
+	auto &children = StructVector::GetEntries(result);
+	auto &postings_child = *children[0];
+	auto postings = FlatVector::GetData<string_t>(postings_child);
+	auto rowid_count = FlatVector::GetData<int64_t>(*children[1]);
+	auto min_rowid = FlatVector::GetData<int64_t>(*children[2]);
+	auto max_rowid = FlatVector::GetData<int64_t>(*children[3]);
+	auto &mask = FlatVector::Validity(result);
+
+	vector<int64_t> rowids;
+	for (idx_t i = 0; i < count; i++) {
+		auto &state = *states[states_format.sel->get_index(i)];
+		auto row = i + offset;
+		if (state.total == 0) {
+			// no rows reached this group (only possible through a FILTER clause);
+			// there is no segment to describe
+			mask.SetInvalid(row);
+			for (auto &child : children) {
+				FlatVector::Validity(*child).SetInvalid(row);
+			}
+			continue;
+		}
+		rowids.clear();
+		rowids.reserve(state.total);
+		for (auto block = state.first; block; block = block->next) {
+			rowids.insert(rowids.end(), block->data, block->data + block->count);
+		}
+		// EncodePostings sorts and dedupes rowids in place, so count/min/max are
+		// read after encoding — the same order the streaming packer uses
+		auto blob = EncodePostings(rowids);
+		postings[row] = StringVector::AddStringOrBlob(postings_child, blob);
+		rowid_count[row] = NumericCast<int64_t>(rowids.size());
+		min_rowid[row] = rowids.front();
+		max_rowid[row] = rowids.back();
+	}
+}
+
+} // namespace
+
+void RegisterPackPostings(ExtensionLoader &loader) {
 	TableFunction unpack("ngram_unpack_postings", {LogicalType::TABLE}, nullptr, UnpackPostingsBind,
-	                     PackPostingsInitGlobal, UnpackPostingsInitLocal);
+	                     UnpackPostingsInitGlobal, UnpackPostingsInitLocal);
 	unpack.in_out_function = UnpackPostingsFunction;
 	loader.RegisterFunction(unpack);
+
+	child_list_t<LogicalType> segment_fields;
+	segment_fields.emplace_back("postings", LogicalType::BLOB);
+	segment_fields.emplace_back("rowid_count", LogicalType::BIGINT);
+	segment_fields.emplace_back("min_rowid", LogicalType::BIGINT);
+	segment_fields.emplace_back("max_rowid", LogicalType::BIGINT);
+	AggregateFunction encode("ngram_pack_segment", {LogicalType::BIGINT}, LogicalType::STRUCT(segment_fields),
+	                         AggregateFunction::StateSize<EncodePostingsState>,
+	                         AggregateFunction::StateInitialize<EncodePostingsState, EncodePostingsOp>,
+	                         EncodePostingsUpdate, EncodePostingsCombine, EncodePostingsFinalize,
+	                         FunctionNullHandling::DEFAULT_NULL_HANDLING);
+	// the payload is a function of the group's rowid set alone: EncodePostings
+	// sorts and dedupes, so neither input order nor repeated rowids change it
+	encode.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	encode.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
+	loader.RegisterFunction(encode);
 }
 
 } // namespace ngram

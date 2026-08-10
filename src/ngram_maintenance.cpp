@@ -468,7 +468,6 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		auto gram_str = to_string(column.meta.options.gram_size);
 		auto ci_str = column.meta.options.case_insensitive ? "true" : "false";
 		// __ngram_ is this extension's reserved temp-table namespace
-		auto pairs = Ident("__ngram_refresh_pairs_" + target.shadow_schema + "_" + column.column_name);
 		auto packed = Ident("__ngram_refresh_packed_" + target.shadow_schema + "_" + column.column_name);
 		// rows past the high-water mark, excluding this transaction's local
 		// rows: their rowids are reassigned at commit, so indexing them would
@@ -477,19 +476,29 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 
 		script += OwnershipGuard(target, meta);
 		script += MetaUnchangedGuard(target, meta, column.column_name, column.meta.hwm_rowid, "ngram_refresh");
-		script += "CREATE OR REPLACE TEMP TABLE " + pairs + " AS SELECT rowid AS r, rowid >> " +
-		          to_string(SEGMENT_SHIFT) + " AS segment_no, unnest(trigrams(" + quoted_column + ", " + gram_str +
-		          ", " + ci_str + ")) AS gram FROM " + base + " WHERE " + tail_predicate + " AND " + quoted_column +
-		          " IS NOT NULL;\n";
-		script += "CREATE OR REPLACE TEMP TABLE " + packed +
-		          " AS SELECT gram, segment_no, postings, rowid_count, min_rowid, max_rowid FROM "
-		          "ngram_pack_postings((SELECT gram, segment_no, r FROM " +
-		          pairs + " ORDER BY gram, segment_no));\n";
+		// One statement per rowid-range partition of the tail. The ranges cover
+		// exactly what tail_predicate covers, including rows committed between
+		// this script being generated and being run, so the high-water mark the
+		// UPDATE below records never runs ahead of what was indexed.
+		auto partitions = BuildPartitionCount(
+		    context, EstimateGramCount(context, *target.entry, column.column_name, column.meta.hwm_rowid + 1,
+		                               fingerprint.total_rows - 1, column.meta.options.gram_size));
+		auto ranges = SegmentAlignedRanges(column.meta.hwm_rowid + 1, fingerprint.total_rows - 1, partitions);
+		for (idx_t i = 0; i < ranges.size(); i++) {
+			script += PackPartitionStatement(
+			    packed, i == 0,
+			    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, unnest(trigrams(" +
+			        quoted_column + ", " + gram_str + ", " + ci_str + ")) AS gram FROM " + base +
+			        " WHERE rowid >= " + to_string(ranges[i].first) + " AND rowid <= " + to_string(ranges[i].second) +
+			        " AND " + quoted_column + " IS NOT NULL");
+		}
 		// a new generation of segment rows for keys the index already holds;
-		// readers union every row of a (gram, segment_no), compaction merges
+		// readers union every row of a (gram, segment_no), compaction merges.
+		// Written in gram order like every other generation, so the probe's
+		// `gram = ?` filter keeps pruning row groups by zone map.
 		script += "INSERT INTO " + segments +
 		          " SELECT gram, segment_no, (SELECT coalesce(max(generation), 0) + 1 FROM " + segments +
-		          "), postings, rowid_count, min_rowid, max_rowid FROM " + packed + ";\n";
+		          "), postings, rowid_count, min_rowid, max_rowid FROM " + packed + " ORDER BY gram, segment_no;\n";
 		// stats rows are summed per gram by the probe, so appending deltas is
 		// enough; compaction folds them back into one row per gram
 		script += "INSERT INTO " + stats + " SELECT gram, sum(rowid_count)::BIGINT, count(*)::BIGINT FROM " + packed +
@@ -498,7 +507,6 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		script += "UPDATE " + meta + " SET hwm_rowid = coalesce((SELECT max(rowid) FROM " + base + " WHERE " +
 		          tail_predicate + "), hwm_rowid), " +
 		          FingerprintAssignments(fingerprint, column.column_name, row_samples) + ";\n";
-		script += "DROP TABLE " + pairs + ";\n";
 		script += "DROP TABLE " + packed + ";\n";
 	}
 	return script;
@@ -507,11 +515,12 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 //===----------------------------------------------------------------------===//
 // PRAGMA ngram_compact
 //
-// Merges the segment rows that share a (gram, segment_no) — the parallel
-// build can split a key across threads and every refresh appends a new
-// generation — back into one row per key, and drops postings whose rowid no
-// longer exists. Results never change: readers already union duplicate rows,
-// and a posting for a deleted row is already filtered by recheck.
+// Merges the segment rows that share a (gram, segment_no) — every refresh
+// appends a new generation, and an index written by an older version of this
+// extension could also hold per-thread partial segments — back into one row
+// per key, and drops postings whose rowid no longer exists. Results never
+// change: readers already union duplicate rows, and a posting for a deleted
+// row is already filtered by recheck.
 //
 // purge := true widens the rewrite from the fragmented keys to every key, so
 // dead postings are removed everywhere rather than only where the merge was
@@ -561,18 +570,33 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		// exist, and re-pack. A rowid is dropped only when the base table has
 		// no such row in this transaction's snapshot, so a live posting can
 		// never be lost; readers on older snapshots still see the pre-compact
-		// segment rows through MVCC.
-		script += "CREATE OR REPLACE TEMP TABLE " + packed +
-		          " AS SELECT gram, segment_no, postings, rowid_count, min_rowid, max_rowid FROM "
-		          "ngram_pack_postings((SELECT gram, segment_no, r FROM ngram_unpack_postings((SELECT s.gram, "
-		          "s.segment_no, s.postings FROM " +
-		          segments + " s WHERE EXISTS (SELECT 1 FROM " + keys +
-		          " k WHERE k.gram = s.gram AND k.segment_no = s.segment_no))) WHERE r IN (SELECT rowid FROM " + base +
-		          ") ORDER BY gram, segment_no));\n";
+		// segment rows through MVCC. Partitioned by segment_no, the same
+		// boundary the build partitions on, so each key is re-packed whole in
+		// exactly one statement. The estimate covers every posting in the index,
+		// which is what a purging compaction re-encodes; a plain compaction
+		// touches only the fragmented keys and so is over-partitioned rather
+		// than under.
+		auto partitions =
+		    BuildPartitionCount(context, EstimateGramCount(context, *target.entry, column.column_name, 0,
+		                                                   column.meta.hwm_rowid, column.meta.options.gram_size));
+		auto ranges = SegmentAlignedRanges(0, column.meta.hwm_rowid, partitions);
+		for (idx_t i = 0; i < ranges.size(); i++) {
+			script += PackPartitionStatement(
+			    packed, i == 0,
+			    "SELECT gram, segment_no, r FROM ngram_unpack_postings((SELECT s.gram, s.segment_no, s.postings FROM " +
+			        segments + " s WHERE s.segment_no >= " + to_string(ranges[i].first >> SEGMENT_SHIFT) +
+			        " AND s.segment_no <= " + to_string(ranges[i].second >> SEGMENT_SHIFT) +
+			        " AND EXISTS (SELECT 1 FROM " + keys +
+			        " k WHERE k.gram = s.gram AND k.segment_no = s.segment_no))) WHERE r IN (SELECT rowid FROM " +
+			        base + ")");
+		}
 		script += "DELETE FROM " + segments + " WHERE EXISTS (SELECT 1 FROM " + keys + " k WHERE k.gram = " + segments +
 		          ".gram AND k.segment_no = " + segments + ".segment_no);\n";
+		// re-inserted in gram order, so the merged rows prune by zone map for
+		// the probe exactly as the generations they replace did
 		script += "INSERT INTO " + segments +
-		          " SELECT gram, segment_no, 0, postings, rowid_count, min_rowid, max_rowid FROM " + packed + ";\n";
+		          " SELECT gram, segment_no, 0, postings, rowid_count, min_rowid, max_rowid FROM " + packed +
+		          " ORDER BY gram, segment_no;\n";
 		// stats are cheap to rebuild exactly (two small columns) and the merge
 		// changed both the per-gram row counts and the segment counts
 		script += "DELETE FROM " + stats + ";\n";

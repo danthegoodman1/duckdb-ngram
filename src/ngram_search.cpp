@@ -10,6 +10,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -448,48 +450,314 @@ static void ThrowIfCertainlyStale(ClientContext &context, DuckTableEntry &base, 
 // Index probe: rarest-first selection + per-segment intersection
 //===----------------------------------------------------------------------===//
 
+//! Run `body(unit)` for every unit in [0, units) across the scheduler's
+//! threads, or inline when there is only one of either. The probe's two scans
+//! and its per-segment intersection are read-only passes whose results the
+//! caller combines, so they parallelize with a plain TaskExecutor and need no
+//! operator pipeline of their own. Every unit writes to its own slot, so the
+//! work is deterministic: the same units produce the same values whatever
+//! order the threads run them in.
+namespace {
+
+class IndexedTask : public BaseExecutorTask {
+public:
+	IndexedTask(TaskExecutor &executor, atomic<idx_t> &cursor, idx_t units, const std::function<void(idx_t)> &body)
+	    : BaseExecutorTask(executor), cursor(cursor), units(units), body(body) {
+	}
+
+	void ExecuteTask() override {
+		while (true) {
+			auto unit = cursor.fetch_add(1);
+			if (unit >= units) {
+				return;
+			}
+			body(unit);
+		}
+	}
+
+private:
+	atomic<idx_t> &cursor;
+	idx_t units;
+	const std::function<void(idx_t)> &body;
+};
+
+} // namespace
+
+//! InitializeParallelScan takes the columns a scan will project, which the
+//! per-thread TableScanState already carries here.
+static const vector<ColumnIndex> NO_COLUMN_INDEXES;
+
+static idx_t ProbeThreads(ClientContext &context) {
+	return MaxValue<idx_t>(NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()), 1);
+}
+
+static void ParallelForEachUnit(ClientContext &context, idx_t units, idx_t workers,
+                                const std::function<void(idx_t)> &body) {
+	if (units == 0) {
+		return;
+	}
+	if (workers <= 1 || units == 1) {
+		for (idx_t unit = 0; unit < units; unit++) {
+			body(unit);
+		}
+		return;
+	}
+	TaskExecutor executor(context);
+	atomic<idx_t> cursor {0};
+	for (idx_t worker = 0; worker < MinValue<idx_t>(workers, units); worker++) {
+		executor.ScheduleTask(make_uniq<IndexedTask>(executor, cursor, units, body));
+	}
+	executor.WorkOnTasks();
+}
+
+//! Scan a whole shadow table in parallel, one row group per claim. `body` is
+//! called once per chunk with the worker's own index so it can accumulate into
+//! a private slot.
+static void ParallelScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
+                                    const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
+                                    optional_ptr<TableFilterSet> filters, idx_t workers,
+                                    const std::function<void(DataChunk &, idx_t)> &body) {
+	ParallelTableScanState parallel_state;
+	storage.InitializeParallelScan(context, parallel_state, NO_COLUMN_INDEXES);
+	ParallelForEachUnit(context, workers, workers, [&](idx_t worker) {
+		TableScanState scan;
+		scan.Initialize(column_ids, &context, filters);
+		DataChunk chunk;
+		chunk.Initialize(Allocator::Get(context), types);
+		while (storage.NextParallelScan(context, parallel_state, scan) != 0) {
+			while (true) {
+				chunk.Reset();
+				storage.Scan(tx, chunk, scan);
+				if (chunk.size() == 0) {
+					break;
+				}
+				body(chunk, worker);
+			}
+		}
+	});
+}
+
+//! A gram's postings inside one segment, decoded. The codec writes every blob
+//! sorted and deduplicated, and every rowid of a (gram, segment_no) blob lies
+//! inside that segment's 2^SEGMENT_SHIFT window — so two segments never
+//! overlap, and concatenating them in ascending order produces a globally
+//! sorted list with no sort at all. Only a key carrying more than one blob (a
+//! refresh generation, or a partial segment left by an index an older version
+//! of this extension built) needs merging.
+struct SegmentPostings {
+	int64_t segment_no = 0;
+	vector<row_t> rowids;
+};
+
+//! Posting counts per needle gram, for rarest-first selection. A rowid indexed
+//! under the same gram by two generations is counted twice, which only biases
+//! the ordering, never the result.
+static unordered_map<string, int64_t> GramPostingCounts(ClientContext &context, DuckTransaction &tx,
+                                                        DuckTableEntry &stats_entry, const vector<string> &grams,
+                                                        idx_t workers) {
+	unordered_map<string, idx_t> gram_index;
+	for (idx_t i = 0; i < grams.size(); i++) {
+		gram_index.emplace(grams[i], i);
+	}
+	// one row of counters per worker, summed at the end: no sharing, and the
+	// sum is the same whatever order the row groups were claimed in
+	vector<vector<int64_t>> partials(workers, vector<int64_t>(grams.size(), 0));
+
+	vector<StorageIndex> column_ids;
+	vector<LogicalType> types;
+	AddShadowColumn(stats_entry, "gram", LogicalTypeId::VARCHAR, column_ids, types);
+	AddShadowColumn(stats_entry, "row_count", LogicalTypeId::BIGINT, column_ids, types);
+	ParallelScanShadowTable(context, tx, stats_entry.GetStorage(), column_ids, types, nullptr, workers,
+	                        [&](DataChunk &chunk, idx_t worker) {
+		                        UnifiedVectorFormat gram_format, count_format;
+		                        chunk.data[0].ToUnifiedFormat(chunk.size(), gram_format);
+		                        chunk.data[1].ToUnifiedFormat(chunk.size(), count_format);
+		                        auto gram_data = UnifiedVectorFormat::GetData<string_t>(gram_format);
+		                        auto count_data = UnifiedVectorFormat::GetData<int64_t>(count_format);
+		                        auto &partial = partials[worker];
+		                        string gram_scratch;
+		                        for (idx_t r = 0; r < chunk.size(); r++) {
+			                        auto gram_idx = gram_format.sel->get_index(r);
+			                        auto count_idx = count_format.sel->get_index(r);
+			                        if (!gram_format.validity.RowIsValid(gram_idx) ||
+			                            !count_format.validity.RowIsValid(count_idx)) {
+				                        continue;
+			                        }
+			                        gram_scratch.assign(gram_data[gram_idx].GetData(), gram_data[gram_idx].GetSize());
+			                        auto entry = gram_index.find(gram_scratch);
+			                        if (entry != gram_index.end()) {
+				                        partial[entry->second] += count_data[count_idx];
+			                        }
+		                        }
+	                        });
+
+	unordered_map<string, int64_t> counts;
+	for (idx_t i = 0; i < grams.size(); i++) {
+		int64_t total = 0;
+		for (auto &partial : partials) {
+			total += partial[i];
+		}
+		counts[grams[i]] = total;
+	}
+	return counts;
+}
+
+//! Distinct segments the surviving candidates occupy, ascending. Candidates are
+//! sorted, so this is one pass and no hashing.
+static vector<int64_t> LiveSegments(const vector<row_t> &candidates) {
+	vector<int64_t> live;
+	for (auto rowid : candidates) {
+		auto segment_no = rowid >> SEGMENT_SHIFT;
+		if (live.empty() || live.back() != segment_no) {
+			live.push_back(segment_no);
+		}
+	}
+	return live;
+}
+
+//! Decode every blob a gram has, in parallel, one SegmentPostings per blob.
+static vector<SegmentPostings> ScanGramSegments(ClientContext &context, DuckTransaction &tx,
+                                                DuckTableEntry &segments_entry, const vector<StorageIndex> &column_ids,
+                                                const vector<LogicalType> &types, const string &gram, bool first,
+                                                const vector<row_t> &candidates, const vector<int64_t> &live_segments,
+                                                idx_t workers) {
+	// one filtered scan per gram: the equality filter prunes row groups via
+	// zone maps and skips reading postings blobs of non-matching rows
+	TableFilterSet filters;
+	filters.PushFilter(ColumnIndex(0), make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value(gram)));
+
+	vector<vector<SegmentPostings>> partials(workers);
+	ParallelScanShadowTable(
+	    context, tx, segments_entry.GetStorage(), column_ids, types, &filters, workers,
+	    [&](DataChunk &chunk, idx_t worker) {
+		    UnifiedVectorFormat segment_format, blob_format, min_format, max_format;
+		    chunk.data[1].ToUnifiedFormat(chunk.size(), segment_format);
+		    chunk.data[2].ToUnifiedFormat(chunk.size(), blob_format);
+		    chunk.data[3].ToUnifiedFormat(chunk.size(), min_format);
+		    chunk.data[4].ToUnifiedFormat(chunk.size(), max_format);
+		    auto segment_data = UnifiedVectorFormat::GetData<int64_t>(segment_format);
+		    auto blob_data = UnifiedVectorFormat::GetData<string_t>(blob_format);
+		    auto min_data = UnifiedVectorFormat::GetData<int64_t>(min_format);
+		    auto max_data = UnifiedVectorFormat::GetData<int64_t>(max_format);
+		    auto &partial = partials[worker];
+		    for (idx_t r = 0; r < chunk.size(); r++) {
+			    auto segment_idx = segment_format.sel->get_index(r);
+			    auto blob_idx = blob_format.sel->get_index(r);
+			    auto min_idx = min_format.sel->get_index(r);
+			    auto max_idx = max_format.sel->get_index(r);
+			    if (!segment_format.validity.RowIsValid(segment_idx) || !blob_format.validity.RowIsValid(blob_idx) ||
+			        !min_format.validity.RowIsValid(min_idx) || !max_format.validity.RowIsValid(max_idx)) {
+				    throw InvalidInputException("ngram: segments table contains NULLs; the index is malformed");
+			    }
+			    if (!first) {
+				    // skip blobs that provably cannot intersect the surviving
+				    // candidates (pure optimization: dropped postings are
+				    // outside the candidate set, so the intersection is
+				    // unchanged)
+				    if (!std::binary_search(live_segments.begin(), live_segments.end(), segment_data[segment_idx])) {
+					    continue;
+				    }
+				    auto lower = std::lower_bound(candidates.begin(), candidates.end(), min_data[min_idx]);
+				    if (lower == candidates.end() || *lower > max_data[max_idx]) {
+					    continue;
+				    }
+			    }
+			    auto &blob = blob_data[blob_idx];
+			    SegmentPostings decoded;
+			    decoded.segment_no = segment_data[segment_idx];
+			    DecodePostings(blob.GetData(), blob.GetSize(), decoded.rowids);
+			    partial.push_back(std::move(decoded));
+		    }
+	    });
+
+	vector<SegmentPostings> scanned;
+	idx_t total = 0;
+	for (auto &partial : partials) {
+		total += partial.size();
+	}
+	scanned.reserve(total);
+	for (auto &partial : partials) {
+		for (auto &entry : partial) {
+			scanned.push_back(std::move(entry));
+		}
+	}
+	// blobs arrive in whatever order the workers claimed row groups; ordering
+	// them by segment is what makes the result independent of that
+	std::sort(scanned.begin(), scanned.end(),
+	          [](const SegmentPostings &a, const SegmentPostings &b) { return a.segment_no < b.segment_no; });
+	return scanned;
+}
+
+//! Fold a gram's blobs into the surviving candidate list. Each segment is
+//! handled independently — segments partition the rowid space, so a segment's
+//! slice of `candidates` is a contiguous range — and the per-segment results
+//! are concatenated in segment order, which is already globally sorted.
+static vector<row_t> FoldSegments(ClientContext &context, vector<SegmentPostings> &scanned,
+                                  const vector<row_t> &candidates, bool first, idx_t workers) {
+	// group boundaries: scanned is sorted by segment, and a key with a single
+	// blob (the common case) needs neither merge nor sort
+	vector<idx_t> group_starts;
+	for (idx_t i = 0; i < scanned.size(); i++) {
+		if (i == 0 || scanned[i].segment_no != scanned[i - 1].segment_no) {
+			group_starts.push_back(i);
+		}
+	}
+	vector<vector<row_t>> results(group_starts.size());
+	ParallelForEachUnit(context, group_starts.size(), workers, [&](idx_t group) {
+		auto begin = group_starts[group];
+		auto end = group + 1 < group_starts.size() ? group_starts[group + 1] : scanned.size();
+
+		vector<row_t> union_scratch;
+		if (end - begin > 1) {
+			for (auto i = begin; i < end; i++) {
+				union_scratch.insert(union_scratch.end(), scanned[i].rowids.begin(), scanned[i].rowids.end());
+			}
+			std::sort(union_scratch.begin(), union_scratch.end());
+			union_scratch.erase(std::unique(union_scratch.begin(), union_scratch.end()), union_scratch.end());
+		}
+		// the single-blob case is the common one and owns its rowids already, so
+		// the first gram hands them straight over rather than copying what can
+		// be hundreds of millions of entries
+		auto &merged = end - begin > 1 ? union_scratch : scanned[begin].rowids;
+		if (first) {
+			results[group] = std::move(merged);
+			return;
+		}
+		auto segment_start = scanned[begin].segment_no << SEGMENT_SHIFT;
+		auto segment_end = segment_start + (int64_t(1) << SEGMENT_SHIFT);
+		auto lower = std::lower_bound(candidates.begin(), candidates.end(), static_cast<row_t>(segment_start));
+		auto upper = std::lower_bound(lower, candidates.end(), static_cast<row_t>(segment_end));
+		std::set_intersection(lower, upper, merged.begin(), merged.end(), std::back_inserter(results[group]));
+	});
+
+	idx_t total = 0;
+	for (auto &result : results) {
+		total += result.size();
+	}
+	vector<row_t> folded;
+	folded.reserve(total);
+	for (auto &result : results) {
+		folded.insert(folded.end(), result.begin(), result.end());
+	}
+	return folded;
+}
+
 //! Candidate rowids among indexed rows for a decomposed needle: the sorted
 //! intersection of the posting lists of the up-to-max_grams rarest grams.
 //! Every narrowing here is superset-preserving: probing fewer grams can only
 //! grow the intersection, and a gram with no postings proves no indexed row
 //! contains the needle.
+//!
+//! Grams are probed in sequence because each one's live-segment and min/max
+//! pruning depends on the survivors of the last; the work inside a gram — the
+//! filtered scan, the blob decode, and the intersection — runs across the
+//! scheduler's threads. The candidate set is a deterministic function of the
+//! index and the needle: thread count and claim order change nothing.
 vector<row_t> ProbeIndex(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
                          DuckTableEntry &stats_entry, const vector<string> &grams, idx_t max_grams) {
 	D_ASSERT(!grams.empty());
-
-	// posting counts per needle gram (rarest-first selection). Counts may be
-	// slightly inflated by parallel-build segment splits, which only biases
-	// the ordering, never the result.
-	unordered_map<string, int64_t> counts;
-	for (auto &gram : grams) {
-		counts[gram] = 0;
-	}
-	{
-		vector<StorageIndex> column_ids;
-		vector<LogicalType> types;
-		AddShadowColumn(stats_entry, "gram", LogicalTypeId::VARCHAR, column_ids, types);
-		AddShadowColumn(stats_entry, "row_count", LogicalTypeId::BIGINT, column_ids, types);
-		ScanShadowTable(context, tx, stats_entry.GetStorage(), column_ids, types, nullptr, [&](DataChunk &chunk) {
-			UnifiedVectorFormat gram_format, count_format;
-			chunk.data[0].ToUnifiedFormat(chunk.size(), gram_format);
-			chunk.data[1].ToUnifiedFormat(chunk.size(), count_format);
-			auto gram_data = UnifiedVectorFormat::GetData<string_t>(gram_format);
-			auto count_data = UnifiedVectorFormat::GetData<int64_t>(count_format);
-			string gram_scratch;
-			for (idx_t r = 0; r < chunk.size(); r++) {
-				auto gram_idx = gram_format.sel->get_index(r);
-				auto count_idx = count_format.sel->get_index(r);
-				if (!gram_format.validity.RowIsValid(gram_idx) || !count_format.validity.RowIsValid(count_idx)) {
-					continue;
-				}
-				gram_scratch.assign(gram_data[gram_idx].GetData(), gram_data[gram_idx].GetSize());
-				auto entry = counts.find(gram_scratch);
-				if (entry != counts.end()) {
-					entry->second += count_data[count_idx];
-				}
-			}
-		});
-	}
+	auto workers = ProbeThreads(context);
+	auto counts = GramPostingCounts(context, tx, stats_entry, grams, workers);
 
 	vector<string> ordered = grams;
 	std::stable_sort(ordered.begin(), ordered.end(),
@@ -512,70 +780,11 @@ vector<row_t> ProbeIndex(ClientContext &context, DuckTransaction &tx, DuckTableE
 
 	vector<row_t> candidates;
 	for (idx_t gram_idx = 0; gram_idx < ordered.size(); gram_idx++) {
-		auto &gram = ordered[gram_idx];
 		bool first = gram_idx == 0;
-		// segments that can still contribute to the intersection
-		unordered_set<int64_t> live_segments;
-		if (!first) {
-			for (auto rowid : candidates) {
-				live_segments.insert(rowid >> SEGMENT_SHIFT);
-			}
-		}
-		// one filtered scan per gram: the equality filter prunes row groups via
-		// zone maps and skips reading postings blobs of non-matching rows
-		TableFilterSet filters;
-		filters.PushFilter(ColumnIndex(0), make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value(gram)));
-
-		vector<row_t> postings;
-		ScanShadowTable(context, tx, segments_entry.GetStorage(), column_ids, types, &filters, [&](DataChunk &chunk) {
-			UnifiedVectorFormat segment_format, blob_format, min_format, max_format;
-			chunk.data[1].ToUnifiedFormat(chunk.size(), segment_format);
-			chunk.data[2].ToUnifiedFormat(chunk.size(), blob_format);
-			chunk.data[3].ToUnifiedFormat(chunk.size(), min_format);
-			chunk.data[4].ToUnifiedFormat(chunk.size(), max_format);
-			auto segment_data = UnifiedVectorFormat::GetData<int64_t>(segment_format);
-			auto blob_data = UnifiedVectorFormat::GetData<string_t>(blob_format);
-			auto min_data = UnifiedVectorFormat::GetData<int64_t>(min_format);
-			auto max_data = UnifiedVectorFormat::GetData<int64_t>(max_format);
-			for (idx_t r = 0; r < chunk.size(); r++) {
-				auto segment_idx = segment_format.sel->get_index(r);
-				auto blob_idx = blob_format.sel->get_index(r);
-				auto min_idx = min_format.sel->get_index(r);
-				auto max_idx = max_format.sel->get_index(r);
-				if (!segment_format.validity.RowIsValid(segment_idx) || !blob_format.validity.RowIsValid(blob_idx) ||
-				    !min_format.validity.RowIsValid(min_idx) || !max_format.validity.RowIsValid(max_idx)) {
-					throw InvalidInputException("ngram: segments table contains NULLs; the index is malformed");
-				}
-				if (!first) {
-					// skip blobs that provably cannot intersect the surviving
-					// candidates (pure optimization: dropped postings are
-					// outside the candidate set, so the intersection is
-					// unchanged)
-					if (live_segments.find(segment_data[segment_idx]) == live_segments.end()) {
-						continue;
-					}
-					auto lower = std::lower_bound(candidates.begin(), candidates.end(), min_data[min_idx]);
-					if (lower == candidates.end() || *lower > max_data[max_idx]) {
-						continue;
-					}
-				}
-				auto &blob = blob_data[blob_idx];
-				DecodePostings(blob.GetData(), blob.GetSize(), postings);
-			}
-		});
-		// a gram's postings can span multiple blobs per segment (parallel build
-		// splits, generations), so union before intersecting
-		std::sort(postings.begin(), postings.end());
-		postings.erase(std::unique(postings.begin(), postings.end()), postings.end());
-		if (first) {
-			candidates = std::move(postings);
-		} else {
-			vector<row_t> intersected;
-			intersected.reserve(MinValue<idx_t>(candidates.size(), postings.size()));
-			std::set_intersection(candidates.begin(), candidates.end(), postings.begin(), postings.end(),
-			                      std::back_inserter(intersected));
-			candidates = std::move(intersected);
-		}
+		auto live_segments = first ? vector<int64_t>() : LiveSegments(candidates);
+		auto scanned = ScanGramSegments(context, tx, segments_entry, column_ids, types, ordered[gram_idx], first,
+		                                candidates, live_segments, workers);
+		candidates = FoldSegments(context, scanned, candidates, first, workers);
 		if (candidates.empty()) {
 			break;
 		}
@@ -807,7 +1016,6 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	// The parallel cursor needs no empty-table special case: an empty row-group
 	// collection leaves it with no current row group and the transaction-local
 	// side is null-guarded, so the first claim reports "nothing left".
-	static const vector<ColumnIndex> NO_COLUMN_INDEXES;
 	storage.InitializeParallelScan(context, state->parallel_scan, NO_COLUMN_INDEXES);
 	state->max_threads = state->fetch_block_count + TailScanUnits(context, storage, *state);
 	return std::move(state);

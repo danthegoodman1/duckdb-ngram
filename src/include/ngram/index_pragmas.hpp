@@ -77,6 +77,49 @@ string OwnershipGuard(const ResolvedTarget &target, const string &meta_qualified
 //! commit, so the index must never record them (duckdb MAX_ROW_ID).
 constexpr int64_t LOCAL_ROWID_START = 36028797018960000LL;
 
+//===----------------------------------------------------------------------===//
+// Partitioned packing
+//
+// Build, refresh and compact all turn a (gram, segment_no, rowid) pair stream
+// into one segment row per (gram, segment_no). They do it with the
+// ngram_pack_segment aggregate under a plain GROUP BY, which runs on DuckDB's
+// radix-partitioned hash aggregate — the only shape measured to use the whole
+// machine (a global ORDER BY feeding the streaming packer saturates at ~5 of
+// 24 threads whatever it is given, benchmarks/RESULTS.md §2).
+//
+// Aggregate states cannot spill, so the pair stream is fed to the aggregate one
+// partition at a time and each partition's states are sized to fit the memory
+// limit. Partitions are rowid ranges aligned to the segment boundary: since
+// segment_no = rowid >> SEGMENT_SHIFT, such a range holds every rowid of every
+// key it touches, so each key is grouped exactly once and the output is one row
+// per key — the same rows, byte for byte, the ordered packer produced.
+//===----------------------------------------------------------------------===//
+
+//! Rowid ranges (inclusive) splitting [lo, hi] into at most `partitions`
+//! segment-aligned pieces. Always returns at least one range; the last one runs
+//! to LOCAL_ROWID_START - 1 so that rows committed between the pragma callback
+//! and the statement are still indexed, which keeps the recorded high-water
+//! mark exact.
+vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_t partitions);
+
+//! One statement filling `packed` (gram, segment_no, postings, rowid_count,
+//! min_rowid, max_rowid) from `pair_source`, a SELECT of (gram, segment_no, r).
+//! The first partition creates the table, the rest append to it.
+string PackPartitionStatement(const string &packed, bool first, const string &pair_source);
+
+//! How many partitions a pair stream of `estimated_pairs` should be split into
+//! for its grouping pass to fit the session's memory limit. Honours the
+//! ngram_build_partitions setting when it is set to a non-zero value.
+idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs);
+
+//! Grams the rows in [min_rowid, max_rowid] of `column` will produce, estimated
+//! from a sample of those rows. Only used to size partitions, and biased to
+//! overestimate (byte lengths rather than character lengths, deleted rows
+//! counted), because too many partitions costs a little time and too few costs
+//! an out-of-memory error.
+int64_t EstimateGramCount(ClientContext &context, TableCatalogEntry &table, const string &column, int64_t min_rowid,
+                          int64_t max_rowid, idx_t gram_size);
+
 void RegisterIndexPragmas(ExtensionLoader &loader);
 
 } // namespace ngram

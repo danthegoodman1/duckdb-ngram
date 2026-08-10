@@ -220,3 +220,128 @@ query I
 SELECT count(*) FROM (SELECT * FROM big WHERE s LIKE '%2468%' ORDER BY id LIMIT 9);
 ----
 9
+
+# --- the probe itself: identical candidates at every thread count ---
+#
+# The probe decodes and intersects posting lists across the scheduler's
+# threads. Its output is a deterministic function of the index and the needle:
+# segments partition the rowid space, so the per-segment results are
+# concatenated in segment order however the threads claimed the row groups.
+# These blocks pin that — the candidate set is compared to a single-threaded
+# probe of the same index, needle by needle, on both query paths.
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE probe_one AS SELECT '12345' AS needle, rowid FROM ngram_candidates('big', 's', '12345')
+	UNION ALL SELECT 'ow', rowid FROM ngram_candidates('big', 's', 'ow')
+	UNION ALL SELECT 'payload', rowid FROM ngram_candidates('big', 's', 'payload')
+	UNION ALL SELECT 'row_', rowid FROM ngram_candidates('big', 's', 'row_')
+	UNION ALL SELECT '999', rowid FROM ngram_candidates('big', 's', '999');
+
+# a single-threaded probe still finds every match: the candidate set is a
+# superset of the true matches among indexed rows, which is the contract the
+# rest relies on (rows past the high-water mark belong to the tail scan, not to
+# the probe)
+query I
+SELECT count(*) FROM (
+	SELECT rowid FROM big
+	WHERE contains(s, 'payload') AND rowid <= (SELECT hwm_rowid FROM ngram_main_big.meta_s)
+	EXCEPT SELECT rowid FROM probe_one WHERE needle = 'payload');
+----
+0
+
+foreach threads 2 3 8 24
+
+statement ok
+SET threads=${threads}
+
+# candidate sets identical to the one-thread probe, in both directions, and in
+# the same order (the probe returns them sorted, and callers binary-search it)
+query I
+SELECT count(*) FROM (
+	(SELECT needle, rowid FROM probe_one
+	 EXCEPT ALL
+	 (SELECT '12345', rowid FROM ngram_candidates('big', 's', '12345')
+	  UNION ALL SELECT 'ow', rowid FROM ngram_candidates('big', 's', 'ow')
+	  UNION ALL SELECT 'payload', rowid FROM ngram_candidates('big', 's', 'payload')
+	  UNION ALL SELECT 'row_', rowid FROM ngram_candidates('big', 's', 'row_')
+	  UNION ALL SELECT '999', rowid FROM ngram_candidates('big', 's', '999')))
+	UNION ALL
+	((SELECT '12345', rowid FROM ngram_candidates('big', 's', '12345')
+	  UNION ALL SELECT 'ow', rowid FROM ngram_candidates('big', 's', 'ow')
+	  UNION ALL SELECT 'payload', rowid FROM ngram_candidates('big', 's', 'payload')
+	  UNION ALL SELECT 'row_', rowid FROM ngram_candidates('big', 's', 'row_')
+	  UNION ALL SELECT '999', rowid FROM ngram_candidates('big', 's', '999'))
+	 EXCEPT ALL
+	 SELECT needle, rowid FROM probe_one));
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT row_number() OVER () AS pos, rowid AS r FROM ngram_candidates('big', 's', 'payload')
+) a JOIN (
+	SELECT row_number() OVER () AS pos, rowid AS r FROM probe_one WHERE needle = 'payload'
+) b USING (pos) WHERE a.r IS DISTINCT FROM b.r;
+----
+0
+
+# explicit path: same rows as brute force at this thread count
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('big', 'payload') EXCEPT ALL SELECT * FROM big WHERE contains(s, 'payload'))
+	UNION ALL
+	(SELECT * FROM big WHERE contains(s, 'payload') EXCEPT ALL SELECT * FROM ngram_search('big', 'payload')));
+----
+0
+
+# transparent path: same rows as the same query with the rewrite disabled
+statement ok
+SET ngram_auto_accelerate=true
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM big WHERE s LIKE '%345%' EXCEPT ALL SELECT id FROM big WHERE contains(s, '345'))
+	UNION ALL
+	(SELECT id FROM big WHERE contains(s, '345') EXCEPT ALL SELECT id FROM big WHERE s LIKE '%345%'));
+----
+0
+
+statement ok
+SET ngram_auto_accelerate=false
+
+endloop
+
+# a needle whose grams span several segments, probed after a refresh has added
+# a second generation: the per-segment merge path, at several thread counts
+statement ok
+SET threads=1
+
+statement ok
+INSERT INTO big SELECT i AS id, ('row ' || i::VARCHAR || ' payload')::VARCHAR FROM range(600000, 700000) t(i)
+
+statement ok
+PRAGMA ngram_refresh('big', col = 's')
+
+statement ok
+CREATE TABLE probe_gen AS SELECT rowid FROM ngram_candidates('big', 's', 'payload')
+
+foreach threads 4 24
+
+statement ok
+SET threads=${threads}
+
+query I
+SELECT count(*) FROM (
+	(SELECT rowid FROM ngram_candidates('big', 's', 'payload') EXCEPT ALL SELECT rowid FROM probe_gen)
+	UNION ALL
+	(SELECT rowid FROM probe_gen EXCEPT ALL SELECT rowid FROM ngram_candidates('big', 's', 'payload')));
+----
+0
+
+endloop
+
+statement ok
+RESET threads

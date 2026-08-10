@@ -540,10 +540,13 @@ so peak memory and crash exposure both follow the bound rather than the tail.
 
 ## Platform support
 
-Built and tested on **Linux x86_64** against DuckDB v1.5.5. The community
-extension build produces binaries for the platforms DuckDB's own distribution
-matrix covers; macOS, Windows, and Wasm coverage in this repository's CI is
-being restored.
+Built against DuckDB v1.5.5 on every architecture in DuckDB's default
+distribution matrix: Linux (x86_64, arm64), macOS (x86_64, arm64), Windows
+(x86_64 MSVC, x86_64 MinGW, arm64) and Wasm (mvp, eh, threads). Five of those
+run the full test suite in CI — linux_amd64, osx_arm64 and all three Windows
+targets — each reporting the same 2,559 assertions across 21 files; the rest
+are built and linked, following the gating in DuckDB's own extension CI. The
+two opt-in musl targets are not built.
 
 ---
 

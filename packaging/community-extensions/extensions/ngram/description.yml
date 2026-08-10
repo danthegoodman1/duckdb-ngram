@@ -7,10 +7,10 @@ extension:
   license: MIT
   maintainers:
     - danthegoodman1
-  # Fill from a green full-matrix run of this repo's MainDistributionPipeline
-  # before submitting; see packaging/SUBMISSION.md. Leaving it unset asks
-  # community CI to build every platform, which is what we want once the
-  # matrix is known to pass.
+  # Deliberately unset: this repo's MainDistributionPipeline is green across all
+  # ten default archs, so community CI is asked to build every platform. Set it
+  # only if a re-run against the submitted commit shows a failure; see
+  # packaging/SUBMISSION.md.
   # excluded_platforms: ""
 
 repo:

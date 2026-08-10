@@ -51,15 +51,23 @@ boundaries. No collision.
 
 - [ ] **The repository is public.** Community extensions "must be public,
       open-source, and hosted on GitHub". This repo is private today.
-- [ ] **The full platform matrix is green in this repo's CI.** Remove the
-      `exclude_archs` trim from `.github/workflows/MainDistributionPipeline.yml`
-      (planned as Phase 9) and get a green run at `duckdb_version: v1.5.5` /
-      `ci_tools_version: v1.5.5`. That workflow *is* the one community CI calls,
-      so a green run there is the real predictor.
-- [ ] **Set `excluded_platforms`** in the descriptor from whatever that run
+- [x] **The full platform matrix is green in this repo's CI.** Done in Phase 9:
+      `exclude_archs` is gone from `.github/workflows/MainDistributionPipeline.yml`,
+      and run
+      [31415223698](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/31415223698)
+      is green at `duckdb_version: v1.5.5` / `ci_tools_version: v1.5.5` across
+      all ten default archs — Linux amd64/arm64, macOS amd64/arm64, Windows
+      amd64/arm64/mingw, and wasm mvp/eh/threads. That workflow *is* the one
+      community CI calls, so this is the real predictor. Re-run it against the
+      exact commit being submitted, since it is a mutable branch ref on the
+      tooling side (`extension-ci-tools` `v1.5.5` is `refs/heads/v1.5.5`, not a
+      tag) and upstream can move it.
+- [x] **Set `excluded_platforms`** in the descriptor from whatever that run
       shows failing, using the `;`-separated syntax
-      (e.g. `"wasm_mvp;wasm_eh;wasm_threads"`). Leave the key out entirely if
-      everything passes.
+      (e.g. `"wasm_mvp;wasm_eh;wasm_threads"`). Nothing failed, so the key stays
+      out entirely — `description.yml` already keeps it commented out, which
+      asks community CI to build every platform. Leave it that way unless a
+      re-run against the submitted commit shows a failure.
 - [ ] **Pin `repo.ref`** to the full 40-character commit SHA of the release
       commit on the public repo, and make `extension.version` match the tag you
       cut. (Both a SHA and a tag are accepted; a SHA is the strong convention.)
@@ -210,8 +218,9 @@ Transparent rewriting of plain `LIKE` is opt-in
 (`SET ngram_auto_accelerate = true`), because v1.5.5 offers no trigger or change
 feed with which to find rows changed by an in-place `UPDATE`.
 
-Testing: 2081 sqllogictest assertions across 19 files (re-count when Phase 9's
-CI work adds coverage), plus property-based
+Testing: 2559 sqllogictest assertions across 21 files, run in CI on
+linux_amd64, osx_arm64 and all three Windows targets to the identical count,
+plus property-based
 differential harnesses (explicit and transparent paths), a churn harness over
 insert/delete/update/refresh/compact/checkpoint/reopen cycles, and a
 crash-interruption harness; all green under a DEBUG + AddressSanitizer build.

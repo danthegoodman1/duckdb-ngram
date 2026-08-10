@@ -169,6 +169,12 @@ a handful of rows and therefore runs only in the maintenance pragmas.
 **Never affected:** false positives. Recheck makes a wrong row impossible in
 every one of the states above.
 
+Closing the `UPDATE` case automatically — detecting changed rows and scanning
+them so a query stays complete without a rebuild — was considered and deferred.
+[docs/stale-updates.md](docs/stale-updates.md) records the design, what
+DuckDB v1.5.5 offers for it, what it would cost, and what should trigger
+revisiting it.
+
 This is exactly why `ngram_auto_accelerate` is **off by default**: a plain
 `LIKE` silently rewritten into a path that can miss rows is not an acceptable
 default. `ngram_search` is explicit — you asked for the index — and errors

@@ -7,6 +7,13 @@ checkpoint that vacuums deleted rows. This note records what the gap is, what
 DuckDB v1.5.5 offers for closing it, which design would close it, and what
 should trigger revisiting the decision.
 
+A deployment that cannot live with the gap has a remedy that needs no code
+here — an ART index on the same column, which makes DuckDB route updates
+through the append path this extension already handles exactly. It is
+[Option D](#option-d-let-an-art-index-convert-the-updates) below, measured and
+verified, and it costs more to build and store than the trigram index it
+protects.
+
 ## The gap
 
 DuckDB v1.5.5 updates rows in place: the rowid survives, the content changes.
@@ -72,6 +79,81 @@ checkpointed yet, `block_id` covers everything after.
 | A | Document the requirement; rebuild is the remedy | Shipped. Silent misses remain possible when the requirement is not followed. |
 | B | Detect changed rows and make `ngram_search` refuse | Contract stays "rebuild after update", but the system enforces it. |
 | C | Detect changed rows and scan them: candidates = index ∪ tail scan ∪ dirty-range scan | Queries stay correct *and* complete with no rebuild. |
+| D | Carry an ART index on the same column, so DuckDB routes updates through the append path | Closes both halves of the gap today, with no extension code. Costs more to build and store than the trigram index it protects. |
+
+## Option D: let an ART index convert the updates
+
+Available now, needs no change to this extension, and closes the vacuum case as
+well as the `UPDATE` case. One declaration per indexed column:
+
+```sql
+CREATE INDEX logs_message_idx ON logs(message);
+```
+
+**Why it closes the `UPDATE` case.** `TableCatalogEntry::BindUpdateConstraints`
+(`duckdb/src/catalog/catalog_entry/table_catalog_entry.cpp:327-336`) converts an
+`UPDATE` into a delete plus an insert when the updated column appears in some
+index's column set. The rewritten row therefore leaves its old rowid and is
+appended at a fresh one above the high-water mark, which puts it in the tail —
+correct on the next query, before any refresh runs — and `ngram_refresh` then
+indexes it exactly. The column sets have to intersect: a `PRIMARY KEY (id)` does
+nothing for `UPDATE logs SET message = ...`.
+
+**Why it closes the vacuum case.** `RowGroupCollection::InitializeVacuumState`
+sets `can_change_row_ids = !has_indexes || can_rebuild_indexes`
+(`duckdb/src/storage/table/row_group_collection.cpp:1359-1369`), where
+`has_indexes` counts DuckDB's own ART indexes. Shadow tables are invisible to
+it, so a table carrying only an ngram index is the case where DuckDB believes
+nothing depends on its rowids and relocates them freely. Any ART index flips
+that, and vacuum falls back to trimming trailing deletions (`:1410-1422`), which
+never move a live row. Here the column does not matter — a primary key on an
+unrelated column is enough.
+
+**Measured** on 500,000 rows, one row group deleted, full checkpoint, 200,000
+rows appended, and every 500th row updated:
+
+| | Bare table | `PRIMARY KEY (id)` | `INDEX ON (message)` |
+| --- | --- | --- | --- |
+| Lowest surviving rowid after vacuum | 122,880 → **0** | unchanged | unchanged |
+| Rowid of an updated row | unchanged | unchanged | 100 → **200,000** |
+| Selective needles resolved after churn (of 5) | **0** | — | **5** |
+
+The five needles covered a row that vacuum moved, a row that was updated, and a
+row appended afterwards. The bare table missed all of them while
+`ngram_index_stats` reported the witness verdict; the ART-indexed table matched
+a full scan on every one, both before and after `ngram_refresh`.
+
+That third case is the sharpest reason to care. Once a vacuum has left the table
+shorter than the mark, later appends land in the reclaimed rowid space *below*
+it, where the index claims coverage it does not have and the tail scan does not
+reach. They are missed from the moment they are written, and go on being missed
+as long as the index stands.
+
+**What it costs.** Measured over 10.9 M rows / 0.98 GB of enwik9 text, 24
+threads, each index built alone on its own copy:
+
+| | Build | On disk |
+| --- | --- | --- |
+| ngram index | 9.2 s | +1.00 GB (1.02× the text) |
+| ART index on the same column | 27.7 s | +1.71 GB (1.74× the text) |
+
+Three times the build time and 1.7× the storage of the index it exists to
+protect, for a structure no query ever reads. At 100 GB that is roughly 171 GB
+of ART on top of ~100 GB of trigrams. Two further consequences worth planning
+for: every `UPDATE` becomes a full row rewrite rather than an in-place edit, and
+each one consumes a fresh rowid, so a heavy update workload inflates the rowid
+space and with it the index's segment count — `ngram_compact` is the answer, and
+`generations` in `ngram_index_stats` is the signal.
+
+Untested here: ART behaviour on very long values, and whether the storage ratio
+holds for text shaped unlike prose. Both are worth checking against a sample of
+real data before committing to this.
+
+**When D beats a rebuild:** the table is large enough that
+`drop_ngram_index` + `create_ngram_index` is disruptive, updates are frequent
+enough that scheduling rebuilds around them is awkward, and the disk is
+available. When updates are rare or batched, a rebuild is cheaper in every
+dimension.
 
 ## If this is revisited, build C
 

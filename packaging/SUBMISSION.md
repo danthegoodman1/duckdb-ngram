@@ -218,7 +218,7 @@ Transparent rewriting of plain `LIKE` is opt-in
 (`SET ngram_auto_accelerate = true`), because v1.5.5 offers no trigger or change
 feed with which to find rows changed by an in-place `UPDATE`.
 
-Testing: 2559 sqllogictest assertions across 21 files, run in CI on
+Testing: 2601 sqllogictest assertions across 22 files, run in CI on
 linux_amd64, osx_arm64 and all three Windows targets to the identical count,
 plus property-based
 differential harnesses (explicit and transparent paths), a churn harness over

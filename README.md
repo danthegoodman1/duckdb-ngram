@@ -169,9 +169,15 @@ a handful of rows and therefore runs only in the maintenance pragmas.
 **Never affected:** false positives. Recheck makes a wrong row impossible in
 every one of the states above.
 
-Closing the `UPDATE` case automatically — detecting changed rows and scanning
-them so a query stays complete without a rebuild — was considered and deferred.
-[docs/stale-updates.md](docs/stale-updates.md) records the design, what
+Both rebuild cases can be removed today by carrying an ART index on the same
+column — see [Avoiding rebuilds entirely](#avoiding-rebuilds-entirely) — which
+trades disk and build time for updates that route through the append path
+instead of changing rows in place.
+
+Closing the `UPDATE` case inside the extension — detecting changed rows and
+scanning them so a query stays complete without either a rebuild or a second
+index — was considered and deferred.
+[docs/stale-updates.md](docs/stale-updates.md) records that design, what
 DuckDB v1.5.5 offers for it, what it would cost, and what should trigger
 revisiting it.
 
@@ -293,6 +299,36 @@ them, and recheck discards the stale postings.
 PRAGMA drop_ngram_index('logs', 'message');
 PRAGMA create_ngram_index('logs', 'message');
 ```
+
+### Avoiding rebuilds entirely
+
+Both cases above come from rows changing underneath rowids the index already
+recorded. An ART index on the same column removes both, because DuckDB then
+routes those changes through the append path this extension tracks exactly:
+
+```sql
+CREATE INDEX logs_message_idx ON logs(message);
+```
+
+An `UPDATE` to a column covered by an index becomes a delete plus an insert, so
+the rewritten row gets a fresh rowid above the high-water mark and lands in the
+tail — correct on the next query, and indexed by the next `ngram_refresh`. The
+same index also stops checkpoint vacuum from relocating live rows, since DuckDB
+only moves rowids when it believes no index depends on them, and shadow tables
+are invisible to that check. For the vacuum half any ART index works; for the
+`UPDATE` half it has to cover the indexed column itself.
+
+The cost is real and you should size it first: measured over 10.9 M rows of
+English text, the ART index took **27.7 s and 1.71 GB** against **9.2 s and
+1.00 GB** for the trigram index it protects — roughly triple the build time and
+1.7× the storage, for a structure no query reads. Updates also become full row
+rewrites, and each consumes a rowid, so heavy update churn grows the index's
+segment count and wants `ngram_compact` on a schedule.
+
+Worth it when the table is large enough that rebuilding is disruptive and
+updates are frequent. When updates are rare or batched, rebuild instead.
+[docs/stale-updates.md](docs/stale-updates.md) has the measurements, the
+upstream mechanics, and the cases still untested.
 
 ### Reading `ngram_index_stats`
 
@@ -525,8 +561,10 @@ so peak memory and crash exposure both follow the bound rather than the tail.
   full scan, still exact).
 - No fuzzy or similarity ranking, and no general regular-expression support —
   only regexes that are a plain literal reduce to an indexable substring.
-- `UPDATE`s to the indexed column require a rebuild (see
-  [Staleness](#staleness-what-is-detected-and-what-is-not)).
+- `UPDATE`s to the indexed column require a rebuild, unless the column also
+  carries an ART index (see
+  [Staleness](#staleness-what-is-detected-and-what-is-not) and
+  [Avoiding rebuilds entirely](#avoiding-rebuilds-entirely)).
 - One index per (table, column). Multi-column indexes do not exist; build one
   index per column you search.
 - Temporary tables and non-DuckDB catalogs are not supported.
@@ -544,7 +582,7 @@ Built against DuckDB v1.5.5 on every architecture in DuckDB's default
 distribution matrix: Linux (x86_64, arm64), macOS (x86_64, arm64), Windows
 (x86_64 MSVC, x86_64 MinGW, arm64) and Wasm (mvp, eh, threads). Five of those
 run the full test suite in CI — linux_amd64, osx_arm64 and all three Windows
-targets — each reporting the same 2,559 assertions across 21 files; the rest
+targets — each reporting the same 2,601 assertions across 22 files; the rest
 are built and linked, following the gating in DuckDB's own extension CI. The
 two opt-in musl targets are not built.
 

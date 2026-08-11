@@ -1,215 +1,240 @@
-# Rows changed by in-place `UPDATE`
+# Rowid safety, updates, and fail-closed recovery
 
-**Status: deferred (2026-08-10).** The shipped behaviour is documented in the
-README under "Not detected — misses only, never wrong rows" and "When to
-rebuild": an `UPDATE` to an indexed column requires a rebuild, and so does a
-checkpoint that vacuums deleted rows. This note records what the gap is, what
-DuckDB v1.5.5 offers for closing it, which design would close it, and what
-should trigger revisiting the decision.
+**Status: implemented in metadata format 3 (2026-08-11).** Updates, deletes,
+checkpoint vacuum, WAL replay, and reopened databases cannot silently make an
+ngram query omit a matching row. When the extension cannot prove that indexed
+rowids are still safe, it scans or refuses before returning.
 
-A deployment that cannot live with the gap has a remedy that needs no code
-here — an ART index on the same column, which makes DuckDB route updates
-through the append path this extension already handles exactly. It is
-[Option D](#option-d-let-an-art-index-convert-the-updates) below, measured and
-verified, and it costs more to build and store than the trigram index it
-protects.
+This note describes the v1.5.5-specific mechanism, its proof, and its costs.
+The implementation is deliberately smaller than a dirty-rowgroup overlay: one
+zero-posting native guard plus one permanent uncertainty bit per ngram index.
 
-## The gap
+## The invariant
 
-DuckDB v1.5.5 updates rows in place: the rowid survives, the content changes.
-The index holds postings built from the old value, and the row sits below the
-high-water mark, so refresh — which scans the tail — walks straight past it. A
-query whose needle matches the new value but shares no trigram with the old one
-never gets that rowid as a candidate. The row is missing from the answer.
+Postings cover rowids through the metadata high-water mark. Rows after that
+mark, including transaction-local inserts, are read by a live tail scan. Every
+posting candidate is fetched under the caller's transaction and rechecked
+against the real predicate.
 
-Two properties bound the damage:
+That is exhaustive if both conditions hold:
 
-- **Recheck makes false positives impossible.** Trigram intersection produces
-  candidates; the real predicate is applied to each against the live table. A
-  stale index can return a short answer, never a wrong row.
-- **A rebuild is a total repair.** `drop_ngram_index` + `create_ngram_index`
-  re-reads the table as it stands, so nothing is permanently damaged. Neither
-  `ngram_refresh` (tail only) nor `ngram_compact` (folds generations without
-  re-reading the base table) helps.
+1. a live rowid at or below the mark never changes to a new value in place or
+   moves to another rowid; and
+2. an append never reuses a rowid at or below a range the guard has already
+   observed.
 
-What makes this the weak point of an otherwise fail-loud design is detection.
-Every other provable stale state — a vacuumed table, a re-created table, a
-renamed column — makes `ngram_search` raise a rebuild-required error. An
-in-place `UPDATE` is caught only when it happens to touch one of the 32 recorded
-row witnesses, which for a small update on a large table is unlikely. The rest
-of the time the index answers, slightly short, indefinitely.
+Each ngram index therefore owns a DuckDB `NGRAM_ROWID_GUARD` index. It stores no
+keys or postings. Its physical column dependencies make DuckDB rewrite updates
+of covered columns as delete plus insert, and its non-ART type permanently
+disables v1.5.5's ART-only moving-vacuum path. The guard persists four facts:
 
-`ngram_auto_accelerate` is off by default because of this: a plain `LIKE`
-rewritten into a path that can miss rows is not an acceptable default. An
-explicit `ngram_search` call is where that trade-off belongs.
+- the greatest append rowid it has observed;
+- a permanent `unsafe_reuse` latch;
+- a random incarnation token, also recorded by ngram metadata; and
+- a checkpoint-iteration seal and compatibility bit.
 
-The companion case is a checkpoint that vacuums deleted rows. `DELETE` alone is
-safe — transaction visibility hides the rows and recheck discards their
-postings — but vacuuming relocates surviving rows to new rowids, which
-invalidates the mapping the index recorded.
+The live predicate recheck remains authoritative. The guard only proves that
+postings are a candidate superset; it never makes postings a source of truth.
 
-## Signals v1.5.5 exposes
+## Atomic creation
 
-Two mechanisms in the vendored source would support automatic detection. Both
-are reachable in-process from C++ far more cheaply than through their SQL
-surface (`PRAGMA storage_info` materialises a row per column segment with
-strings and stats; walking the row-group collection directly does not).
+The hard case is a transaction whose write plan predates guard creation. A
+native index created later cannot retroactively change that plan. The first
+ngram index on an unprotected column uses this barrier:
 
-**`ColumnData::HasChanges(start_row, end_row)`**
-(`duckdb/src/storage/table/column_data.cpp:59`), backed by
-`UpdateSegment::HasUpdates`. Reports pending updates over a rowid range at
-vector granularity (2,048 rows). It reflects the in-memory update chain, so a
-checkpoint merges the updates into base data and clears it — precise, but
-transient. Surfaced to SQL as the `has_updates` column of `PRAGMA storage_info`.
+1. Mark the creating DuckDB transaction as `CREATE_INDEX`, acquire the external
+   checkpoint lock exclusively, and reject active or recently committed
+   writers. An explicit transaction that already performed global update,
+   delete, or catalog work is rejected early; transaction-local inserts remain
+   supported.
+2. Add and immediately drop a UUID-named nullable column. DuckDB replaces the
+   base `DataTable`, marking every pre-existing storage snapshot `ALTERED`.
+   Writers blocked behind the exclusive lock can no longer commit against that
+   old storage.
+3. Create the scan-free rowid guard while still holding the exclusive lock. Its
+   build state holds the table append lock from the allocated-row baseline read
+   through `PhysicalCreateIndex::AddIndex`, closing the insert gap between
+   baseline and physical installation. The guard mints its own token.
+4. `__ngram_creation_finish` validates the exact fresh guard and replacement
+   storage, copies the token, and releases the exclusive lock. The potentially
+   long postings build then runs with only the ordinary Phase 10 vacuum fence.
 
-**Per-row-group `block_id`** (also in `PRAGMA storage_info`). `RowGroup::WriteToDisk`
-reuses a row group's existing metadata when `can_reuse_metadata && !HasChanges()`
-(`duckdb/src/storage/table/row_group.cpp:1322`), so a persistent row group that
-did not change keeps its blocks across checkpoints. An unchanged `block_id`
-therefore *proves* unchanged content. Row-group granularity (~122,880 rows),
-survives restarts — the durable counterpart to the signal above.
+Reads continue during the build. Writers whose snapshots overlap the barrier
+may fail with DuckDB's altered-table transaction conflict and must retry after
+the create commits. A staged writer whose rollback restores the old storage
+makes the creator's commit fail; guard and shadows are not published, and a
+fresh retry is safe.
 
-The two are complementary: `HasChanges` covers updates that have not been
-checkpointed yet, `block_id` covers everything after.
+The ADD/DROP barrier invalidates DuckDB's reservoir sample. It also cannot run
+through every pre-existing index dependency. Two narrowly proven protectors
+avoid it:
 
-## Options considered
+- an exact format-3 ngram guard may protect another column only if that guard's
+  persisted physical dependency set contains the new target; the new guard
+  copies no broader coverage than that proven set;
+- an explicit, non-internal native ART on the target may protect it only when
+  its committed catalog timestamp is strictly older than every active
+  transaction. That fallback creates a target-only guard.
 
-| | Approach | Result |
-| --- | --- | --- |
-| A | Document the requirement; rebuild is the remedy | Shipped. Silent misses remain possible when the requirement is not followed. |
-| B | Detect changed rows and make `ngram_search` refuse | Contract stays "rebuild after update", but the system enforces it. |
-| C | Detect changed rows and scan them: candidates = index ∪ tail scan ∪ dirty-range scan | Queries stay correct *and* complete with no rebuild. |
-| D | Carry an ART index on the same column, so DuckDB routes updates through the append path | Closes both halves of the gap today, with no extension code. Costs more to build and store than the trigram index it protects. |
+The normal barrier-created guard depends on every physical `VARCHAR` column
+that exists at creation time. This lets later ngram indexes on those columns
+reuse the protection proof without another ADD/DROP barrier.
 
-## Option D: let an ART index convert the updates
+## Updates, deletes, and vacuum
 
-Available now, needs no change to this extension, and closes the vacuum case as
-well as the `UPDATE` case. One declaration per indexed column:
+- Updating any guard-covered column, including `NULL` and equal-value cases,
+  becomes delete plus insert. The old posting is a harmless false positive that
+  recheck discards; the new rowid is in the live tail until refresh.
+- Updating an uncovered column may remain in place. That is safe because it
+  cannot change the indexed value. A normal broad guard covers all `VARCHAR`
+  columns that existed when it was created; a native-ART fallback may cover
+  only the indexed target.
+- Delete alone is safe. Visibility and recheck remove deleted candidates.
+- The non-ART guard makes `CanRebuildExistingIndexesAfterVacuum` false even
+  when `vacuum_rebuild_indexes` is enabled, so vacuum cannot move a surviving
+  live rowid.
+- DuckDB may still discard fully deleted *trailing* row groups. That moves no
+  live row. If a later committed append reuses any rowid at or below the
+  guard's maximum, `unsafe_reuse` latches before the append becomes visible.
+
+Guard mutation is intentionally conservative, not rollback-aware. If the guard
+observes a reused rowid and a later UNIQUE index rejects that commit, no row is
+written but the guard remains unsafe. Exactness is preserved; the cost is a
+full-scan fallback until the ngram index is rebuilt.
+
+## Query and maintenance behavior
+
+Guard uncertainty includes a missing or replaced name/token, wrong type or
+column dependency, incompatible source/version, unbound buffered WAL replay,
+checkpoint-seal mismatch, guard maximum behind the ngram high-water mark, and
+the unsafe latch.
+
+| Entry point | On guard uncertainty |
+| --- | --- |
+| `ngram_search` | one exhaustive live-table scan with the original matching semantics |
+| transparent `NGRAM_INDEX_SCAN` | one ordinary sequential-scan fallback with the original predicate |
+| `ngram_candidates` | every visible rowid at or below the recorded high-water mark; its caller still owns the disjoint tail |
+| `ngram_refresh` / `ngram_compact` | refuse with a rebuild-required error |
+| `ngram_index_stats` | report the reason in `stale_reason` |
+
+There is no list of dirty groups or repeated overlay work. One boolean selects
+one scan, so 1, 10, 100, or 1,000 uncertain events have the same query-plan
+shape and bounded state. Proven table/meta identity corruption may instead make
+the explicit APIs raise before returning; the transparent path still leaves or
+chooses a sequential scan.
+
+Recovery is explicit:
 
 ```sql
-CREATE INDEX logs_message_idx ON logs(message);
+PRAGMA drop_ngram_index('logs', 'message');
+PRAGMA create_ngram_index('logs', 'message');
 ```
 
-**Why it closes the `UPDATE` case.** `TableCatalogEntry::BindUpdateConstraints`
-(`duckdb/src/catalog/catalog_entry/table_catalog_entry.cpp:327-336`) converts an
-`UPDATE` into a delete plus an insert when the updated column appears in some
-index's column set. The rewritten row therefore leaves its old rowid and is
-appended at a fresh one above the high-water mark, which puts it in the tail —
-correct on the next query, before any refresh runs — and `ngram_refresh` then
-indexes it exactly. The column sets have to intersect: a `PRIMARY KEY (id)` does
-nothing for `UPDATE logs SET message = ...`.
+Public drop validates metadata layout and catalog OID at execution time. For a
+format-3 index it drops the recorded guard only when name, type, table, column,
+and token prove the incarnation; a genuinely missing guard is recoverable.
+Format-2 metadata is drop-only and is accepted only when it truly has no guard
+columns and no guard covering the target column on the base table.
 
-**Why it closes the vacuum case.** `RowGroupCollection::InitializeVacuumState`
-sets `can_change_row_ids = !has_indexes || can_rebuild_indexes`
-(`duckdb/src/storage/table/row_group_collection.cpp:1359-1369`), where
-`has_indexes` counts DuckDB's own ART indexes. Shadow tables are invisible to
-it, so a table carrying only an ngram index is the case where DuckDB believes
-nothing depends on its rowids and relocates them freely. Any ART index flips
-that, and vacuum falls back to trimming trailing deletions (`:1410-1422`), which
-never move a live row. Here the column does not matter — a primary key on an
-unrelated column is enough.
+## WAL, checkpoints, and reopen
 
-**Measured** on 500,000 rows, one row group deleted, full checkpoint, 200,000
-rows appended, and every 500th row updated:
+`SerializeToWAL` records the guard's live state at creator commit. That includes
+creator-local and external rows committed before publication; later WAL
+transactions replay through DuckDB's buffered unbound-index appends. Disk
+checkpoint serialization records the current state plus the database header's
+next checkpoint iteration.
 
-| | Bare table | `PRIMARY KEY (id)` | `INDEX ON (message)` |
-| --- | --- | --- | --- |
-| Lowest surviving rowid after vacuum | 122,880 → **0** | unchanged | unchanged |
-| Rowid of an updated row | unchanged | unchanged | 100 → **200,000** |
-| Selective needles resolved after churn (of 5) | **0** | — | **5** |
+An extension-free or context-free checkpoint can copy an unbound index without
+applying its buffered replays. Binding carries the persisted seal as pending;
+the next query validation compares it while holding a shared checkpoint lock,
+and a bound checkpoint compares it under the checkpoint's exclusive lock before
+writing a new seal. Either path treats a mismatch as unsafe; a bound guard
+latches it permanently. This prevents a crash, extension-free reopen, and
+shutdown checkpoint from laundering a reused-rowid event back to “clean,”
+without racing DuckDB's non-atomic header iteration counter.
 
-The five needles covered a row that vacuum moved, a row that was updated, and a
-row appended afterwards. The bare table missed all of them while
-`ngram_index_stats` reported the witness verdict; the ART-indexed table matched
-a full scan on every one, both before and after `ngram_refresh`.
+To avoid needless fallback on ordinary lifecycle paths, compatible guards are
+bound best-effort when the extension loads before any user connection and when
+the last connection closes without an active transaction. Contextful explicit,
+forced, and automatic checkpoints also bind indexes themselves. A `DETACH`
+that checkpoints an untouched unbound guard has no safe callback; it may
+conservatively require rebuild on the next attach.
 
-That third case is the sharpest reason to care. Once a vacuum has left the table
-shorter than the mark, later appends land in the reclaimed rowid space *below*
-it, where the index claims coverage it does not have and the tail scan does not
-reach. They are missed from the moment they are written, and go on being missed
-as long as the index stands.
+Malformed non-identity persisted guard options (source, version, seal, or
+state) create a bound quarantine guard with
+`protection_compatible=false` and `unsafe_reuse=true` instead of leaving
+DuckDB's v1.5.5 bind state stuck at `BINDING`. Queries scan, future protection
+proofs reject it, ordinary extension-loaded writes remain usable, and public
+drop can recover it while the recorded token remains readable and matches.
+A missing or wrong-typed identity token must make exact drop refuse. Every use
+of checkpoint internals is gated by the exact v1.5.5 version/source pin.
 
-**What it costs.** Measured over 10.9 M rows / 0.98 GB of enwik9 text, 24
-threads, each index built alone on its own copy:
+## API and operational costs
 
-| | Build | On disk |
-| --- | --- | --- |
-| ngram index | 9.2 s | +1.00 GB (1.02× the text) |
-| ART index on the same column | 27.7 s | +1.71 GB (1.74× the text) |
+- **Load the extension before writing guarded tables.** Stock DuckDB can read
+  them, but guarded-table DML and guard-touching ALTER are unsupported without
+  `ngram`. In the pinned host, INSERT and UPDATE fail on the unknown custom
+  type, DELETE can busy-spin in index binding and must be terminated, and
+  guarded-column DROP/rename is refused. An unrelated ADD COLUMN works.
+- A normal broad guard makes updates to every then-existing `VARCHAR` column
+  full delete-plus-insert rewrites. Bulk INSERT callback work is O(1) per
+  vector: the guard stores no key data and handles the sequence rowid vector
+  without flattening or per-row iteration.
+- DELETE and rollback cleanup on a wide guarded table may fetch every
+  guard-covered `VARCHAR`: v1.5.5 unions index dependencies before calling the
+  value-independent `TryDelete`. Multiple broad guards deduplicate that union.
+- ADD COLUMN is safe for existing ngram indexes, but a newly added `VARCHAR` is
+  outside their dependency sets. Indexing that new column requires an old
+  guard that already covers it, an old-enough explicit ART on the target, or
+  dropping/rebuilding the table's ngram indexes.
+- DuckDB index dependencies refuse table/column rename and many DROP/ALTER
+  operations while a guard exists. Drop the ngram indexes first.
+- Creation invalidates the reservoir sample and can make overlapping writers
+  retry. Quiescing writes around a first build avoids that API cost.
+- The native guard queries the host's built-in `pragma_version()` at load and
+  accepts only DuckDB v1.5.5 source `d8cdaa33` (local build form) or
+  `d8cdaa33fd` (official binary form). Query and maintenance paths fail closed
+  on mismatch; the generic drop validator stays available when the extension
+  is loadable so an exact incompatible guard can be removed.
 
-Three times the build time and 1.7× the storage of the index it exists to
-protect, for a structure no query ever reads. At 100 GB that is roughly 171 GB
-of ART on top of ~100 GB of trigrams. Two further consequences worth planning
-for: every `UPDATE` becomes a full row rewrite rather than an in-place edit, and
-each one consumes a fresh rowid, so a heavy update workload inflates the rowid
-space and with it the index's segment count — `ngram_compact` is the answer, and
-`generations` in `ngram_index_stats` is the signal.
+A small release characterization (`threads=1`, `/usr/bin/time`) makes the
+shape concrete. Starting from 200,000 rows, appending 500,000 rows took 0.21 s
+unguarded, 0.22 s with one broad guard, and 0.22 s with two; peak RSS was
+60.1/60.2/60.5 MB. Updating 100,000 covered rows took 0.04/4.73/4.76 s and
+40.0/47.9/48.0 MB respectively. The material cost is DuckDB's delete-plus-
+insert rewrite; the sequence-vector fast path makes another zero-data guard
+negligible.
 
-Untested here: ART behaviour on very long values, and whether the storage ratio
-holds for text shaped unlike prose. Both are worth checking against a sample of
-real data before committing to this.
+For the first-build barrier, a cold 57,946,112-byte table with 200,000 rows and
+16 varied `VARCHAR` columns was compared with the same file copied byte-for-
+byte. Cold open plus `count(*)` and ADD UUID column + DROP it + create a
+16-column guard both rounded to 0.01 s; peak RSS was 26,372 versus 26,468 KiB,
+and the checkpointed file size stayed exactly 57,946,112 bytes. These are
+single-run mechanism measurements, not portable throughput claims. “Cold” here
+means a fresh DuckDB process; the OS page cache was not flushed. Run from the
+repository root, this compact recipe reproduces the data shapes and measured
+statements (the wide-table number measures only the barrier and zero-data
+guard, not the postings build):
 
-**When D beats a rebuild:** the table is large enough that
-`drop_ngram_index` + `create_ngram_index` is disruptive, updates are frequent
-enough that scheduling rebuilds around them is awkward, and the disk is
-available. When updates are rare or batched, a rebuild is cheaper in every
-dimension.
+```sh
+build/release/duckdb /tmp/ng-base.db -c "SET threads=1; CREATE TABLE t AS SELECT i, md5(i::VARCHAR) s, md5((i+1)::VARCHAR) note FROM range(200000) r(i); CHECKPOINT"
+cp /tmp/ng-base.db /tmp/ng-u-a.db; cp /tmp/ng-base.db /tmp/ng-u-u.db; cp /tmp/ng-base.db /tmp/ng-g1-base.db; cp /tmp/ng-base.db /tmp/ng-g2-base.db
+build/release/duckdb /tmp/ng-g1-base.db -c "LOAD ngram; CREATE INDEX g1 ON t USING NGRAM_ROWID_GUARD(s,note)"; build/release/duckdb /tmp/ng-g2-base.db -c "LOAD ngram; CREATE INDEX g1 ON t USING NGRAM_ROWID_GUARD(s,note); CREATE INDEX g2 ON t USING NGRAM_ROWID_GUARD(s,note)"
+cp /tmp/ng-g1-base.db /tmp/ng-g1-a.db; cp /tmp/ng-g1-base.db /tmp/ng-g1-u.db; cp /tmp/ng-g2-base.db /tmp/ng-g2-a.db; cp /tmp/ng-g2-base.db /tmp/ng-g2-u.db
+/usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kb=%M' build/release/duckdb /tmp/ng-u-a.db  -c "SET threads=1; INSERT INTO t SELECT i, md5(i::VARCHAR), md5((i+1)::VARCHAR) FROM range(200000,700000) r(i)"
+/usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kb=%M' build/release/duckdb /tmp/ng-g1-a.db -c "LOAD ngram; SET threads=1; INSERT INTO t SELECT i, md5(i::VARCHAR), md5((i+1)::VARCHAR) FROM range(200000,700000) r(i)"
+/usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kb=%M' build/release/duckdb /tmp/ng-g2-a.db -c "LOAD ngram; SET threads=1; INSERT INTO t SELECT i, md5(i::VARCHAR), md5((i+1)::VARCHAR) FROM range(200000,700000) r(i)"
+/usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kb=%M' build/release/duckdb /tmp/ng-u-u.db  -c "SET threads=1; UPDATE t SET note=note||'x' WHERE i<100000"
+/usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kb=%M' build/release/duckdb /tmp/ng-g1-u.db -c "LOAD ngram; SET threads=1; UPDATE t SET note=note||'x' WHERE i<100000"
+/usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kb=%M' build/release/duckdb /tmp/ng-g2-u.db -c "LOAD ngram; SET threads=1; UPDATE t SET note=note||'x' WHERE i<100000"
+build/release/duckdb /tmp/ng-wide.db -c "SET threads=1; CREATE TABLE w AS SELECT i, md5((i+0)::VARCHAR)c00, md5((i+1)::VARCHAR)c01, md5((i+2)::VARCHAR)c02, md5((i+3)::VARCHAR)c03, md5((i+4)::VARCHAR)c04, md5((i+5)::VARCHAR)c05, md5((i+6)::VARCHAR)c06, md5((i+7)::VARCHAR)c07, md5((i+8)::VARCHAR)c08, md5((i+9)::VARCHAR)c09, md5((i+10)::VARCHAR)c10, md5((i+11)::VARCHAR)c11, md5((i+12)::VARCHAR)c12, md5((i+13)::VARCHAR)c13, md5((i+14)::VARCHAR)c14, md5((i+15)::VARCHAR)c15 FROM range(200000) r(i); CHECKPOINT"; cp /tmp/ng-wide.db /tmp/ng-wide-guard.db
+/usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kb=%M' build/release/duckdb /tmp/ng-wide.db -c "SET threads=1; SELECT count(*) FROM w"
+/usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kb=%M' build/release/duckdb /tmp/ng-wide-guard.db -c "LOAD ngram; SET threads=1; ALTER TABLE w ADD COLUMN __ngram_barrier_bench BOOLEAN; ALTER TABLE w DROP COLUMN __ngram_barrier_bench; CREATE INDEX gw ON w USING NGRAM_ROWID_GUARD(c00,c01,c02,c03,c04,c05,c06,c07,c08,c09,c10,c11,c12,c13,c14,c15); CHECKPOINT"
+stat -c '%s bytes, %b blocks' /tmp/ng-wide.db /tmp/ng-wide-guard.db
+```
 
-## If this is revisited, build C
-
-Both B and C need the same detection machinery, which is the bulk of the work.
-They differ in how they tolerate imprecision, and that difference is decisive:
-
-- Under C a false positive costs scan time — a row group is rescanned that did
-  not need it.
-- Under B a false positive takes the index **offline** and demands a rebuild of
-  a table nobody changed.
-
-A refuse-policy therefore needs detection that is precise in both directions;
-an overlay only needs it to be conservative, which is far easier to guarantee.
-The concrete case that separates them: row groups still transient when the
-index was built get new block ids at the first checkpoint with no content
-change at all — the common shape of bulk-load-then-build. Under C that is one
-wasted rescan. Under B a brand-new index errors on every query until it is
-rebuilt, and the rebuild inherits the same problem.
-
-So the detection lands once and feeds the overlay, and the policy becomes a
-setting on top of a verdict already proven conservative — `scan` (stay
-complete, pay the scan) or `error` (refuse, demand a rebuild).
-
-Repair is surgical rather than a full rebuild. Because `segment_no = rowid >>
-SEGMENT_SHIFT`, re-indexing a dirty range is the Phase 8 bounded-refresh path
-pointed at a rowid range instead of the tail: delete that range's segment rows,
-re-pack, drop the range from the dirty set.
-
-## What it would cost
-
-**Performance** scales with dirtied data volume, not update count, and the
-persistent signal's granularity is a whole row group. Estimated against measured
-Phase 7/8 figures at a ~90 bytes/row shape: roughly 10 ms to rescan one dirty
-row group, so ~10 dirty row groups doubles the 0.133 s warm p95 and ~100 makes
-it several times worse. Scattered single-row updates are the pathological case —
-1,000 of them across 1,000 distinct row groups dirties ~123 M rows, which is a
-full scan. Clustered updates are cheap; prompt surgical repair keeps the dirty
-set a queue rather than a permanent state. The worst case is the speed of no
-index at all, and even then everything outside the dirty set stays accelerated.
-
-**Coupling** is the durable cost. The extension currently reads rowids and
-column values — stable public surface. This design depends on what `block_id`
-means and on checkpoint's rewrite rules, and a DuckDB version bump could change
-either with the failure mode being missed rows. That needs the churn harness
-aimed directly at it plus a test that fails loudly when the internals shift.
-
-**Scope** is a full phase on the scale of Phase 5 or 8: a new shadow table and a
-`format_version` bump, per-query baseline caching whose invalidation must not
-err stale, and adversarial testing of the detection itself.
-
-## What should trigger revisiting
-
-Any one of these:
-
-1. The workload starts updating indexed column values, rather than appending
-   and deleting.
-2. `ngram_auto_accelerate` should default to on, so plain `LIKE` is accelerated
-   transparently — which requires that a rewritten query cannot miss rows.
-3. A miss is observed in production.
+These costs replace the former probabilistic row witnesses and blanket
+user-managed ART requirement. Format 3 stores no witnesses and maintenance
+performs no random row fetches: the guard/barrier proof is deterministic, and
+any uncertainty has an exhaustive fallback. An explicit ART remains an
+optional creation protector for the added-column/dependency cases above.

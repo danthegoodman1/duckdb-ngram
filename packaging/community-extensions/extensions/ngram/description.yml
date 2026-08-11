@@ -54,10 +54,15 @@ docs:
     brute-force tail scan, and rows your own open transaction has inserted are
     found too.
 
-    Postings live in ordinary DuckDB tables, so the index is durable, recovered
-    by the WAL, buffer-managed, and completely inert when the extension is not
-    loaded — a database with an ngram index reads and writes normally in a
-    stock DuckDB build.
+    Postings live in ordinary DuckDB tables, so they are durable, recovered by
+    the WAL, and buffer-managed. Each index also owns a zero-posting native
+    rowid guard: covered updates become delete+append, moving vacuum is
+    disabled, and trailing-rowid reuse is latched. A stock DuckDB build can
+    read a guarded database, but base-table DML requires `ngram` to be loaded.
+    On pinned v1.5.5, extension-free INSERT/UPDATE fail and DELETE may busy-spin
+    in the unknown-index binder, so treat guarded tables as read-only until
+    `LOAD ngram`. The guard accepts only host-reported v1.5.5 source
+    `d8cdaa33` (local) or `d8cdaa33fd` (official); other hosts fail closed.
 
     Surface:
 
@@ -74,11 +79,12 @@ docs:
       `ILIKE` into index scans, with an automatic fall back to a sequential
       scan when the needle is not selective enough to be worth it
 
-    Transparent acceleration is opt-in: DuckDB v1.5.5 has no triggers and no
-    change feed, so an in-place `UPDATE` of an already-indexed row cannot be
-    found incrementally and needs a rebuild. Every state the extension can
-    *prove* stale is refused (on the explicit path) or declined (on the
-    transparent one) rather than answered.
+    Guard identity and durable state are validated on every query. If they
+    cannot prove the indexed prefix safe, explicit and transparent search take
+    one exhaustive scan, candidates enumerate the visible indexed prefix, and
+    maintenance refuses until rebuild. Transparent acceleration remains opt-in
+    until candidate materialization is resource-bounded and its two execution
+    engines are consolidated; exactness is unconditional today.
 
     Expect the index to be roughly the size of the text it indexes, which is
     the usual range for an exhaustive trigram index. Not a fuzzy-matching or

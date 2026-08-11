@@ -73,10 +73,9 @@ SELECT (SELECT hwm_rowid FROM ngram_main_docs.meta_s), (SELECT count(*) FROM ngr
 
 # refresh after a DELETE that was not vacuumed is allowed: deleting rows leaves
 # every surviving rowid where it was, and recheck already hides the dead
-# postings. The test harness checkpoints after every statement
-# (checkpoint_wal_size 0), which would vacuum the deleted row away and move
-# rowids, so this raises the threshold first — the vacuum case is the block
-# below and in ngram_search_scale.test.
+# postings. Raise the harness's zero checkpoint threshold so this block pins
+# the un-vacuumed-delete refresh path separately; the rowid guard makes a later
+# checkpoint non-moving.
 statement ok
 SET checkpoint_threshold = '1GB';
 
@@ -485,7 +484,7 @@ statement ok
 SET ngram_auto_accelerate = false;
 
 statement ok
-UPDATE ngram_main_versioned.meta_s SET format_version = 2;
+UPDATE ngram_main_versioned.meta_s SET format_version = 3;
 
 statement ok
 PRAGMA ngram_refresh('versioned');
@@ -522,9 +521,12 @@ SELECT count(*) FROM ngram_search('shaped', 'tent');
 statement ok
 PRAGMA ngram_refresh('shaped');
 
-# dropping another column preserves every rowid and every indexed value
-statement ok
+# DuckDB's index dependency refuses removal of a physical column before the
+# indexed one because that would renumber the guard's physical column id.
+statement error
 ALTER TABLE shaped DROP COLUMN id;
+----
+index depends on a column after it
 
 query I
 SELECT count(*) FROM ngram_search('shaped', 'tent');
@@ -534,23 +536,17 @@ SELECT count(*) FROM ngram_search('shaped', 'tent');
 statement ok
 PRAGMA ngram_refresh('shaped');
 
-# the indexed column is the exception: retyping it away from VARCHAR leaves
-# nothing the index can describe
+# Type and rename ALTERs are likewise refused while any physical index depends
+# on the table. Drop the ngram index first when changing its shape.
 statement error
 ALTER TABLE shaped ALTER COLUMN s TYPE INTEGER;
 ----
-<REGEX>:.*(Conversion|Cast|convert).*
-
-statement ok
-ALTER TABLE shaped RENAME COLUMN s TO renamed;
+index depends on it
 
 statement error
-SELECT count(*) FROM ngram_search('shaped', 'tent');
+ALTER TABLE shaped RENAME COLUMN s TO renamed;
 ----
-which no longer exists
-
-statement ok
-ALTER TABLE shaped RENAME COLUMN renamed TO s;
+entries that depend on it
 
 query I
 SELECT count(*) FROM ngram_search('shaped', 'tent');

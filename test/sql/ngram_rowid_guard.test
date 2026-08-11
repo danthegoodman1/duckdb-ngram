@@ -1,0 +1,195 @@
+# name: test/sql/ngram_rowid_guard.test
+# description: rowid guard keeps updates/vacuum exhaustive and detects trailing rowid reuse
+# group: [sql]
+
+require ngram
+
+# The ngram-owned non-ART guard, rather than a user ART index, routes updates
+# of the indexed column through delete+insert. Unrelated-column updates remain
+# in place. Every assertion compares against the live predicate; postings are
+# candidates only.
+
+statement ok
+CREATE TABLE updated(id INTEGER, s VARCHAR, note INTEGER);
+
+statement ok
+INSERT INTO updated
+SELECT i, CASE WHEN i = 3 THEN NULL ELSE 'row ' || i || ' filler' END, 0
+FROM range(2000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('updated', 's');
+
+# clustered and scattered changes below the original HWM
+statement ok
+UPDATE updated SET s = 'phase11 clustered needle ' || id WHERE id BETWEEN 100 AND 109;
+
+statement ok
+UPDATE updated SET s = 'phase11 scattered needle ' || id WHERE id IN (200, 600, 1000, 1400);
+
+# equal-value and NULL transitions still take the guarded update path
+statement ok
+UPDATE updated SET s = s WHERE id = 20;
+
+statement ok
+UPDATE updated SET s = 'phase11 null became needle' WHERE id = 3;
+
+statement ok
+UPDATE updated SET s = NULL WHERE id = 4;
+
+# a non-indexed-column update stays at its old rowid
+statement ok
+UPDATE updated SET note = 1 WHERE id = 5;
+
+query II
+SELECT id, rowid FROM updated WHERE id IN (3, 4, 20, 100, 109, 200, 600, 1000, 1400) ORDER BY id;
+----
+3	2015
+4	2016
+20	2014
+100	2000
+109	2009
+200	2010
+600	2011
+1000	2012
+1400	2013
+
+query II
+SELECT id, rowid FROM updated WHERE id = 5;
+----
+5	5
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('updated', 'phase11')
+	 EXCEPT ALL SELECT * FROM updated WHERE contains(lower(s), 'phase11'))
+	UNION ALL
+	(SELECT * FROM updated WHERE contains(lower(s), 'phase11')
+	 EXCEPT ALL SELECT * FROM ngram_search('updated', 'phase11'))
+);
+----
+0
+
+query I
+SELECT count(*) FROM ngram_search('updated', 'row 4 filler');
+----
+0
+
+# Candidates own only the indexed prefix; guarded updates are in the tail.
+query I
+SELECT count(*) FROM ngram_candidates('updated', 's', 'phase11') WHERE rowid > 1999;
+----
+0
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+query II
+EXPLAIN SELECT count(*) FROM updated WHERE s LIKE '%phase11%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM updated WHERE s LIKE '%phase11%';
+----
+15
+
+# Deletes and checkpoints do not move surviving rowids while the non-ART guard
+# exists. Recheck removes deleted postings.
+statement ok
+DELETE FROM updated WHERE id IN (100, 600, 777);
+
+statement ok
+FORCE CHECKPOINT;
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('updated', 'phase11')
+	 EXCEPT ALL SELECT * FROM updated WHERE contains(lower(s), 'phase11'))
+	UNION ALL
+	(SELECT * FROM updated WHERE contains(lower(s), 'phase11')
+	 EXCEPT ALL SELECT * FROM ngram_search('updated', 'phase11'))
+);
+----
+0
+
+# A fully deleted trailing range may be physically removed even with a
+# non-ART index. Shrink alone is harmless: live rows have not moved, so the
+# index remains accelerated. The first committed append into a reused rowid
+# latches the guard unsafe forever and every query takes one exhaustive scan.
+statement ok
+CREATE TABLE reused(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO reused
+SELECT i, CASE WHEN i = 42 THEN 'reuse needle original' ELSE 'padding' END
+FROM range(250000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('reused', 's');
+
+statement ok
+DELETE FROM reused WHERE rowid >= 122880;
+
+statement ok
+FORCE CHECKPOINT;
+
+query II
+SELECT min(rowid), max(rowid) FROM reused;
+----
+0	122879
+
+query I
+SELECT id FROM ngram_search('reused', 'reuse needle');
+----
+42
+
+query II
+EXPLAIN SELECT count(*) FROM reused WHERE s LIKE '%reuse needle%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+statement ok
+INSERT INTO reused
+SELECT i, CASE WHEN i IN (250000, 379999) THEN 'reuse needle appended ' || i ELSE 'padding' END
+FROM range(250000, 380000) t(i);
+
+query I
+SELECT id FROM ngram_search('reused', 'reuse needle') ORDER BY id;
+----
+42
+250000
+379999
+
+# Unsafe fallback for candidates scans exactly the visible prefix, leaving the
+# ordinary tail/local branch disjoint.
+query III
+SELECT count(*), min(rowid), max(rowid) FROM ngram_candidates('reused', 's', 'reuse needle');
+----
+250000	0	249999
+
+query I
+SELECT count(*) FROM ngram_candidates('reused', 's', 'reuse needle') c,
+     ngram_main_reused.meta_s m WHERE c.rowid > m.hwm_rowid;
+----
+0
+
+query II
+EXPLAIN SELECT count(*) FROM reused WHERE s LIKE '%reuse needle%';
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+query I
+SELECT count(*) FROM reused WHERE s LIKE '%reuse needle%';
+----
+3
+
+statement error
+PRAGMA ngram_refresh('reused');
+----
+cannot exclude reuse
+
+statement error
+PRAGMA ngram_compact('reused');
+----
+cannot exclude reuse

@@ -98,6 +98,16 @@ The point of this test is that a **stock** DuckDB binary — not this repo's
 build, which links the extension statically — can install the distributable
 artifact from a repository and use it.
 
+Revalidated on 2026-08-11 with the current format-3 artifact and the official
+v1.5.5 CLI (`d8cdaa33fd`, SHA-256
+`3d33b1df037cb049155c393778df7853fafb23e9d49d7c9cacdde4dd67155788`).
+The run used a fresh temporary `extension_directory`, `FORCE INSTALL ngram`
+from the repository layout below, and `LOAD ngram`; it reported
+`install_mode=REPOSITORY`. A guard-backed create survived reopen; a covered
+`UPDATE` plus tail `INSERT` then produced exactly two search matches, and a
+second loaded reopen ran public drop with two base rows and zero remaining
+meta tables. A separate checkpoint/reopen pass reported `stale_reason=NULL`.
+
 ```sh
 # 1. a stock v1.5.5 CLI
 curl -sSL -o duckdb.zip \
@@ -143,6 +153,7 @@ SELECT name, value FROM duckdb_settings() WHERE name LIKE 'ngram%' ORDER BY name
 │             name             │  value  │
 ├──────────────────────────────┼─────────┤
 │ ngram_auto_accelerate        │ false   │
+│ ngram_build_partitions       │ 0       │
 │ ngram_max_candidate_fraction │ 0.01    │
 │ ngram_max_grams_per_query    │ 3       │
 └──────────────────────────────┴─────────┘
@@ -164,23 +175,26 @@ SELECT * FROM ngram_search('logs','reset by peer #4242');
 ```
 
 Reopened by the same stock binary **without** loading the extension, the
-database stays fully usable and the index is inert:
+database remains readable, but the guarded base table is read-only until
+`ngram` is loaded. On pinned v1.5.5, INSERT/UPDATE fail binding and DELETE may
+busy-spin in the unknown-index binder, so do not attempt extension-free DML:
 
 ```
 SELECT count(*) FROM logs;                              -- 5000
-INSERT INTO logs VALUES (99999, 'written without the extension loaded');
-SELECT count(*) FROM logs;                              -- 5001
 SELECT count(*) FROM ngram_main_logs.segments_message;  -- 1124
+INSERT INTO logs VALUES (99999, 'requires the extension');
+-- Binder Error mentioning unknown index type NGRAM_ROWID_GUARD
 SELECT * FROM ngram_search('logs','reset');
 -- Catalog Error: Table Function with name ngram_search does not exist!
 ```
 
-Reopened again with the extension loaded, the index is intact and the row
-written while it was absent is found by the tail scan:
+Reopened again with the extension loaded, the index is intact and ordinary
+writes resume; the new row is found by the tail scan:
 
 ```
+INSERT INTO logs VALUES (99999, 'written after the extension loaded');
 SELECT count(*) FROM ngram_search('logs','reset by peer #4242');   -- 1
-SELECT count(*) FROM ngram_search('logs','without the extension'); -- 1
+SELECT count(*) FROM ngram_search('logs','after the extension');   -- 1
 ```
 
 ## Draft PR
@@ -206,25 +220,26 @@ accelerates substring search (`LIKE '%needle%'`, `contains()`, `ILIKE`, literal
   `MainDistributionPipeline` run: `<link>`
 
 Design: postings live in ordinary DuckDB tables (the duckdb-fts storage model),
-so the index is durable, WAL-recovered, buffer-managed, and inert when the
-extension is not loaded — a database carrying an index opens and writes
-normally in a stock build. Candidate rowids from posting-list intersection are
-always a superset of the true matches, and every candidate is rechecked against
-the original predicate, so index imprecision or lag can only cost time, never
-correctness. Rows appended since the last refresh, and rows in the caller's own
-uncommitted transaction, are covered by a brute-force tail scan.
+so they are durable, WAL-recovered, and buffer-managed. A zero-posting native
+rowid guard makes covered updates delete+append, prevents moving vacuum, and
+latches trailing-rowid reuse. Candidate rowids remain supersets only; every
+candidate is rechecked, the tail is scanned, and uncertain guard state selects
+one exhaustive scan. A stock build can read the database, but guarded-table DML
+requires `ngram` to be loaded; on pinned v1.5.5 extension-free DELETE may
+busy-spin, so guarded tables must be treated as read-only before `LOAD ngram`.
 
 Transparent rewriting of plain `LIKE` is opt-in
-(`SET ngram_auto_accelerate = true`), because v1.5.5 offers no trigger or change
-feed with which to find rows changed by an in-place `UPDATE`.
+(`SET ngram_auto_accelerate = true`) until the next phase bounds candidate
+materialization and consolidates the explicit and transparent engines; both
+paths are exhaustive today.
 
-Testing: 2601 sqllogictest assertions across 22 files, run in CI on
-linux_amd64, osx_arm64 and all three Windows targets to the identical count,
-plus property-based
-differential harnesses (explicit and transparent paths), a churn harness over
-insert/delete/update/refresh/compact/checkpoint/reopen cycles, and a
-crash-interruption harness; all green under a DEBUG + AddressSanitizer build.
-Scale benchmarks up to a 100 GB corpus are recorded in `benchmarks/RESULTS.md`.
+Testing: local release and DEBUG + AddressSanitizer gates, property-based
+differential harnesses (explicit and transparent paths), churn over
+insert/delete/update/refresh/compact/checkpoint/reopen cycles, deterministic
+transaction/checkpoint schedules, and crash interruption. The full distribution
+matrix must be rerun against the exact submitted commit; earlier cross-platform
+runs are historical, not evidence for this final tree. Scale benchmarks up to a
+100 GB corpus are recorded in `benchmarks/RESULTS.md`.
 
 No scope collision with existing extensions: nothing in the registry provides
 substring/trigram indexing, and duckdb-fts's (unreleased) trigram sidecar

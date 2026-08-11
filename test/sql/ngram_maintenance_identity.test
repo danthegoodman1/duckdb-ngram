@@ -23,15 +23,13 @@ statement ok
 PRAGMA create_ngram_index('t', 's');
 
 #===----------------------------------------------------------------------===#
-# identity proven: ALTERs to other columns leave the index alone
-#
-# They preserve every rowid and every value of the indexed column, and the
-# table cannot have been re-created because its catalog entry is the recorded
-# one. Only the indexed column's own shape still matters.
+# physical-index dependency deliberately narrows ALTER while guarded
 #===----------------------------------------------------------------------===#
 
-statement ok
+statement error
 ALTER TABLE t RENAME COLUMN other TO other2;
+----
+entries that depend on it
 
 query I
 SELECT count(*) FROM ngram_search('t', 'tent');
@@ -41,16 +39,20 @@ SELECT count(*) FROM ngram_search('t', 'tent');
 statement ok
 PRAGMA ngram_refresh('t');
 
-statement ok
-ALTER TABLE t ALTER COLUMN other2 TYPE BIGINT;
+statement error
+ALTER TABLE t ALTER COLUMN other TYPE BIGINT;
+----
+entries that depend on it
 
 query I
 SELECT count(*) FROM ngram_search('t', 'tent');
 ----
 1
 
-statement ok
+statement error
 ALTER TABLE t DROP COLUMN id;
+----
+index depends on a column after it
 
 query I
 SELECT count(*) FROM ngram_search('t', 'tent');
@@ -69,64 +71,27 @@ PRAGMA ngram_refresh('t');
 statement ok
 PRAGMA ngram_compact('t');
 
-# the indexed column itself is a different matter: renaming it away leaves the
-# index pointing at a column that no longer exists
-statement ok
+# Renaming the indexed column, including case-only spelling changes, and
+# renaming the table are refused by DuckDB while the guard depends on it.
+statement error
 ALTER TABLE t RENAME COLUMN s TO s_renamed;
-
-statement error
-SELECT count(*) FROM ngram_search('t', 'tent');
 ----
-which no longer exists
-
-statement error
-PRAGMA ngram_refresh('t');
-----
-which no longer exists
-
-statement ok
-ALTER TABLE t RENAME COLUMN s_renamed TO s;
+entries that depend on it
 
 query I
 SELECT count(*) FROM ngram_search('t', 'tent');
 ----
 1
 
-# a case-only rename is not a rename at all: identifiers match
-# case-insensitively and every value stays where it was
-statement ok
+statement error
 ALTER TABLE t RENAME COLUMN s TO S;
-
-query I
-SELECT count(*) FROM ngram_search('t', 'tent');
 ----
-1
+entries that depend on it
 
-statement ok
-PRAGMA ngram_refresh('t');
-
-statement ok
-ALTER TABLE t RENAME COLUMN S TO s;
-
-# Table ownership follows the same identifier rules. The shadow schema keeps
-# its original spelling, but every reader and generated guard must accept the
-# case-only rename.
-statement ok
+statement error
 ALTER TABLE t RENAME TO T;
-
-query I
-SELECT count(*) FROM ngram_search('T', 'tent');
 ----
-1
-
-statement ok
-PRAGMA ngram_refresh('T');
-
-statement ok
-PRAGMA ngram_compact('T');
-
-statement ok
-ALTER TABLE T RENAME TO t;
+entries that depend on it
 
 # Shadow-table discovery follows the same semantics; catalog-equivalent casing
 # cannot hide an existing index from create/refresh/compact.
@@ -195,21 +160,46 @@ SELECT count(*) FROM ngram_candidates('side.main.docs', 's', 'tent');
 ----
 1
 
+# The first reattach copied a valid bound checkpoint. Detaching it again while
+# the guard is still unbound has no safe bind hook; the checkpoint-iteration
+# seal therefore degrades conservatively instead of trusting copied state.
 statement ok
-PRAGMA ngram_refresh('side.main.docs');
+CREATE TABLE side.unrelated(i INTEGER);
 
 statement ok
-PRAGMA ngram_compact('side.main.docs');
+INSERT INTO side.unrelated VALUES (1);
+
+statement ok
+DETACH side;
+
+statement ok
+ATTACH '__TEST_DIR__/ngram_identity_attached.db' AS side;
 
 # a pragma cannot be wrapped in a subquery, so the row is pinned whole; the
 # last column is the staleness verdict
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('side.main.docs');
 ----
-s	3	true	1	1	0	9	9	0	1	9	27	NULL
+s	3	true	1	1	0	9	9	0	1	9	27	the rowid guard cannot exclude reuse of rowids already covered by the ngram index
 
-# a real re-creation inside the new incarnation is still proof: the refresh
-# above re-recorded the identity, so the oids are comparable again
+statement error
+PRAGMA ngram_refresh('side.main.docs');
+----
+cannot exclude reuse
+
+statement error
+PRAGMA ngram_compact('side.main.docs');
+----
+cannot exclude reuse
+
+statement ok
+PRAGMA drop_ngram_index('side.main.docs', 's');
+
+statement ok
+PRAGMA create_ngram_index('side.main.docs', 's');
+
+# a real re-creation inside the new incarnation is still proof: the rebuild
+# above recorded the new identity, so the oids are comparable again
 statement ok
 DROP TABLE side.docs;
 
@@ -231,11 +221,7 @@ statement ok
 DETACH side;
 
 #===----------------------------------------------------------------------===#
-# without identity proof the column list is the only recreation signal
-#
-# After a restart the oids mean nothing, so a changed column list has to be
-# treated as "a different table now carries this name" — the conservative
-# reading, and the reason the check is relaxed only when identity is proven.
+# reopen and supported append-only shape changes
 #===----------------------------------------------------------------------===#
 
 restart
@@ -258,27 +244,10 @@ SELECT count(*) FROM ngram_search('t', 'tent');
 ----
 1
 
-restart
-
-statement ok
-ALTER TABLE t RENAME COLUMN other2 TO other3;
-
 statement error
-SELECT count(*) FROM ngram_search('t', 'tent');
+ALTER TABLE t RENAME COLUMN other TO other3;
 ----
-column list changed
-
-statement error
-PRAGMA ngram_refresh('t');
-----
-column list changed
-
-# and the repair the error names works
-statement ok
-PRAGMA drop_ngram_index('t', 's');
-
-statement ok
-PRAGMA create_ngram_index('t', 's');
+entries that depend on it
 
 query I
 SELECT count(*) FROM ngram_search('t', 'tent');

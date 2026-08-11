@@ -107,9 +107,8 @@ statement ok
 RESET ngram_max_grams_per_query;
 
 # delete a spread of rows (indexed and tail) and re-run: stale candidates must
-# be filtered by visibility, never returned. No checkpoint runs between the
-# deletes and the checks, so vacuum cannot move the surviving rowids (the
-# post-vacuum case is the Phase 5 refresh contract).
+# be filtered by visibility, never returned. A valid non-ART rowid guard also
+# prevents any later checkpoint from moving the surviving rowids.
 statement ok
 DELETE FROM corpus WHERE id % 4 = 1;
 

@@ -5,12 +5,12 @@
 require ngram
 
 statement ok
-CREATE TABLE docs(id INTEGER, s VARCHAR);
+CREATE TABLE docs(id INTEGER, s VARCHAR, t VARCHAR);
 
 # rows 2 and 5 are false-positive traps for needle 'tent': they contain the
 # grams 'ten' and 'ent' but not the substring
 statement ok
-INSERT INTO docs VALUES
+INSERT INTO docs(id, s) VALUES
 	(1, 'Hello world'),
 	(2, 'often entered'),
 	(3, NULL),
@@ -28,7 +28,7 @@ PRAGMA create_ngram_index('docs', 's');
 
 # rows inserted after the build sit past the high-water mark and must still be found
 statement ok
-INSERT INTO docs VALUES (12, 'tail tent row'), (13, 'tail noise'), (14, NULL);
+INSERT INTO docs(id, s) VALUES (12, 'tail tent row'), (13, 'tail noise'), (14, NULL);
 
 # happy path: false-positive traps rechecked away, tail row found, case folded
 query II
@@ -157,7 +157,7 @@ RESET ngram_max_grams_per_query;
 # needle decomposition dedupes repeated grams (ledger 1B): 'aaaa' decomposes to
 # the single gram 'aaa', probed once
 statement ok
-INSERT INTO docs VALUES (15, 'aaaa'), (16, 'aaab');
+INSERT INTO docs(id, s) VALUES (15, 'aaaa'), (16, 'aaab');
 
 query II
 SELECT id, s FROM ngram_search('docs', 'aaaa') ORDER BY id;
@@ -234,10 +234,8 @@ SELECT * FROM ngram_search('docs_view', 'tent');
 ----
 view, not a table
 
-# a second indexed column requires disambiguation
-statement ok
-ALTER TABLE docs ADD COLUMN t VARCHAR;
-
+# a second indexed column requires disambiguation. It predates the first broad
+# rowid guard, so that guard safely protects this later build.
 statement ok
 UPDATE docs SET t = CASE WHEN id = 1 THEN 'Needle in t' ELSE 'nothing' END;
 

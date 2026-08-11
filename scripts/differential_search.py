@@ -14,8 +14,8 @@ for randomized needles: substrings sampled from real rows (guaranteed matches,
 lengths crossing the gram boundary), random non-matching strings, gram-splice
 traps (grams present in the corpus, substring likely absent), case-flipped
 variants, and the empty needle. Each corpus is rechecked after tail inserts
-(past the high-water mark), after deletes, and inside an uncommitted writing
-transaction.
+(past the high-water mark), after below-HWM indexed-column updates, after
+deletes/vacuum, and inside an uncommitted writing transaction.
 
 With --transparent the harness exercises the Phase 4 optimizer rewrite
 instead of the explicit functions: every needle becomes plain
@@ -45,6 +45,7 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DUCKDB = os.path.join(REPO, "build", "release", "duckdb")
 NULL_SENTINEL = "__NGRAM_NULL__"
+UPDATE_MARKER = "QzPhaseElevenMarker917"
 
 
 def set_duckdb_binary(path):
@@ -173,12 +174,10 @@ def make_patterns(rng, needles, count):
     return patterns
 
 
-def transparent_checks(patterns, subset_only=False):
+def transparent_checks(patterns):
     """Per pattern, compare accelerated vs disabled_optimizers='extension'
     execution of the same plain query, for LIKE / contains / ILIKE forms.
-    With subset_only, only accelerated-minus-plain is checked (post-vacuum the
-    index may legitimately miss rows, but must never invent them). Session
-    settings (ngram_auto_accelerate etc.) are the caller's business."""
+    Session settings (ngram_auto_accelerate etc.) are the caller's business."""
     statements = []
     for kind, pattern in patterns:
         forms = [("like", "s LIKE %s" % sql_quote("%" + pattern + "%")),
@@ -193,32 +192,20 @@ def transparent_checks(patterns, subset_only=False):
                 "SET disabled_optimizers='extension';",
                 "CREATE OR REPLACE TEMP TABLE r_plain AS SELECT * FROM corpus WHERE %s;" % pred,
             ]
-            if subset_only:
-                statements.append(
-                    "SELECT 'diff', %s, count(*) FROM (TABLE r_acc EXCEPT TABLE r_plain);" % sql_quote(tag))
-            else:
-                statements.append(
-                    "SELECT 'diff', %s, count(*) FROM ((TABLE r_acc EXCEPT TABLE r_plain)"
-                    " UNION ALL (TABLE r_plain EXCEPT TABLE r_acc));" % sql_quote(tag))
+            statements.append(
+                "SELECT 'diff', %s, count(*) FROM ((TABLE r_acc EXCEPT TABLE r_plain)"
+                " UNION ALL (TABLE r_plain EXCEPT TABLE r_acc));" % sql_quote(tag))
     statements.append("SET disabled_optimizers='';")
     return statements
 
 
-#! Phase 5 detectors turn a vacuum that shrank the table below the index's
-#! high-water mark into an error instead of a silent subset; a phase that
-#! deliberately provokes one accepts that as the better outcome.
-STALE_MARKER = "is stale and cannot be used"
-
-
-def run_duckdb(db_path, script, allow_stale=False):
+def run_duckdb(db_path, script):
     proc = subprocess.run(
         [DUCKDB, db_path],
         input=".headers off\n.mode csv\n" + script,
         capture_output=True, text=True, timeout=600,
     )
     if proc.returncode != 0:
-        if allow_stale and STALE_MARKER in proc.stderr:
-            return proc.stdout
         raise RuntimeError("duckdb failed:\n%s" % proc.stderr[-4000:])
     return proc.stdout
 
@@ -299,6 +286,22 @@ def one_trial(trial, rng, rows, transparent):
         # phase 1: committed, fully indexed corpus
         checks += check_output(run_duckdb(db_path, "\n".join(phase_checks)), "committed", failures)
 
+        # phase 1b: introduce and then remove a marker through two committed
+        # updates below the HWM. Both directions must remain exhaustive.
+        if transparent:
+            update_checks = session_settings + transparent_checks([("plain", UPDATE_MARKER)])
+        else:
+            update_checks = [differential_sql(UPDATE_MARKER, case_insensitive),
+                             candidates_sql(UPDATE_MARKER, case_insensitive)]
+        run_duckdb(db_path, "UPDATE corpus SET s = coalesce(s, '') || %s WHERE id = 0;"
+                   % sql_quote(" " + UPDATE_MARKER))
+        checks += check_output(run_duckdb(db_path, "\n".join(update_checks)),
+                               "update-introduce", failures)
+        run_duckdb(db_path, "UPDATE corpus SET s = replace(s, %s, '') WHERE id = 0;"
+                   % sql_quote(UPDATE_MARKER))
+        checks += check_output(run_duckdb(db_path, "\n".join(update_checks)),
+                               "update-remove", failures)
+
         # phase 2: tail rows past the high-water mark
         inserts = ["INSERT INTO corpus VALUES (%d, %s);"
                    % (len(corpus) + i, "NULL" if s is None else sql_quote(s)) for i, s in enumerate(tail)]
@@ -314,35 +317,19 @@ def one_trial(trial, rng, rows, transparent):
         checks += check_output(run_duckdb(db_path, "\n".join(txn)), "in-txn", failures)
 
         # phase 4: deletes across indexed and tail rows, checked in the same
-        # session. Identity holds for deletes until a checkpoint vacuums them:
-        # vacuum merges row groups, squeezing out deleted gaps and MOVING the
-        # rowids of surviving rows, which strands the index's postings until
-        # PRAGMA ngram_refresh (Phase 5). Closing the database checkpoints, so
-        # the deletes and their checks must share one session.
+        # session and then after close/checkpoint below.
         deleted = ["DELETE FROM corpus WHERE id % 3 = 1;"] + phase_checks
         checks += check_output(run_duckdb(db_path, "\n".join(deleted)), "deleted", failures)
 
-        # phase 5: after close+reopen the deletes above have been vacuumed and
-        # surviving rowids may have moved. Either the Phase 5 detectors prove
-        # it — in which case the query refuses and there is nothing to compare
-        # — or the index answers, and recheck must still guarantee zero false
-        # positives: search results ⊆ brute force, always.
+        # phase 5: close/reopen may vacuum deleted trailing groups and reuse
+        # their rowids. The guard must preserve acceleration or force a full
+        # scan; either way both query paths remain exactly equal to brute force.
         if transparent:
-            subset = session_settings + transparent_checks(patterns, subset_only=True)
+            post_vacuum = session_settings + transparent_checks(patterns)
         else:
-            subset = []
-            for n in needles:
-                q = sql_quote(n)
-                if case_insensitive:
-                    pred = "contains(lower(s), lower(%s))" % q
-                else:
-                    pred = "contains(s, %s)" % q
-                subset.append(
-                    "SELECT 'diff', %s, count(*) FROM "
-                    "(SELECT * FROM ngram_search('corpus', %s) EXCEPT SELECT * FROM corpus WHERE %s);"
-                    % (q, q, pred))
-        checks += check_output(run_duckdb(db_path, "\n".join(subset), allow_stale=True),
-                               "post-vacuum-subset", failures)
+            post_vacuum = phase_checks
+        checks += check_output(run_duckdb(db_path, "\n".join(post_vacuum)),
+                               "post-vacuum", failures)
 
     return checks, failures
 

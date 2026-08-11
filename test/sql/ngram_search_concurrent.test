@@ -3,12 +3,9 @@
 # group: [sql]
 
 # Every differential check is a single query, so both sides share one snapshot:
-# identity must hold at any interleaving. Deletes stay confined to rows past
-# the index high-water mark: checkpoint vacuum squeezes deleted gaps out by
-# rewriting row groups, and with all gaps in the tail the indexed rowids keep
-# their positions and moved tail rows stay past the high-water mark. Deleting
-# indexed rows and then checkpointing strands the index's postings until
-# PRAGMA ngram_refresh (Phase 5).
+# identity must hold at any interleaving. A non-ART guard prevents checkpoint
+# vacuum from moving live rowids, covered updates become delete+append, and
+# deletes are harmless false-positive postings removed by live recheck.
 
 require ngram
 
@@ -49,9 +46,8 @@ SELECT count(*) FROM (
 ----
 0
 
-# rewrite some of this thread's tail rows without the needle (removing the
-# needle is always exact; introducing it below the high-water mark is the
-# documented Phase 5 refresh gap)
+# Rewrite some of this thread's tail rows without the needle. The guarded
+# update's replacement remains in the scanned tail.
 statement ok
 UPDATE churn SET s = 'rewritten ' || id WHERE id >= 100000 + ${t} * 10000 + ${i} * 1000 AND id < 100000 + ${t} * 10000 + ${i} * 1000 + 50;
 

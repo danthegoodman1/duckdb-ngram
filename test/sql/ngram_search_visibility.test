@@ -95,14 +95,8 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 ----
 4
 
-# DOCUMENTED STALENESS GAP, unchanged by Phase 5 and unfixable on duckdb
-# v1.5.5: an in-place UPDATE that introduces the needle into an
-# already-indexed row (rowid <= hwm) is invisible to ngram_search. DuckDB
-# updates rows in place (same rowid) unless an ART index forces
-# delete+insert, and offers no trigger or change feed naming the updated rows
-# (CREATE TRIGGER is a parser error), so there is nothing for an incremental
-# refresh to read: refresh covers appends past the high-water mark only.
-# Recheck still guarantees no false positives; a rebuild is the repair.
+# The ngram rowid guard converts an indexed-column UPDATE into delete+insert,
+# so a newly matching value is immediately visible in the tail.
 statement ok
 UPDATE docs SET s = 'tent snuck into an indexed row' WHERE id = 2;
 
@@ -115,30 +109,12 @@ SELECT id FROM docs WHERE contains(lower(s), 'tent') ORDER BY id;
 query I
 SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 ----
+2
 4
 
-# refresh cannot repair it — there is nothing to refresh, the row is below the
-# high-water mark and the engine never reported the change — so it refuses
-# rather than leaving the user with a refreshed-looking index that still
-# misses rows. Here the update happened to hit one of the rows the index
-# recorded as a witness, which is what makes the refusal possible at all; an
-# update that misses every witness stays undetected (see ngram/maintenance.hpp).
-statement error
+# refresh can now fold that appended row into postings
+statement ok
 PRAGMA ngram_refresh('docs');
-----
-no longer holds the value the index recorded
-
-query I
-SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
-----
-4
-
-# the rebuild does
-statement ok
-PRAGMA drop_ngram_index('docs', 's');
-
-statement ok
-PRAGMA create_ngram_index('docs', 's');
 
 query I
 SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
@@ -196,17 +172,11 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 4
 5
 
-# PHASE 5 CHANGE (was: a silent miss — count 0 while the table holds a match).
-# DROP TABLE leaves the shadow schema behind and the name-based ownership
-# guard matches a re-created table of the same name, so searches still bind
-# the dead index; they now refuse instead of answering from it. The proof is
-# the table's catalog oid: it survives every ALTER but is handed out afresh by
-# CREATE, so within the instance that recorded it a changed oid means the
-# table was replaced. The index records the instance too, because oids are
-# renumbered on restart — which is the residual gap: a same-shape re-creation
-# performed in an earlier session is still undetectable (v1.5.5 persists no
-# table identity token, and catalog ownership dependencies are in-memory
-# only), and stays misses-only there.
+# DROP TABLE leaves the shadow schema behind, but a same-name replacement does
+# not inherit the exact native guard incarnation recorded by format-3 meta.
+# Within the running instance the table oid also proves replacement. Explicit
+# search therefore refuses here; after reopen, missing/mismatched guard state
+# still forces an exhaustive scan rather than trusting the dead postings.
 statement ok
 CREATE TABLE reborn(id INTEGER, s VARCHAR);
 

@@ -569,83 +569,63 @@ a	4	4	6
 b	4	8	2
 
 #===----------------------------------------------------------------------===#
-# a bounded refresh's staleness witnesses stop at its own mark
+# bounded refresh remains valid across guarded tail and prefix updates
 #
-# The index records (rowid, value hash) witnesses so that maintenance can catch
-# a checkpoint vacuum that moved rows out from under its postings. Past the
-# mark there are no postings and every query reads the row live, so a witness
-# there proves nothing and can only produce false refusals — and a bounded
-# refresh leaves a tail behind by design. Recording witnesses over the whole
-# table (which is what an unbounded refresh, ending at the table's last row,
-# amounts to) made an ordinary tail UPDATE, or a vacuumed tail DELETE, refuse
-# every later increment and demand a rebuild.
+# The rowid guard turns indexed updates into delete+insert. Replacements remain
+# in the live tail until the next bounded increment reaches them.
 #===----------------------------------------------------------------------===#
 
 statement ok
-CREATE TABLE witnessed(id INTEGER, s VARCHAR);
+CREATE TABLE guarded(id INTEGER, s VARCHAR);
 
 statement ok
-INSERT INTO witnessed SELECT i, 'row ' || i || ' tent' FROM range(100) t(i);
+INSERT INTO guarded SELECT i, 'row ' || i || ' tent' FROM range(100) t(i);
 
 statement ok
-PRAGMA create_ngram_index('witnessed', 's');
+PRAGMA create_ngram_index('guarded', 's');
 
 statement ok
-INSERT INTO witnessed SELECT i, 'row ' || i || ' tail tent' FROM range(100, 1000) t(i);
+INSERT INTO guarded SELECT i, 'row ' || i || ' tail tent' FROM range(100, 1000) t(i);
 
 query IIII
-PRAGMA ngram_refresh('witnessed', 50);
+PRAGMA ngram_refresh('guarded', 50);
 ----
 s	50	149	850
 
-# the mark, the highest rowid witnessed, and how many witnesses there are: all
-# 32 land inside the range this call covers
-query III
-SELECT (SELECT hwm_rowid FROM ngram_main_witnessed.meta_s),
-	(SELECT max(CAST(split_part(x, ':', 1) AS BIGINT))
-		FROM (SELECT unnest(str_split(row_samples, ',')) AS x FROM ngram_main_witnessed.meta_s)),
-	(SELECT count(*) FROM (SELECT unnest(str_split(row_samples, ',')) FROM ngram_main_witnessed.meta_s));
-----
-149	149	32
-
 statement ok
-UPDATE witnessed SET s = 'mutated in the tail' WHERE rowid = 999;
+UPDATE guarded SET s = 'mutated in the tail' WHERE rowid = 999;
 
-# nothing to report: the row is tail, the tail scan reads it live
+# The guarded update is re-appended at rowid 1000. It is still in the tail and
+# the tail scan reads it live.
 query IIIIIIIIIIIII
-PRAGMA ngram_index_stats('witnessed');
+PRAGMA ngram_index_stats('guarded');
 ----
-s	3	true	149	999	850	280	341	61	2	1640	2368	NULL
+s	3	true	149	1000	850	280	341	61	2	1640	2368	NULL
 
 # and the loop keeps going
 query IIII
-PRAGMA ngram_refresh('witnessed', 50);
+PRAGMA ngram_refresh('guarded', 50);
 ----
 s	50	199	800
 
-# an in-place UPDATE below the mark is still caught: there the index does hold
-# postings, and they now describe a row that no longer exists
+# An update below the mark is delete+insert under the rowid guard. The stale
+# posting is hidden by visibility and the live value is in the tail, so
+# maintenance remains valid.
 statement ok
-UPDATE witnessed SET s = 'mutated below the mark' WHERE rowid = 96;
+UPDATE guarded SET s = 'mutated below the mark' WHERE rowid = 96;
 
-statement error
-PRAGMA ngram_refresh('witnessed', 50);
-----
-row id 96 no longer holds the value the index recorded for it
+statement ok
+PRAGMA ngram_refresh('guarded', 50);
 
-statement error
-PRAGMA ngram_compact('witnessed');
-----
-row id 96 no longer holds the value the index recorded for it
+statement ok
+PRAGMA ngram_compact('guarded');
 
 #===----------------------------------------------------------------------===#
 # the same, for the state that reaches this by accident: a plain DELETE in the
 # tail that the next checkpoint vacuums
 #
-# The vacuum rewrites row groups and renumbers the rows above the hole. Every
-# rowid it moved is past the mark, so the index still describes its own range
-# exactly, and maintenance must carry on. Small row groups so a few thousand
-# rows span enough of them for the vacuum to actually compact.
+# The non-ART rowid guard prevents vacuum from renumbering survivors. The hole
+# is past the mark and maintenance carries on.
 #===----------------------------------------------------------------------===#
 
 statement ok
@@ -674,15 +654,12 @@ DELETE FROM vac.t WHERE id >= 40000 AND id < 50000;
 statement ok
 CHECKPOINT vac;
 
-# the vacuum really did move rows: the table's last rowid dropped by the size of
-# the hole, and all of that motion is past the mark
-query III
+# live rowids did not move across the checkpoint
+query II
 SELECT (SELECT max(rowid) FROM vac.t),
-	(SELECT hwm_rowid FROM vac.ngram_main_t.meta_s),
-	(SELECT max(CAST(split_part(x, ':', 1) AS BIGINT))
-		FROM (SELECT unnest(str_split(row_samples, ',')) AS x FROM vac.ngram_main_t.meta_s));
+	(SELECT hwm_rowid FROM vac.ngram_main_t.meta_s);
 ----
-51807	24999	24999
+59999	24999
 
 query IIII
 PRAGMA ngram_refresh('vac.main.t', 5000);

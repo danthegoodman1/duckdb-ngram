@@ -6,37 +6,22 @@ Interleaves INSERT / DELETE / UPDATE / CHECKPOINT / PRAGMA ngram_refresh
 the database between every step (each step runs in its own duckdb process), and
 verifies the maintenance contract after every step:
 
-  I1  no false positives, ever: ngram_search results are a subset of the
-      brute-force answer in every state, however stale the index is. A
-      violation is always a bug.
+  I1  exact search, always: ngram_search results equal the brute-force answer
+      after every mutation, checkpoint, reopen, and maintenance operation.
 
-  I2  exhaustive results whenever the contract promises them: after any
-      sequence of appends, deletes, refreshes and compactions, the index path
-      must return exactly what brute force returns.
-
-  I3  staleness is surfaced, not silent: a state the index cannot answer
-      exhaustively must be reported by a detector. The harness looks at the
+  I2  maintenance uncertainty is surfaced: the harness looks at the
       index between steps the way an operator would — PRAGMA ngram_index_stats
       reports stale_reason, and the maintenance pragmas refuse — and rebuilds
-      when told to. A state that is neither exhaustive nor reported is a
-      failure, except for the one gap the contract documents as undetectable
-      (an in-place UPDATE that no checkpoint has folded into the storage of an
-      earlier row group), which is counted and reported.
+      when told to. Query fallback must remain exact before that rebuild.
 
 The corpus is created with a small row-group size so that a few thousand rows
-span many row groups: that is what makes deletes trigger real vacuum merges,
-and what gives the row-group and column-storage detectors something to see.
+span many row groups, making vacuum and trailing-rowid-reuse schedules easier
+to reach in a bounded run.
 
---no-stale-expected turns the harness into a false-alarm gate instead. It drops
-the operations that legitimately invalidate an index — deletes, which the next
-checkpoint vacuums out from under the index's postings once refresh has carried
-the mark past them, and in-place updates below the mark — but keeps an in-place
-update confined to rows past the mark, which cannot invalidate anything. Then
-it FAILS on any detector verdict at all: a refusal, a query error, or a
-stale_reason in the stats pragma. Appending, refreshing, compacting, and
-mutating rows the index does not cover must never make a detector fire, and the
-ordinary mode cannot notice if they start to, because it treats every verdict
-as legitimate and rebuilds.
+--no-stale-expected turns the harness into a false-alarm gate instead. It omits
+operations that may legitimately make incremental maintenance uncertain, but
+keeps an indexed-column update confined to rows past the mark. It FAILS on any
+detector verdict; ordinary mode accepts a conservative verdict and rebuilds.
 
 Usage: python3 scripts/churn_maintenance.py [--rounds N] [--rows N] [--seed S]
                                             [--duckdb PATH] [--no-stale-expected]
@@ -56,7 +41,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DUCKDB = os.path.join(REPO, "build", "release", "duckdb")
 ROW_GROUP_SIZE = 2048
 # words the rows are built from; UPDATE splices in MARKER, which no generated
-# row contains, so an unrepaired in-place update is always visible as a miss
+# row contains, so indexed-column update exhaustiveness is directly checked
 WORDS = ["tent", "ten", "cent", "often", "entered", "content", "connection",
          "reset", "peer", "needle", "haystack", "gram", "index", "duck", "row"]
 MARKER = "grendel"
@@ -97,8 +82,7 @@ def rows_sql(rng, start, count):
 
 
 def verification_script():
-    """Per needle: rows the index path returns that brute force does not (I1),
-    and rows brute force returns that the index path does not (I2)."""
+    """Per needle, check both directions of the exact-search invariant."""
     out = []
     for needle in NEEDLES:
         q = sql_quote(needle)
@@ -126,18 +110,14 @@ class Churn:
         self.next_id = rows
         self.checks = 0
         self.failures = []
-        #! an in-place UPDATE happened; only a rebuild can repair it
-        self.updated_in_place = False
         self.stale_states = 0
         self.detected = 0
-        self.undetected_updates = 0
         self.ops = {}
         self.reasons = {}
 
     def rebuild(self):
         self.db.run("PRAGMA drop_ngram_index('corpus', 's');\n"
                     "PRAGMA create_ngram_index('corpus', 's');")
-        self.updated_in_place = False
 
     def maintenance(self, statement):
         """Run a maintenance pragma. A refusal is a detection, after which the
@@ -160,30 +140,21 @@ class Churn:
     def step(self, round_no):
         ops = ["insert", "insert", "checkpoint", "refresh", "refresh", "compact", "compact_purge"]
         if not self.strict:
-            # a delete is vacuumed by the next checkpoint (and every step here
-            # closes the database), and an in-place update is unrepairable:
-            # both legitimately invalidate the index
+            # Deletes/checkpoints may make incremental maintenance uncertain;
+            # indexed-column updates exercise the guard's delete+insert path.
             ops += ["delete", "update"]
         else:
-            # An in-place UPDATE confined to rows past the high-water mark.
-            # Those rows are not indexed — every query reads them by scanning —
-            # and v1.5.5 updates in place (verified: row count, max rowid and
-            # the updated row's own rowid are unchanged across the update and
-            # the checkpoint after it), so this leaves no gap for a vacuum to
-            # close and cannot invalidate anything. Any detector verdict after
-            # it is a false alarm. Without it, strict mode drops mutation
-            # entirely and structurally cannot reach the state where a false
-            # alarm lives, which is how a bounded refresh recording witnesses
-            # over tail rows got past this harness once already.
+            # A covered-column UPDATE confined to rows past the high-water
+            # mark. The guard turns it into delete+append and the replacement
+            # remains in the scanned tail, so any detector verdict is a false
+            # alarm. This keeps mutation in strict mode instead of making that
+            # mode append-only.
             #
             # A tail-confined DELETE is deliberately NOT here: refresh advances
             # the mark over deleted rowids on purpose (otherwise an increment of
             # nothing but deleted rows would stall a bounded loop), so the gap
             # ends up below the mark, and the next checkpoint's vacuum then
-            # shifts indexed rows down out from under the index's postings.
-            # That is genuine staleness — the documented "rebuild after a
-            # checkpoint has vacuumed deleted rows" case — and it belongs in the
-            # ordinary mode, where it already is.
+            # can create a trailing-reuse risk that belongs in ordinary mode.
             ops += ["tail_update"]
         op = self.rng.choice(sorted(ops))
         self.ops[op] = self.ops.get(op, 0) + 1
@@ -198,7 +169,6 @@ class Churn:
             modulus = self.rng.randint(7, 23)
             self.db.run("UPDATE corpus SET s = s || ' %s' WHERE id %% %d = %d;"
                         % (MARKER, modulus, self.rng.randrange(modulus)))
-            self.updated_in_place = True
         elif op == "tail_update":
             modulus = self.rng.randint(7, 23)
             self.db.run("UPDATE corpus SET s = s || ' %s' "
@@ -257,20 +227,10 @@ class Churn:
         return bool(stale)
 
     def verify(self, round_no, op):
-        reported = self.look_at_index()
         code, out, err = self.db.run(verification_script(), allow_error=True)
         if code != 0:
-            if "is stale and cannot be used" in err:
-                if self.strict:
-                    self.failures.append("round %d (%s): false alarm, the query path refused on an index nothing "
-                                         "invalidated: %s" % (round_no, op, err.strip()[-300:]))
-                else:
-                    # the query path itself refused: also a detection
-                    self.detected += 1
-                    self.stale_states += 1
-                self.rebuild()
-                return
             self.failures.append("round %d (%s): verification failed: %s" % (round_no, op, err.strip()[-400:]))
+            self.look_at_index()
             return
         missing = 0
         for kind, needle, count in parse_counts(out):
@@ -280,24 +240,17 @@ class Churn:
                                      % (round_no, op, needle, count))
             elif kind == "missing":
                 missing += count
+        # Inspect maintenance health only after querying the pre-rebuild state:
+        # an unsafe guard must take its exact fallback before stats triggers a
+        # conservative rebuild.
+        reported = self.look_at_index()
         if not missing:
             return
         if reported:
-            self.failures.append("round %d (%s): %d rows missing after a rebuild the detector asked for"
+            self.failures.append("round %d (%s): %d rows missing before a detector-triggered rebuild"
                                  % (round_no, op, missing))
-        elif self.strict:
-            self.failures.append("round %d (%s): I2 violated, %d rows missing in a run that only appended"
-                                 % (round_no, op, missing))
-        elif self.updated_in_place:
-            # the documented gap: an in-place UPDATE the storage detector could
-            # not see yet (no checkpoint has folded it into an earlier row
-            # group). Only a rebuild repairs it, which is what the contract
-            # tells the user to do.
-            self.undetected_updates += 1
-            self.stale_states += 1
-            self.rebuild()
         else:
-            self.failures.append("round %d (%s): I2 violated, %d rows missing with no detector firing"
+            self.failures.append("round %d (%s): I1 violated, %d matching rows were omitted"
                                  % (round_no, op, missing))
 
 
@@ -347,10 +300,10 @@ def main():
         final = out.strip().splitlines()[-1] if out.strip() else "?"
 
     print("TOTAL: %d checks, %d failures, %d un-maintainable states "
-          "(%d reported by a detector, %d undetected in-place updates), ops %s, final rows/row-groups %s "
+          "(%d reported by a detector), ops %s, final rows/row-groups %s "
           "(master seed %d)"
           % (churn.checks, len(churn.failures), churn.stale_states, churn.detected,
-             churn.undetected_updates, sorted(churn.ops.items()), final, seed))
+             sorted(churn.ops.items()), final, seed))
     print("detector reasons: %s" % sorted(churn.reasons.items()))
     for f in churn.failures[:50]:
         print("FAIL:", f)

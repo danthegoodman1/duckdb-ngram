@@ -69,14 +69,21 @@ struct MetaInfo {
 	int64_t table_oid = 0;
 	int64_t catalog_oid = 0;
 	string instance_id;
-	//! (rowid, value hash) witnesses of where the postings point.
-	string row_samples;
+	//! Exact zero-posting DuckDB index that prevents rowid-moving vacuum and
+	//! latches reuse of a truncated trailing rowid range.
+	string guard_name;
+	string guard_token;
 };
 
 //! Read and validate the single meta row of an index (format version,
 //! ownership, gram options, high-water mark); throws when the shadow tables do
 //! not look like this extension built them for `target`.
 MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry, const ShadowTarget &target);
+
+//! Read only the common ownership/version prefix. Used by DROP to recognize
+//! the known guard-less v2 layout without weakening normal readers.
+int64_t ReadMetaFormatVersion(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
+                              const ShadowTarget &target);
 
 //! Candidate rowids among indexed rows for a set of needle grams: the sorted
 //! intersection of the posting lists of the up-to-max_grams rarest grams.

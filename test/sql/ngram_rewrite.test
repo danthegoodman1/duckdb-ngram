@@ -219,12 +219,13 @@ SELECT id, s FROM docs WHERE s LIKE '%tent%' ORDER BY id;
 9	contentment
 12	tail tent row
 
-# an index created inside a still-open transaction accelerates there
-statement ok
-BEGIN;
-
+# An index can include transaction-local inserts, but target-catalog DDL must
+# be committed before the creation barrier starts.
 statement ok
 CREATE TABLE txn_docs(id INTEGER, s VARCHAR);
+
+statement ok
+BEGIN;
 
 statement ok
 INSERT INTO txn_docs VALUES (1, 'a tent inside'), (2, 'ten cents');
@@ -270,16 +271,8 @@ SELECT count(*), count(CASE WHEN id % 3 = 0 THEN 1 END) FROM dml;
 ----
 66	0
 
-# the transparent path inherits the Phase 3 staleness contract, misses-only:
-# an in-place UPDATE that introduces a needle into already-indexed rows is
-# invisible to the accelerated scan until Phase 5 refresh (this is why
-# ngram_auto_accelerate defaults to false). Pinned here: the accelerated
-# query misses the updated rows, the kill switch finds them, and false
-# positives remain impossible. Verification is disabled for this section —
-# it compares optimized vs unoptimized plans, and this divergence is exactly
-# the documented gap.
-statement ok
-PRAGMA disable_verification
+# Indexed-column updates are delete+insert under the guard. The accelerated
+# path sees their fresh rowids in the tail and stays identical to a seq scan.
 
 statement ok
 UPDATE dml SET s = s || ' grendel' WHERE id % 5 = 0;
@@ -287,7 +280,7 @@ UPDATE dml SET s = s || ' grendel' WHERE id % 5 = 0;
 query I
 SELECT count(*) FROM dml WHERE s LIKE '%grendel%';
 ----
-0
+13
 
 statement ok
 SET disabled_optimizers = 'extension';
@@ -299,9 +292,6 @@ SELECT count(*) FROM dml WHERE s LIKE '%grendel%';
 
 statement ok
 SET disabled_optimizers = '';
-
-statement ok
-PRAGMA enable_verification
 
 #===----------------------------------------------------------------------===#
 # prepared statements across index drop and rebuild

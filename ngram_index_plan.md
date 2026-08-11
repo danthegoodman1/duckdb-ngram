@@ -5,19 +5,20 @@
 Build a C++ DuckDB extension providing a disk-persisted trigram index that accelerates
 substring search (`LIKE '%needle%'` / `contains(col, 'needle')`) over large text columns,
 returning **every** matching row (exact search, 100% recall). Postings live in ordinary
-DuckDB shadow tables (the duckdb-fts model), so the index is durable, buffer-managed,
-WAL-recovered, and inert-but-readable when the extension is not loaded. Query
-acceleration is a transparent optimizer rewrite plus explicit table functions; every
-result is rechecked against the real string, so index imprecision or staleness can only
-cost performance, never correctness.
+DuckDB shadow tables (the duckdb-fts model), while a zero-posting native rowid guard keeps
+the base-table mapping safe or forces one exhaustive scan. The index is durable,
+buffer-managed, and WAL-recovered. It remains readable without the extension, but guarded
+base-table DML requires the custom type to be loaded. Query acceleration is a transparent
+optimizer rewrite plus explicit table functions; every result is rechecked against the
+real string, so index imprecision or guard uncertainty can only cost performance, never
+correctness.
 
 Performance target: hundreds of milliseconds per selective substring query over TB-scale
 corpora. Interactive (sub-ms) latency is a non-goal, which is why the shadow-table
-architecture is chosen over a native `BoundIndex` custom index type: DuckDB's custom-index
-path (as of Aug 2026 main) pins index buffers permanently after first touch, writes the
-whole index image to the WAL at `CREATE INDEX`, forces `KEEP_ROW_IDS` vacuum on the whole
-table, and its WAL-replay path is lightly exercised (duckdb-vss still gates persistence
-behind an experimental flag; see vss issue #81). Non-goals: similarity/fuzzy ranking,
+architecture is chosen over putting postings in a native `BoundIndex`: DuckDB's custom-index
+path (as of Aug 2026 main) pins index buffers permanently after first touch and writes the
+whole index image to the WAL at `CREATE INDEX`. Phase 11 uses only a zero-data native guard
+for rowid safety. Non-goals: similarity/fuzzy ranking,
 regex literal extraction (stretch, later), needles shorter than the gram size (fall back
 to seq scan, still exhaustive).
 
@@ -84,15 +85,12 @@ submodule tag `research-e500d778` for the main-only references flagged below.
   ending in a SELECT are not wrapped; inside a user transaction the wrapper instead sets
   `current_transaction_invalidation_policy` globally and restores the hardcoded default
   (a user's custom policy is silently reset — document).
-- **Shadow tables** persist/recover as ordinary tables; a database opened without the
-  extension reads and writes normally (verified against the stock duckdb 1.5.5 wheel).
-  This beats the custom-index route, which on v1.5.5 still pins fixed-size buffers after
-  first touch (`fixed_size_buffer.hpp:120-144` FIXME), writes the whole index image to
-  the WAL at CREATE INDEX (`write_ahead_log.cpp:372-408`; the default
-  `BoundIndex::SerializeToWAL` throws, `bound_index.cpp:177-179`), forces rowid-stable
-  non-compacting vacuum for any non-ART index (`row_group_collection.cpp:28-39`,
-  `:1359-1369`; main's `KEEP_ROW_IDS` naming does not exist on v1.5.5), and raises
-  `MissingExtensionException` on write when the extension is absent (`index_binder.cpp:27`).
+- **Shadow postings** persist/recover as ordinary tables. Phase 11 additionally installs a
+  zero-posting non-ART guard: stock DuckDB can read the database, but guarded-table DML is
+  unsupported without the extension (`index_binder.cpp:27`; v1.5.5 DELETE may busy-spin
+  after a failed bind). The guard deliberately makes rowid-moving vacuum ineligible
+  (`row_group_collection.cpp:28-39`, `:1359-1369`) without paying the fixed-buffer/WAL-image
+  costs that made native posting storage unattractive.
 - **No triggers, no change feed, no persistent table identity** (all verified on v1.5.5
   during Phase 5): `CREATE TRIGGER` is a parser error; catalog ownership dependencies
   (`ALTER SEQUENCE ... OWNED BY tbl`, which does cascade a DROP TABLE onto the sequence)
@@ -111,10 +109,11 @@ submodule tag `research-e500d778` for the main-only references flagged below.
   restores the row-group layout, the row count and the max rowid to their pre-delete
   values while the moved rows stay moved. Row counts, `pragma_storage_info` layout and
   the column's block layout are therefore all unsound as "no motion" oracles; only the
-  *contents* of recorded rowids distinguish the two states, which is what the Phase 5 row
-  witnesses read. Related: row-group merges also happen with no deletes at all (adjacent
-  partial groups), and those preserve rowids — so a changed layout is not evidence of
-  motion either.
+  *contents* of recorded rowids distinguish the two states. Phase 5 sampled those contents;
+  Phase 11 supersedes that probabilistic detector with a non-ART guard that prevents live
+  motion and durably latches later reuse, then removes the witnesses. Related: row-group
+  merges also happen with no deletes at all (adjacent partial groups), and those preserve
+  rowids — so a changed layout is not evidence of motion either.
 - **`pragma_storage_info`'s `start` is relative to the row group**, not an absolute rowid;
   the absolute (start, count) layout comes from `DataTable::GetPartitionStats`, and
   `count` there includes rows deleted but not yet vacuumed. Cost is metadata-only: 2 ms
@@ -266,8 +265,9 @@ Out of scope:
 
 Completion gate:
 Index builds on a 10 GB corpus without OOM under a constrained memory limit; database
-close/reopen round-trips the index; reopening WITHOUT the extension leaves the base table
-fully usable and the index schema inert.
+close/reopen round-trips the index. The original extension-absent writeability guarantee
+was true for shadow-only format 2 and is superseded by Phase 11: guarded format-3 tables
+remain readable, but their DML requires the extension.
 
 Testing plan:
 - sqllogictests: create/drop lifecycle, duplicate create, stats output, options round-trip.
@@ -514,7 +514,7 @@ Status ledger:
 | Complete | Decision | Segment granularity (`SEGMENT_SHIFT`) stays 20 | Same analysis, all shifts costed exactly on the 1 GB posting stream: shift 16 costs +3.88%, 18 +1.09%, 22 −0.43%, 24/26 −0.59%. Coarser buckets buy at most 0.6% of bytes while giving the probe's live-segment and min/max pruning less to work with; finer buckets cost real space. |
 | Complete | Decision | Build-time `preserve_insertion_order=false` rejected | Matched pair at 1 replica (both 12 threads / 24 GB, same background load): order preserved 364.3 s / 2,549,366 segment rows / 913,035,911 blob bytes; order relaxed 484.8 s / 2,601,819 segment rows / 913,367,136 bytes. 33% slower and slightly larger — the packer wants one ordered pass. Postings were identical either way and spot verification was exact, so the option is safe, just not useful. |
 | Complete | Risk | duckdb-fts trigram sidecar overlaps scope | Resolved: no collision. duckdb-fts merged PR #52 ("Add indexed wildcard and regex search") to main on 2026-08-04 and has **not released it** — no tags, no releases, last version bump 2026-02-16 — so `INSTALL fts` on v1.5.5 does not contain it. What it builds is a *dictionary* trigram sidecar (`term_grams`/`raw_term_grams`, keyed by termid) used to expand a whole-token wildcard or regex query term before BM25 scoring; its README states the sidecars "grow with the term dictionary rather than with the document corpus" and that a pattern is matched "as one whole-token pattern ... against the normalized raw-term dictionary". Character-level substring search across token boundaries over raw strings is a different structure with a different cost model. duckdb/duckdb #16071 (a real trigram *tokenizer*) is still open and unanswered; the only implementation of that idea is `tkys/duckdb-fts-trigram`, an unaffiliated single-author repo with 0 stars, one push, and no distribution. Registry survey: 306 community extensions, zero hits for trigram/ngram/substring/inverted index; the name `ngram` is unclaimed and no core extension uses it. Recorded in Key Research Facts. |
-| Complete | Work | 6C: Community-extension packaging (prepared and validated, PR not opened) | packaging/community-extensions/extensions/ngram/description.yml is the exact single file a submission consists of; packaging/SUBMISSION.md carries the format research, the blocking checklist, the local validation transcript and the drafted PR text. community-extensions pins DuckDB centrally (`build.yml`: `DUCKDB_LATEST_STABLE: 'v1.5.5'`, ci_tools `v1.5-variegata`) — there is no `duckdb_version` field — so this repo's v1.5.5 pin is exactly right, and with no external dependencies neither `vcpkg_commit` nor `requires_toolchains` is needed. **Installability proven against a STOCK binary**, not this repo's build: duckdb_cli-linux-amd64 v1.5.5 (`d8cdaa33fd`) + a local repository in DuckDB's own layout (`<repo>/v1.5.5/linux_amd64/ngram.duckdb_extension.gz`) + `SET custom_extension_repository`; `INSTALL ngram; LOAD ngram;` reports `install_mode = REPOSITORY`, then build/search/refresh/stats all work, the database reopens fully usable in the same stock binary with the extension *absent* (reads 5000 rows, inserts a 5001st, reads the shadow tables, and `ngram_search` is a clean catalog error), and reopening with the extension finds both the indexed row and the row written while it was gone. Blocking on the maintainer: the repo is private, and the full CI matrix (Phase 9) has to be green before `excluded_platforms` can be filled in and a release SHA pinned. |
+| Complete | Work | 6C: Community-extension packaging (prepared and validated, PR not opened) | packaging/community-extensions/extensions/ngram/description.yml is the exact single file a submission consists of; packaging/SUBMISSION.md carries the format research, the blocking checklist, the local validation transcript and the drafted PR text. community-extensions pins DuckDB centrally (`build.yml`: `DUCKDB_LATEST_STABLE: 'v1.5.5'`, ci_tools `v1.5-variegata`) — there is no `duckdb_version` field — so this repo's v1.5.5 pin is exactly right, and with no external dependencies neither `vcpkg_commit` nor `requires_toolchains` is needed. **Historical format-2 installability was proven against a STOCK binary**, not this repo's build: duckdb_cli-linux-amd64 v1.5.5 (`d8cdaa33fd`) + a local repository in DuckDB's own layout (`<repo>/v1.5.5/linux_amd64/ngram.duckdb_extension.gz`) + `SET custom_extension_repository`; `INSTALL ngram; LOAD ngram;` reported `install_mode = REPOSITORY`, and build/search/refresh/stats worked. Phase 11 supersedes the old extension-absent writeability result: format-3 guarded tables remain readable but require `LOAD ngram` for DML. Blocking on the maintainer: the repo is private, and the full CI matrix (Phase 9) has to be rerun on the final submission commit before a release SHA is pinned. |
 | Complete | Doc | User docs: maintenance contract, fallbacks, settings | README.md rewritten from the extension template into user documentation: install, quick start, the correctness contract (superset + recheck, tail scan, transaction-local phase, case semantics), the full staleness contract as two tables in user language (detected → refused; not detected → misses only, with the repair for each) copied from the Phase 5 ledger, maintenance guidance (when to refresh, when to compact, when only a rebuild will do) and a column-by-column reading of `ngram_index_stats`, an API reference including which query shapes the transparent path accepts and declines, a settings table with defaults and the reason for each, performance expectations by selectivity class, limitations (including the pragma-in-a-batch caveat and the `current_transaction_invalidation_policy` reset), and platform support. Measured numbers live in benchmarks/RESULTS.md, which the README links. |
 | Complete | Test | Parallel fetch/recheck measured before and after | `threads=1` reproduces the pre-parallel pipeline exactly (it ran on one thread whatever the thread setting was), compared against the same 24-thread scan both versions raced. Dense worst case: 10.016 s → 3.138 s at 10 GB (3.19×) and **218.887 s → 34.367 s at 100 GB (6.37×)**; moderate 23.082 s → 5.279 s at 100 GB (4.37×); rare 1.08× (it is all probe, and the probe was never the parallel part). Against the scan it races, the dense case went from 47.4× slower to 7.43× at 100 GB. In gate terms: fetch fell from ~2,970 ns to ~279 ns per candidate at 100 GB, moving the fetch-versus-scan crossover from 0.14% to 1.1% of rows — the band of selectivities where the index is the right choice is about eight times wider. The packet's predicted "~0.2 s worst case" did not materialise and is corrected in RESULTS.md: fetching tens of millions of rows is expensive on any thread count, and the gate, not parallelism, is what keeps the default path off that number. The in-scan fallback also stopped being a single-threaded crawl — it is now a parallel scan, measured at 1.3-4.3× a plain scan with nearly all the excess being the already-paid probe. |
 | Complete | Test | Phase 1-5 harnesses re-run with fresh seeds after the Phase 6 code changes | Release build: `make test` 19 files / 2081 assertions green (2074 before test/sql/ngram_parallel.test was strengthened to 43 assertions); scripts/differential_search.py explicit seed 20260901 = 6281 checks / 0 failures, `--transparent` seed 20260902 = 3472 checks / 0 failures; churn seed 20260903 (60 rounds, 5000 rows) = 960 checks / 0 failures / 9 un-maintainable states (8 detector-reported, 1 the documented in-place-update gap), churn `--no-stale-expected` seed 20260904 (30 rounds) = 480 checks / 0 failures / 0 detector verdicts; crash seed 20260905 (400k rows + 150k tail, 16 kills across a 0.84 s refresh and 16 across a 1.79 s purging compact) and seed 20260906 (150k + 60k) = 0 failures, every reopen landing on exactly the pre- or post-operation state. DEBUG + AddressSanitizer build: full suite 19 files / 2081 assertions green, churn seed 20260907 (20 rounds) = 320 checks / 0 failures, churn strict seed 20260908 (15 rounds) = 240 checks / 0 failures / 0 verdicts, `--transparent` differential seed 20260909 (4 trials) = 1732 checks / 0 failures. |
@@ -723,7 +723,7 @@ Scope:
 - Add an execution-time shared vacuum fence that is acquired before maintenance validates
   rowid-derived state and held across every generated statement until commit, rollback,
   cancellation, or error.
-- Re-run ownership, identity, high-water-mark, and witness validation after acquiring the
+- Re-run ownership, identity, high-water-mark, and index-option validation after acquiring the
   fence. Pragma-callback validation may reject obvious failures early, but is not the
   correctness boundary.
 - Make owner identity comparisons case-insensitive in every reader and generated guard;
@@ -740,9 +740,9 @@ Completion gate:
 In the deterministic preprocessing-to-execution race, fence-first maintenance makes an
 overlapping checkpoint use a non-rowid-moving path and commits metadata and postings from
 that fenced snapshot. If a rowid-moving checkpoint completes first, execution-time
-identity, HWM, and witness validation refuses refresh or compaction and leaves the
+identity, HWM, and option validation refuses refresh or compaction and leaves the
 previously published index unchanged; a create may instead build wholly from the fenced
-post-checkpoint snapshot using a runtime HWM and witnesses. No schedule may commit
+post-checkpoint snapshot using a runtime HWM. No schedule may commit
 maintenance state assembled from two rowid epochs. Exact search through an index that a
 checkpoint invalidated before the fence is acquired remains Phase 11's responsibility.
 
@@ -766,11 +766,11 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Scope | Maintenance holds one execution-time rowid-stability fence through publication | `AcquireMaintenanceFence` takes DuckDB's normal transaction vacuum lock before any generated write. `MaintenanceFenceState` keeps a second shared lock in connection state until DuckDB's post-commit or rollback callback; that bridge is necessary because DuckDB releases the transaction-owned lock before running the same commit's automatic checkpoint. The holder is mutex-protected for direct parallel invocation and stores each manager/lock as one exception-safe aggregate. |
-| Complete | Scope | Validation runs after the fence and against the publishing snapshot | The volatile, fallible `system.main.__ngram_maintenance_guard` is the first generated body expression for create, refresh, and compact. After fencing it re-resolves the table and verifies table OID, schema fingerprint, ASCII-case-insensitive ownership, indexed column, HWM, gram size, case option, and row witnesses. Create separately enumerates current metadata owners, rejects an existing same-column index, and derives both HWM and witnesses from the same runtime committed maximum rowid. |
+| Complete | Scope | Validation runs after the fence and against the publishing snapshot | The volatile, fallible `system.main.__ngram_maintenance_guard` is the first generated body expression for create, refresh, and compact. After fencing it re-resolves the table and verifies table OID, schema fingerprint, ASCII-case-insensitive ownership, indexed column, HWM, gram size, and case option. Create separately enumerates current metadata owners, rejects an existing same-column index, and derives HWM from the runtime committed maximum rowid. Phase 11 later removed format-3 row witnesses. |
 | Complete | Scope | Identifier, scratch, and guard state cannot collide with user state | Scratch/guard tables use random UUID names and transactional `CREATE TEMP TABLE`, and maintenance no longer reads or writes a session variable. Generated calls are `system.main` qualified so user macros cannot intercept them. SQL owner guards compare encoded ASCII-folded bytes, matching C++ `StringUtil::CIEquals` even under `default_collation='nocase'`; `ExistingMetaTables` and stats discovery use case-insensitive prefix matching. |
 | Complete | Scope | Fence and scratch cleanup covers every exit | The lock has one `ClientContextState` owner and is cleared by DuckDB's commit/rollback callbacks; temp scratch belongs to the generated transaction. The deterministic harness proves rollback after an execution-time error and success both permit a later checkpoint to move rowids, and SQL regressions prove failed work leaves no invocation scratch. Cancellation is not separately injected; it follows DuckDB's same automatic rollback callback. |
 | Complete | Work | 10A: Introduce a maintenance execution wrapper with transaction-lifetime vacuum fencing | Implemented by the shared guard scalar plus `MaintenanceFenceState`, covering every statement in each generated transaction and the otherwise-unprotected automatic-checkpoint interval inside commit. No production scheduling hook or custom lock protocol was added. |
-| Complete | Work | 10B: Move definitive identity/HWM/witness checks behind the fence | Callback checks remain only as early rejection. The generated body repeats all publication-critical checks after its fence, includes explicit create/existing mode and index-option comparisons, and samples witnesses at execution time. |
+| Complete | Work | 10B: Move definitive identity/HWM checks behind the fence | Callback checks remain only as early rejection. The generated body repeats all publication-critical checks after its fence and includes explicit create/existing mode and index-option comparisons. Phase 11 superseded and removed the witness mechanism from unreleased format 3. |
 | Complete | Work | 10C: Replace name-derived scratch objects and shared session variables | Create, refresh, and compact now use UUID temp names; the fixed `__ngram_guard` variable is gone. Owner semantics are shared across create/search/maintenance/drop/stats, including case-only renames and distinct non-ASCII identifiers. |
 | Complete | Gate | Checkpoint/maintenance schedules cannot mix rowid epochs | The old transaction-only build failed the same-commit discriminator 3/3 with `max(rowid)=127119`, `HWM=124999`, brute-force count 1, and indexed count 0. The final deterministic harness passes repeatedly: fence-first checkpoint is non-moving; checkpoint-first refresh refuses without publishing; checkpoint-first create builds exactly from the moved snapshot; and same-commit automatic checkpoint leaves rowids stable until publication, after which a fresh delete plus checkpoint proves release. The full release gate passed the harness and all 22 SQL tests (2,668 assertions). |
 | Complete | Test | Deterministic checkpoint/fence mechanism coverage | `test/cpp/ngram_maintenance_checkpoint_gap.cpp`, wired into normal release/debug/reldebug test targets, freezes expanded ASTs at the real preprocessing/execution seam and covers both external schedules, the distinct create branch, same-commit automatic checkpoint, exact search/HWM outcomes, and real lock release. Ordinary SQL tests cover bounded/unbounded refresh and both compact modes, which share the same first-statement existing-index guard. No full operation-by-schedule matrix is claimed. |
@@ -784,55 +784,92 @@ is literal: every accelerated result is identical to the same predicate's brute-
 result, without requiring callers to remember a rebuild rule.
 
 Scope:
-- Implement the conservative dirty-range design in `docs/stale-updates.md`: persist an
-  indexed-row-group baseline, combine transient `ColumnData::HasChanges` information with
-  durable block/layout identities, and treat any ambiguous mapping as dirty rather than
-  clean.
-- Execute one exact result pipeline over index candidates, the unindexed tail, and dirty
-  row-group scans. Deduplicate rowids and apply the original predicate once; a completely
-  uncertain baseline degrades to a full scan.
-- Add bounded, atomic repair for dirty ranges using segment-aligned re-indexing, then
-  publish the new baseline only with the repaired postings.
-- Version-gate every DuckDB-internal assumption and define `scan` and `error` policies for
-  detected dirtiness. Consider making `ngram_auto_accelerate` default-on only after this
-  phase's exactness and upgrade gates pass.
+- Create one zero-posting `NGRAM_ROWID_GUARD` native index per ngram index. Its physical
+  column dependencies make covered updates delete and append rather than mutate a rowid in
+  place; its non-ART type makes DuckDB's live-rowid-moving vacuum path ineligible. Persist
+  an allocated-rowid high-water mark, permanent unsafe-reuse latch, random incarnation
+  token, compatibility bit, and database-header checkpoint seal without scanning the base
+  table to build the guard.
+- Make guard installation atomic with the postings build. Under the Phase 10 vacuum fence,
+  exclude old writers, replace the base `DataTable` with an ADD/DROP of a UUID-named nullable
+  column, create the scan-free guard while its build state holds the table append lock across
+  baseline and physical installation, then validate its internally minted token and release
+  the exclusive checkpoint lock before the long postings scan. Existing format-3 guard
+  coverage or a strictly old explicit native ART can replace the ADD/DROP barrier. Reject
+  transaction histories that cannot be made safe and make every race fail or retry before
+  publication.
+- Record the exact guard name and token in meta format 3 and validate type, table, physical
+  column, token, persisted state, and pinned DuckDB runtime on every query and maintenance
+  path. A missing, incompatible, replaced, or unsafe guard makes explicit and transparent
+  search scan; `ngram_candidates` emits every visible covered-prefix rowid; refresh and
+  compact refuse until rebuild.
+- Allow checkpoint vacuum to discard fully deleted trailing row groups while keeping live
+  rowids stable. The first committed append that reuses any previously allocated rowid
+  latches the guard unsafe, so no stale posting can cause a miss. Seal guard state to the
+  database-header checkpoint iteration so an unbound checkpoint cannot launder buffered WAL
+  replay; eagerly bind only at safe startup/last-close boundaries and quarantine malformed
+  persisted state without poisoning DuckDB's bind state. Make public DROP recover
+  exact bound or unbound guards and guard-less format 2 indexes without deleting a
+  same-named or re-created unrelated index.
+- Pin the custom index implementation to the exact host-reported DuckDB version/source whose
+  transaction, index, and checkpoint behavior was audited. Read the qualified host built-in
+  `pragma_version()` before registration and accept only the exact 8-character local or
+  10-character official ID for the pinned commit; a mismatch latches fail-closed without
+  blocking inspection/drop. Document the material costs: writes require
+  the extension while a guard exists, creation invalidates the reservoir sample and makes
+  concurrent writers retry, native index dependencies restrict some ALTER operations, and
+  conservative commit-conflict handling may require rebuild even when no wrong answer was
+  possible.
 
 Out of scope:
-- Requiring triggers or a change feed, or requiring users to add an ART index merely to
-  protect ngram rowids.
-- Fuzzy matching, ranking, and a native DuckDB index backend.
+- A dirty-rowgroup overlay, surgical repair, or clearing an unsafe guard in place: a full
+  scan plus explicit rebuild is the deliberately smaller recovery path.
+- Supporting the custom guard across unaudited DuckDB internals; incompatible runtimes fail
+  closed and retain a safe removal path.
+- Enabling transparent acceleration by default. Exactness is no longer the blocker after
+  this phase, but Phase 12 must first bound its memory and work.
+- Fuzzy matching, ranking, or storing ngram postings in the native guard.
 
 Completion gate:
-For committed inserts, in-place updates, deletes, checkpoints that vacuum or preserve
-rowids, close/reopen, and mixed concurrent snapshots, the explicit and transparent paths
-equal brute force. If the detector cannot prove a range clean, the query scans that range
-or refuses before returning; it never answers from an uncertain index alone.
+For committed inserts, indexed and non-indexed updates, deletes, rowid-preserving and
+trailing-rowgroup checkpoints, actual trailing-rowid reuse, close/reopen, WAL replay, and
+mixed snapshots, explicit and transparent results equal brute force. Every uncertain guard
+state scans or refuses before returning; every creation interleaving either publishes one
+atomic guard/postings snapshot or publishes nothing; and public DROP remains a safe recovery
+path without deleting an index whose identity it cannot prove.
 
 Testing plan:
-- Extend the differential and churn harnesses with clustered and scattered below-HWM
-  updates, deletes before and after checkpoint, row-group merges, masked row motion plus
-  later appends, and reopen at each stage.
-- Pin transient-to-persistent row groups, changed/unchanged block identities, vanished and
-  shifted row groups, equal-value updates, NULLs, and changes to non-indexed columns.
-- Measure query and surgical-repair cost by dirty row-group count at 1/10/100/1000 groups;
-  the worst case must be a bounded full scan, never unbounded duplicate work.
-- Add a DuckDB-version compatibility test that fails closed when the internal signals or
-  baseline interpretation change.
+- Add a deterministic in-process barrier harness for active and recently committed writers,
+  pre-bound updates, staged append rollback, creator commit failure, retry, explicit rollback,
+  connection close, post-barrier build error, and proof that the custom guard's
+  physical build plan never scans the base table.
+- Exercise indexed-column updates that introduce and remove matches, NULL/equal-value cases,
+  non-indexed controls, local inserts in the creator transaction, WAL-only crash/replay,
+  checkpoint/reopen, harmless trailing shrink, actual reused rowids, and
+  `vacuum_rebuild_indexes` under both explicit and transparent search.
+- Verify unsafe/missing/re-created/incompatible guards choose exact full-scan or covered-prefix
+  behavior, maintenance refuses, stats explains why, rebuild recovers, and the candidate API's
+  prefix remains disjoint from its caller's tail scan.
+- Cover format-2 cleanup, malformed format/version combinations, missing and unbound format-3
+  guards, same-name indexes on another table, direct guard/query concurrency, unsupported
+  runtime behavior, extension-absent reads and writes, and the documented ALTER restrictions.
+- Characterize creation time/RSS on representative wide and cold tables, then pass the full
+  release and DEBUG/ASAN suites with differential exactness checks.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Scope | Conservative transient + durable dirty-range detection | `docs/stale-updates.md` identifies `ColumnData::HasChanges` and per-row-group block identity, but no baseline is persisted and query execution does not consume either signal. Missing: implementation and format-version design. |
-| Incomplete | Scope | Exact union of index candidates, tail, and dirty scans | Missing: dirty-range scan source, deduplication contract, and a full-scan fallback for ambiguous layouts. Current query composition covers candidates plus `rowid > hwm` only. |
-| Incomplete | Scope | Segment-aligned surgical repair with atomic baseline publication | Missing: dirty-range repair path, crash semantics, and proof that postings and baseline cannot describe different snapshots. |
-| Incomplete | Scope | Fail-closed version policy and post-gate transparent default decision | Missing: internal compatibility check, `scan`/`error` policy, exactness evidence, and an explicit decision on `ngram_auto_accelerate`. |
-| Incomplete | Work | 11A: Add dirty-baseline storage and conservative detector | Missing: shadow-table schema, format-version migration/rebuild policy, cache invalidation, and handling for transient or unalignable row groups. |
-| Incomplete | Work | 11B: Add dirty-range overlay to the shared query pipeline | Missing: range scheduling, rowid dedupe, original-predicate recheck, projection support, and full-scan degradation. |
-| Incomplete | Work | 11C: Add bounded repair and revisit the transparent default | Missing: atomic range replacement, crash recovery, maintenance integration, cost measurements, and the default-setting decision after the gate. |
-| Incomplete | Gate | Explicit and transparent searches stay exhaustive through update/vacuum/reopen churn | Current documentation concedes misses after below-HWM in-place updates and some checkpoint vacuums (`docs/stale-updates.md`). Missing: zero-mismatch differential evidence across all dirty-state transitions and fail-closed behavior when uncertain. |
-| Incomplete | Test | Adversarial dirty-detector and overlay suite | Missing: clustered/scattered updates, masked row motion, transient/persistent transitions, shifted/vanished groups, unchanged controls, and concurrent-snapshot cases. |
-| Incomplete | Test | Dirty-cost curve and DuckDB-version coupling gate | Missing: rows/bytes scanned, RSS and repair timings by dirty-group count, plus a test that rejects unsupported internal semantics. |
+| Complete | Scope | A zero-posting non-ART guard makes update/vacuum histories exhaustive | `src/rowid_guard.cpp` stores no keys, broad normal guards cover every then-existing physical `VARCHAR`, the ordinary sequence-rowid append path is O(1), and non-ART presence makes v1.5.5's ART-only moving-vacuum predicate false. `ngram_rowid_guard.test` covers clustered/scattered below-HWM updates, NULL/equal-value transitions, a non-covered control, delete/checkpoint, harmless trailing shrink, committed reuse, candidates-prefix disjointness, and explicit/transparent parity. Bulk/all-NULL append is source-audited rather than given a separate fixture: pinned v1.5.5 `DataTable::AppendToIndexes` passes every row and the guard consumes only its value-independent rowid sequence. The C++ harness first proves an ART-only control moves rowid 122880→0 with `vacuum_rebuild_indexes=500000`, then proves the identical guarded survivor remains 122880 and accelerated. |
+| Complete | Scope | Creation atomically excludes pre-guard writers without holding EXCLUSIVE through postings build | The generated transaction upgrades the checkpoint lock, rejects active/recent writers and prior global update/delete/catalog undo, performs the UUID ADD/DROP barrier, installs the scan-free guard while its global state retains `TableAppendState` through `PhysicalCreateIndex::AddIndex`, and releases through one validating/token-returning finish scalar. The deterministic harness covers pre-bound UPDATE/INSERT/DELETE, active/recent refusal, local INSERT, post-finish build error and rollback, connection-close release, physically staged append + `RevertAppend` restoring old storage and forcing creator COMMIT failure, and retry. Cancellation is not injected; it uses the same DuckDB rollback owner as the exercised error/close paths. |
+| Complete | Scope | WAL, checkpoint, reopen, and incompatible persisted state fail closed | WAL serialization records current commit-time guard state, distinguishing creator-local from later replayed appends. Binding carries the persisted header-iteration seal without reading DuckDB's non-atomic live counter; query validation compares it under a temporary shared checkpoint lock (or the context's existing creation EXCLUSIVE), while disk/WAL serialization consumes and latches it under their existing checkpoint ordering before resealing. This detects an unbound checkpoint that discards buffered replay, including bind followed by checkpoint before first query. Strict eager bind runs only before a first connection or on safe last close; a tolerant incompatible quarantine avoids v1.5.5's stuck-`BINDING` path while query validation stays strict. Runtime compatibility is derived from the host-executed `system.main.pragma_version()`, not the DSO's statically linked `DuckDB::SourceID()`, and accepts only v1.5.5 `d8cdaa33`/`d8cdaa33fd`. Harness cases cover crash WAL, actual reuse then stock extension-free shutdown followed by eager bind and FORCE-before-query, startup/dynamic-FORCE/last-close seal paths, repeated source-mismatch query/write/reopen/drop, and one malformed unrelated guard not poisoning a valid index. |
+| Complete | Scope | Uncertain state preserves every public query contract | Missing, replaced, incompatible, replay-buffered, max-behind, seal-mismatched, and unsafe guards select one full live scan in `ngram_search` and transparent execution; candidates enumerate visible `rowid <= HWM`, leaving tail/local rows disjoint; maintenance refuses; stats exposes the reason. State is one fixed-size latch, not dirty ranges, so 1/10/100/1000 uncertain events cannot add overlay work: the SQL plan gate shows exactly one `SEQ_SCAN` after the latch. |
+| Complete | Scope | Public DROP is an identity-safe recovery path | The execution scalar pins meta catalog OID, layout, format, guard name/token, table/type/column, and physical state before unconditional `DROP INDEX IF EXISTS`. A present unbound v3 guard is structurally pre-screened with every same-type guard, bound through the tolerant quarantine path, and re-read as the exact BOUND incarnation before validation succeeds; a current `BINDING` state refuses with retry instead of racing DuckDB's retained raw entry pointer. It accepts a genuinely missing expected guard even when another broad guard overlaps, rejects same-name replacement/cross-table collisions, and conservatively refuses malformed format-2 hybrids. Harness cases cover both preprocessing/execution races, forced BINDING refusal then UNBOUND→BOUND validation, same-name token replacement, missing overlapping guards, unbound incompatible cleanup, and rendered option-free guard DDL. |
+| Complete | Work | Format 3 supersedes probabilistic row witnesses | `row_samples`, 32 random fetches, digest/hash helpers, scalar registration, generated SQL, and tests were deleted from the unreleased format-3 layout. The Phase 10 fence plus deterministic guard/barrier proof covers the schedules witnesses attempted to sample. Historical Phase 5/8 ledger rows remain history; they do not describe current metadata. |
+| Complete | Test | Adversarial SQL and internal-schedule harness | `test/sql/ngram_rowid_guard.test` and the repurposed `ngram_maintenance_checkpoint_gap.cpp` cover the required result and engine schedules, including stock v1.5.5's exact boundary: SELECT and unrelated ADD work, INSERT/UPDATE/guard ALTER fail, and DELETE busy-spins in the host binder under a bounded child timeout without committing. Added-VARCHAR lifecycle proves the old index remains usable, the uncovered new target refuses, and an explicit old ART permits a target-only guard. |
+| Complete | Test | Guard/barrier cost characterized without a benchmark subsystem | Release, one thread, 200k-row base plus 500k appended rows: `/usr/bin/time` measured 0.21 s unguarded, 0.22 s with one broad guard, and 0.22 s with two; peak RSS was 60.1/60.2/60.5 MB. Updating 100k covered rows was 0.04/4.73/4.76 s and 40.0/47.9/48.0 MB: the cost is DuckDB's required delete+insert rewrite, while a second zero-data guard is negligible. Source audit adds a distinct wide-table DELETE/rollback cost: v1.5.5 fetches the union of every guard-covered `VARCHAR` before value-independent `TryDelete`; multiple broad guards deduplicate that union. On a cold 57,946,112-byte table with 200k rows × 16 varied `VARCHAR`s, cold open/count and UUID ADD+DROP+16-column guard both rounded to 0.01 s; peak RSS was 26,372 vs 26,468 KiB and file bytes were identical. These are one-run mechanism characterizations, not general throughput claims. |
+| Complete | Gate | Full release, randomized differential/churn, DEBUG/ASAN, and skeptical approval | Exact-source `timeout 1800s env CCACHE_DISABLE=1 make test_release` and `timeout 3600s env ASAN_OPTIONS=detect_leaks=0 CCACHE_DISABLE=1 make test_debug` both pass the deterministic C++ harness and all **2,674 assertions / 22 SQL cases**, with no sanitizer finding. The corrected exhaustive differential harness passes explicit `--seed 110311 --trials 2 --rows 1500` (1,752 checks) and transparent seed 110312 (886); both exercise introducing/removing a below-HWM marker and exact post-vacuum parity. Churn verifies before any stats-triggered rebuild and passes ordinary seed 110313 plus `--no-stale-expected` seed 110314 (`--rounds 20 --rows 3000`, 320 checks each, zero failures/verdicts). The official stock v1.5.5 `d8cdaa33fd` CLI also passes a fresh local-repository `FORCE INSTALL`/`LOAD` format-3 lifecycle: covered update + checkpoint stays healthy/exact, extension-free SELECT works while INSERT fails closed, loaded reopen finds a tail append, and public drop removes guard/meta without touching two base rows. The skeptical reviewer independently passed the focused harness, `make test_release` (2,674/22), the same four seeds (1,752/0, 886/0, 320/0, strict 320/0/0 verdicts), the exact current DSO (SHA-256 prefix `5eb4797d`) on the official v1.5.5 lifecycle, and `git diff --check`, then approved the phase with no remaining production blocker or safe high-leverage LOC cut. |
+| Complete | Docs | User-visible contract and costs replace the blanket ART requirement | `README.md` and `docs/stale-updates.md` now describe unconditional scan/refusal semantics, creation writer retries and sample loss, broad update rewrite, the narrow added-column/native-ART protector path, dependency-limited ALTER, conservative conflict/DETACH degradation, source pinning, and the extension-absent read-only boundary. |
 
 ## Phase 12: Bound and Consolidate Query Execution
 
@@ -1002,3 +1039,93 @@ Status ledger:
 | Incomplete | Gate | Lifecycle is leak-free/collision-free and release claims are traceable | Missing: orphan/rename matrix, storage-collision proof, generated-doc diff check, artifact provenance, and green correctness CI. |
 | Incomplete | Test | Registry and lifecycle transition matrix | Missing: rename/drop/recreate/detach/reopen/collision/rebind/legacy tests across one and multiple indexed columns. |
 | Incomplete | Test | Artifact-generation and correctness-CI gates | Missing: golden/stale-artifact tests, local CI transcript, DEBUG/ASAN/UBSan result, deterministic maintenance race, and bounded differential/churn evidence. |
+
+## Phase 15: Benchmark Against ClickHouse on the Same Machine
+
+Goal:
+Produce a reproducible, apples-as-practical comparison against ClickHouse so users can
+see which system wins on load time, index cost, storage, and selective substring queries
+on this machine, without hiding semantic or architectural differences.
+
+Scope:
+- Use the existing 1 GB `enwik9` line-per-row corpus and one frozen query manifest shared
+  by both systems. Freeze equivalent query templates, bytewise case-sensitive semantics,
+  escaping, NULL handling, and a checksum over normalized `(row_id, text)` rows before
+  loading either engine. Needles shorter than 3 bytes are scan controls, not indexed wins.
+- Configure DuckDB for bytewise case-sensitive 3-grams and pin one exact ClickHouse
+  `ngrambf_v1` expression (n-gram size, Bloom-filter bytes, hash count, and GRANULARITY)
+  for the whole campaign. Freeze the parameter-selection rule before any timed run. No
+  per-query settings or index tuning are allowed; record the unavoidable difference
+  between data skipping and DuckDB's exact postings.
+- Pin DuckDB, extension, and ClickHouse versions; CPU count/governor, RAM limit, storage
+  device, filesystem, compression, threads, row/block granularity, cache state, and every
+  non-default setting. Run both engines under the same resource envelope and on the same
+  local storage class.
+- Define executable timing boundaries: fresh process and fresh database/table per measured
+  load, explicit cgroup/resource envelope covering the ClickHouse server, client, and all
+  measured background workers, durability/checkpoint/merge completion, cold cache
+  preparation, warm-up, and measured query loop. Isolate ClickHouse data and system-log
+  state per repetition or freeze an explicit exclusion rule. Measure base-table ingest,
+  index construction/materialization, end-to-end indexed ingest, peak RSS, CPU time, and
+  spill or temporary bytes. CPU/RSS/spill are diagnostics; no profiler framework is required.
+- Measure storage from paired fresh states (base-only and indexed) after DuckDB checkpoint
+  and ClickHouse merge/materialization. Record logical bytes, allocated filesystem bytes,
+  free blocks, inactive-part cleanup, incremental index bytes, and final totals so neither
+  engine receives credit for deferred or merely unlinked work.
+- Measure exact substring counts for short, rare, medium, and common needles at several
+  selectivities. For each engine/query mode collect at least 5 independently prepared cold
+  observations and report median plus full range (not p95); collect at least 20 warm
+  observations and report p50/p95. Record rows/bytes read, CPU time, and result parity
+  with each engine's unindexed scan. Include a no-index scan baseline for both engines.
+- Check in the corpus/query manifest, runnable commands, raw machine-readable samples,
+  and a generated comparison table. Every cell applies one frozen winner rule: winner only
+  when uncertainty ranges do not overlap and the ratio clears the declared practical
+  threshold; otherwise tie or inconclusive. CV above 10% requires more repetitions or an
+  inconclusive result. Include the end-to-end indexed-ingest p50 ratio explicitly.
+
+Out of scope:
+- Distributed ClickHouse, cloud services, replication, concurrency saturation, or a
+  broad tuning competition.
+- Claiming the two index structures are identical: ClickHouse's Bloom/data-skipping
+  behavior and DuckDB's posting-list candidates must be described explicitly.
+- Repeating the existing 100 GB scale campaign unless the 1 GB result is too noisy or
+  reveals a crossover that needs one bounded 10 GB confirmation.
+- Adding a profiler/telemetry subsystem; process metrics and engine-reported counters are
+  enough for this bounded comparison.
+
+Completion gate:
+At least 5 independently prepared cold observations and 20 warm observations per query
+cell produce exact matching result counts and complete raw provenance. Base ingest, index
+build, and end-to-end indexed ingest each use at least 5 paired fresh-state repetitions
+and report median plus full range, including the end-to-end indexed-ingest median (p50) ratio.
+The generated summary applies the frozen winner/tie/inconclusive rule to
+ingest, build, incremental storage, total storage, cold median/range, and warm p50/p95;
+CV above 10% is resolved with more repetitions or labeled inconclusive. No headline number
+may mix deferred ClickHouse work, cache state, process lifetime, or resource limits.
+
+Testing plan:
+- Validate the shared corpus manifest (row count, raw bytes, and normalized-row checksum),
+  NULL/escaping/case-sensitive query templates, and query manifest before timing; compare
+  every timed query count to an untimed full-scan oracle in both engines.
+- Run randomized query order and alternating engine order within the frozen cold/warm
+  process and cache protocol. Retain every sample; cold reports median/range from at least
+  5 preparations, warm reports p50/p95 from at least 20 observations, and CV above 10%
+  triggers more samples or an inconclusive label.
+- Verify storage only after DuckDB checkpoint and ClickHouse merge/materialization have
+  completed and inactive parts are cleaned; record engine logical bytes plus filesystem
+  allocated bytes/free blocks for paired fresh base-only/indexed states.
+- Capture EXPLAIN for every indexed query and require proof that the intended index is used.
+  Re-run every query with index use disabled; sub-3-byte needles must remain scan controls.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Scope | One frozen corpus, query workload, semantics, and resource envelope | Missing: checked normalized-row/corpus/query manifests; exact case/escaping/NULL templates; pre-timing parameter-selection rule and fixed `ngrambf_v1` parameters; engine versions; and machine/cgroup/process/cache protocol covering server/client/background workers. |
+| Incomplete | Scope | Ingest, build, memory, and storage costs are separated and comparable | Missing: scripts and ≥5 paired fresh-state median/range measurements separating base ingest, index build, end-to-end indexed ingest, deferred materialization/merge, isolated/excluded system logs, and logical/allocated storage after cleanup. |
+| Incomplete | Scope | Query comparison covers selectivity and cache state with exact result parity | Missing: short scan controls, rare/medium/common needles, scan oracles, EXPLAIN proof for every indexed query, ≥5 cold median/range samples, and ≥20 warm p50/p95 samples. |
+| Incomplete | Work | 15A: Build reproducible same-machine benchmark harness | Missing: ClickHouse provisioning, shared loader/query driver, resource controls, randomized run order, and provenance capture. |
+| Incomplete | Work | 15B: Choose and document the closest stable ClickHouse n-gram configuration | Missing: one version-pinned `ngrambf_v1` expression with fixed n-gram/Bloom/hash/granularity parameters, no per-query tuning, and explicit comparability limits. |
+| Incomplete | Work | 15C: Generate raw artifacts and decision-oriented comparison | Missing: versioned JSON/CSV samples, aggregation script, generated Markdown table, fixed practical-threshold and overlap rule, ratios, winner/tie/inconclusive labels, variability, and caveats. |
+| Incomplete | Gate | Clear same-machine winner by metric with reproducible numbers | Missing: required cold/warm and ≥5 fresh-state load/build repetitions, exact count parity, complete provenance, end-to-end indexed-ingest median (p50) ratio, and generated ingest/storage/query decisions; noisy cells must expand or remain inconclusive. |
+| Incomplete | Test | Corpus, oracle, plan-use, storage-attribution, and variance checks | Missing: normalized manifest checksums, semantics templates, bidirectional result checks, per-query EXPLAIN and disabled-index controls, paired post-materialization allocated/logical size checks, and enforced >10% CV handling. |

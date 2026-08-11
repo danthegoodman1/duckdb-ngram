@@ -5,16 +5,16 @@
 require ngram
 
 statement ok
-CREATE TABLE docs(id INTEGER, s VARCHAR, n INTEGER);
+CREATE TABLE docs(id INTEGER, s VARCHAR, n INTEGER, t VARCHAR);
 
 statement ok
 INSERT INTO docs VALUES
-	(1, 'Hello world', 10),
-	(2, 'hello DUCK', 20),
-	(3, NULL, 30),
-	(4, 'ab', 40),
-	(5, 'connection reset by peer', 50),
-	(6, 'öft ÖFT often', 60);
+	(1, 'Hello world', 10, NULL),
+	(2, 'hello DUCK', 20, NULL),
+	(3, NULL, 30, NULL),
+	(4, 'ab', 40, NULL),
+	(5, 'connection reset by peer', 50, NULL),
+	(6, 'öft ÖFT often', 60, NULL);
 
 statement ok
 PRAGMA create_ngram_index('docs', 's');
@@ -30,7 +30,7 @@ query IIIIII
 SELECT format_version, schema_name, table_name, column_name, gram_size, case_insensitive
 FROM ngram_main_docs.meta_s;
 ----
-2	main	docs	s	3	true
+3	main	docs	s	3	true
 
 # hwm covers all rows at build time
 query I
@@ -102,10 +102,10 @@ PRAGMA ngram_index_stats('unindexed');
 ----
 No ngram indexes
 
-# a second indexed column on the same table shares the shadow schema
-statement ok
-ALTER TABLE docs ADD COLUMN t VARCHAR;
-
+# The first broad guard covers every VARCHAR that existed at build time, so a
+# second index needs no second ALTER barrier. Updating that future-indexable
+# VARCHAR is therefore already delete+insert and advances the first index's
+# tail.
 statement ok
 UPDATE docs SET t = 'tent often entered';
 
@@ -120,8 +120,8 @@ SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-s	3	true	5	5	0	44	44	0	1	48	136	NULL
-t	2	false	5	5	0	12	12	0	1	72	96	NULL
+s	3	true	5	11	6	44	44	0	1	48	136	NULL
+t	2	false	11	11	0	12	12	0	1	72	96	NULL
 
 # dropping one column's index leaves the other intact
 statement ok
@@ -135,7 +135,7 @@ SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-t	2	false	5	5	0	12	12	0	1	72	96	NULL
+t	2	false	11	11	0	12	12	0	1	72	96	NULL
 
 # dropping the last index removes the shadow schema
 statement ok
@@ -146,15 +146,53 @@ SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_docs';
 ----
 0
 
+# A VARCHAR added after the first broad guard leaves the old index healthy but
+# is not retrospectively covered. A committed explicit ART on that new target
+# supplies the safe creation protector for its own ngram index.
+statement ok
+CREATE TABLE added_column(s VARCHAR);
+
+statement ok
+INSERT INTO added_column VALUES ('old needle');
+
+statement ok
+PRAGMA create_ngram_index('added_column', 's');
+
+statement ok
+ALTER TABLE added_column ADD COLUMN later VARCHAR;
+
+statement ok
+UPDATE added_column SET later='later needle';
+
+statement ok
+PRAGMA ngram_refresh('added_column');
+
+statement error
+PRAGMA create_ngram_index('added_column', 'later');
+----
+no existing v3 rowid guard safely covers later
+
+statement ok
+CREATE INDEX added_column_later_art ON added_column(later);
+
+statement ok
+PRAGMA create_ngram_index('added_column', 'later');
+
+statement ok
+UPDATE added_column SET later='updated later needle';
+
+query I
+SELECT count(*) FROM ngram_search('added_column', 'updated', col := 'later');
+----
+1
+
 statement error
 PRAGMA drop_ngram_index('docs', 's');
 ----
 No ngram index
 
-# an orphaned index (its column dropped from the base table) drops cleanly,
-# including through a differently-cased column name: identifiers match
-# case-insensitively, so the shadow tables must be recognized that way or the
-# schema is left behind, empty
+# DuckDB refuses to drop a guarded column. Dropping the ngram index first is
+# the explicit lifecycle operation and accepts differently-cased spelling.
 statement ok
 CREATE TABLE orphan(id INTEGER, "Payload" VARCHAR);
 
@@ -164,8 +202,10 @@ INSERT INTO orphan VALUES (1, 'a tent');
 statement ok
 PRAGMA create_ngram_index('orphan', 'Payload');
 
-statement ok
+statement error
 ALTER TABLE orphan DROP COLUMN "Payload";
+----
+index depends on it
 
 statement ok
 PRAGMA drop_ngram_index('orphan', 'PAYLOAD');
@@ -187,12 +227,15 @@ statement ok
 PRAGMA create_ngram_index('guarded', 's');
 
 statement ok
+CREATE TEMP TABLE guarded_meta AS SELECT * FROM ngram_main_guarded.meta_s;
+
+statement ok
 DELETE FROM ngram_main_guarded.meta_s;
 
 statement error
 PRAGMA drop_ngram_index('guarded', 's');
 ----
-no owner recorded
+is empty
 
 statement error
 PRAGMA ngram_refresh('guarded');
@@ -200,7 +243,7 @@ PRAGMA ngram_refresh('guarded');
 is empty
 
 statement ok
-INSERT INTO ngram_main_guarded.meta_s SELECT 2, 'main', 'guarded', 's', 3, true, 0, '', '', 0, 0, '', '';
+INSERT INTO ngram_main_guarded.meta_s SELECT * FROM guarded_meta;
 
 statement ok
 PRAGMA drop_ngram_index('guarded', 's');
@@ -402,9 +445,6 @@ statement ok
 PRAGMA create_ngram_index('case_drop', 's');
 
 statement ok
-ALTER TABLE case_drop RENAME TO CASE_DROP;
-
-statement ok
 PRAGMA drop_ngram_index('CASE_DROP', 's');
 
 query I
@@ -416,13 +456,10 @@ SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_case_drop'
 # These are the deterministic scratch names used by older builds: every one is
 # deliberately occupied, and the user's session variable is deliberately set.
 
-# Current-schema macros must not be able to shadow the internal runtime fence
-# or witness sampler used by generated maintenance SQL.
+# Current-schema macros must not be able to shadow internal runtime functions
+# used by generated maintenance SQL.
 statement ok
-CREATE MACRO __ngram_maintenance_guard(a, b, c, d, e, f, g, h, i, j, k) AS error('shadow guard called');
-
-statement ok
-CREATE MACRO __ngram_row_samples(a, b, c, d, e) AS error('shadow sampler called');
+CREATE MACRO __ngram_maintenance_guard(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) AS error('shadow guard called');
 
 statement ok
 CREATE MACRO trigrams(a, b, c) AS error('shadow trigrams called');
@@ -526,9 +563,6 @@ DROP TABLE "__ngram_compact_packed_ngram_main_guard_output_s";
 
 statement ok
 DROP MACRO __ngram_maintenance_guard;
-
-statement ok
-DROP MACRO __ngram_row_samples;
 
 statement ok
 DROP MACRO trigrams;

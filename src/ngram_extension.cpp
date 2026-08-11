@@ -7,11 +7,14 @@
 #include "ngram/ngram_rewrite.hpp"
 #include "ngram/ngram_search.hpp"
 #include "ngram/postings_codec.hpp"
+#include "ngram/rowid_guard.hpp"
 #include "ngram/trigram.hpp"
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
+	ngram::InitializeRowIdGuardHostRuntime(loader);
+	ngram::RegisterRowIdGuard(loader);
 	ngram::RegisterTrigramsFunction(loader);
 	ngram::RegisterPostingsCodec(loader);
 	ngram::RegisterPackPostings(loader);

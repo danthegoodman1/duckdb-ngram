@@ -26,6 +26,7 @@
 #include "ngram/index_pragmas.hpp"
 #include "ngram/maintenance.hpp"
 #include "ngram/ngram_rewrite.hpp"
+#include "ngram/rowid_guard.hpp"
 #include "ngram/search_core.hpp"
 #include "ngram/trigram.hpp"
 
@@ -78,16 +79,12 @@ namespace ngram {
 // case-insensitive indexes; probing a CS index with an ILIKE needle would
 // miss case-variant matches and is never done.
 //
-// Staleness: the same detectors the explicit path errors on make this path
-// decline instead — a plain LIKE must keep returning every matching row, so a
-// proven-stale index falls back to the plain scan (at plan time, leaving the
-// seq scan; at run time, as the "index stale" full-scan fallback). What
-// remains undetectable is an in-place UPDATE of an indexed row, which
-// PRAGMA ngram_refresh cannot repair either (duckdb v1.5.5 has no trigger or
-// change feed to find such rows — see ngram/maintenance.hpp), so
-// ngram_auto_accelerate stays opt-in: enabling it accepts that a table
-// changed by UPDATEs needs a rebuild to stay exhaustive. Recheck still makes
-// false positives impossible.
+// Staleness: the same identity checks and rowid-guard validation as the
+// explicit path make this path decline instead. At plan time it leaves the
+// sequential scan intact; at execution time the replacement performs one full
+// scan. Updates, vacuum, reopen, and uncertain guard state therefore cannot
+// make a rewritten predicate omit rows. Auto acceleration remains opt-in until
+// Phase 12 bounds candidate materialization and consolidates the two engines.
 //===----------------------------------------------------------------------===//
 
 //! The gate runs after the probe, so it cannot recover probe cost; its only
@@ -443,6 +440,11 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 		// a plain LIKE must return every matching row: a proven-stale index
 		// cannot, so the scan degrades instead of erroring the user's query
 		state.fallback_reason = "index stale";
+		return false;
+	}
+	auto guard_reason = RowIdGuardReason(context, base, info);
+	if (!guard_reason.empty()) {
+		state.fallback_reason = "rowid guard: " + guard_reason;
 		return false;
 	}
 	auto usable = UsableNeedles(bind.needles, info.options);
@@ -861,6 +863,9 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 			// still return every matching row, so leave the seq scan in place
 			continue;
 		}
+		if (!RowIdGuardReason(context, table->Cast<DuckTableEntry>(), info).empty()) {
+			continue;
+		}
 		auto usable = UsableNeedles(needles, info.options);
 		if (usable.empty()) {
 			// short needles, or ILIKE against a case-sensitive index
@@ -915,7 +920,7 @@ void RegisterRewrite(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("ngram_auto_accelerate",
 	                          "rewrite contains/LIKE/ILIKE filters over ngram-indexed columns into index scans "
-	                          "(opt-in: the index can miss rows changed since the last refresh)",
+	                          "(opt-in while accelerated-query resource use remains unbounded)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption("ngram_max_candidate_fraction",
 	                          "accelerated scans fall back to a full scan when the index returns more than this "

@@ -22,6 +22,7 @@
 #include "ngram/maintenance.hpp"
 #include "ngram/ngram_search.hpp"
 #include "ngram/postings_codec.hpp"
+#include "ngram/rowid_guard.hpp"
 #include "ngram/search_core.hpp"
 #include "ngram/trigram.hpp"
 
@@ -174,36 +175,15 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 //! both folded with the extension's simple per-codepoint lowercase (the same
 //! fold the index build uses), so matching is case-insensitive; over a
 //! case-sensitive index matching is exact byte-wise `contains`. Results are
-//! exhaustive for INSERTs and DELETEs as long as indexed rowids are where the
-//! build recorded them: rows past the index high-water mark and uncommitted
-//! transaction-local rows are found by a brute-force tail scan, deleted rows
-//! are filtered by transaction visibility, and every candidate is rechecked
-//! against the real string. Recheck makes false positives impossible in every
-//! scenario.
-//!
-//! The staleness contract, in full:
-//! (a) An in-place UPDATE of a row at or below the high-water mark is missed
-//!     until the index is rebuilt. duckdb v1.5.5 updates rows in place (unless
-//!     an ART index forces delete+insert) and offers no trigger or change feed
-//!     naming the updated rows — CREATE TRIGGER is a parser error — so there
-//!     is no sound way to find them incrementally; PRAGMA ngram_refresh
-//!     therefore covers appends only, and updated rows need drop + create.
-//! (b) Checkpoint vacuum after DELETEs of indexed rows merges row groups and
-//!     moves surviving rowids out from under the index's postings. The shared
-//!     vacuum lock held for the duration of every query means this can only
-//!     happen between queries, never mid-query. Where the table is left
-//!     shorter than the recorded high-water mark this is detected here and
-//!     raised as an error; a vacuum whose row loss is masked by later appends
-//!     before anything looks is not detectable on v1.5.5 (see
-//!     ngram/maintenance.hpp) and stays a misses-only gap.
-//! (c) DROP TABLE + re-CREATE under the same name: the shadow schema survives
-//!     the drop and the name-based ownership guard matches the new
-//!     incarnation. Detected — and refused here — whenever the recreation
-//!     happened in the running database instance (catalog oids are handed out
-//!     per process, so a recorded oid is comparable only within the instance
-//!     that wrote it) or changed the table's column list. A same-shape
-//!     recreation in an earlier session is not detectable: v1.5.5 persists no
-//!     table identity token, and catalog dependencies are in-memory only.
+//! exhaustive in every admitted state. Rows past the high-water mark and
+//! transaction-local rows are found by a brute-force tail scan; deleted rows
+//! are hidden by visibility and discarded by recheck. A per-index non-ART
+//! rowid guard makes covered-column updates delete+insert and prevents vacuum
+//! from moving live rowids. If that guard is missing, incompatible, replaced,
+//! or cannot exclude reuse of a discarded trailing range, this function scans
+//! the whole table instead of probing postings. Proven table/meta identity
+//! mismatches still raise a rebuild-required error. Recheck makes false
+//! positives impossible in every path.
 static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<QueryBindData>();
@@ -364,37 +344,37 @@ static void ScanMetaRow(ClientContext &context, DuckTransaction &tx, DuckTableEn
 	}
 }
 
+int64_t ReadMetaFormatVersion(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
+                              const ShadowTarget &bind) {
+	int64_t format_version = -1;
+	vector<StorageIndex> column_ids;
+	vector<LogicalType> types;
+	AddShadowColumn(meta_entry, "format_version", LogicalTypeId::INTEGER, column_ids, types);
+	AddShadowColumn(meta_entry, "schema_name", LogicalTypeId::VARCHAR, column_ids, types);
+	AddShadowColumn(meta_entry, "table_name", LogicalTypeId::VARCHAR, column_ids, types);
+	ScanMetaRow(context, tx, meta_entry, bind, column_ids, types, [&](DataChunk &chunk, idx_t r) {
+		auto owner_schema = StringValue::Get(chunk.GetValue(1, r));
+		auto owner_table = StringValue::Get(chunk.GetValue(2, r));
+		if (!StringUtil::CIEquals(owner_schema, bind.schema_name) ||
+		    !StringUtil::CIEquals(owner_table, bind.table_name)) {
+			throw CatalogException("ngram shadow schema collision: %s belongs to the index on %s.%s, not to "
+			                       "%s.%s; no usable ngram index exists",
+			                       bind.shadow_schema, owner_schema, owner_table, bind.schema_name, bind.table_name);
+		}
+		format_version = chunk.GetValue(0, r).GetValue<int64_t>();
+	});
+	return format_version;
+}
+
 MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry, const ShadowTarget &bind) {
 	MetaInfo info;
-	{
-		// columns every format version has: ownership and the version itself,
-		// checked before reading anything version-specific
-		vector<StorageIndex> column_ids;
-		vector<LogicalType> types;
-		AddShadowColumn(meta_entry, "format_version", LogicalTypeId::INTEGER, column_ids, types);
-		AddShadowColumn(meta_entry, "schema_name", LogicalTypeId::VARCHAR, column_ids, types);
-		AddShadowColumn(meta_entry, "table_name", LogicalTypeId::VARCHAR, column_ids, types);
-		ScanMetaRow(context, tx, meta_entry, bind, column_ids, types, [&](DataChunk &chunk, idx_t r) {
-			// the shadow schema name is not injective across base tables; refuse
-			// to answer through a shadow schema owned by someone else
-			auto owner_schema = StringValue::Get(chunk.GetValue(1, r));
-			auto owner_table = StringValue::Get(chunk.GetValue(2, r));
-			if (!StringUtil::CIEquals(owner_schema, bind.schema_name) ||
-			    !StringUtil::CIEquals(owner_table, bind.table_name)) {
-				throw CatalogException("ngram shadow schema collision: %s belongs to the index on %s.%s, not to "
-				                       "%s.%s; no usable ngram index exists",
-				                       bind.shadow_schema, owner_schema, owner_table, bind.schema_name,
-				                       bind.table_name);
-			}
-			auto format_version = chunk.GetValue(0, r).GetValue<int64_t>();
-			if (format_version != NGRAM_FORMAT_VERSION) {
-				// never guess at another version's column layout
-				throw InvalidInputException(
-				    "ngram: the index on %s.%s uses meta format_version %lld, but this version of the extension "
-				    "writes and reads format_version %lld; drop and rebuild the index",
-				    bind.table_name, bind.column_name, format_version, NGRAM_FORMAT_VERSION);
-			}
-		});
+	auto format_version = ReadMetaFormatVersion(context, tx, meta_entry, bind);
+	if (format_version != NGRAM_FORMAT_VERSION) {
+		// never guess at another version's column layout
+		throw InvalidInputException(
+		    "ngram: the index on %s.%s uses meta format_version %lld, but this version of the extension writes and "
+		    "reads format_version %lld; drop and rebuild the index",
+		    bind.table_name, bind.column_name, format_version, NGRAM_FORMAT_VERSION);
 	}
 	vector<StorageIndex> column_ids;
 	vector<LogicalType> types;
@@ -404,10 +384,11 @@ MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &m
 	AddShadowColumn(meta_entry, "schema_fingerprint", LogicalTypeId::VARCHAR, column_ids, types);
 	AddShadowColumn(meta_entry, "table_oid", LogicalTypeId::BIGINT, column_ids, types);
 	AddShadowColumn(meta_entry, "instance_id", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "row_samples", LogicalTypeId::VARCHAR, column_ids, types);
 	AddShadowColumn(meta_entry, "column_name", LogicalTypeId::VARCHAR, column_ids, types);
 	AddShadowColumn(meta_entry, "catalog_oid", LogicalTypeId::BIGINT, column_ids, types);
 	AddShadowColumn(meta_entry, "column_type", LogicalTypeId::VARCHAR, column_ids, types);
+	AddShadowColumn(meta_entry, "guard_name", LogicalTypeId::VARCHAR, column_ids, types);
+	AddShadowColumn(meta_entry, "guard_token", LogicalTypeId::VARCHAR, column_ids, types);
 	ScanMetaRow(context, tx, meta_entry, bind, column_ids, types, [&](DataChunk &chunk, idx_t r) {
 		auto gram_size = chunk.GetValue(0, r).GetValue<int64_t>();
 		if (gram_size < 1) {
@@ -421,10 +402,11 @@ MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &m
 		info.schema_fingerprint = StringValue::Get(chunk.GetValue(3, r));
 		info.table_oid = chunk.GetValue(4, r).GetValue<int64_t>();
 		info.instance_id = StringValue::Get(chunk.GetValue(5, r));
-		info.row_samples = StringValue::Get(chunk.GetValue(6, r));
-		info.column_name = StringValue::Get(chunk.GetValue(7, r));
-		info.catalog_oid = chunk.GetValue(8, r).GetValue<int64_t>();
-		info.column_type = StringValue::Get(chunk.GetValue(9, r));
+		info.column_name = StringValue::Get(chunk.GetValue(6, r));
+		info.catalog_oid = chunk.GetValue(7, r).GetValue<int64_t>();
+		info.column_type = StringValue::Get(chunk.GetValue(8, r));
+		info.guard_name = StringValue::Get(chunk.GetValue(9, r));
+		info.guard_token = StringValue::Get(chunk.GetValue(10, r));
 	});
 	return info;
 }
@@ -964,6 +946,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	                                  "ngram index meta table");
 	auto info = ReadMeta(context, *state->tx, meta, bind.Target());
 	ThrowIfCertainlyStale(context, base, info, bind, "ngram_search");
+	auto guard_reason = RowIdGuardReason(context, base, info);
 	state->hwm = info.hwm_rowid;
 	state->options = info.options;
 	state->search_column_idx = bind.search_column_idx;
@@ -980,7 +963,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	}
 
 	auto decomposition = DecomposeNeedle(bind.needle.data(), bind.needle.size(), info.options);
-	if (decomposition.too_short) {
+	if (!guard_reason.empty() || decomposition.too_short) {
 		// the index cannot be probed; the tail scan becomes a full scan, which
 		// is still exhaustive
 		state->hwm = -1;
@@ -1173,9 +1156,12 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 	auto info = ReadMeta(context, *state->tx, meta, bind.Target());
 	ThrowIfCertainlyStale(context, base, info, bind, "ngram_candidates");
 	state->hwm = info.hwm_rowid;
+	auto guard_reason = RowIdGuardReason(context, base, info);
 
 	auto decomposition = DecomposeNeedle(bind.needle.data(), bind.needle.size(), info.options);
-	if (decomposition.too_short) {
+	if (!guard_reason.empty()) {
+		state->all_rowids = true;
+	} else if (decomposition.too_short) {
 		state->all_rowids = true;
 	} else {
 		auto &segments = ResolveExistingTable(context, bind.catalog_name, bind.shadow_schema,

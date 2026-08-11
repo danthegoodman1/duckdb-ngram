@@ -15,6 +15,7 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "ngram/index_pragmas.hpp"
 #include "ngram/maintenance.hpp"
+#include "ngram/rowid_guard.hpp"
 #include "ngram/search_core.hpp"
 
 #include <algorithm>
@@ -22,10 +23,10 @@
 namespace duckdb {
 namespace ngram {
 
-//! The index lives in ordinary tables under one schema per indexed base table
-//! (ngram_<schema>_<table>), three tables per indexed column. Nothing persisted
-//! references extension functions, so a database opened without the extension
-//! reads and writes normally and the index schema is inert.
+//! The postings live in ordinary tables under one schema per indexed base
+//! table (ngram_<schema>_<table>), three tables per indexed column. The rowid
+//! guard is a custom physical index: without this extension DuckDB can still
+//! read the base and shadow tables, but writes to the guarded base fail closed.
 
 string ShadowSchemaName(const string &schema, const string &table) {
 	return "ngram_" + schema + "_" + table;
@@ -87,6 +88,10 @@ ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, 
 			throw CatalogException("Table %s does not have a column named %s", table_input, column_name);
 		}
 		auto &column = table_entry.GetColumn(column_name);
+		if (column.Generated()) {
+			throw BinderException("ngram indexes require a physical VARCHAR column; %s.%s is generated", table_input,
+			                      column_name);
+		}
 		if (column.Type().id() != LogicalTypeId::VARCHAR) {
 			throw BinderException("ngram indexes require a VARCHAR column; %s.%s is %s", table_input, column_name,
 			                      column.Type().ToString());
@@ -177,17 +182,29 @@ static string ScratchName(const char *purpose) {
 	return Ident(string("__ngram_") + purpose + "_" + UUID::ToString(UUID::GenerateRandomUUID()));
 }
 
+struct CreationProtector {
+	CreationProtector() = default;
+	CreationProtector(string kind_p, string detail_p, string name_p, string identity_p, transaction_t timestamp_p)
+	    : kind(std::move(kind_p)), detail(std::move(detail_p)), name(std::move(name_p)),
+	      identity(std::move(identity_p)), timestamp(timestamp_p) {
+	}
+
+	string kind;
+	string detail;
+	string name;
+	string identity;
+	transaction_t timestamp = 0;
+};
+
 static string MaintenanceGuardCall(const ResolvedTarget &target, const string &column_name,
-                                   const TableFingerprint &fingerprint, const char *fn) {
+                                   const TableFingerprint &fingerprint, const char *fn,
+                                   const CreationProtector &protector, const string &new_guard_name) {
 	return SystemFunction(NGRAM_MAINTENANCE_GUARD) + "(" + Lit(fn) + ", " + Lit(target.catalog_name) + ", " +
 	       Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(column_name) + ", true, " +
 	       "-1, " + to_string(fingerprint.table_oid) + ", " +
-	       Lit(fingerprint.schema_fingerprint) + ", 0, false)";
-}
-
-static string RowSamplesCall(const ResolvedTarget &target, const string &column_name, const string &max_rowid) {
-	return SystemFunction(NGRAM_ROW_SAMPLES) + "(" + Lit(target.catalog_name) + ", " + Lit(target.schema_name) +
-	       ", " + Lit(target.table_name) + ", " + Lit(column_name) + ", " + max_rowid + ")";
+	       Lit(fingerprint.schema_fingerprint) + ", 0, false, " + Lit(protector.kind) + ", " +
+	       Lit(protector.detail) + ", " + Lit(protector.name) + ", " + Lit(protector.identity) + ", " +
+	       to_string(protector.timestamp) + ", " + Lit(new_guard_name) + ")";
 }
 
 //===----------------------------------------------------------------------===//
@@ -371,6 +388,11 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	auto column = Ident(column_name);
 	auto gram_str = to_string(gram_size);
 	auto ci_str = case_insensitive ? "true" : "false";
+	// ALTER verification in DuckDB v1.5.5 does not reparse a quoted column
+	// name containing '-', so keep generated physical identifiers unquoted-safe.
+	auto incarnation = StringUtil::Replace(UUID::ToString(UUID::GenerateRandomUUID()), "-", "_");
+	auto epoch_name = "__ngram_epoch_" + incarnation;
+	auto fresh_guard_name = "__ngram_rowid_guard_" + incarnation;
 
 	// No BEGIN/COMMIT here: DuckDB's statement preprocessor wraps a multi-statement
 	// pragma expansion in a transaction itself (statement_preprocessor.cpp).
@@ -384,6 +406,69 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	// Duplicate (gram, rowid) instances survive until the codec, which sorts and
 	// dedupes.
 	auto fingerprint = ComputeTableFingerprint(context, *target.entry);
+	CreationProtector protector;
+	vector<string> protector_columns;
+	auto existing_meta = ExistingMetaTables(context, target);
+	if (!existing_meta.empty()) {
+		auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
+		for (auto &meta_name : existing_meta) {
+			auto indexed_column = meta_name.substr(strlen("meta_"));
+			auto &meta_entry = ResolveExistingTable(context, target.catalog_name, target.shadow_schema, meta_name,
+			                                        "ngram index meta table");
+			ShadowTarget existing {target.schema_name, target.table_name, indexed_column, target.shadow_schema};
+			auto info = ReadMeta(context, transaction, meta_entry, existing);
+			if (StringUtil::CIEquals(indexed_column, column_name)) {
+				throw InvalidInputException("An ngram index already exists on %s.%s (%s); use drop_ngram_index first",
+				                            target.table_name, column_name, target.shadow_schema);
+			}
+			vector<string> covered_columns;
+			auto reason = RowIdGuardProtectionReason(target.entry->Cast<DuckTableEntry>(), info, column_name,
+			                                         covered_columns);
+			if (reason.empty() && protector.kind.empty()) {
+				// A v3 guard was created behind this phase's ADD/DROP barrier,
+				// so its broad column dependency proves every older snapshot was
+				// invalidated. It can bridge a later per-column guard install.
+				protector = {"ngram_v3", indexed_column, info.guard_name, info.guard_token, 0};
+				protector_columns = std::move(covered_columns);
+			}
+		}
+	}
+	if (protector.kind.empty()) {
+		NativeUpdateProtector native;
+		if (FindNativeUpdateProtector(context, target.entry->Cast<DuckTableEntry>(), column_name, native)) {
+			protector = {"native_art", "", native.name, to_string(native.oid), native.timestamp};
+		}
+	}
+	if (protector.kind.empty() && !existing_meta.empty()) {
+		throw InvalidInputException(
+		    "create_ngram_index: no existing v3 rowid guard safely covers %s; drop and rebuild the table's ngram "
+		    "indexes before indexing a VARCHAR column added after their creation barriers",
+		    column_name);
+	}
+	auto guard_name = fresh_guard_name;
+	string guard_columns;
+	if (protector.kind.empty()) {
+		for (auto &definition : target.entry->GetColumns().Physical()) {
+			if (definition.Type().id() != LogicalTypeId::VARCHAR) {
+				continue;
+			}
+			if (!guard_columns.empty()) {
+				guard_columns += ", ";
+			}
+			guard_columns += Ident(definition.Name());
+		}
+	} else if (protector.kind == "ngram_v3") {
+		for (auto &protected_column : protector_columns) {
+			if (!guard_columns.empty()) {
+				guard_columns += ", ";
+			}
+			guard_columns += Ident(protected_column);
+		}
+	} else {
+		// The existing protector proves only the target's update history. A
+		// fresh per-index guard is therefore deliberately target-only here.
+		guard_columns = column;
+	}
 	string script;
 	string guard = ScratchName("guard");
 	string packed = ScratchName("build_packed");
@@ -391,8 +476,31 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	// target transaction's vacuum fence before checking that the table planned
 	// above is still the table the remaining script will scan.
 	script += "CREATE TEMP TABLE " + guard + " AS SELECT " +
-	          MaintenanceGuardCall(target, column_name, fingerprint, "create_ngram_index") +
-	          " AS ignored;\n";
+	          MaintenanceGuardCall(target, column_name, fingerprint, "create_ngram_index", protector, guard_name) +
+	          " AS ignored, NULL::VARCHAR AS guard_token;\n";
+	// Replacing the physical table invalidates every snapshot that predates the
+	// rowid guard. The temporary all-NULL column is dropped immediately; only
+	// DuckDB's reservoir sample is intentionally discarded by this pair.
+	if (protector.kind.empty()) {
+		script += "ALTER TABLE " + base + " ADD COLUMN " + Ident(epoch_name) + " BOOLEAN;\n";
+		script += "ALTER TABLE " + base + " DROP COLUMN " + Ident(epoch_name) + ";\n";
+	}
+	// Every ngram index owns a separate physical guard. The ordinary barrier
+	// creates a broad guard for all current VARCHARs; a protector-backed build
+	// creates only the target dependency its proof covers.
+	script += "CREATE INDEX " + Ident(guard_name) + " ON " + base + " USING " + NGRAM_ROWID_GUARD_TYPE + "(" +
+	          guard_columns + ");\n";
+	// Retain EXCLUSIVE through this scan-free CREATE in every mode. This one
+	// scalar proves the fresh physical guard, captures its internal token, and
+	// releases the fence before the postings build begins.
+	auto finish = SystemFunction(NGRAM_CREATION_FINISH) + "(" + Lit(target.catalog_name) + ", " +
+	              Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(column_name) + ", " +
+	              Lit(guard_name) + ")";
+	script += "UPDATE " + guard + " SET guard_token = " + finish + ";\n";
+	// This custom index has no postings and its build plan never scans the base
+	// table. Its physical column dependency rewrites future indexed-column
+	// updates to delete+insert, while its non-ART type disables rowid-moving
+	// vacuum. Two persisted scalars detect reuse of a truncated trailing range.
 	// Only committed rows are indexed. A transaction-local rowid is reassigned
 	// at commit, so recording one would leave the index pointing at a rowid
 	// that never exists (and, before this filter, made ngram_search fetch a
@@ -411,7 +519,7 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	          " AS schema_fingerprint, " + Lit(fingerprint.ColumnType(column_name)) + " AS column_type, " +
 	          to_string(fingerprint.table_oid) + "::BIGINT AS table_oid, " + to_string(fingerprint.catalog_oid) +
 	          "::BIGINT AS catalog_oid, " + Lit(fingerprint.instance_id) + " AS instance_id, " +
-	          RowSamplesCall(target, column_name, committed_hwm) + " AS row_samples;\n";
+	          Lit(guard_name) + " AS guard_name, (SELECT guard_token FROM " + guard + ") AS guard_token;\n";
 	auto partitions =
 	    BuildPartitionCount(context, EstimateGramCount(context, *target.entry, column_name, 0,
 	                                                   fingerprint.total_rows - 1, NumericCast<idx_t>(gram_size)));
@@ -453,6 +561,30 @@ static string DropNgramIndexQuery(ClientContext &context, const FunctionParamete
 	if (!ShadowTableExists(context, target, MetaTableName(column_name))) {
 		throw CatalogException("No ngram index exists on %s.%s", target.table_name, column_name);
 	}
+	auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
+	auto &meta_entry = ResolveExistingTable(context, target.catalog_name, target.shadow_schema,
+	                                      MetaTableName(column_name), "ngram index meta table");
+	ShadowTarget shadow_target {target.schema_name, target.table_name, column_name, target.shadow_schema};
+	auto format_version = ReadMetaFormatVersion(context, transaction, meta_entry, shadow_target);
+	string guard_name;
+	string guard_token;
+	if (format_version == NGRAM_FORMAT_VERSION) {
+		auto info = ReadMeta(context, transaction, meta_entry, shadow_target);
+		guard_name = info.guard_name;
+		guard_token = info.guard_token;
+	} else if (format_version == 2) {
+		// A real v2 meta table predates the guard columns. Merely editing a v3
+		// row's version must not strand its physical guard.
+		if (meta_entry.ColumnExists("guard_name") || meta_entry.ColumnExists("guard_token")) {
+			throw InvalidInputException(
+			    "drop_ngram_index: malformed format_version 2 meta table contains rowid guard columns");
+		}
+	} else {
+		throw InvalidInputException(
+		    "drop_ngram_index: unsupported meta format_version %lld; only the known guard-less v2 layout can be "
+		    "removed by this extension",
+		    format_version);
+	}
 
 	// Count everything else living in the shadow schema, across every catalog set
 	// a schema holds (TABLE_ENTRY also covers views, MACRO_ENTRY covers scalar and
@@ -490,6 +622,15 @@ static string DropNgramIndexQuery(ClientContext &context, const FunctionParamete
 	script += "CREATE TEMP TABLE " + guard + "(ignored BOOLEAN);\n";
 	// refuse to drop through a shadow schema owned by a different base table
 	script += OwnershipGuard(target, shadow + "." + Ident(MetaTableName(column_name)), guard);
+	script += SilentGuard(guard, SystemFunction(NGRAM_ROWID_GUARD_VALIDATE) + "(" + Lit(target.catalog_name) + ", " +
+	                                Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " +
+	                                Lit(column_name) + ", " + Lit(target.shadow_schema) + ", " +
+	                                to_string(format_version) + ", " + to_string(meta_entry.oid) + ", " +
+	                                Lit(guard_name) + ", " + Lit(guard_token) + ")");
+	if (format_version == NGRAM_FORMAT_VERSION) {
+		script += "DROP INDEX IF EXISTS " + Ident(target.catalog_name) + "." + Ident(target.schema_name) + "." +
+		          Ident(guard_name) + ";\n";
+	}
 	script += "DROP TABLE " + shadow + "." + Ident(MetaTableName(column_name)) + ";\n";
 	script += "DROP TABLE " + shadow + "." + Ident(SegmentsTableName(column_name)) + ";\n";
 	script += "DROP TABLE " + shadow + "." + Ident(StatsTableName(column_name)) + ";\n";
@@ -545,7 +686,7 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 			auto info = ReadMeta(context, transaction, meta_entry, shadow_target);
 			staleness = CertainStaleReason(info, fingerprint);
 			if (staleness.empty()) {
-				staleness = SampleStaleReason(context, *target.entry, info);
+				staleness = RowIdGuardReason(context, target.entry->Cast<DuckTableEntry>(), info);
 			}
 		}
 		if (!query.empty()) {

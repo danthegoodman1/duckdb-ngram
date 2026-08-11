@@ -377,6 +377,11 @@ SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_atomic.segments_s) FROM ngram
 statement ok
 ROLLBACK;
 
+# The execution-time vacuum fence belongs to the rolled-back transaction; a
+# following forced checkpoint must not remain blocked by leaked lock state.
+statement ok
+FORCE CHECKPOINT;
+
 query II
 SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_atomic.segments_s) FROM ngram_main_atomic.meta_s;
 ----

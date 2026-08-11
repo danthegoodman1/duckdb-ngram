@@ -1,21 +1,27 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/pragma_function.hpp"
+#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/object_cache.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/index_pragmas.hpp"
 #include "ngram/maintenance.hpp"
 #include "ngram/search_core.hpp"
 
 #include <algorithm>
+#include <mutex>
 
 namespace duckdb {
 namespace ngram {
@@ -348,6 +354,42 @@ static string RequireStringParam(const Value &value, const char *fn, const char 
 	return text;
 }
 
+static string ScratchName(const char *purpose) {
+	return Ident(string("__ngram_") + purpose + "_" + UUID::ToString(UUID::GenerateRandomUUID()));
+}
+
+//! Read and validate one indexed column. This is used once while expanding the
+//! pragma for useful early errors and again after the generated script owns its
+//! transaction-lifetime vacuum fence, where it becomes the correctness check.
+static MaintenanceColumn ResolveMaintenanceColumn(ClientContext &context, const char *fn, ResolvedTarget &target,
+                                                   const string &column_name,
+                                                   const TableFingerprint &fingerprint) {
+	if (!target.entry->ColumnExists(column_name)) {
+		throw CatalogException("%s: the ngram index on %s references column %s, which no longer exists; drop the "
+		                       "index with PRAGMA drop_ngram_index",
+		                       fn, target.table_name, column_name);
+	}
+	auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
+	auto &meta_entry = ResolveExistingTable(context, target.catalog_name, target.shadow_schema,
+	                                      MetaTableName(column_name), "ngram index meta table");
+	ShadowTarget shadow {target.schema_name, target.table_name, column_name, target.shadow_schema};
+	MaintenanceColumn column;
+	column.column_name = column_name;
+	column.meta = ReadMeta(context, transaction, meta_entry, shadow);
+	auto reason = CertainStaleReason(column.meta, fingerprint);
+	if (reason.empty()) {
+		reason = SampleStaleReason(context, *target.entry, column.meta);
+	}
+	if (!reason.empty()) {
+		throw InvalidInputException("%s: the ngram index on %s.%s cannot be maintained incrementally because %s. "
+		                            "Rebuild it: PRAGMA drop_ngram_index('%s', '%s') then PRAGMA "
+		                            "create_ngram_index('%s', '%s')",
+		                            fn, target.table_name, column_name, reason, target.table_name, column_name,
+		                            target.table_name, column_name);
+	}
+	return column;
+}
+
 //! Resolve every index that the pragma should operate on: all indexed columns
 //! of the table, or the single column named by `only_column`. Reads and
 //! validates each meta row (format version, ownership) and refuses outright
@@ -376,69 +418,165 @@ static vector<MaintenanceColumn> ResolveMaintenanceColumns(ClientContext &contex
 	}
 	std::sort(names.begin(), names.end());
 
-	auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
 	vector<MaintenanceColumn> result;
 	for (auto &column_name : names) {
-		if (!target.entry->ColumnExists(column_name)) {
-			throw CatalogException("%s: the ngram index on %s references column %s, which no longer exists; drop the "
-			                       "index with PRAGMA drop_ngram_index",
-			                       fn, target.table_name, column_name);
-		}
-		auto &meta_entry = ResolveExistingTable(context, target.catalog_name, target.shadow_schema,
-		                                        MetaTableName(column_name), "ngram index meta table");
-		ShadowTarget shadow {target.schema_name, target.table_name, column_name, target.shadow_schema};
-		MaintenanceColumn column;
-		column.column_name = column_name;
-		column.meta = ReadMeta(context, transaction, meta_entry, shadow);
-		auto reason = CertainStaleReason(column.meta, fingerprint);
-		if (reason.empty()) {
-			// the pragmas can afford to re-read the recorded witnesses; the
-			// query paths cannot, which is why refresh and compact are where a
-			// vacuum that appends have papered over gets caught
-			reason = SampleStaleReason(context, *target.entry, column.meta);
-		}
-		if (!reason.empty()) {
-			// A rebuild can take hours at scale, so the user chooses when to
-			// pay for it: refusing here keeps the stale index exactly as it
-			// is, which is misses-only, instead of cementing the damage by
-			// advancing the high-water mark over moved rows.
-			throw InvalidInputException("%s: the ngram index on %s.%s cannot be maintained incrementally because %s. "
-			                            "Rebuild it: PRAGMA drop_ngram_index('%s', '%s') then PRAGMA "
-			                            "create_ngram_index('%s', '%s')",
-			                            fn, target.table_name, column_name, reason, target.table_name, column_name,
-			                            target.table_name, column_name);
-		}
-		result.push_back(std::move(column));
+		result.push_back(ResolveMaintenanceColumn(context, fn, target, column_name, fingerprint));
 	}
 	return result;
 }
 
-//! A statement that fails the whole script unless the meta row still says what
-//! the generated SQL assumes. The pragma callback reads meta in its own
-//! transaction, before the transaction the script runs in, so a concurrent
-//! refresh could have advanced the high-water mark in between; rather than
-//! writing a stale hwm the script stops and asks for a retry.
-static string MetaUnchangedGuard(const ResolvedTarget &target, const string &meta_qualified, const string &column_name,
-                                 int64_t hwm, const char *fn) {
-	return SilentGuard("CASE WHEN (SELECT count(*) FROM " + meta_qualified + " WHERE format_version = " +
-	                   to_string(NGRAM_FORMAT_VERSION) + " AND schema_name IS NOT DISTINCT FROM " +
-	                   Lit(target.schema_name) + " AND table_name IS NOT DISTINCT FROM " + Lit(target.table_name) +
-	                   " AND hwm_rowid = " + to_string(hwm) + ") <> 1 THEN error(" +
-	                   Lit(string(fn) + ": the index on " + target.table_name + "." + column_name +
-	                       " changed while the statement was being prepared; run it again") +
-	                   ") END");
+static string MaintenanceGuardCall(const char *fn, const ResolvedTarget &target, const MaintenanceColumn &column,
+                                   const TableFingerprint &fingerprint) {
+	return SystemFunction(NGRAM_MAINTENANCE_GUARD) + "(" + Lit(fn) + ", " + Lit(target.catalog_name) + ", " +
+	       Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(column.column_name) + ", false, " +
+	       to_string(column.meta.hwm_rowid) + ", " + to_string(fingerprint.table_oid) + ", " +
+	       Lit(fingerprint.schema_fingerprint) + ", " + to_string(column.meta.options.gram_size) + ", " +
+	       (column.meta.options.case_insensitive ? "true" : "false") + ")";
 }
 
-//! Re-record the table facts the detectors compare against. Written as
-//! literals: the pragma callback reads them before the script runs, so a
-//! concurrent append can only make them older than the state the script
-//! commits, and every comparison against them stays conservative.
+static string RowSamplesCall(const ResolvedTarget &target, const string &column_name, const string &max_rowid) {
+	return SystemFunction(NGRAM_ROW_SAMPLES) + "(" + Lit(target.catalog_name) + ", " + Lit(target.schema_name) +
+	       ", " + Lit(target.table_name) + ", " + Lit(column_name) + ", " + max_rowid + ")";
+}
+
 static string FingerprintAssignments(const TableFingerprint &fingerprint, const string &column_name,
-                                     const string &row_samples) {
+                                     const string &row_samples_expression) {
 	return "table_oid = " + to_string(fingerprint.table_oid) + ", catalog_oid = " + to_string(fingerprint.catalog_oid) +
 	       ", instance_id = " + Lit(fingerprint.instance_id) +
 	       ", schema_fingerprint = " + Lit(fingerprint.schema_fingerprint) +
-	       ", column_type = " + Lit(fingerprint.ColumnType(column_name)) + ", row_samples = " + Lit(row_samples);
+	       ", column_type = " + Lit(fingerprint.ColumnType(column_name)) + ", row_samples = " +
+	       row_samples_expression;
+}
+
+//! DuckTransaction drops its own vacuum lock just before running an automatic
+//! checkpoint during commit. Keep one extra shared lock until DuckDB's
+//! post-commit callback, which runs after that checkpoint, or until rollback.
+class MaintenanceFenceState final : public ClientContextState {
+private:
+	struct HeldFence {
+		DuckTransactionManager *manager;
+		unique_ptr<StorageLockKey> lock;
+	};
+
+public:
+	void Acquire(DuckTransactionManager &manager) {
+		lock_guard<mutex> guard(fences_lock);
+		for (auto &held : fences) {
+			if (held.manager == &manager) {
+				return;
+			}
+		}
+		auto vacuum_lock = manager.SharedVacuumLock();
+		fences.push_back({&manager, std::move(vacuum_lock)});
+	}
+
+	void TransactionCommit(MetaTransaction &, ClientContext &) override {
+		Clear();
+	}
+	void TransactionRollback(MetaTransaction &, ClientContext &) override {
+		Clear();
+	}
+
+private:
+	void Clear() {
+		lock_guard<mutex> guard(fences_lock);
+		fences.clear();
+	}
+
+	mutex fences_lock;
+	vector<HeldFence> fences;
+};
+
+static void AcquireMaintenanceFence(ClientContext &context, Catalog &catalog) {
+	auto &transaction = DuckTransaction::Get(context, catalog);
+	transaction.SetModifications(DatabaseModificationType::INSERT_DATA);
+	auto state = context.registered_state->GetOrCreate<MaintenanceFenceState>("ngram_maintenance_fence");
+	state->Acquire(transaction.GetTransactionManager());
+}
+
+//! Acquires the vacuum fence, then repeats the checks that were necessarily
+//! done once during pragma expansion. The transaction owns its normal copy;
+//! MaintenanceFenceState bridges the small commit/autocheckpoint interval.
+static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto output = FlatVector::GetData<bool>(result);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto fn = args.GetValue(0, row).ToString();
+		auto catalog_name = args.GetValue(1, row).ToString();
+		auto schema_name = args.GetValue(2, row).ToString();
+		auto table_name = args.GetValue(3, row).ToString();
+		auto column_name = args.GetValue(4, row).ToString();
+		auto creating = args.GetValue(5, row).GetValue<bool>();
+		auto expected_hwm = args.GetValue(6, row).GetValue<int64_t>();
+		auto expected_table_oid = args.GetValue(7, row).GetValue<int64_t>();
+		auto expected_schema_fingerprint = args.GetValue(8, row).ToString();
+		auto expected_gram_size = args.GetValue(9, row).GetValue<int32_t>();
+		auto expected_case_insensitive = args.GetValue(10, row).GetValue<bool>();
+
+		auto &catalog = Catalog::GetCatalog(context, catalog_name);
+		AcquireMaintenanceFence(context, catalog);
+
+		auto qualified = Ident(catalog_name) + "." + Ident(schema_name) + "." + Ident(table_name);
+		auto target = ResolveTarget(context, qualified, column_name, true);
+		auto fingerprint = ComputeTableFingerprint(context, *target.entry);
+		if (fingerprint.table_oid != expected_table_oid ||
+		    fingerprint.schema_fingerprint != expected_schema_fingerprint) {
+			throw InvalidInputException("%s: %s changed while the statement was being prepared; run it again", fn,
+			                            table_name);
+		}
+		if (creating) {
+			// CREATE can add tables to a pre-existing, non-injective shadow
+			// schema. Enumerate it now, not during pragma expansion: another
+			// owner may have populated the colliding schema before this fenced
+			// transaction began.
+			auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
+			for (auto &meta_name : ExistingMetaTables(context, target)) {
+				auto indexed_column = meta_name.substr(strlen("meta_"));
+				auto &meta_entry = ResolveExistingTable(context, target.catalog_name, target.shadow_schema, meta_name,
+				                                        "ngram index meta table");
+				ShadowTarget shadow {target.schema_name, target.table_name, indexed_column, target.shadow_schema};
+				ReadMeta(context, transaction, meta_entry, shadow);
+				if (StringUtil::CIEquals(meta_name, MetaTableName(column_name))) {
+					throw InvalidInputException(
+					    "An ngram index already exists on %s.%s (%s); use drop_ngram_index first", target.table_name,
+					    column_name, target.shadow_schema);
+				}
+			}
+		} else {
+			auto column = ResolveMaintenanceColumn(context, fn.c_str(), target, column_name, fingerprint);
+			if (column.meta.hwm_rowid != expected_hwm ||
+			    column.meta.options.gram_size != NumericCast<idx_t>(expected_gram_size) ||
+			    column.meta.options.case_insensitive != expected_case_insensitive) {
+				throw InvalidInputException("%s: the index on %s.%s changed while the statement was being prepared; "
+				                            "run it again",
+				                            fn, target.table_name, column_name);
+			}
+		}
+		output[row] = true;
+	}
+}
+
+//! Re-sample only after the guard above owns the vacuum fence. Reacquiring here
+//! keeps the generated one-row call independent of optimizer evaluation order.
+static void RowSamplesFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto output = FlatVector::GetData<string_t>(result);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto catalog_name = args.GetValue(0, row).ToString();
+		auto schema_name = args.GetValue(1, row).ToString();
+		auto table_name = args.GetValue(2, row).ToString();
+		auto column_name = args.GetValue(3, row).ToString();
+		auto max_rowid = args.GetValue(4, row).GetValue<int64_t>();
+
+		auto &catalog = Catalog::GetCatalog(context, catalog_name);
+		AcquireMaintenanceFence(context, catalog);
+		auto qualified = Ident(catalog_name) + "." + Ident(schema_name) + "." + Ident(table_name);
+		auto target = ResolveTarget(context, qualified, column_name, true);
+		auto samples = BuildRowSampleDigest(context, *target.entry, target.column_name, max_rowid);
+		output[row] = StringVector::AddString(result, samples);
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -543,6 +681,8 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 	auto local_start = to_string(LOCAL_ROWID_START);
 
 	string script;
+	auto guard = ScratchName("guard");
+	bool first_guard = true;
 	vector<string> summary_rows;
 	for (auto &column : columns) {
 		auto meta = shadow + "." + Ident(MetaTableName(column.column_name));
@@ -552,8 +692,7 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		auto hwm = to_string(column.meta.hwm_rowid);
 		auto gram_str = to_string(column.meta.options.gram_size);
 		auto ci_str = column.meta.options.case_insensitive ? "true" : "false";
-		// __ngram_ is this extension's reserved temp-table namespace
-		auto packed = Ident("__ngram_refresh_packed_" + target.shadow_schema + "_" + column.column_name);
+		auto packed = ScratchName("refresh_packed");
 		// rows past the high-water mark, excluding this transaction's local
 		// rows: their rowids are reassigned at commit, so indexing them would
 		// record postings for rowids that never exist
@@ -566,8 +705,13 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		auto stops_short = bound_end < fingerprint.total_rows - 1;
 		auto range_end = stops_short ? bound_end : fingerprint.total_rows - 1;
 
-		script += OwnershipGuard(target, meta);
-		script += MetaUnchangedGuard(target, meta, column.column_name, column.meta.hwm_rowid, "ngram_refresh");
+		auto guard_call = MaintenanceGuardCall("ngram_refresh", target, column, fingerprint);
+		if (first_guard) {
+			script += "CREATE TEMP TABLE " + guard + " AS SELECT " + guard_call + " AS ignored;\n";
+			first_guard = false;
+		} else {
+			script += "INSERT INTO " + guard + " SELECT " + guard_call + ";\n";
+		}
 		// One statement per rowid-range partition of the tail. Unbounded, the
 		// ranges cover exactly what tail_predicate covers, including rows
 		// committed between this script being generated and being run, so the
@@ -580,8 +724,10 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		for (idx_t i = 0; i < ranges.size(); i++) {
 			script += PackPartitionStatement(
 			    packed, i == 0,
-			    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, unnest(trigrams(" +
-			        quoted_column + ", " + gram_str + ", " + ci_str + ")) AS gram FROM " + base +
+			    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, " +
+			        SystemFunction("unnest") + "(" +
+			        SystemFunction("trigrams") + "(" + quoted_column + ", " + gram_str + ", " + ci_str +
+			        ")) AS gram FROM " + base +
 			        " WHERE rowid >= " + to_string(ranges[i].first) + " AND rowid <= " + to_string(ranges[i].second) +
 			        " AND " + quoted_column + " IS NOT NULL");
 		}
@@ -590,27 +736,14 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		// Written in gram order like every other generation, so the probe's
 		// `gram = ?` filter keeps pruning row groups by zone map.
 		script += "INSERT INTO " + segments +
-		          " SELECT gram, segment_no, (SELECT coalesce(max(generation), 0) + 1 FROM " + segments +
+		          " SELECT gram, segment_no, (SELECT coalesce(" + SystemFunction("max") +
+		          "(generation), 0) + 1 FROM " + segments +
 		          "), postings, rowid_count, min_rowid, max_rowid FROM " + packed + " ORDER BY gram, segment_no;\n";
 		// stats rows are summed per gram by the probe, so appending deltas is
 		// enough; compaction folds them back into one row per gram
-		script += "INSERT INTO " + stats + " SELECT gram, sum(rowid_count)::BIGINT, count(*)::BIGINT FROM " + packed +
+		script += "INSERT INTO " + stats + " SELECT gram, " + SystemFunction("sum") +
+		          "(rowid_count)::BIGINT, " + SystemFunction("count") + "(*)::BIGINT FROM " + packed +
 		          " GROUP BY gram;\n";
-		// Witnesses are drawn over the range this call records coverage of, not
-		// over the whole table: past the mark the index holds no postings, so a
-		// witness there would report an ordinary tail UPDATE — or a vacuumed
-		// tail DELETE — as an index that cannot be maintained, which is the one
-		// state a bounded refresh is in by design. Unbounded this is the same
-		// value it always was, so that path is untouched.
-		//
-		// range_end is an upper bound on the mark rather than the mark itself,
-		// which is only known when the UPDATE below runs. The two differ only in
-		// the fallback branch, and only over rowids that hold no visible row
-		// when the script commits, so a witness lands in the gap solely when a
-		// row was visible to this callback and deleted before the script's
-		// snapshot. SampleStaleReason ignores witnesses past the recorded mark,
-		// which closes that race and every other way one could get there.
-		auto row_samples = BuildRowSampleDigest(context, *target.entry, column.column_name, range_end);
 		// Unbounded, the new mark is the highest committed rowid the partitions
 		// just covered. Bounded, it is bound_end itself — but only once some
 		// committed row past bound_end proves the rowid slots at or below it are
@@ -650,13 +783,17 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		if (stops_short) {
 			auto bound_str = to_string(bound_end);
 			new_hwm = "CASE WHEN EXISTS (SELECT 1 FROM " + base + " WHERE rowid > " + bound_str + " AND rowid < " +
-			          local_start + ") THEN " + bound_str + " ELSE coalesce((SELECT max(rowid) FROM " + base +
+			          local_start + ") THEN " + bound_str + " ELSE coalesce((SELECT " + SystemFunction("max") +
+			          "(rowid) FROM " + base +
 			          " WHERE " + tail_predicate + " AND rowid <= " + bound_str + "), hwm_rowid) END";
 		} else {
-			new_hwm = "coalesce((SELECT max(rowid) FROM " + base + " WHERE " + tail_predicate + "), hwm_rowid)";
+			new_hwm = "coalesce((SELECT " + SystemFunction("max") + "(rowid) FROM " + base + " WHERE " +
+			          tail_predicate + "), hwm_rowid)";
 		}
 		script += "UPDATE " + meta + " SET hwm_rowid = " + new_hwm + ", " +
-		          FingerprintAssignments(fingerprint, column.column_name, row_samples) + ";\n";
+		          FingerprintAssignments(fingerprint, column.column_name,
+		                                 RowSamplesCall(target, column.column_name, new_hwm)) +
+		          ";\n";
 		script += "DROP TABLE " + packed + ";\n";
 
 		if (bounded) {
@@ -667,20 +804,23 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 			// still answering with a tail scan. Both are counted in the same
 			// transaction, and so in the same snapshot, as the packing pass, so
 			// they reconcile with what was indexed exactly. The old mark is a
-			// literal: MetaUnchangedGuard above has already refused the whole
-			// script if the meta row no longer held it.
+			// literal: the execution-time maintenance guard above has already
+			// refused the whole script if the meta row no longer held it.
 			auto recorded = "(SELECT hwm_rowid FROM " + meta + ")";
-			summary_rows.push_back("SELECT " + Lit(column.column_name) + " AS column_name, (SELECT count(*) FROM " +
+			summary_rows.push_back("SELECT " + Lit(column.column_name) + " AS column_name, (SELECT " +
+			                       SystemFunction("count") + "(*) FROM " +
 			                       base + " WHERE rowid > " + hwm + " AND rowid <= " + recorded +
-			                       ") AS rows_indexed, " + recorded + " AS hwm_rowid, (SELECT count(*) FROM " + base +
+			                       ") AS rows_indexed, " + recorded + " AS hwm_rowid, (SELECT " +
+			                       SystemFunction("count") + "(*) FROM " + base +
 			                       " WHERE rowid > " + recorded + " AND rowid < " + local_start +
 			                       ") AS remaining_tail");
 		}
 	}
+	script += "DROP TABLE " + guard + ";\n";
 	if (!summary_rows.empty()) {
-		// The pragma's only output row (guards assign to a session variable and
-		// the rest of the script returns counts, not results), and the last
-		// statement of an expansion that is still several statements long, so
+		// The pragma's only output row (guard writes go to an invocation-scoped
+		// temp table and the rest of the script returns counts, not results), and
+		// the last statement of an expansion that is still several statements long, so
 		// the preprocessor's BEGIN/COMMIT — the crash atomicity this pragma
 		// rests on — is untouched.
 		script += StringUtil::Join(summary_rows, " UNION ALL ") + " ORDER BY column_name;\n";
@@ -731,17 +871,25 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 	auto shadow = Ident(target.catalog_name) + "." + Ident(target.shadow_schema);
 
 	string script;
+	auto guard = ScratchName("guard");
+	bool first_guard = true;
 	for (auto &column : columns) {
 		auto meta = shadow + "." + Ident(MetaTableName(column.column_name));
 		auto segments = shadow + "." + Ident(SegmentsTableName(column.column_name));
 		auto stats = shadow + "." + Ident(StatsTableName(column.column_name));
-		auto keys = Ident("__ngram_compact_keys_" + target.shadow_schema + "_" + column.column_name);
-		auto packed = Ident("__ngram_compact_packed_" + target.shadow_schema + "_" + column.column_name);
+		auto keys = ScratchName("compact_keys");
+		auto packed = ScratchName("compact_packed");
 
-		script += OwnershipGuard(target, meta);
-		script += MetaUnchangedGuard(target, meta, column.column_name, column.meta.hwm_rowid, "ngram_compact");
-		script += "CREATE OR REPLACE TEMP TABLE " + keys + " AS SELECT gram, segment_no FROM " + segments +
-		          " GROUP BY gram, segment_no" + (purge_everywhere ? "" : " HAVING count(*) > 1") + ";\n";
+		auto guard_call = MaintenanceGuardCall("ngram_compact", target, column, fingerprint);
+		if (first_guard) {
+			script += "CREATE TEMP TABLE " + guard + " AS SELECT " + guard_call + " AS ignored;\n";
+			first_guard = false;
+		} else {
+			script += "INSERT INTO " + guard + " SELECT " + guard_call + ";\n";
+		}
+		script += "CREATE TEMP TABLE " + keys + " AS SELECT gram, segment_no FROM " + segments +
+		          " GROUP BY gram, segment_no" +
+		          (purge_everywhere ? "" : " HAVING " + SystemFunction("count") + "(*) > 1") + ";\n";
 		// decode the selected keys, drop postings for rowids that no longer
 		// exist, and re-pack. A rowid is dropped only when the base table has
 		// no such row in this transaction's snapshot, so a live posting can
@@ -759,7 +907,8 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		for (idx_t i = 0; i < ranges.size(); i++) {
 			script += PackPartitionStatement(
 			    packed, i == 0,
-			    "SELECT gram, segment_no, r FROM ngram_unpack_postings((SELECT s.gram, s.segment_no, s.postings FROM " +
+			    "SELECT gram, segment_no, r FROM " + SystemFunction("ngram_unpack_postings") +
+			        "((SELECT s.gram, s.segment_no, s.postings FROM " +
 			        segments + " s WHERE s.segment_no >= " + to_string(ranges[i].first >> SEGMENT_SHIFT) +
 			        " AND s.segment_no <= " + to_string(ranges[i].second >> SEGMENT_SHIFT) +
 			        " AND EXISTS (SELECT 1 FROM " + keys +
@@ -776,20 +925,40 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		// stats are cheap to rebuild exactly (two small columns) and the merge
 		// changed both the per-gram row counts and the segment counts
 		script += "DELETE FROM " + stats + ";\n";
-		script += "INSERT INTO " + stats + " SELECT gram, sum(rowid_count)::BIGINT, count(*)::BIGINT FROM " + segments +
+		script += "INSERT INTO " + stats + " SELECT gram, " + SystemFunction("sum") +
+		          "(rowid_count)::BIGINT, " + SystemFunction("count") + "(*)::BIGINT FROM " + segments +
 		          " GROUP BY gram;\n";
 		script += "UPDATE " + meta + " SET " +
-		          FingerprintAssignments(
-		              fingerprint, column.column_name,
-		              BuildRowSampleDigest(context, *target.entry, column.column_name, column.meta.hwm_rowid)) +
+		          FingerprintAssignments(fingerprint, column.column_name,
+		                                 RowSamplesCall(target, column.column_name,
+		                                                to_string(column.meta.hwm_rowid))) +
 		          ";\n";
 		script += "DROP TABLE " + keys + ";\n";
 		script += "DROP TABLE " + packed + ";\n";
 	}
+	script += "DROP TABLE " + guard + ";\n";
 	return script;
 }
 
 void RegisterMaintenance(ExtensionLoader &loader) {
+	auto guard = ScalarFunction(NGRAM_MAINTENANCE_GUARD,
+	                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
+	                             LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR,
+	                             LogicalType::INTEGER, LogicalType::BOOLEAN},
+	                            LogicalType::BOOLEAN, MaintenanceGuardFunction);
+	guard.stability = FunctionStability::VOLATILE;
+	guard.SetFallible();
+	loader.RegisterFunction(guard);
+
+	auto row_samples = ScalarFunction(NGRAM_ROW_SAMPLES,
+	                                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                   LogicalType::VARCHAR, LogicalType::BIGINT},
+	                                  LogicalType::VARCHAR, RowSamplesFunction);
+	row_samples.stability = FunctionStability::VOLATILE;
+	row_samples.SetFallible();
+	loader.RegisterFunction(row_samples);
+
 	// two overloads so the bound can be written either way: positionally,
 	// PRAGMA ngram_refresh('t', 100000), or by name, max_rows = 100000 (pragma
 	// named parameters take =, not :=)

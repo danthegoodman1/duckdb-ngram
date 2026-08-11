@@ -172,15 +172,23 @@ SET ngram_max_grams_per_query = 8;   -- probe only the K rarest trigrams of the 
 
 - Recall is structurally protected: candidate generation may only ever over-approximate;
   every optimization must be provably superset-preserving; recheck always runs.
+- An accelerated path may answer only when exactness is established for its snapshot. If
+  that cannot be established, scan or refuse; availability does not outrank completeness.
 - The index is an optimization, never a correctness dependency: rows past the refresh
   high-water mark are covered by a brute-force tail scan unioned into results;
   transaction-local rows are scanned separately.
+- Acquire rowid-stability protection before validating or consuming rowid-derived state,
+  and keep it through the operation that publishes or reads that state.
+- Admit probe work against explicit memory and work budgets before decoding postings;
+  query limits that run after materialization are not resource limits.
 - Build and maintenance run through DuckDB's own SQL engine (parallel, out-of-core,
   compressed) rather than custom pipelines; the extension orchestrates queries.
 - Normalization (case folding, unicode) is defined in exactly one place and shared by
   index build and needle decomposition — a mismatch is the one bug class that drops rows.
 - The public surface (pragmas, functions, settings) hides the storage backend so a future
   native custom-index backend can be swapped in without breaking users.
+- Performance claims are generated from versioned benchmark artifacts tied to a commit,
+  corpus, settings, and implementation; prose is not the source of truth.
 - Pin the DuckDB version per release; the C++ extension ABI couples to internals
   (`OptimizerExtension`, `DataTable::Fetch`, `ExpressionFilter`).
 
@@ -192,7 +200,13 @@ SET ngram_max_grams_per_query = 8;   -- probe only the K rarest trigrams of the 
 - sqllogictest suites for API surface, EXPLAIN plan shape, fallback behavior, and
   persistence across close/reopen (with and without the extension loaded).
 - Concurrency tests: index probes racing inserts/deletes/updates and checkpoints;
-  uncommitted-row visibility inside a writing transaction.
+  maintenance racing rowid-moving checkpoints; uncommitted-row visibility inside a
+  writing transaction. Correctness races use deterministic barriers, not timing alone.
+- Resource tests record peak resident memory, decoded rowids, rows/bytes scanned, spill,
+  and wall time; latency alone cannot prove bounded execution.
+- Linux release, DEBUG + AddressSanitizer/UBSan, fixed-seed differential/churn, and focused
+  concurrency tests form the pre-release correctness lane; the distribution matrix remains
+  the portability lane.
 - Scale benchmark tracked per release: index build time, index size ratio, and query
   latency percentiles on a ≥100 GB corpus, plus a measured scaling curve (1/10/100 GB)
   supporting an explicit TB extrapolation. True-TB validation needs hardware this project
@@ -690,3 +704,301 @@ Status ledger:
 | Complete | Work | 9A: Re-enable macOS archs in CI | `osx_amd64;osx_arm64` dropped from `exclude_archs` in .github/workflows/MainDistributionPipeline.yml (commit `abeef27`), leaving Windows and Wasm excluded so a red run would name one toolchain. **Run [31412998562](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/31412998562): success, first try, no source change needed.** Both macOS jobs green — `MacOS (osx_arm64, macos-15, arm64, arm64-osx-release)` and `MacOS (osx_amd64, macos-15, x86_64, x64-osx-release, host arm64-osx-release)` — alongside both Linux archs and `format;tidy`; Windows and DuckDB-Wasm skipped as intended. So AppleClang compiled eight phases of previously-Linux-only C++ (disk format, custom aggregate, parallel probe, pragma-generated SQL) with no source change and no compiler warning citing a file under src/, and `osx_arm64` ran the suite to **2,559 assertions / 21 test cases**, the identical figure Phase 8 recorded on Linux. (The job log is not warning-free: `osx_arm64.log:820` carries the `cmake_minimum_required` deprecation warning against this repo's own CMakeLists.txt, which 9B's row shows is universal and predates this phase.) **What a green macOS check does not cover, because upstream's matrix gates the test step:** `_extension_distribution.yml@v1.5.5:716` runs tests only when `matrix.osx_build_arch == 'arm64'`, so `osx_amd64` is a build-only cross-compile from the same arm64 `macos-15` runner and never executes an assertion; `:462` likewise skips tests on `linux_arm64`. Of the four archs green here, two ran the suite and two only proved they compile and link. The `macos` job also carries `needs: [generate_matrix, linux]`, so macOS never starts until both Linux archs pass — a macOS failure surfaces ~10 minutes into a run, not at the start. |
 | Complete | Work | 9B: Re-enable Windows + Wasm archs | `exclude_archs` deleted outright, along with the comment explaining the trim, and `opt_in_archs: "windows_arm64"` added in its place (commit `ccac5b0`) — the workflow now passes `duckdb_version`, `ci_tools_version`, `extension_name` and `opt_in_archs` and nothing else. **Run [31415223698](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/31415223698): success, first try, no source change needed on any toolchain.** All 13 jobs green: `Windows (windows_amd64, windows-latest, x64-windows-static-release)`, `Windows (windows_amd64_mingw, windows-latest, x64-mingw-static)`, `Windows (windows_arm64, windows-11-arm, arm64-windows-static-release)`, `DuckDB-Wasm (wasm_mvp / wasm_eh / wasm_threads, wasm32-emscripten, host x64-linux)`, both MacOS archs, both Linux archs, and `format;tidy`. Windows and Wasm are sibling jobs that both fan out from `linux`, so pushing them together still attributes a failure to one toolchain by job boundary; that is why they went in one commit. **`windows_arm64` was opted in rather than un-excluded, because the exclude entry never did anything.** It carries `"opt_in": true` in extension-ci-tools' `config/distribution_matrix.json`, and `scripts/modify_distribution_matrix.py`'s `should_run()` drops any opt-in arch not named in `--opt_in`. Verified by running that script from the `v1.5.5` ref against the config it carries: `--exclude "windows_arm64" --opt_in ""` and `--exclude "" --opt_in ""` produce byte-identical Windows matrices, both exactly `[windows_amd64, windows_amd64_mingw]`. **`linux_amd64_musl` / `linux_arm64_musl` remain unbuilt**: they are opt-in too, but they were never part of the trim this phase reverses, so switching them on would add coverage the extension has never had rather than restore coverage it lost — a separate decision with its own cost, not this phase's. It is worth being precise about what that leaves uncovered: musl is a distinct libc, an axis no glibc arch exercises, so the ten archs below are the twelve in v1.5.5's config minus those two. Computed matrix, from the same script: linux_amd64, linux_arm64, osx_amd64, osx_arm64, windows_amd64, windows_arm64, windows_amd64_mingw, wasm_mvp, wasm_eh, wasm_threads. **A pre-existing warning recorded rather than patched**: this repo's `cmake_minimum_required(VERSION 3.5)` (CMakeLists.txt:1, inherited from the extension template) draws a deprecation warning — "Compatibility with CMake < 3.10 will be removed from a future version of CMake" — from **nine of the ten job logs**: `linux_amd64:4523`, `linux_arm64:4550`, both macOS at `:820`, `windows_amd64:857`, `windows_arm64:1038`, and all three wasm jobs around `:698-701`. The body is byte-identical everywhere; only the header differs, because newer CMake reclassifies the same policy warning as a dev warning ("CMake Deprecation Warning at" versus "CMake Warning (deprecated) at"). windows_amd64_mingw is the sole job without it, since rtools ships an older CMake. It is not a Windows finding and not something the widened matrix surfaced: run 31411718292, the pre-Phase-9 tip, already carries it on linux_amd64. Deferred because it is its own item — a universal, long-standing build-config warning that breaks nothing today and becomes a build error only when CMake drops 3.5 compatibility, at which point the one-line floor raise belongs in a commit that can be tested on its own. |
 | Complete | Gate | Full matrix green incl. macOS | **Run [31415223698](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/31415223698) at `duckdb_version: v1.5.5`: 13 of 13 jobs success**, covering all ten default archs of the distribution matrix — linux_amd64, linux_arm64, osx_amd64, osx_arm64, windows_amd64, windows_arm64, windows_amd64_mingw, wasm_mvp, wasm_eh, wasm_threads — plus `format;tidy`. **Five archs executed the test suite, each reporting `All tests passed (2559 assertions in 21 test cases)`**, pulled from the job logs: linux_amd64, osx_arm64, windows_amd64, windows_amd64_mingw, windows_arm64. The same 2,559 across MSVC, MinGW/GCC, AppleClang and Linux GCC is the phase's strongest single fact: `duckdb/CMakeLists.txt:677` suppresses MSVC's C4244/C4267 conversion warnings, so a genuine narrowing bug in the `SEGMENT_SHIFT` arithmetic or the LEB128 varint codec would have compiled silently and surfaced as a wrong answer — instead every assertion agrees with Linux, including the byte-exact postings-blob and index-identity tests. **Five archs proved compile-and-link only**, because upstream gates the test steps: `_extension_distribution.yml@v1.5.5:462,467` skip tests on linux_arm64; `:716` runs the macOS test step only when `osx_build_arch == 'arm64'`, so osx_amd64 is a build-only cross-compile from an arm64 runner; and the `wasm` job (`:1038-1224`) defines no test step at all, ending at "Build Wasm module" — Emscripten linked and uploaded `build/wasm_mvp/extension/ngram/ngram.duckdb_extension.wasm`, which is the whole of what Wasm coverage asserts here. The Windows test step (`:995`) is gated only on `skip_tests`, which is why all three Windows archs ran assertions. So this green means: all ten default archs build and link, and half of them — including all three Windows toolchains and one macOS — execute the complete suite to the identical count. Two further boundaries a reader should have without digging. The two opt-in musl archs (`linux_amd64_musl`, `linux_arm64_musl`) are unbuilt by choice, so a distinct libc remains unexercised; the ten here are v1.5.5's twelve minus those. And "pinned" means two different things across the two refs this workflow names: `duckdb/duckdb` `v1.5.5` is a genuine immutable tag (`refs/tags/v1.5.5` → `d8cdaa33`), while `duckdb/extension-ci-tools` `v1.5.5` exists only as `refs/heads/v1.5.5` — a **branch**, resolved by this run at `72e76e9`. Upstream can move that branch and change this repo's CI with no commit here, so the gate's green is reproducible against a mutable ref on the tooling side. Pre-existing and out of this phase's scope to change, but the word "pinned" should not be read as immutable for the CI tooling. **No source change was needed on any platform across both stages.** That is a property of the code rather than luck: it reaches platform behaviour only through DuckDB's own abstractions (`idx_t`/`row_t`, `NumericCast`, `MinValue`/`MaxValue`, `StringUtil::Format` over the bundled fmt rather than the C library, `TaskExecutor`, `ArenaAllocator`), and a pre-push audit of the 4,756 lines under src/ confirmed the absence of every predicted failure class — no POSIX headers, no `__attribute__`/`__builtin_*`, no VLAs, no alternative operator spellings, non-ASCII confined to comments covered by DuckDB's `/utf-8`. Two portability questions the audit answered by reading the source, **and which CI has compiled and linked but never executed**, because Wasm runs no tests: the parallel probe should degrade correctly on a single-threaded Wasm build, since `ParallelForEachUnit` (src/ngram_search.cpp:494-511) runs its body inline when `workers <= 1 || units == 1` and `ProbeThreads` clamps `NumberOfThreads()` to a minimum of 1; and the aggregate's arena block header should stay 8-aligned on wasm32's 4-byte pointers because it stores an explicit `int64_t *data` rather than a flexible array member (src/pack_postings.cpp:124-128). Neither property has been exercised on any 32-bit-pointer target; both rest on code reading alone. No compiler warning in any Windows job cites a file under src/ — the only C++ warnings are in DuckDB's own `roaring.hpp` and MSVC's `<algorithm>`. **No test was weakened, skipped, or platform-gated to obtain any of these greens**, and no test file was touched in this phase: the only changes are the workflow and this ledger. **Review lane**: reviewed on Opus rather than the usual reviewer model, which was unavailable; the reviewer re-derived the evidence from the CI logs rather than the ledger's prose — pulling the assertion lines from all ten job logs, checking the suite for platform-conditional directives, reproducing the distribution-matrix result byte-for-byte, and confirming every upstream line citation — and corrected three claims, chief among them that the CMake deprecation warning is universal and pre-existing rather than a Windows-specific finding. **Confirmation**: run [31422576000](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/31422576000) on the corrected tree is 13 of 13 success against a byte-identical workflow. |
+
+## Post-completion Review Objective (2026-08-11)
+
+Preserve the ordinary-table, superset-candidate, recheck, and tail-scan architecture,
+while removing the conditions under which it can return an incomplete result or consume
+unbounded resources. Phases 10 and 11 are correctness release blockers; Phase 12 bounds
+and consolidates query execution; Phases 13 and 14 then address read amplification,
+lifecycle safety, observability, and release evidence.
+
+## Phase 10: Fence Rowid-Dependent Maintenance
+
+Goal:
+No completed create, refresh, or compaction can publish postings or advance a high-water
+mark from a different rowid epoch than the base-table snapshot it validated.
+
+Scope:
+- Add an execution-time shared vacuum fence that is acquired before maintenance validates
+  rowid-derived state and held across every generated statement until commit, rollback,
+  cancellation, or error.
+- Re-run ownership, identity, high-water-mark, and witness validation after acquiring the
+  fence. Pragma-callback validation may reject obvious failures early, but is not the
+  correctness boundary.
+- Make owner identity comparisons case-insensitive in every reader and generated guard;
+  replace deterministic temp-table names and the shared `__ngram_guard` session variable
+  with invocation-scoped internal state that cannot overwrite user state.
+- Give the fence and all scratch state one cleanup owner whose lifetime covers success,
+  fallback, cancellation, and exceptional exits.
+
+Out of scope:
+- Detecting and overlay-scanning updated row groups; Phase 11 closes that independent
+  correctness gap.
+
+Completion gate:
+In the deterministic preprocessing-to-execution race, fence-first maintenance makes an
+overlapping checkpoint use a non-rowid-moving path and commits metadata and postings from
+that fenced snapshot. If a rowid-moving checkpoint completes first, execution-time
+identity, HWM, and witness validation refuses refresh or compaction and leaves the
+previously published index unchanged; a create may instead build wholly from the fenced
+post-checkpoint snapshot using a runtime HWM and witnesses. No schedule may commit
+maintenance state assembled from two rowid epochs. Exact search through an index that a
+checkpoint invalidated before the fence is acquired remains Phase 11's responsibility.
+
+Testing plan:
+- Add a deterministic in-process three-connection harness that freezes a pragma after
+  preprocessing but before its generated transaction executes. Exercise both external
+  schedules (fence first and rowid-moving checkpoint first), checkpoint-first create,
+  and the automatic checkpoint run by the maintenance transaction's own commit.
+- Prove rollback, error, and commit cleanup by causing real rowid movement in a following
+  checkpoint, and assert failed work leaves the previous HWM and temp catalog unchanged.
+- Use functional SQL tests for ordinary create, bounded and unbounded refresh, purging and
+  non-purging compaction, case-only renames, ASCII/non-ASCII owner identity, pre-existing
+  user temp tables and the `__ngram_guard` session variable, and macro shadowing.
+- This is mechanism coverage, not a timing matrix for every operation and exit. Compact
+  and bounded refresh enter through the same first-statement fence and existing-index
+  guard as unbounded refresh; cancellation reaches the same DuckDB rollback callback as
+  an error. No cancellation injection or concurrent-maintenance stress is claimed here.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Scope | Maintenance holds one execution-time rowid-stability fence through publication | `AcquireMaintenanceFence` takes DuckDB's normal transaction vacuum lock before any generated write. `MaintenanceFenceState` keeps a second shared lock in connection state until DuckDB's post-commit or rollback callback; that bridge is necessary because DuckDB releases the transaction-owned lock before running the same commit's automatic checkpoint. The holder is mutex-protected for direct parallel invocation and stores each manager/lock as one exception-safe aggregate. |
+| Complete | Scope | Validation runs after the fence and against the publishing snapshot | The volatile, fallible `system.main.__ngram_maintenance_guard` is the first generated body expression for create, refresh, and compact. After fencing it re-resolves the table and verifies table OID, schema fingerprint, ASCII-case-insensitive ownership, indexed column, HWM, gram size, case option, and row witnesses. Create separately enumerates current metadata owners, rejects an existing same-column index, and derives both HWM and witnesses from the same runtime committed maximum rowid. |
+| Complete | Scope | Identifier, scratch, and guard state cannot collide with user state | Scratch/guard tables use random UUID names and transactional `CREATE TEMP TABLE`, and maintenance no longer reads or writes a session variable. Generated calls are `system.main` qualified so user macros cannot intercept them. SQL owner guards compare encoded ASCII-folded bytes, matching C++ `StringUtil::CIEquals` even under `default_collation='nocase'`; `ExistingMetaTables` and stats discovery use case-insensitive prefix matching. |
+| Complete | Scope | Fence and scratch cleanup covers every exit | The lock has one `ClientContextState` owner and is cleared by DuckDB's commit/rollback callbacks; temp scratch belongs to the generated transaction. The deterministic harness proves rollback after an execution-time error and success both permit a later checkpoint to move rowids, and SQL regressions prove failed work leaves no invocation scratch. Cancellation is not separately injected; it follows DuckDB's same automatic rollback callback. |
+| Complete | Work | 10A: Introduce a maintenance execution wrapper with transaction-lifetime vacuum fencing | Implemented by the shared guard scalar plus `MaintenanceFenceState`, covering every statement in each generated transaction and the otherwise-unprotected automatic-checkpoint interval inside commit. No production scheduling hook or custom lock protocol was added. |
+| Complete | Work | 10B: Move definitive identity/HWM/witness checks behind the fence | Callback checks remain only as early rejection. The generated body repeats all publication-critical checks after its fence, includes explicit create/existing mode and index-option comparisons, and samples witnesses at execution time. |
+| Complete | Work | 10C: Replace name-derived scratch objects and shared session variables | Create, refresh, and compact now use UUID temp names; the fixed `__ngram_guard` variable is gone. Owner semantics are shared across create/search/maintenance/drop/stats, including case-only renames and distinct non-ASCII identifiers. |
+| Complete | Gate | Checkpoint/maintenance schedules cannot mix rowid epochs | The old transaction-only build failed the same-commit discriminator 3/3 with `max(rowid)=127119`, `HWM=124999`, brute-force count 1, and indexed count 0. The final deterministic harness passes repeatedly: fence-first checkpoint is non-moving; checkpoint-first refresh refuses without publishing; checkpoint-first create builds exactly from the moved snapshot; and same-commit automatic checkpoint leaves rowids stable until publication, after which a fresh delete plus checkpoint proves release. The full release gate passed the harness and all 22 SQL tests (2,668 assertions). |
+| Complete | Test | Deterministic checkpoint/fence mechanism coverage | `test/cpp/ngram_maintenance_checkpoint_gap.cpp`, wired into normal release/debug/reldebug test targets, freezes expanded ASTs at the real preprocessing/execution seam and covers both external schedules, the distinct create branch, same-commit automatic checkpoint, exact search/HWM outcomes, and real lock release. Ordinary SQL tests cover bounded/unbounded refresh and both compact modes, which share the same first-statement existing-index guard. No full operation-by-schedule matrix is claimed. |
+| Complete | Test | Cleanup and namespace regressions | The C++ harness covers commit, explicit rollback after a generated execution error, temp-catalog cleanup on the maintenance connection, and subsequent real rowid movement. SQL covers case-only table/meta renames, non-ASCII owner separation under `nocase`, preserved legacy temp names and user `__ngram_guard`, and user macros shadowing internal names. Cancellation and concurrent-maintenance stress were not injected; cleanup there follows the already-exercised rollback owner. |
+
+## Phase 11: Make Exhaustiveness Unconditional
+
+Goal:
+Close the in-place-update and post-vacuum miss paths so the extension's primary promise
+is literal: every accelerated result is identical to the same predicate's brute-force
+result, without requiring callers to remember a rebuild rule.
+
+Scope:
+- Implement the conservative dirty-range design in `docs/stale-updates.md`: persist an
+  indexed-row-group baseline, combine transient `ColumnData::HasChanges` information with
+  durable block/layout identities, and treat any ambiguous mapping as dirty rather than
+  clean.
+- Execute one exact result pipeline over index candidates, the unindexed tail, and dirty
+  row-group scans. Deduplicate rowids and apply the original predicate once; a completely
+  uncertain baseline degrades to a full scan.
+- Add bounded, atomic repair for dirty ranges using segment-aligned re-indexing, then
+  publish the new baseline only with the repaired postings.
+- Version-gate every DuckDB-internal assumption and define `scan` and `error` policies for
+  detected dirtiness. Consider making `ngram_auto_accelerate` default-on only after this
+  phase's exactness and upgrade gates pass.
+
+Out of scope:
+- Requiring triggers or a change feed, or requiring users to add an ART index merely to
+  protect ngram rowids.
+- Fuzzy matching, ranking, and a native DuckDB index backend.
+
+Completion gate:
+For committed inserts, in-place updates, deletes, checkpoints that vacuum or preserve
+rowids, close/reopen, and mixed concurrent snapshots, the explicit and transparent paths
+equal brute force. If the detector cannot prove a range clean, the query scans that range
+or refuses before returning; it never answers from an uncertain index alone.
+
+Testing plan:
+- Extend the differential and churn harnesses with clustered and scattered below-HWM
+  updates, deletes before and after checkpoint, row-group merges, masked row motion plus
+  later appends, and reopen at each stage.
+- Pin transient-to-persistent row groups, changed/unchanged block identities, vanished and
+  shifted row groups, equal-value updates, NULLs, and changes to non-indexed columns.
+- Measure query and surgical-repair cost by dirty row-group count at 1/10/100/1000 groups;
+  the worst case must be a bounded full scan, never unbounded duplicate work.
+- Add a DuckDB-version compatibility test that fails closed when the internal signals or
+  baseline interpretation change.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Scope | Conservative transient + durable dirty-range detection | `docs/stale-updates.md` identifies `ColumnData::HasChanges` and per-row-group block identity, but no baseline is persisted and query execution does not consume either signal. Missing: implementation and format-version design. |
+| Incomplete | Scope | Exact union of index candidates, tail, and dirty scans | Missing: dirty-range scan source, deduplication contract, and a full-scan fallback for ambiguous layouts. Current query composition covers candidates plus `rowid > hwm` only. |
+| Incomplete | Scope | Segment-aligned surgical repair with atomic baseline publication | Missing: dirty-range repair path, crash semantics, and proof that postings and baseline cannot describe different snapshots. |
+| Incomplete | Scope | Fail-closed version policy and post-gate transparent default decision | Missing: internal compatibility check, `scan`/`error` policy, exactness evidence, and an explicit decision on `ngram_auto_accelerate`. |
+| Incomplete | Work | 11A: Add dirty-baseline storage and conservative detector | Missing: shadow-table schema, format-version migration/rebuild policy, cache invalidation, and handling for transient or unalignable row groups. |
+| Incomplete | Work | 11B: Add dirty-range overlay to the shared query pipeline | Missing: range scheduling, rowid dedupe, original-predicate recheck, projection support, and full-scan degradation. |
+| Incomplete | Work | 11C: Add bounded repair and revisit the transparent default | Missing: atomic range replacement, crash recovery, maintenance integration, cost measurements, and the default-setting decision after the gate. |
+| Incomplete | Gate | Explicit and transparent searches stay exhaustive through update/vacuum/reopen churn | Current documentation concedes misses after below-HWM in-place updates and some checkpoint vacuums (`docs/stale-updates.md`). Missing: zero-mismatch differential evidence across all dirty-state transitions and fail-closed behavior when uncertain. |
+| Incomplete | Test | Adversarial dirty-detector and overlay suite | Missing: clustered/scattered updates, masked row motion, transient/persistent transitions, shifted/vanished groups, unchanged controls, and concurrent-snapshot cases. |
+| Incomplete | Test | Dirty-cost curve and DuckDB-version coupling gate | Missing: rows/bytes scanned, RSS and repair timings by dirty-group count, plus a test that rejects unsupported internal semantics. |
+
+## Phase 12: Bound and Consolidate Query Execution
+
+Goal:
+Make query memory and work predictable before decoding starts, while replacing the two
+nearly parallel explicit/transparent engines with one projection-aware implementation.
+
+Scope:
+- Replace the post-materialization candidate gate with admission checks based on posting
+  counts, estimated decoded bytes, DuckDB's memory limit, and an explicit hard work budget.
+  Full-result functions fall back to a scan; candidate-only APIs stream or return a clear
+  resource-limit error before oversized allocation.
+- Change `ProbeIndex` from a whole-query `vector<row_t>` result to a segment/chunk-oriented
+  candidate source. Intersect, fetch, recheck, and emit bounded chunks without retaining
+  an all-row posting list or final candidate set in extension memory.
+- Factor candidate probing, fetched-row recheck, tail/dirty scan, partition scheduling,
+  and fallback into one execution core used by `ngram_search` and `NGRAM_INDEX_SCAN`.
+- Add projection pushdown to `ngram_search`: fetch the indexed column for recheck plus
+  only the output columns the parent requested, including the zero-output `count(*)` case.
+- Catch only expected index-availability/staleness conditions for fallback. Propagate OOM,
+  cancellation, corruption, and internal errors, and release the vacuum fence before a
+  full-scan fallback begins.
+
+Out of scope:
+- Approximate result modes, ranking, or changing the exact semantics of either result API.
+- Changing postings encoding; Phase 6 measured and rejected that trade.
+
+Completion gate:
+No query path allocates memory proportional to the full posting count or candidate count
+without a pre-approved reservation. A corpus-scale dense gram under a tight memory limit
+streams within budget or selects a full scan before materialization; explicit and
+transparent results and output order remain identical to their current exact oracles.
+
+Testing plan:
+- Add dense single-gram and common-gram-conjunction cases with posting counts extrapolated
+  through the 1.09-billion-row benchmark shape; run under tight memory limits and record
+  peak RSS, decoded rowids, and selected mode.
+- Compare candidate chunks and final results at thread counts 1/2/8/24, across refresh
+  generations, partial segments, fallback decisions, cancellation, and corruption/OOM
+  injection.
+- Add wide and nested tables and assert physical fetch columns for `count(*)`, one-column,
+  reordered, duplicate, and all-column projections on both explicit and rewritten paths.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Scope | Probe admission happens before decoded candidate allocation | Current `ProbeIndex` returns `vector<row_t>` (`src/ngram_search.cpp:756`), while the transparent fraction gate runs only after it returns (`src/ngram_rewrite.cpp:474-493`) and explicit search has no corresponding gate. Missing: byte/work estimates and reservations before decode. |
+| Incomplete | Scope | Candidate decode/intersection/fetch is segment-streaming and bounded | Missing: chunked candidate-source interface and executor. At 1.092B rows, one all-row `vector<row_t>` is about 8.1 GiB before copies or intersection scratch. |
+| Incomplete | Scope | Explicit and transparent paths share one execution core | Missing: consolidation. `src/ngram_search.cpp` and `src/ngram_rewrite.cpp` separately own probe, fetch, tail-scan, fallback, local-state, and scheduling logic. |
+| Incomplete | Scope | Explicit search supports projection pushdown | Missing: projection callback and fetch-column mapping. `SearchInitGlobal` currently gathers every base column (`src/ngram_search.cpp:969-975`), and registration at `src/ngram_search.cpp:1241-1250` does not enable projection pushdown. |
+| Incomplete | Scope | Fallback classification preserves fatal errors and releases locks | Missing: typed fallback results and lock transition. `src/ngram_rewrite.cpp:470-479` catches every `std::exception` as “index unavailable”. |
+| Incomplete | Work | 12A: Define probe admission and resource-budget policy | Missing: settings/defaults, memory-manager integration or reservation, explain output, and API behavior for `ngram_candidates` when a hard limit is exceeded. |
+| Incomplete | Work | 12B: Implement a bounded segment candidate source | Missing: streaming decode/intersection, multi-generation merge, sorted-order proof, cancellation, and counters for work/RSS tests. |
+| Incomplete | Work | 12C: Build one projection-aware search executor and migrate both entry points | Missing: shared state machine, predicate adapters, projected fetch mapping, tail/dirty integration, and removal of duplicate engines. |
+| Incomplete | Work | 12D: Replace broad exception fallback with explicit outcomes | Missing: expected decline categories, fatal exception propagation, fence release, and EXPLAIN/ANALYZE reason reporting. |
+| Incomplete | Gate | Dense probes are bounded before materialization and both APIs retain exact parity | Missing: peak-memory evidence under a constrained limit, no whole-posting vectors, and differential/order identity on both paths. |
+| Incomplete | Test | Dense-probe memory/work matrix | Missing: common grams and conjunctions at several scales, tight-memory behavior, decoded-row/work counters, RSS, and candidate-only streaming coverage. |
+| Incomplete | Test | Shared-engine projection, fallback, ordering, and fault suite | Missing: wide/nested projection assertions, thread-count identity, multi-generation segments, cancellation/corruption/OOM classification, and lock-release checks. |
+
+## Phase 13: Remove Maintenance and Stats Read Amplification
+
+Goal:
+Make compaction cost proportional to data actually rewritten and make rarest-gram lookup
+proportional to the requested grams, not to the accumulated global stats history.
+
+Scope:
+- Make non-purging compaction a shadow-table-only merge. Retaining dead postings is safe
+  because fetch/recheck removes them; only `purge = true` should pay to consult the base
+  table for liveness.
+- Range-restrict every purging base-table membership scan to the segment interval being
+  rewritten, and verify that all partitions together read the base table approximately
+  once rather than once per generated statement.
+- Profile and remove repeated full scans of the gram-ordered segments table as partition
+  count grows. Choose a bounded, layout-aware source plan using measured rows/bytes read,
+  spill, RSS, and wall time rather than preserving the current statement shape.
+- Replace the full stats-table scan with either physically gram-filterable bounded
+  generations or counts derived from filtered segment metadata. If a stats table remains,
+  add cheap stats-only consolidation before refresh generations make lookup global again.
+
+Out of scope:
+- Changing exact query semantics or postings encoding.
+- A background compaction scheduler; this phase makes each requested operation efficient.
+
+Completion gate:
+Non-purging compaction performs zero base-table row reads. Purging compaction performs at
+most one aggregate pass over the relevant base and shadow ranges, independent of the
+memory-driven partition count. Query gram-count lookup reads data proportional to the
+needle grams and their generations, with output identical to current stats sums.
+
+Testing plan:
+- Profile compact at partition counts 1/8/auto over low/high fragmentation and purge
+  on/off; record base/segments rows and bytes read, peak RSS, spill, and wall time at 1,
+  10, and the existing 100 GB benchmark shape.
+- Compare postings and stats before/after each compaction in both directions, including
+  deleted rows, partial segments, many generations, rollback, crash, and reopen.
+- Benchmark gram-count lookup over 1/10/100 refresh generations and rare/common needle
+  grams; require identical gram choices, candidates, and final results.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Scope | Non-purging compaction does not read the base table | Current packing always filters unpacked rowids through `WHERE r IN (SELECT rowid FROM base)` (`src/ngram_maintenance.cpp:766-767`), even when only fragmented keys are merged. Missing: pure shadow merge and updated docs/tests. |
+| Incomplete | Scope | Purging base reads are range-restricted and not multiplied by partitions | Current generated membership subquery has no rowid bounds, inside one statement per range (`src/ngram_maintenance.cpp:755-768`). Missing: range predicate plus profiler evidence that partitions collectively perform about one pass. |
+| Incomplete | Scope | Segment-source reads do not become full-table scans per partition | The source filters `segment_no` while the table is physically ordered by gram, so pruning is not guaranteed; the 100 GB sizing produces roughly 95 packing statements. Missing: operator-profile evidence and a layout-aware bounded replacement. |
+| Incomplete | Scope | Rarest-gram counts avoid a global stats scan | `GramPostingCounts` parallel-scans every stats row and filters in C++ (`src/ngram_search.cpp:555-603`); refresh appends unordered delta groups (`src/ngram_maintenance.cpp:597-599`). Missing: evaluated replacement and generation control. |
+| Incomplete | Work | 13A: Split merge-only and purging compaction plans | Missing: two explicit SQL-generation paths, base-range predicates for purge, and unchanged posting/result proofs. |
+| Incomplete | Work | 13B: Eliminate partition-multiplied segment scans | Missing: profiles at several partition counts, chosen streaming/materialization/layout design, and bounded-memory implementation. |
+| Incomplete | Work | 13C: Prototype filtered stats generations versus segment-derived counts | Missing: A/B measurements, chosen representation, refresh/compact integration, and stats-only consolidation if retained. |
+| Incomplete | Gate | Maintenance and stats reads scale with selected work, not partition/history count | Missing: operator cardinalities, bytes, RSS, spill, and time demonstrating zero base reads for merge-only, near-one-pass purge, and gram-filtered lookup. |
+| Incomplete | Test | Compaction amplification and identity matrix | Missing: purge modes × partitions × fragmentation × scale, with bidirectional posting/stats equality, crash, rollback, and reopen. |
+| Incomplete | Test | Stats-history scaling and query parity matrix | Missing: generation-count curve, chosen-gram identity, candidate identity, and explicit/transparent differential results. |
+
+## Phase 14: Lifecycle, Observability, and Release Evidence
+
+Goal:
+Make every index discoverable and removable throughout its lifecycle, and make release
+claims reproducible from artifacts and correctness checks rather than hand-maintained
+prose or a portability-only CI matrix.
+
+Scope:
+- Add a durable ordinary-table registry with opaque index IDs. Derive new shadow object
+  names from the ID rather than user identifiers, and expose list/status/drop-by-ID APIs
+  that continue to work when the base table or indexed column is absent.
+- Define rename and orphan handling: case-insensitive lookup, safe rebind when current
+  catalog identity proves it is the same table, rebuild when identity cannot be proven,
+  and legacy-index discovery/drop during the format transition.
+- Emit versioned machine-readable benchmark artifacts containing commit, DuckDB version,
+  corpus manifest, settings, hardware, commands, and raw samples. Generate README and
+  `benchmarks/RESULTS.md` tables/claims from those artifacts with consistency checks.
+- Add a Linux correctness CI lane: release suite, DEBUG + AddressSanitizer/UBSan, the
+  deterministic Phase 10 race, and bounded fixed-seed differential/churn tests. Keep the
+  existing distribution workflow as a separate build/portability lane.
+
+Out of scope:
+- Automatically migrating postings to a native DuckDB index backend.
+- Running the 100 GB benchmark on every pull request; release artifacts may be produced on
+  dedicated hardware and verified cheaply in CI.
+
+Completion gate:
+Every shadow allocation can be listed and dropped by stable ID even after base drop or
+rename, and no pair of valid identifiers can alias a new index's storage. Every numeric
+README/RESULTS claim is traceable to a checked artifact for the current implementation,
+and the correctness CI lane is green in addition to the platform matrix.
+
+Testing plan:
+- Cover schema/table/column rename (including case-only), drop, drop-and-recreate,
+  `CREATE OR REPLACE`, detach/attach, reopen, colliding legacy names, two indexed columns,
+  orphan listing/drop, safe/unsafe rebind, and upgrade/rebuild behavior.
+- Add golden tests for artifact schema and generated Markdown; deliberately mix commits,
+  defaults, or old/new benchmark stages and require generation to fail.
+- Run the new CI commands locally and pin their exact bounded seed/corpus budgets; retain a
+  scheduled or release-only lane for longer sanitizer and scale checks.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Scope | Opaque registry makes indexes discoverable and removable independently of the base name | Current `ShadowSchemaName` is name-derived and explicitly non-injective (`src/index_pragmas.cpp:29,113-116`); `drop_ngram_index` first resolves the live base target (`src/index_pragmas.cpp:427-433`). Dropping the base therefore leaves storage the public drop API cannot address. Missing: registry and ID-based APIs. |
+| Incomplete | Scope | Rename, orphan, legacy, and rebind semantics are explicit and safe | Missing: lifecycle state machine and transition support. Review reproductions found case-only rename breaking search/drop and base drop leaving an orphan; exact owner comparisons are also tracked in Phase 10. |
+| Incomplete | Scope | Performance documentation is generated from versioned artifacts | No machine-readable result artifacts are checked in. README says 0.92 GiB indexed in 8.1 s is “roughly 1 GB ... per second” (`README.md:530-533`, actually about 0.11 GiB/s), while the TB table still extrapolates the superseded 208–211 s/replica build and old compaction/probe figures (`benchmarks/RESULTS.md:878-907`). |
+| Incomplete | Scope | CI has a dedicated correctness/sanitizer/race lane | `.github/workflows/MainDistributionPipeline.yml` invokes distribution and format/tidy workflows only. Missing: Linux DEBUG/ASAN/UBSan and focused differential/churn/race jobs. |
+| Incomplete | Work | 14A: Introduce opaque index identity, registry, and lifecycle APIs | Missing: registry schema, ID generation, lookup/list/drop/rebind APIs, ordinary-table persistence proof, and legacy discovery/rebuild policy. |
+| Incomplete | Work | 14B: Add benchmark artifact schema and documentation generator | Missing: raw artifact format, provenance validation, checked generator output, and correction of the inconsistent throughput/TB claims. |
+| Incomplete | Work | 14C: Add bounded correctness CI and release-evidence checks | Missing: workflow/jobs, runtime budgets, artifact-consistency check, deterministic race target, and fixed seeds. |
+| Incomplete | Gate | Lifecycle is leak-free/collision-free and release claims are traceable | Missing: orphan/rename matrix, storage-collision proof, generated-doc diff check, artifact provenance, and green correctness CI. |
+| Incomplete | Test | Registry and lifecycle transition matrix | Missing: rename/drop/recreate/detach/reopen/collision/rebind/legacy tests across one and multiple indexed columns. |
+| Incomplete | Test | Artifact-generation and correctness-CI gates | Missing: golden/stale-artifact tests, local CI transcript, DEBUG/ASAN/UBSan result, deterministic maintenance race, and bounded differential/churn evidence. |

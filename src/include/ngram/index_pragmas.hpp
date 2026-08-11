@@ -56,22 +56,11 @@ bool ShadowTableExists(ClientContext &context, const ResolvedTarget &target, con
 //! Names of meta_* tables currently present in the target's shadow schema.
 vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &target);
 
-//! Quote an identifier / a string literal for generated SQL.
+//! Quote an identifier / a string literal, or qualify a built-in function so
+//! generated SQL cannot resolve a same-named macro from the current schema.
 string Ident(const string &name);
 string Lit(const string &value);
-
-//! Session variable the generated guard statements assign to. Its value is
-//! always NULL; only the act of evaluating the guard matters.
-constexpr const char *NGRAM_GUARD_VARIABLE = "__ngram_guard";
-
-//! Wrap a guard expression in a statement that raises when the guard fires and
-//! produces no result rows otherwise, so a pragma's output is the pragma's own.
-string SilentGuard(const string &guard_expression);
-
-//! A statement that raises the shadow-schema collision error unless the meta
-//! table holds exactly one row naming `target` as its owner. Pragma callbacks
-//! cannot run queries, so every generated script guards itself this way.
-string OwnershipGuard(const ResolvedTarget &target, const string &meta_qualified);
+string SystemFunction(const string &name);
 
 //! Rowids at or above this value are transaction-local: they are reassigned at
 //! commit, so the index must never record them (duckdb MAX_ROW_ID).

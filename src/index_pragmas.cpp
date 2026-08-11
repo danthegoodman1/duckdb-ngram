@@ -4,6 +4,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -48,6 +49,10 @@ string Ident(const string &name) {
 
 string Lit(const string &value) {
 	return KeywordHelper::WriteQuoted(value);
+}
+
+string SystemFunction(const string &name) {
+	return Ident("system") + "." + Ident("main") + "." + Ident(name);
 }
 
 ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, const string &column_name,
@@ -120,45 +125,69 @@ bool ShadowTableExists(ClientContext &context, const ResolvedTarget &target, con
 
 //! SQL condition: this meta row records an owner other than target
 static string MetaMismatchCondition(const ResolvedTarget &target) {
-	return "schema_name IS DISTINCT FROM " + Lit(target.schema_name) + " OR table_name IS DISTINCT FROM " +
-	       Lit(target.table_name);
+	constexpr const char *UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	constexpr const char *LOWER = "abcdefghijklmnopqrstuvwxyz";
+	auto fold = [&](const string &column) {
+		return SystemFunction("encode") + "(" + SystemFunction("translate") + "(" + column + ", '" + UPPER +
+		       "', '" + LOWER + "'))";
+	};
+	auto literal = [&](const string &value) {
+		return SystemFunction("encode") + "(" + Lit(StringUtil::Lower(value)) + ")";
+	};
+	return fold("schema_name") + " IS DISTINCT FROM " + literal(target.schema_name) + " OR " +
+	       fold("table_name") + " IS DISTINCT FROM " + literal(target.table_name);
 }
 
 //! SQL scalar counting the meta rows that name target as their owner. The
 //! guards compare it against 1: a meta table that is empty, holds several
 //! rows, or names someone else is equally unusable.
 static string OwnedMetaRowCount(const ResolvedTarget &target, const string &meta_qualified) {
-	return "(SELECT count(*) FROM " + meta_qualified + " WHERE NOT (" + MetaMismatchCondition(target) + "))";
+	return "(SELECT " + SystemFunction("count") + "(*) FROM " + meta_qualified + " WHERE NOT (" +
+	       MetaMismatchCondition(target) + "))";
 }
 
 //! SQL expression raising the collision error, naming both tables. Reads the
 //! owner back out of the meta table, so it works from a statement that has no
 //! FROM clause of its own.
 static string CollisionErrorCall(const ResolvedTarget &target, const string &meta_qualified) {
-	return "error('ngram shadow schema collision: ' || " + Lit(target.shadow_schema) +
+	return SystemFunction("error") + "('ngram shadow schema collision: ' || " + Lit(target.shadow_schema) +
 	       " || ' belongs to the index on ' || coalesce((SELECT coalesce(schema_name, '?') || '.' || "
 	       "coalesce(table_name, '?') FROM " +
 	       meta_qualified + " LIMIT 1), '(no owner recorded)') || ', not to ' || " +
 	       Lit(target.schema_name + "." + target.table_name) + ")";
 }
 
-//! Wrap a guard expression in a statement that produces no result set. A bare
-//! `SELECT <guard>` works but prints a NULL row per guard, which is what a
-//! user of these pragmas actually sees; `SET VARIABLE` evaluates the same
-//! expression, raises the same error, and returns nothing. The statement count
-//! is unchanged, so the preprocessor still wraps the expansion in one
-//! transaction exactly as before.
-string SilentGuard(const string &guard_expression) {
-	return "SET VARIABLE " + string(NGRAM_GUARD_VARIABLE) + " = (SELECT " + guard_expression + ");\n";
+//! Evaluate a guard by inserting into an invocation-scoped temp table. A bare
+//! `SELECT <guard>` works but prints a NULL row per guard; the INSERT raises the
+//! same error without producing a result row.
+static string SilentGuard(const string &guard_table, const string &guard_expression) {
+	return "INSERT INTO " + guard_table + " SELECT " + guard_expression + ";\n";
 }
 
 //! Statement raising the collision error unless the meta table holds exactly
 //! one row naming target as its owner. Evaluating a scalar subquery rather
 //! than a per-row CASE keeps the guard from passing vacuously on an empty
 //! meta table.
-string OwnershipGuard(const ResolvedTarget &target, const string &meta_qualified) {
-	return SilentGuard("CASE WHEN " + OwnedMetaRowCount(target, meta_qualified) + " <> 1 THEN " +
-	                   CollisionErrorCall(target, meta_qualified) + " END");
+static string OwnershipGuard(const ResolvedTarget &target, const string &meta_qualified, const string &guard_table) {
+	return SilentGuard(guard_table, "CASE WHEN " + OwnedMetaRowCount(target, meta_qualified) + " <> 1 THEN " +
+	                                    CollisionErrorCall(target, meta_qualified) + " END");
+}
+
+static string ScratchName(const char *purpose) {
+	return Ident(string("__ngram_") + purpose + "_" + UUID::ToString(UUID::GenerateRandomUUID()));
+}
+
+static string MaintenanceGuardCall(const ResolvedTarget &target, const string &column_name,
+                                   const TableFingerprint &fingerprint, const char *fn) {
+	return SystemFunction(NGRAM_MAINTENANCE_GUARD) + "(" + Lit(fn) + ", " + Lit(target.catalog_name) + ", " +
+	       Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(column_name) + ", true, " +
+	       "-1, " + to_string(fingerprint.table_oid) + ", " +
+	       Lit(fingerprint.schema_fingerprint) + ", 0, false)";
+}
+
+static string RowSamplesCall(const ResolvedTarget &target, const string &column_name, const string &max_rowid) {
+	return SystemFunction(NGRAM_ROW_SAMPLES) + "(" + Lit(target.catalog_name) + ", " + Lit(target.schema_name) +
+	       ", " + Lit(target.table_name) + ", " + Lit(column_name) + ", " + max_rowid + ")";
 }
 
 //===----------------------------------------------------------------------===//
@@ -214,13 +243,13 @@ vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_
 }
 
 string PackPartitionStatement(const string &packed, bool first, const string &pair_source) {
-	string statement = first ? "CREATE OR REPLACE TEMP TABLE " + packed + " AS " : "INSERT INTO " + packed + " ";
+	string statement = first ? "CREATE TEMP TABLE " + packed + " AS " : "INSERT INTO " + packed + " ";
 	return statement +
-	       "SELECT gram, segment_no, struct_extract(segment, 'postings') AS postings, "
-	       "struct_extract(segment, 'rowid_count') AS rowid_count, "
-	       "struct_extract(segment, 'min_rowid') AS min_rowid, "
-	       "struct_extract(segment, 'max_rowid') AS max_rowid FROM ("
-	       "SELECT gram, segment_no, ngram_pack_segment(r) AS segment FROM (" +
+	       "SELECT gram, segment_no, " + SystemFunction("struct_extract") + "(segment, 'postings') AS postings, " +
+	       SystemFunction("struct_extract") + "(segment, 'rowid_count') AS rowid_count, " +
+	       SystemFunction("struct_extract") + "(segment, 'min_rowid') AS min_rowid, " +
+	       SystemFunction("struct_extract") + "(segment, 'max_rowid') AS max_rowid FROM (" +
+	       "SELECT gram, segment_no, " + SystemFunction("ngram_pack_segment") + "(r) AS segment FROM (" +
 	       pair_source + ") GROUP BY gram, segment_no);\n";
 }
 
@@ -296,7 +325,7 @@ vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &
 	}
 	schema_entry->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
 		const string prefix = "meta_";
-		if (entry.name.rfind(prefix, 0) == 0) {
+		if (StringUtil::CIStartsWith(entry.name, prefix)) {
 			result.push_back(entry.name);
 		}
 	});
@@ -354,27 +383,16 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	// (not count), which is what lets a rowid-range partition hold whole keys.
 	// Duplicate (gram, rowid) instances survive until the codec, which sorts and
 	// dedupes.
+	auto fingerprint = ComputeTableFingerprint(context, *target.entry);
 	string script;
-	// __ngram_ is this extension's reserved temp-table namespace; suffixing the
-	// shadow schema and column keeps concurrent builds of different targets from
-	// sharing one scratch table
-	string packed = Ident("__ngram_build_packed_" + target.shadow_schema + "_" + column_name);
-	// Ownership guards run first: each existing meta table must name this base
-	// table. The guard on this column's own meta also converts a matching meta
-	// into the "already exists" error; if that meta is somehow empty, the
-	// CREATE TABLE below still fails on the name clash.
-	for (auto &meta_name : ExistingMetaTables(context, target)) {
-		auto meta_qualified = shadow + "." + Ident(meta_name);
-		if (meta_name == MetaTableName(column_name)) {
-			script += SilentGuard("CASE WHEN " + OwnedMetaRowCount(target, meta_qualified) + " <> 1 THEN " +
-			                      CollisionErrorCall(target, meta_qualified) + " ELSE error(" +
-			                      Lit("An ngram index already exists on " + target.table_name + "." + column_name +
-			                          " (" + target.shadow_schema + "); use drop_ngram_index first") +
-			                      ") END");
-		} else {
-			script += OwnershipGuard(target, meta_qualified);
-		}
-	}
+	string guard = ScratchName("guard");
+	string packed = ScratchName("build_packed");
+	// This is the first executed statement. The volatile scalar acquires the
+	// target transaction's vacuum fence before checking that the table planned
+	// above is still the table the remaining script will scan.
+	script += "CREATE TEMP TABLE " + guard + " AS SELECT " +
+	          MaintenanceGuardCall(target, column_name, fingerprint, "create_ngram_index") +
+	          " AS ignored;\n";
 	// Only committed rows are indexed. A transaction-local rowid is reassigned
 	// at commit, so recording one would leave the index pointing at a rowid
 	// that never exists (and, before this filter, made ngram_search fetch a
@@ -382,21 +400,18 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	// Uncommitted rows are found by the tail scan instead, and land past the
 	// high-water mark when they commit.
 	auto committed_only = "rowid < " + to_string(LOCAL_ROWID_START);
-	auto fingerprint = ComputeTableFingerprint(context, *target.entry);
-	// witnesses are drawn over the rowids the build is about to index; the
-	// callback runs before it, so the bound is the table's committed end
-	auto row_samples = BuildRowSampleDigest(context, *target.entry, column_name, fingerprint.total_rows - 1);
+	auto committed_hwm = "(SELECT coalesce(" + SystemFunction("max") + "(rowid), -1) FROM " + base + " WHERE " +
+	                     committed_only + ")";
 	script += "CREATE SCHEMA IF NOT EXISTS " + shadow + ";\n";
 	script += "CREATE TABLE " + meta + " AS SELECT " + to_string(NGRAM_FORMAT_VERSION) + " AS format_version, " +
 	          Lit(target.schema_name) + " AS schema_name, " + Lit(target.table_name) + " AS table_name, " +
 	          Lit(column_name) + " AS column_name, " + gram_str + " AS gram_size, " + ci_str +
-	          " AS case_insensitive, "
-	          "(SELECT coalesce(max(rowid), -1) FROM " +
-	          base + " WHERE " + committed_only + ") AS hwm_rowid, " + Lit(fingerprint.schema_fingerprint) +
+	          " AS case_insensitive, " +
+	          committed_hwm + " AS hwm_rowid, " + Lit(fingerprint.schema_fingerprint) +
 	          " AS schema_fingerprint, " + Lit(fingerprint.ColumnType(column_name)) + " AS column_type, " +
 	          to_string(fingerprint.table_oid) + "::BIGINT AS table_oid, " + to_string(fingerprint.catalog_oid) +
-	          "::BIGINT AS catalog_oid, " + Lit(fingerprint.instance_id) + " AS instance_id, " + Lit(row_samples) +
-	          " AS row_samples;\n";
+	          "::BIGINT AS catalog_oid, " + Lit(fingerprint.instance_id) + " AS instance_id, " +
+	          RowSamplesCall(target, column_name, committed_hwm) + " AS row_samples;\n";
 	auto partitions =
 	    BuildPartitionCount(context, EstimateGramCount(context, *target.entry, column_name, 0,
 	                                                   fingerprint.total_rows - 1, NumericCast<idx_t>(gram_size)));
@@ -404,7 +419,9 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	for (idx_t i = 0; i < ranges.size(); i++) {
 		script += PackPartitionStatement(
 		    packed, i == 0,
-		    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, unnest(trigrams(" + column +
+		    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, " +
+		        SystemFunction("unnest") + "(" +
+		        SystemFunction("trigrams") + "(" + column +
 		        ", " + gram_str + ", " + ci_str + ")) AS gram FROM " + base +
 		        " WHERE rowid >= " + to_string(ranges[i].first) + " AND rowid <= " + to_string(ranges[i].second) +
 		        " AND " + column + " IS NOT NULL");
@@ -418,9 +435,11 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	          packed + " ORDER BY gram, segment_no;\n";
 	script += "CREATE TABLE " + stats +
 	          " AS "
-	          "SELECT gram, sum(rowid_count)::BIGINT AS row_count, count(*)::BIGINT AS segment_count FROM " +
+	          "SELECT gram, " + SystemFunction("sum") + "(rowid_count)::BIGINT AS row_count, " +
+	          SystemFunction("count") + "(*)::BIGINT AS segment_count FROM " +
 	          segments + " GROUP BY gram;\n";
 	script += "DROP TABLE " + packed + ";\n";
+	script += "DROP TABLE " + guard + ";\n";
 	return script;
 }
 
@@ -466,9 +485,11 @@ static string DropNgramIndexQuery(ClientContext &context, const FunctionParamete
 	}
 
 	auto shadow = Ident(target.catalog_name) + "." + Ident(target.shadow_schema);
+	auto guard = ScratchName("guard");
 	string script;
+	script += "CREATE TEMP TABLE " + guard + "(ignored BOOLEAN);\n";
 	// refuse to drop through a shadow schema owned by a different base table
-	script += OwnershipGuard(target, shadow + "." + Ident(MetaTableName(column_name)));
+	script += OwnershipGuard(target, shadow + "." + Ident(MetaTableName(column_name)), guard);
 	script += "DROP TABLE " + shadow + "." + Ident(MetaTableName(column_name)) + ";\n";
 	script += "DROP TABLE " + shadow + "." + Ident(SegmentsTableName(column_name)) + ";\n";
 	script += "DROP TABLE " + shadow + "." + Ident(StatsTableName(column_name)) + ";\n";
@@ -477,6 +498,7 @@ static string DropNgramIndexQuery(ClientContext &context, const FunctionParamete
 		// failing loudly beats destroying it
 		script += "DROP SCHEMA " + shadow + ";\n";
 	}
+	script += "DROP TABLE " + guard + ";\n";
 	return script;
 }
 
@@ -487,19 +509,10 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 	if (!target.entry->IsDuckTable()) {
 		throw BinderException("ngram_index_stats: %s is not a DuckDB base table", table_input);
 	}
-	auto schema_entry =
-	    Catalog::GetSchema(context, target.catalog_name, target.shadow_schema, OnEntryNotFound::RETURN_NULL);
-	if (!schema_entry) {
-		throw CatalogException("No ngram indexes exist on %s", target.table_name);
-	}
-
 	vector<string> columns;
-	schema_entry->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-		const string prefix = "meta_";
-		if (entry.name.rfind(prefix, 0) == 0) {
-			columns.push_back(entry.name.substr(prefix.size()));
-		}
-	});
+	for (auto &meta_name : ExistingMetaTables(context, target)) {
+		columns.push_back(meta_name.substr(strlen("meta_")));
+	}
 	if (columns.empty()) {
 		throw CatalogException("No ngram indexes exist on %s", target.table_name);
 	}
@@ -546,25 +559,26 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 		query += "SELECT m.column_name, m.gram_size, m.case_insensitive, m.hwm_rowid, " +
 		         to_string(fingerprint.total_rows - 1) +
 		         "::BIGINT AS table_max_rowid, "
-		         "(SELECT count(*) FROM " +
+		         "(SELECT " + SystemFunction("count") + "(*) FROM " +
 		         base + " WHERE rowid > m.hwm_rowid AND rowid < " + to_string(LOCAL_ROWID_START) +
 		         ") AS remaining_tail, "
-		         "(SELECT count(DISTINCT gram) FROM " +
+		         "(SELECT " + SystemFunction("count") + "(DISTINCT gram) FROM " +
 		         stats +
 		         ") AS distinct_grams, "
-		         "(SELECT count(*) FROM " +
+		         "(SELECT " + SystemFunction("count") + "(*) FROM " +
 		         segments +
 		         ") AS segments, "
-		         "(SELECT count(*) FROM (SELECT gram, segment_no FROM " +
+		         "(SELECT " + SystemFunction("count") + "(*) FROM (SELECT gram, segment_no FROM " +
 		         segments +
-		         " GROUP BY gram, segment_no HAVING count(*) > 1)) AS fragmented_keys, "
-		         "(SELECT count(DISTINCT generation) FROM " +
+		         " GROUP BY gram, segment_no HAVING " + SystemFunction("count") + "(*) > 1)) AS fragmented_keys, "
+		         "(SELECT " + SystemFunction("count") + "(DISTINCT generation) FROM " +
 		         segments +
 		         ") AS generations, "
-		         "(SELECT coalesce(sum(rowid_count), 0) FROM " +
+		         "(SELECT coalesce(" + SystemFunction("sum") + "(rowid_count), 0) FROM " +
 		         segments +
 		         ") AS posting_entries, "
-		         "(SELECT coalesce(sum(octet_length(postings)), 0) FROM " +
+		         "(SELECT coalesce(" + SystemFunction("sum") + "(" + SystemFunction("octet_length") +
+		         "(postings)), 0) FROM " +
 		         segments + ") AS postings_bytes, " + (staleness.empty() ? string("NULL::VARCHAR") : Lit(staleness)) +
 		         " AS stale_reason FROM " + meta + " m ";
 	}

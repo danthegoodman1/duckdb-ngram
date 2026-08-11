@@ -32,6 +32,10 @@ constexpr int64_t NGRAM_FORMAT_VERSION = 2;
 //! How many rows an index records as witnesses of where its postings point.
 constexpr idx_t ROW_SAMPLE_COUNT = 32;
 
+//! Internal execution-time functions used by generated maintenance scripts.
+constexpr const char *NGRAM_MAINTENANCE_GUARD = "__ngram_maintenance_guard";
+constexpr const char *NGRAM_ROW_SAMPLES = "__ngram_row_samples";
+
 //! Facts about a base table that the index records at build/refresh and
 //! re-derives later to detect staleness. All of it is O(1) or O(columns), so
 //! every query path can afford it.

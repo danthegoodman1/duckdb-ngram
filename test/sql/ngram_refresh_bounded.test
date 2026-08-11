@@ -123,7 +123,7 @@ query I
 PRAGMA ngram_refresh('docs');
 ----
 
-# and the guard statements still print nothing of their own
+# and the invocation-scoped guard table leaves no session-variable value
 query I
 SELECT getvariable('__ngram_guard') IS NULL;
 ----

@@ -350,13 +350,115 @@ a_b	c
 statement ok
 PRAGMA drop_ngram_index('a_b.c', 's');
 
-# The generated scripts guard themselves with statements that must not show up
-# in a pragma's output: a bare SELECT guard printed a NULL ngram_ownership_check
-# / ngram_meta_guard row per pragma call. The guard is now an assignment to a
-# session variable, which evaluates the same expression and returns nothing.
+# DuckDB folds only ASCII bytes for identifiers. SQL lower() is Unicode-aware,
+# so ownership guards must not use it: Ä and ä remain distinct identifiers.
+statement ok
+SET default_collation = 'nocase';
+
+statement ok
+CREATE TABLE "Ä"(s VARCHAR);
+
+statement ok
+INSERT INTO "Ä" VALUES ('a tent');
+
+statement ok
+PRAGMA create_ngram_index('"Ä"', 's');
+
+statement ok
+UPDATE "ngram_main_Ä".meta_s SET table_name = 'ä';
+
+statement error
+SELECT * FROM ngram_search('"Ä"', 'tent');
+----
+shadow schema collision
+
+statement error
+PRAGMA drop_ngram_index('"Ä"', 's');
+----
+shadow schema collision
+
+query I
+SELECT count(*) FROM "ngram_main_Ä".segments_s;
+----
+4
+
+statement ok
+UPDATE "ngram_main_Ä".meta_s SET table_name = 'Ä';
+
+statement ok
+PRAGMA drop_ngram_index('"Ä"', 's');
+
+statement ok
+SET default_collation = 'binary';
+
+# The SQL ownership guard used by drop follows the same ASCII case semantics.
+statement ok
+CREATE TABLE case_drop(s VARCHAR);
+
+statement ok
+INSERT INTO case_drop VALUES ('a tent');
+
+statement ok
+PRAGMA create_ngram_index('case_drop', 's');
+
+statement ok
+ALTER TABLE case_drop RENAME TO CASE_DROP;
+
+statement ok
+PRAGMA drop_ngram_index('CASE_DROP', 's');
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_case_drop';
+----
+0
+
+# Generated guards must not show up in pragma output or borrow user namespace.
+# These are the deterministic scratch names used by older builds: every one is
+# deliberately occupied, and the user's session variable is deliberately set.
+
+# Current-schema macros must not be able to shadow the internal runtime fence
+# or witness sampler used by generated maintenance SQL.
+statement ok
+CREATE MACRO __ngram_maintenance_guard(a, b, c, d, e, f, g, h, i, j, k) AS error('shadow guard called');
+
+statement ok
+CREATE MACRO __ngram_row_samples(a, b, c, d, e) AS error('shadow sampler called');
+
+statement ok
+CREATE MACRO trigrams(a, b, c) AS error('shadow trigrams called');
+
+statement ok
+CREATE MACRO max(a) AS error('shadow max called');
 
 statement ok
 CREATE TABLE guard_output AS SELECT i AS id, 'row ' || i AS s FROM range(100) t(i);
+
+statement ok
+CREATE TEMP TABLE "__ngram_build_packed_ngram_main_guard_output_s"(marker INTEGER);
+
+statement ok
+CREATE TEMP TABLE "__ngram_refresh_packed_ngram_main_guard_output_s"(marker INTEGER);
+
+statement ok
+CREATE TEMP TABLE "__ngram_compact_keys_ngram_main_guard_output_s"(marker INTEGER);
+
+statement ok
+CREATE TEMP TABLE "__ngram_compact_packed_ngram_main_guard_output_s"(marker INTEGER);
+
+statement ok
+INSERT INTO "__ngram_build_packed_ngram_main_guard_output_s" VALUES (1);
+
+statement ok
+INSERT INTO "__ngram_refresh_packed_ngram_main_guard_output_s" VALUES (2);
+
+statement ok
+INSERT INTO "__ngram_compact_keys_ngram_main_guard_output_s" VALUES (3);
+
+statement ok
+INSERT INTO "__ngram_compact_packed_ngram_main_guard_output_s" VALUES (4);
+
+statement ok
+SET VARIABLE __ngram_guard = 'user-owned';
 
 query I
 PRAGMA create_ngram_index('guard_output', 's');
@@ -373,11 +475,16 @@ query I
 PRAGMA ngram_compact('guard_output');
 ----
 
-# the guard did run; its value is always NULL, only the evaluation matters
-query I
-SELECT getvariable('__ngram_guard') IS NULL;
+# the old scratch objects and the user's variable are byte-for-byte untouched
+query II
+SELECT getvariable('__ngram_guard') = 'user-owned',
+       (SELECT sum(marker) FROM (
+           SELECT * FROM "__ngram_build_packed_ngram_main_guard_output_s"
+           UNION ALL SELECT * FROM "__ngram_refresh_packed_ngram_main_guard_output_s"
+           UNION ALL SELECT * FROM "__ngram_compact_keys_ngram_main_guard_output_s"
+           UNION ALL SELECT * FROM "__ngram_compact_packed_ngram_main_guard_output_s"));
 ----
-true
+true	10
 
 # and it still fires: a second create is refused by the same guard expression
 statement error
@@ -385,6 +492,51 @@ PRAGMA create_ngram_index('guard_output', 's');
 ----
 An ngram index already exists on guard_output.s
 
+# That error rolled its transaction back, including its UUID scratch table and
+# transaction-owned vacuum fence. Only the four user tables remain, and a
+# forced checkpoint can acquire the corresponding exclusive locks.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'temp' AND table_name LIKE '__ngram_%';
+----
+4
+
+statement ok
+FORCE CHECKPOINT;
+
 query I
 PRAGMA drop_ngram_index('guard_output', 's');
 ----
+
+query I
+SELECT getvariable('__ngram_guard') = 'user-owned';
+----
+true
+
+statement ok
+DROP TABLE "__ngram_build_packed_ngram_main_guard_output_s";
+
+statement ok
+DROP TABLE "__ngram_refresh_packed_ngram_main_guard_output_s";
+
+statement ok
+DROP TABLE "__ngram_compact_keys_ngram_main_guard_output_s";
+
+statement ok
+DROP TABLE "__ngram_compact_packed_ngram_main_guard_output_s";
+
+statement ok
+DROP MACRO __ngram_maintenance_guard;
+
+statement ok
+DROP MACRO __ngram_row_samples;
+
+statement ok
+DROP MACRO trigrams;
+
+statement ok
+DROP MACRO max;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'temp' AND table_name LIKE '__ngram_%';
+----
+0

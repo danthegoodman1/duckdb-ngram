@@ -108,6 +108,50 @@ PRAGMA ngram_refresh('t');
 statement ok
 ALTER TABLE t RENAME COLUMN S TO s;
 
+# Table ownership follows the same identifier rules. The shadow schema keeps
+# its original spelling, but every reader and generated guard must accept the
+# case-only rename.
+statement ok
+ALTER TABLE t RENAME TO T;
+
+query I
+SELECT count(*) FROM ngram_search('T', 'tent');
+----
+1
+
+statement ok
+PRAGMA ngram_refresh('T');
+
+statement ok
+PRAGMA ngram_compact('T');
+
+statement ok
+ALTER TABLE T RENAME TO t;
+
+# Shadow-table discovery follows the same semantics; catalog-equivalent casing
+# cannot hide an existing index from create/refresh/compact.
+statement ok
+ALTER TABLE ngram_main_t.meta_s RENAME TO META_s;
+
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('t');
+----
+s	3	true	1	1	0	9	9	0	1	9	27	NULL
+
+statement error
+PRAGMA create_ngram_index('t', 's');
+----
+An ngram index already exists
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+statement ok
+PRAGMA ngram_compact('t');
+
+statement ok
+ALTER TABLE ngram_main_t.META_s RENAME TO meta_s;
+
 #===----------------------------------------------------------------------===#
 # DETACH + re-ATTACH is not a re-creation
 #

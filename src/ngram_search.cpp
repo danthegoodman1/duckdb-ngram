@@ -379,7 +379,8 @@ MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &m
 			// to answer through a shadow schema owned by someone else
 			auto owner_schema = StringValue::Get(chunk.GetValue(1, r));
 			auto owner_table = StringValue::Get(chunk.GetValue(2, r));
-			if (owner_schema != bind.schema_name || owner_table != bind.table_name) {
+			if (!StringUtil::CIEquals(owner_schema, bind.schema_name) ||
+			    !StringUtil::CIEquals(owner_table, bind.table_name)) {
 				throw CatalogException("ngram shadow schema collision: %s belongs to the index on %s.%s, not to "
 				                       "%s.%s; no usable ngram index exists",
 				                       bind.shadow_schema, owner_schema, owner_table, bind.schema_name,

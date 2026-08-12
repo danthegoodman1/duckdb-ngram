@@ -10,7 +10,7 @@
     "rows": 10920423,
     "text_bytes": 986852975
   },
-  "created_utc": "2026-08-12T21:19:28Z",
+  "created_utc": "2026-08-12T21:55:52Z",
   "machine": {
     "architecture": "x86_64",
     "kernel": "7.0.0-27-generic",
@@ -23,15 +23,15 @@
       "mode": "indexed",
       "query": "rare",
       "wall_ns": [
-        9000000,
-        8000000,
         7000000,
-        9000000,
-        9000000,
         6000000,
         6000000,
         6000000,
-        8000000,
+        6000000,
+        7000000,
+        6000000,
+        7000000,
+        6000000,
         6000000
       ]
     },
@@ -41,16 +41,16 @@
       "mode": "scan",
       "query": "rare",
       "wall_ns": [
-        39000000,
-        41000000,
         40000000,
         41000000,
-        43000000,
+        42000000,
         41000000,
-        40000000,
         41000000,
-        40000000,
-        40000000
+        41000000,
+        41000000,
+        42000000,
+        42000000,
+        41000000
       ]
     },
     {
@@ -61,12 +61,12 @@
       "wall_ns": [
         14000000,
         15000000,
-        14000000,
+        13000000,
+        15000000,
+        13000000,
         16000000,
-        14000000,
-        15000000,
         17000000,
-        15000000,
+        14000000,
         15000000,
         15000000
       ]
@@ -77,15 +77,15 @@
       "mode": "scan",
       "query": "moderate",
       "wall_ns": [
-        27000000,
-        27000000,
-        27000000,
-        27000000,
-        27000000,
-        27000000,
         28000000,
         28000000,
-        26000000,
+        28000000,
+        27000000,
+        27000000,
+        29000000,
+        27000000,
+        28000000,
+        27000000,
         27000000
       ]
     },
@@ -95,16 +95,16 @@
       "mode": "indexed",
       "query": "common",
       "wall_ns": [
-        41000000,
-        42000000,
-        42000000,
-        41000000,
-        42000000,
         43000000,
-        41000000,
+        43000000,
+        43000000,
+        43000000,
+        43000000,
+        43000000,
+        44000000,
+        43000000,
         42000000,
-        45000000,
-        43000000
+        42000000
       ]
     },
     {
@@ -113,16 +113,16 @@
       "mode": "scan",
       "query": "common",
       "wall_ns": [
-        37000000,
-        37000000,
         36000000,
-        36000000,
-        38000000,
         37000000,
         36000000,
         37000000,
         37000000,
-        37000000
+        37000000,
+        39000000,
+        37000000,
+        37000000,
+        36000000
       ]
     },
     {
@@ -131,16 +131,16 @@
       "mode": "indexed",
       "query": "rare",
       "wall_ns": [
-        13549941,
-        12689048,
-        13686904,
-        12895186,
-        11447504,
-        12235776,
-        11138999,
-        9792022,
-        10744013,
-        10819543
+        13683847,
+        13090806,
+        15322434,
+        11236779,
+        14348730,
+        12732490,
+        11144068,
+        9737765,
+        11508326,
+        9675565
       ]
     },
     {
@@ -149,16 +149,16 @@
       "mode": "scan",
       "query": "rare",
       "wall_ns": [
-        40340982,
-        42991089,
-        42774738,
-        40772390,
-        43557711,
-        41107504,
-        39239433,
-        39070790,
-        40091317,
-        40915783
+        41433013,
+        44230736,
+        41044369,
+        41707869,
+        41411103,
+        40623252,
+        40746979,
+        41322633,
+        40160727,
+        41912308
       ]
     },
     {
@@ -167,16 +167,16 @@
       "mode": "indexed",
       "query": "moderate",
       "wall_ns": [
-        65863728,
-        65421257,
-        66587802,
-        65007849,
-        64756746,
-        65742362,
-        64716990,
-        65542342,
-        63691987,
-        65135617
+        68656713,
+        65556022,
+        66335541,
+        66147760,
+        66012159,
+        64836814,
+        66013756,
+        65774835,
+        67026351,
+        72314633
       ]
     },
     {
@@ -185,16 +185,16 @@
       "mode": "scan",
       "query": "moderate",
       "wall_ns": [
-        41797141,
-        39417616,
-        42694312,
-        43352612,
-        42388141,
-        43153031,
-        43713717,
-        42039119,
-        42507317,
-        40699530
+        45032114,
+        41461208,
+        41903974,
+        41031295,
+        43917179,
+        44370052,
+        43644839,
+        43476416,
+        42650176,
+        45577984
       ]
     },
     {
@@ -203,16 +203,16 @@
       "mode": "indexed",
       "query": "common",
       "wall_ns": [
-        96466730,
-        92291141,
-        92090239,
-        92222141,
-        92059803,
-        93620542,
-        94012051,
-        95201663,
-        96862149,
-        93114937
+        92340423,
+        93059842,
+        92735514,
+        93742352,
+        94974161,
+        95736861,
+        94575841,
+        95668385,
+        96668558,
+        94033399
       ]
     },
     {
@@ -221,22 +221,109 @@
       "mode": "scan",
       "query": "common",
       "wall_ns": [
-        43008837,
-        42897424,
-        44169839,
-        40952002,
-        42672251,
-        40578981,
-        41144664,
-        41411242,
-        40854416,
-        42396269
+        44731271,
+        45778947,
+        44346761,
+        44812954,
+        40741928,
+        42857929,
+        41603873,
+        41854217,
+        43093720,
+        42021797
       ]
+    }
+  ],
+  "result_sets": [
+    {
+      "engine": "duckdb",
+      "mode": "indexed",
+      "query": "rare",
+      "row_id_sha256": "483bd6686694a8aaba9363453d0baefadd6dbe5873706a2bb1585cd5a09ea337",
+      "rows": 1
+    },
+    {
+      "engine": "duckdb",
+      "mode": "scan",
+      "query": "rare",
+      "row_id_sha256": "483bd6686694a8aaba9363453d0baefadd6dbe5873706a2bb1585cd5a09ea337",
+      "rows": 1
+    },
+    {
+      "engine": "duckdb",
+      "mode": "indexed",
+      "query": "moderate",
+      "row_id_sha256": "4d31c532f926b9c8abb4ace6e73a8af9e00ea5234847ae20fe5e1d5dee8d8835",
+      "rows": 26068
+    },
+    {
+      "engine": "duckdb",
+      "mode": "scan",
+      "query": "moderate",
+      "row_id_sha256": "4d31c532f926b9c8abb4ace6e73a8af9e00ea5234847ae20fe5e1d5dee8d8835",
+      "rows": 26068
+    },
+    {
+      "engine": "duckdb",
+      "mode": "indexed",
+      "query": "common",
+      "row_id_sha256": "7a17da0937cef4fd69056d3a10b11d1562376606cb952dfdeae712312c148051",
+      "rows": 1963067
+    },
+    {
+      "engine": "duckdb",
+      "mode": "scan",
+      "query": "common",
+      "row_id_sha256": "7a17da0937cef4fd69056d3a10b11d1562376606cb952dfdeae712312c148051",
+      "rows": 1963067
+    },
+    {
+      "engine": "clickhouse",
+      "mode": "indexed",
+      "query": "rare",
+      "row_id_sha256": "483bd6686694a8aaba9363453d0baefadd6dbe5873706a2bb1585cd5a09ea337",
+      "rows": 1
+    },
+    {
+      "engine": "clickhouse",
+      "mode": "scan",
+      "query": "rare",
+      "row_id_sha256": "483bd6686694a8aaba9363453d0baefadd6dbe5873706a2bb1585cd5a09ea337",
+      "rows": 1
+    },
+    {
+      "engine": "clickhouse",
+      "mode": "indexed",
+      "query": "moderate",
+      "row_id_sha256": "4d31c532f926b9c8abb4ace6e73a8af9e00ea5234847ae20fe5e1d5dee8d8835",
+      "rows": 26068
+    },
+    {
+      "engine": "clickhouse",
+      "mode": "scan",
+      "query": "moderate",
+      "row_id_sha256": "4d31c532f926b9c8abb4ace6e73a8af9e00ea5234847ae20fe5e1d5dee8d8835",
+      "rows": 26068
+    },
+    {
+      "engine": "clickhouse",
+      "mode": "indexed",
+      "query": "common",
+      "row_id_sha256": "7a17da0937cef4fd69056d3a10b11d1562376606cb952dfdeae712312c148051",
+      "rows": 1963067
+    },
+    {
+      "engine": "clickhouse",
+      "mode": "scan",
+      "query": "common",
+      "row_id_sha256": "7a17da0937cef4fd69056d3a10b11d1562376606cb952dfdeae712312c148051",
+      "rows": 1963067
     }
   ],
   "schema": "duckdb-ngram-clickhouse-text-quick-v1",
   "scope": "same-machine point of reference; 3 fresh load/build reps and 10 warm query samples",
   "settings": {
+    "case_insensitive": false,
     "clickhouse_index": "text(tokenizer = ngrams(3))",
     "duckdb_index": "gram=3, case_insensitive=false",
     "memory_limit": "48GiB",
@@ -246,14 +333,14 @@
   },
   "stages": [
     {
-      "base_allocated_bytes": 739262464,
-      "base_bytes": 739258368,
-      "build_ns": 7743675107,
+      "base_allocated_bytes": 742670336,
+      "base_bytes": 742666240,
+      "build_ns": 7601697241,
       "engine": "duckdb",
       "index_bytes": 1068236800,
-      "indexed_allocated_bytes": 1807499264,
-      "indexed_bytes": 1807495168,
-      "load_ns": 2743698740,
+      "indexed_allocated_bytes": 1810907136,
+      "indexed_bytes": 1810903040,
+      "load_ns": 2395083114,
       "repetition": 1
     },
     {
@@ -272,13 +359,13 @@
         "table_on_disk_bytes": 577563379,
         "table_uncompressed_bytes": 1161579743
       },
-      "build_ns": 17986035362,
+      "build_ns": 18115153120,
       "engine": "clickhouse",
       "index_bytes": 1412423529,
-      "indexed_allocated_bytes": 2992230400,
+      "indexed_allocated_bytes": 2992238592,
       "indexed_bytes": 1989986908,
       "indexed_filesystem": {
-        "allocated_bytes": 2992230400,
+        "allocated_bytes": 2992238592,
         "apparent_bytes": 2991345920
       },
       "indexed_logical": {
@@ -290,15 +377,15 @@
         "table_on_disk_bytes": 1989986908,
         "table_uncompressed_bytes": 1161579743
       },
-      "load_ns": 1299061524,
+      "load_ns": 1382804440,
       "repetition": 1
     },
     {
-      "base_allocated_bytes": 662028288,
+      "base_allocated_bytes": 674615296,
       "base_bytes": 577563379,
       "base_filesystem": {
-        "allocated_bytes": 662028288,
-        "apparent_bytes": 661459365
+        "allocated_bytes": 674615296,
+        "apparent_bytes": 674042277
       },
       "base_logical": {
         "index_compressed_bytes": 0,
@@ -309,55 +396,55 @@
         "table_on_disk_bytes": 577563379,
         "table_uncompressed_bytes": 1161579743
       },
-      "build_ns": 16711537638,
+      "build_ns": 18484090880,
       "engine": "clickhouse",
-      "index_bytes": 1413226541,
-      "indexed_allocated_bytes": 2959859712,
-      "indexed_bytes": 1990789920,
+      "index_bytes": 1412423529,
+      "indexed_allocated_bytes": 2992234496,
+      "indexed_bytes": 1989986908,
       "indexed_filesystem": {
-        "allocated_bytes": 2959859712,
-        "apparent_bytes": 2958901152
+        "allocated_bytes": 2992234496,
+        "apparent_bytes": 2991345920
       },
       "indexed_logical": {
-        "index_compressed_bytes": 1413218797,
-        "index_marks_bytes": 630,
-        "index_uncompressed_bytes": 1415533000,
+        "index_compressed_bytes": 1412437197,
+        "index_marks_bytes": 504,
+        "index_uncompressed_bytes": 1414540189,
         "rows": 10920423,
-        "table_compressed_bytes": 577548489,
-        "table_on_disk_bytes": 1990789920,
+        "table_compressed_bytes": 577527761,
+        "table_on_disk_bytes": 1989986908,
         "table_uncompressed_bytes": 1161579743
       },
-      "load_ns": 1282243022,
+      "load_ns": 1412010516,
       "repetition": 2
     },
     {
-      "base_allocated_bytes": 734806016,
-      "base_bytes": 734801920,
-      "build_ns": 7598023764,
+      "base_allocated_bytes": 747126784,
+      "base_bytes": 747122688,
+      "build_ns": 7696449345,
+      "engine": "duckdb",
+      "index_bytes": 1068236800,
+      "indexed_allocated_bytes": 1815363584,
+      "indexed_bytes": 1815359488,
+      "load_ns": 1553995442,
+      "repetition": 2
+    },
+    {
+      "base_allocated_bytes": 730873856,
+      "base_bytes": 730869760,
+      "build_ns": 7574906526,
       "engine": "duckdb",
       "index_bytes": 1068761088,
-      "indexed_allocated_bytes": 1803567104,
-      "indexed_bytes": 1803563008,
-      "load_ns": 1641301310,
-      "repetition": 2
-    },
-    {
-      "base_allocated_bytes": 734543872,
-      "base_bytes": 734539776,
-      "build_ns": 7593519202,
-      "engine": "duckdb",
-      "index_bytes": 1067712512,
-      "indexed_allocated_bytes": 1802256384,
-      "indexed_bytes": 1802252288,
-      "load_ns": 3309011267,
+      "indexed_allocated_bytes": 1799634944,
+      "indexed_bytes": 1799630848,
+      "load_ns": 1868812323,
       "repetition": 3
     },
     {
-      "base_allocated_bytes": 667271168,
+      "base_allocated_bytes": 669368320,
       "base_bytes": 577563379,
       "base_filesystem": {
-        "allocated_bytes": 667271168,
-        "apparent_bytes": 666702245
+        "allocated_bytes": 669368320,
+        "apparent_bytes": 668799397
       },
       "base_logical": {
         "index_compressed_bytes": 0,
@@ -368,13 +455,13 @@
         "table_on_disk_bytes": 577563379,
         "table_uncompressed_bytes": 1161579743
       },
-      "build_ns": 16761164024,
+      "build_ns": 17152349777,
       "engine": "clickhouse",
       "index_bytes": 1413226541,
-      "indexed_allocated_bytes": 2959867904,
+      "indexed_allocated_bytes": 2959863808,
       "indexed_bytes": 1990789920,
       "indexed_filesystem": {
-        "allocated_bytes": 2959867904,
+        "allocated_bytes": 2959863808,
         "apparent_bytes": 2958901152
       },
       "indexed_logical": {
@@ -386,7 +473,7 @@
         "table_on_disk_bytes": 1990789920,
         "table_uncompressed_bytes": 1161579743
       },
-      "load_ns": 1303579758,
+      "load_ns": 1320318192,
       "repetition": 3
     }
   ],
@@ -395,7 +482,7 @@
     "clickhouse_sha256": "d2a2611ed56bc6d1544fafe8ece7e888ae2af6e13ea7095993a5105d8c74d4f3",
     "duckdb": "v1.5.5",
     "duckdb_sha256": "72da7e2299ea874da3cb2595793a9f3805623180705ad526b347817f41c01d36",
-    "source_commit": "2f4e597a86d0df324863d1cce7ba0b1735c2da40",
-    "tool_sha256": "4c0d4d0c004de84346b77683a579663f3d6d20e6ce6774fb796c7ceedc08b6c4"
+    "source_commit": "1722afab90f49582ac142883807784890effa8fe",
+    "tool_sha256": "166b99051fd3977cf8c6f83bdb2173ecabeb7ce5b2729351206f5eb336442718"
   }
 }

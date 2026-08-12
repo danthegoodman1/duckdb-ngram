@@ -1063,12 +1063,15 @@ Scope:
 - Reuse the checked 1 GB `enwik9` line corpus and its normalized SHA-256.
 - Compare bytewise case-sensitive trigrams using DuckDB `gram=3` with
   `case_insensitive=false` and ClickHouse's GA `TYPE text(tokenizer = ngrams(3))` index.
+  Add a fair case-insensitive follow-up without changing stored text: DuckDB folds index
+  keys and ClickHouse uses `lowerUTF8(text)` index preprocessing plus an exact `ILIKE` recheck.
 - Use three fresh load/build repetitions, alternating engine order, and paired whole-state
   storage before and after index creation. Run both engines with 24 threads and a 48 GiB
   memory limit on the same local machine.
 - Measure rare, moderate, and dense substring needles. For each engine, run its normal
   search path and an index-disabled scan control in one persistent warm session, with one
-  warm-up and ten measured samples. Require all four counts to match.
+  warm-up and ten measured samples. Require sorted matching-row SHA-256 values—not only
+  counts—to match across both search paths and both scan controls.
 - Retain raw samples, binary/tool hashes, versions, ClickHouse plans, and a generated concise
   comparison. Call differences below 10% roughly tied; otherwise report the lower value.
 
@@ -1081,9 +1084,9 @@ Out of scope:
 
 Completion gate:
 The compact harness completes three fresh paired load/build states, ten positive warm
-samples for every query/mode cell, exact cross-engine count parity, paired storage, and
-ClickHouse plan capture. The checked JSON reproduces the concise Markdown comparison and
-clearly labels the result as a same-machine point of reference.
+samples for every query/mode cell, exact cross-engine row-set identity, paired storage,
+and ClickHouse plan capture for both case modes. The checked JSON reproduces the concise
+Markdown comparisons and clearly labels them as same-machine points of reference.
 
 Testing plan:
 - Verify the normalized input size/SHA-256 and pinned ClickHouse binary before collection.
@@ -1098,6 +1101,6 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Scope | One bounded same-machine point of reference | Uses the checked enwik9 normalization, 24 threads, 48 GiB, three fresh paired states, and one warm-up plus ten samples for rare/moderate/dense needles. |
 | Complete | Work | Compare against the modern ClickHouse n-gram text index | `benchmarks/clickhouse_compare.py` uses ClickHouse 26.7.3.19 `TYPE text(tokenizer = ngrams(3))`, not the deprecated Bloom-filter index, with normal LIKE search and a fully index-disabled scan control. |
-| Complete | Work | Publish raw evidence and concise generated results | `benchmarks/artifacts/enwik9-clickhouse-text-vs-ngram-v1.json` retains all stage/query samples, plans, counts, settings, versions, and hashes; `benchmarks/CLICKHOUSE.md` renders the decision-oriented table. |
-| Complete | Gate | Result counts, repetitions, samples, storage, and provenance are coherent | The final artifact has six stage records, twelve query cells, ten positive timings per cell, exact four-way count parity per needle, paired apparent/allocated storage, and a rare-query plan naming `text_ngram`. |
-| Complete | Test | Harness and repository evidence checks pass | `py_compile`, artifact shape/hash assertions, deterministic render, Phase 14 `release_evidence.py check`, and `git diff --check` pass. |
+| Complete | Work | Publish raw evidence and concise generated results | The case-sensitive and case-insensitive JSON artifacts retain stage/query samples, plans, exact row-set digests, settings, versions, and hashes; `CLICKHOUSE.md` and `CLICKHOUSE_CASE_INSENSITIVE.md` render the tables. |
+| Complete | Gate | Results, repetitions, samples, storage, and provenance are coherent | Each artifact has six stage records, twelve query cells, ten positive timings per cell, four-way sorted row-ID SHA-256 identity per needle, paired storage, and a rare-query plan naming `text_ngram`. |
+| Complete | Test | Harness and repository evidence checks pass | `py_compile`, both artifact/tool/row-set assertions, deterministic rendering, Phase 14 `release_evidence.py check`, and `git diff --check` pass. |

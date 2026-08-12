@@ -12,6 +12,7 @@ import shutil
 import socket
 import statistics
 import subprocess
+import tempfile
 import time
 
 
@@ -192,32 +193,39 @@ CHECKPOINT;
     return timed(lambda: run([binary, database], input_text=sql))
 
 
-def duck_build(binary, database):
+def duck_build(binary, database, case_insensitive=False):
     sql = DUCK_SETTINGS + """PRAGMA create_ngram_index(
- 'docs', 'text', gram=3, case_insensitive=false);
+ 'docs', 'text', gram=3, case_insensitive=%s);
 CHECKPOINT;
-"""
+""" % str(case_insensitive).lower()
     return timed(lambda: run([binary, database], input_text=sql))
 
 
-def ch_table_sql(with_index=False):
-    index = ", INDEX text_ngram text TYPE text(tokenizer = ngrams(3))" if with_index else ""
+def ch_index_type(case_insensitive=False):
+    if case_insensitive:
+        return "text(tokenizer = ngrams(3), preprocessor = lowerUTF8(text))"
+    return "text(tokenizer = ngrams(3))"
+
+
+def ch_table_sql(with_index=False, case_insensitive=False):
+    index = ", INDEX text_ngram text TYPE " + ch_index_type(case_insensitive) if with_index else ""
     return """CREATE TABLE docs(
  id UInt64 CODEC(LZ4), text String CODEC(LZ4)%s
 ) ENGINE=MergeTree ORDER BY id
 SETTINGS index_granularity=8192,index_granularity_bytes=0""" % index
 
 
-def ch_load(server, normalized, with_index=False):
-    server.query(ch_table_sql(with_index))
+def ch_load(server, normalized, with_index=False, case_insensitive=False):
+    server.query(ch_table_sql(with_index, case_insensitive))
     insert = """INSERT INTO docs SELECT id, unhex(payload)
 FROM input('id UInt64, payload String') FORMAT TabSeparated"""
     return timed(lambda: server.query(insert, stdin_path=normalized))
 
 
-def ch_build(server):
-    sql = """ALTER TABLE docs ADD INDEX text_ngram text TYPE text(tokenizer = ngrams(3));
+def ch_build(server, case_insensitive=False):
+    sql = """ALTER TABLE docs ADD INDEX text_ngram text TYPE %s;
 ALTER TABLE docs MATERIALIZE INDEX text_ngram SETTINGS mutations_sync=2;"""
+    sql %= ch_index_type(case_insensitive)
     return timed(lambda: server.query(sql))
 
 
@@ -246,18 +254,59 @@ def pattern_hex(needle_hex):
     return (b"%" + escaped + b"%").hex()
 
 
-def ch_query(needle_hex, indexed=True):
-    sql = "SELECT count() FROM docs WHERE text LIKE unhex('%s')" % pattern_hex(needle_hex)
+def ch_query(needle_hex, indexed=True, case_insensitive=False):
+    pattern = pattern_hex(needle_hex)
+    if case_insensitive:
+        predicate = "text ILIKE unhex('%s')" % pattern
+        if indexed:
+            predicate = "hasAllTokens(text,unhex('%s')) AND " % needle_hex + predicate
+    else:
+        predicate = "text LIKE unhex('%s')" % pattern
+    sql = "SELECT count() FROM docs WHERE " + predicate
     return sql + (" SETTINGS use_query_cache=0,use_query_condition_cache=0" if indexed else CH_SCAN_SETTINGS)
 
 
-def ch_query_samples(server, samples):
+def digest_command(argv, input_text=None):
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(
+            [str(value) for value in argv], cwd=ROOT, input=input_text, text=True,
+            stdout=output, stderr=subprocess.PIPE, timeout=3600,
+        )
+        if result.returncode:
+            fail("result-set command failed: %s\n%s" % (argv, result.stderr[-4000:]))
+        output.seek(0)
+        digest, rows = hashlib.sha256(), 0
+        for chunk in iter(lambda: output.read(1 << 20), b""):
+            digest.update(chunk)
+            rows += chunk.count(b"\n")
+        return {"rows": rows, "row_id_sha256": digest.hexdigest()}
+
+
+def ch_result_sets(server, case_insensitive=False):
+    records = []
+    argv = [server.binary, "client", "--host", "127.0.0.1", "--port", server.tcp,
+            "--database", "default", "--query"]
+    for query_id, needle_hex in NEEDLES.items():
+        for mode in ("indexed", "scan"):
+            count_sql = ch_query(needle_hex, mode == "indexed", case_insensitive)
+            id_sql = count_sql.replace("SELECT count()", "SELECT id", 1)
+            settings = id_sql.partition(" SETTINGS ")
+            id_sql = settings[0] + " ORDER BY id"
+            if settings[1]:
+                id_sql += " SETTINGS " + settings[2]
+            id_sql += " FORMAT TabSeparatedRaw"
+            records.append({"engine": "clickhouse", "query": query_id, "mode": mode,
+                            **digest_command(argv + [id_sql])})
+    return records
+
+
+def ch_query_samples(server, samples, case_insensitive=False):
     connection = http.client.HTTPConnection("127.0.0.1", server.http, timeout=3600)
     records = []
     try:
         for query_id, needle_hex in NEEDLES.items():
             for mode in ("indexed", "scan"):
-                sql = ch_query(needle_hex, mode == "indexed") + " FORMAT TabSeparatedRaw"
+                sql = ch_query(needle_hex, mode == "indexed", case_insensitive) + " FORMAT TabSeparatedRaw"
                 connection.request("POST", "/", body=sql.encode())
                 response = connection.getresponse()
                 body = response.read()
@@ -284,14 +333,17 @@ def ch_query_samples(server, samples):
     return records
 
 
-def duck_query_samples(binary, database, samples):
+def duck_query_samples(binary, database, samples, case_insensitive=False):
     script = ".headers off\n.mode list\n.timer off\n" + DUCK_SETTINGS
     order = []
     for query_id, needle_hex in NEEDLES.items():
         for mode in ("indexed", "scan"):
-            source = ("ngram_search('docs',decode(unhex('%s')),col := 'text')" % needle_hex
-                      if mode == "indexed" else
-                      "docs WHERE contains(text,decode(unhex('%s')))" % needle_hex)
+            if mode == "indexed":
+                source = "ngram_search('docs',decode(unhex('%s')),col := 'text')" % needle_hex
+            elif case_insensitive:
+                source = "docs WHERE text ILIKE ('%%' || decode(unhex('%s')) || '%%')" % needle_hex
+            else:
+                source = "docs WHERE contains(text,decode(unhex('%s')))" % needle_hex
             script += "SELECT count(*) FROM %s;\n" % source
             for index in range(samples):
                 script += ".timer on\nSELECT 'Q|%s|%s|%d|' || count(*) FROM %s;\n.timer off\n" % (
@@ -315,6 +367,23 @@ def duck_query_samples(binary, database, samples):
             for (query_id, mode), record in grouped.items()]
 
 
+def duck_result_sets(binary, database, case_insensitive=False):
+    records = []
+    for query_id, needle_hex in NEEDLES.items():
+        for mode in ("indexed", "scan"):
+            if mode == "indexed":
+                source = "ngram_search('docs',decode(unhex('%s')),col := 'text')" % needle_hex
+            elif case_insensitive:
+                source = "docs WHERE text ILIKE ('%%' || decode(unhex('%s')) || '%%')" % needle_hex
+            else:
+                source = "docs WHERE contains(text,decode(unhex('%s')))" % needle_hex
+            sql = ".headers off\n.mode list\n" + DUCK_SETTINGS
+            sql += "SELECT id FROM %s ORDER BY id;\n" % source
+            records.append({"engine": "duckdb", "query": query_id, "mode": mode,
+                            **digest_command([binary, "-readonly", database], sql)})
+    return records
+
+
 def summarize(values):
     return {"median_ns": int(statistics.median(values)), "min_ns": min(values), "max_ns": max(values)}
 
@@ -334,7 +403,7 @@ def collect(args):
     if sha256(clickhouse) != CLICKHOUSE_SHA256:
         fail("ClickHouse binary differs")
     work.mkdir(parents=True)
-    stages, queries = [], []
+    stages, queries, result_sets = [], [], []
     for repetition in range(1, args.repetitions + 1):
         duck_db = work / ("duck-%d.db" % repetition)
         ch_root = work / ("clickhouse-%d" % repetition)
@@ -343,7 +412,7 @@ def collect(args):
             if engine == "duckdb":
                 load_ns = duck_load(duckdb, duck_db, normalized)
                 base = file_size(duck_db)
-                build_ns = duck_build(duckdb, duck_db)
+                build_ns = duck_build(duckdb, duck_db, args.case_insensitive)
                 indexed = file_size(duck_db)
                 stages.append({"repetition": repetition, "engine": engine, "load_ns": load_ns,
                                "build_ns": build_ns, "base_bytes": base["apparent_bytes"],
@@ -352,13 +421,16 @@ def collect(args):
                                "base_allocated_bytes": base["allocated_bytes"],
                                "indexed_allocated_bytes": indexed["allocated_bytes"]})
                 if repetition == args.repetitions:
-                    queries.extend(duck_query_samples(duckdb, duck_db, args.samples))
+                    queries.extend(duck_query_samples(
+                        duckdb, duck_db, args.samples, args.case_insensitive))
+                    result_sets.extend(duck_result_sets(
+                        duckdb, duck_db, args.case_insensitive))
             else:
                 with ClickHouse(clickhouse, ch_root) as server:
                     load_ns = ch_load(server, normalized)
                     base_logical = ch_sizes(server)
                     base = tree_size(ch_root / "data")
-                    build_ns = ch_build(server)
+                    build_ns = ch_build(server, args.case_insensitive)
                     indexed_logical = ch_sizes(server)
                     indexed = tree_size(ch_root / "data")
                     stages.append({"repetition": repetition, "engine": engine, "load_ns": load_ns,
@@ -373,8 +445,11 @@ def collect(args):
                                    "base_logical": base_logical,
                                    "indexed_logical": indexed_logical})
                     if repetition == args.repetitions:
-                        queries.extend(ch_query_samples(server, args.samples))
-                        plans = {query_id: server.query("EXPLAIN indexes=1 " + ch_query(needle)).stdout
+                        queries.extend(ch_query_samples(server, args.samples, args.case_insensitive))
+                        result_sets.extend(ch_result_sets(server, args.case_insensitive))
+                        plans = {query_id: server.query(
+                            "EXPLAIN indexes=1 " + ch_query(
+                                needle, case_insensitive=args.case_insensitive)).stdout
                                  for query_id, needle in NEEDLES.items()}
                         if "Name: text_ngram" not in plans["rare"]:
                             fail("ClickHouse rare query did not expose text_ngram in EXPLAIN")
@@ -386,8 +461,15 @@ def collect(args):
                   for engine in ("duckdb", "clickhouse") for mode in ("indexed", "scan")}
         if len(counts) != 1:
             fail("cross-engine count mismatch for %s: %s" % (query_id, counts))
+        sets = [record for record in result_sets if record["query"] == query_id]
+        if len(sets) != 4 or len({(record["rows"], record["row_id_sha256"])
+                                  for record in sets}) != 1:
+            fail("cross-engine result-set mismatch for %s" % query_id)
+        if sets[0]["rows"] != next(iter(counts)):
+            fail("result-set row count differs for %s" % query_id)
     artifact = {
-        "schema": "duckdb-ngram-clickhouse-text-quick-v1",
+        "schema": ("duckdb-ngram-clickhouse-text-ci-quick-v1" if args.case_insensitive else
+                   "duckdb-ngram-clickhouse-text-quick-v1"),
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "scope": "same-machine point of reference; %d fresh load/build reps and %d warm query samples" %
                  (args.repetitions, args.samples),
@@ -402,11 +484,14 @@ def collect(args):
         "machine": {"kernel": os.uname().release, "architecture": os.uname().machine,
                     "logical_cpus": os.cpu_count()},
         "settings": {"threads": 24, "memory_limit": "48GiB",
-                     "clickhouse_index": "text(tokenizer = ngrams(3))",
-                     "duckdb_index": "gram=3, case_insensitive=false",
+                     "case_insensitive": args.case_insensitive,
+                     "clickhouse_index": ch_index_type(args.case_insensitive),
+                     "duckdb_index": "gram=3, case_insensitive=%s" %
+                                     str(args.case_insensitive).lower(),
                      "query_samples": args.samples, "repetitions": args.repetitions},
         "stages": stages,
         "queries": queries,
+        "result_sets": result_sets,
         "clickhouse_plans": plans,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -437,12 +522,19 @@ def verdict(values, labels=("DuckDB", "ClickHouse")):
 def render(args):
     artifact = json.loads(Path(args.artifact).read_text())
     stages = artifact["stages"]
-    lines = ["# DuckDB ngram vs ClickHouse text index", "",
+    case_insensitive = artifact["settings"].get("case_insensitive", False)
+    qualifier = "case-insensitive " if case_insensitive else ""
+    index_description = (["ClickHouse used `ngrams(3)` with `lowerUTF8(text)` preprocessing;",
+                          "DuckDB used its native case-insensitive trigram index."]
+                         if case_insensitive else
+                         ["ClickHouse used `TYPE text(tokenizer = ngrams(3))`; DuckDB used its",
+                          "native case-sensitive trigram index."])
+    lines = ["# DuckDB ngram vs ClickHouse %stext index" % qualifier, "",
              "This is a bounded same-machine point of reference, not an exhaustive tuning study.",
              "Both engines used 24 threads, a 48 GiB memory setting, the same 1 GB enwik9-derived",
-             "line corpus, case-sensitive 3-grams, and exact substring rechecks.", "",
-             "ClickHouse used `TYPE text(tokenizer = ngrams(3))`; DuckDB used this extension's",
-             "default production query policy, including its adaptive scan fallback for dense terms.", "",
+             "line corpus, %s3-grams, and exact substring rechecks." % qualifier, "",
+             *index_description,
+             "DuckDB retained its production adaptive scan fallback for dense terms.", "",
              "## Load, build, and storage", "",
              "The input file was already in the host page cache; these are warm-source ingest times.",
              "Storage is paired DuckDB database-file and ClickHouse active-table on-disk size;",
@@ -471,9 +563,9 @@ def render(args):
               "- Incremental index storage: %s." % verdict(
                   [stage_medians[engine]["index"] for engine in ("duckdb", "clickhouse")]),
               "", "## Warm query latency", "",
-              "One warm-up preceded %d measured samples per cell. Counts matched across both engines" %
+              "One warm-up preceded %d measured samples per cell. Sorted matching-row digests matched" %
               artifact["settings"]["query_samples"],
-              "and their scan controls.", "",
+              "across both engines and their scan controls.", "",
               "| Needle | Matches | DuckDB search | DuckDB scan | ClickHouse search | ClickHouse scan | Faster search |",
               "| --- | ---: | ---: | ---: | ---: | ---: | --- |"]
     cells = {(row["engine"], row["query"], row["mode"]): row for row in artifact["queries"]}
@@ -484,8 +576,12 @@ def render(args):
         lines.append("| %s | %d | %s ms | %s ms | %s ms | %s ms | %s |" % (
             query_id, values[0]["count"], *(ms(value) for value in medians),
             verdict([medians[0], medians[2]])))
+    if case_insensitive:
+        lines += ["", "The original mixed-case text was stored unchanged in both engines. DuckDB folded",
+                  "its index keys; ClickHouse used `lowerUTF8` preprocessing for index tokens."]
+    artifact_name = Path(args.artifact).name
     lines += ["", "Raw samples and exact versions are in",
-              "[`artifacts/enwik9-clickhouse-text-vs-ngram-v1.json`](artifacts/enwik9-clickhouse-text-vs-ngram-v1.json).",
+              "[`artifacts/%s`](artifacts/%s)." % (artifact_name, artifact_name),
               "", "The result compares different architectures: ClickHouse's native text inverted index",
               "and this extension's postings index plus exact base-table recheck. It should be read as a",
               "practical reference for this corpus and machine, not a universal engine ranking.", ""]
@@ -504,6 +600,7 @@ def main():
     collect_parser.add_argument("--output", default=ROOT / "benchmarks/artifacts/enwik9-clickhouse-text-vs-ngram-v1.json")
     collect_parser.add_argument("--repetitions", type=int, default=3)
     collect_parser.add_argument("--samples", type=int, default=10)
+    collect_parser.add_argument("--case-insensitive", action="store_true")
     collect_parser.set_defaults(function=collect)
     render_parser = sub.add_parser("render")
     render_parser.add_argument("--artifact", default=ROOT / "benchmarks/artifacts/enwik9-clickhouse-text-vs-ngram-v1.json")

@@ -1,11 +1,11 @@
-# DuckDB ngram vs ClickHouse text index
+# DuckDB ngram vs ClickHouse case-insensitive text index
 
 This is a bounded same-machine point of reference, not an exhaustive tuning study.
 Both engines used 24 threads, a 48 GiB memory setting, the same 1 GB enwik9-derived
-line corpus, 3-grams, and exact substring rechecks.
+line corpus, case-insensitive 3-grams, and exact substring rechecks.
 
-ClickHouse used `TYPE text(tokenizer = ngrams(3))`; DuckDB used its
-native case-sensitive trigram index.
+ClickHouse used `ngrams(3)` with `lowerUTF8(text)` preprocessing;
+DuckDB used its native case-insensitive trigram index.
 DuckDB retained its production adaptive scan fallback for dense terms.
 
 ## Load, build, and storage
@@ -16,14 +16,14 @@ ClickHouse logs and temporarily retained inactive parts are excluded.
 
 | Engine | Load median (range) | Index build median (range) | Base | Indexed | Index delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| duckdb | 1.869 s (1.554–2.395) | 7.602 s (7.575–7.696) | 0.692 GiB | 1.687 GiB | 0.995 GiB |
-| clickhouse | 1.383 s (1.320–1.412) | 18.115 s (17.152–18.484) | 0.538 GiB | 1.853 GiB | 1.315 GiB |
+| duckdb | 1.890 s (1.776–2.010) | 7.089 s (7.012–7.126) | 0.683 GiB | 1.613 GiB | 0.930 GiB |
+| clickhouse | 1.328 s (1.325–1.348) | 17.471 s (16.242–19.425) | 0.538 GiB | 1.808 GiB | 1.270 GiB |
 
 At a glance:
 
-- Load: ClickHouse by 1.35x.
-- Index build: DuckDB by 2.38x.
-- Incremental index storage: DuckDB by 1.32x.
+- Load: ClickHouse by 1.42x.
+- Index build: DuckDB by 2.46x.
+- Incremental index storage: DuckDB by 1.37x.
 
 ## Warm query latency
 
@@ -32,12 +32,15 @@ across both engines and their scan controls.
 
 | Needle | Matches | DuckDB search | DuckDB scan | ClickHouse search | ClickHouse scan | Faster search |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| rare | 1 | 6.0 ms | 41.0 ms | 12.1 ms | 41.4 ms | DuckDB by 2.02x |
-| moderate | 26068 | 15.0 ms | 27.5 ms | 66.1 ms | 43.6 ms | DuckDB by 4.41x |
-| common | 1963067 | 43.0 ms | 37.0 ms | 94.3 ms | 43.0 ms | DuckDB by 2.19x |
+| rare | 12 | 8.0 ms | 211.0 ms | 12.9 ms | 62.4 ms | DuckDB by 1.61x |
+| moderate | 26540 | 16.5 ms | 190.0 ms | 84.4 ms | 54.2 ms | DuckDB by 5.12x |
+| common | 2203902 | 119.5 ms | 135.0 ms | 149.3 ms | 56.1 ms | DuckDB by 1.25x |
+
+The original mixed-case text was stored unchanged in both engines. DuckDB folded
+its index keys; ClickHouse used `lowerUTF8` preprocessing for index tokens.
 
 Raw samples and exact versions are in
-[`artifacts/enwik9-clickhouse-text-vs-ngram-v1.json`](artifacts/enwik9-clickhouse-text-vs-ngram-v1.json).
+[`artifacts/enwik9-clickhouse-text-ci-vs-ngram-v1.json`](artifacts/enwik9-clickhouse-text-ci-vs-ngram-v1.json).
 
 The result compares different architectures: ClickHouse's native text inverted index
 and this extension's postings index plus exact base-table recheck. It should be read as a

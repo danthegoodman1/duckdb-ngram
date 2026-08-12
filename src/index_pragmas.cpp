@@ -262,12 +262,13 @@ vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_
 string PackPartitionStatement(const string &packed, bool first, const string &pair_source) {
 	string statement = first ? "CREATE TEMP TABLE " + packed + " AS " : "INSERT INTO " + packed + " ";
 	return statement +
-	       "SELECT gram, segment_no, " + SystemFunction("struct_extract") + "(segment, 'postings') AS postings, " +
+	       "SELECT " + SystemFunction("decode") + "(gram_key) AS gram, segment_no, " +
+	       SystemFunction("struct_extract") + "(segment, 'postings') AS postings, " +
 	       SystemFunction("struct_extract") + "(segment, 'rowid_count') AS rowid_count, " +
 	       SystemFunction("struct_extract") + "(segment, 'min_rowid') AS min_rowid, " +
 	       SystemFunction("struct_extract") + "(segment, 'max_rowid') AS max_rowid FROM (" +
-	       "SELECT gram, segment_no, " + SystemFunction("ngram_pack_segment") + "(r) AS segment FROM (" +
-	       pair_source + ") GROUP BY gram, segment_no);\n";
+	       "SELECT " + SystemFunction("encode") + "(gram) AS gram_key, segment_no, " +
+	       SystemFunction("ngram_pack_segment") + "(r) AS segment FROM (" + pair_source + ") GROUP BY gram_key, segment_no);\n";
 }
 
 idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs) {
@@ -287,7 +288,8 @@ idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs) {
 	}
 	auto pairs_per_partition =
 	    MaxValue<int64_t>(LossyNumericCast<int64_t>(double(limit) * PARTITION_MEMORY_FRACTION) / PAIR_STATE_BYTES, 1);
-	auto partitions = (MaxValue<int64_t>(estimated_pairs, 0) + pairs_per_partition - 1) / pairs_per_partition;
+	auto pairs = MaxValue<int64_t>(estimated_pairs, 0);
+	auto partitions = pairs / pairs_per_partition + (pairs % pairs_per_partition != 0);
 	return NumericCast<idx_t>(MinValue<int64_t>(MaxValue<int64_t>(partitions, 1), MAX_BUILD_PARTITIONS));
 }
 
@@ -540,12 +542,14 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	script += "CREATE TABLE " + segments +
 	          " AS "
 	          "SELECT gram, segment_no, 0 AS generation, postings, rowid_count, min_rowid, max_rowid FROM " +
-	          packed + " ORDER BY gram, segment_no;\n";
+	          packed + " ORDER BY " + SystemFunction("encode") + "(gram), segment_no;\n";
 	script += "CREATE TABLE " + stats +
 	          " AS "
-	          "SELECT gram, " + SystemFunction("sum") + "(rowid_count)::BIGINT AS row_count, " +
+	          "SELECT " + SystemFunction("decode") + "(gram_key) AS gram, " + SystemFunction("sum") +
+	          "(rowid_count)::BIGINT AS row_count, " +
 	          SystemFunction("count") + "(*)::BIGINT AS segment_count FROM " +
-	          segments + " GROUP BY gram;\n";
+	          "(SELECT " + SystemFunction("encode") + "(gram) AS gram_key, rowid_count FROM " + segments +
+	          ") GROUP BY gram_key ORDER BY gram_key;\n";
 	script += "DROP TABLE " + packed + ";\n";
 	script += "DROP TABLE " + guard + ";\n";
 	return script;
@@ -703,15 +707,17 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 		         "(SELECT " + SystemFunction("count") + "(*) FROM " +
 		         base + " WHERE rowid > m.hwm_rowid AND rowid < " + to_string(LOCAL_ROWID_START) +
 		         ") AS remaining_tail, "
-		         "(SELECT " + SystemFunction("count") + "(DISTINCT gram) FROM " +
+		         "(SELECT " + SystemFunction("count") + "(DISTINCT " + SystemFunction("encode") + "(gram)) FROM " +
 		         stats +
 		         ") AS distinct_grams, "
 		         "(SELECT " + SystemFunction("count") + "(*) FROM " +
 		         segments +
 		         ") AS segments, "
-		         "(SELECT " + SystemFunction("count") + "(*) FROM (SELECT gram, segment_no FROM " +
+		         "(SELECT " + SystemFunction("count") + "(*) FROM (SELECT " + SystemFunction("encode") +
+		         "(gram) AS gram_key, segment_no FROM " +
 		         segments +
-		         " GROUP BY gram, segment_no HAVING " + SystemFunction("count") + "(*) > 1)) AS fragmented_keys, "
+		         " GROUP BY " + SystemFunction("encode") + "(gram), segment_no HAVING " +
+		         SystemFunction("count") + "(*) > 1)) AS fragmented_keys, "
 		         "(SELECT " + SystemFunction("count") + "(DISTINCT generation) FROM " +
 		         segments +
 		         ") AS generations, "

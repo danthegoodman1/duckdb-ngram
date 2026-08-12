@@ -102,3 +102,42 @@ statement error
 SELECT * FROM ngram_unpack_postings((SELECT 'g'::VARCHAR, 0::BIGINT, 'not a blob'::VARCHAR));
 ----
 expects a table of
+
+# Compaction uses the checked form so corrupt persisted descriptors cannot be
+# filtered away as dead postings. The public three-column form above remains
+# backwards compatible for callers that only need codec inversion.
+query TII
+SELECT * FROM ngram_unpack_postings((
+	SELECT 'abc', 0::BIGINT, ngram_encode_postings([1, 3]::BIGINT[]),
+	       2::BIGINT, 1::BIGINT, 3::BIGINT, 0::BIGINT, 3::BIGINT));
+----
+abc	0	1
+abc	0	3
+
+statement error
+SELECT * FROM ngram_unpack_postings((
+	SELECT 'abc', 0::BIGINT, ngram_encode_postings([1048576]::BIGINT[]),
+	       1::BIGINT, 1048576::BIGINT, 1048576::BIGINT, 0::BIGINT, 1048576::BIGINT));
+----
+outside its declared segment
+
+statement error
+SELECT * FROM ngram_unpack_postings((
+	SELECT 'abc', 0::BIGINT, ngram_encode_postings([3]::BIGINT[]),
+	       1::BIGINT, 3::BIGINT, 3::BIGINT, 0::BIGINT, 2::BIGINT));
+----
+outside its declared segment or indexed range
+
+statement error
+SELECT * FROM ngram_unpack_postings((
+	SELECT 'abc', 0::BIGINT, ngram_encode_postings([1]::BIGINT[]),
+	       2::BIGINT, 1::BIGINT, 1::BIGINT, 0::BIGINT, 1::BIGINT));
+----
+descriptor disagrees
+
+statement error
+SELECT * FROM ngram_unpack_postings((
+	SELECT 'abc', 0::BIGINT, ngram_encode_postings([1]::BIGINT[]),
+	       1::BIGINT, 1::BIGINT, 1::BIGINT, NULL::BIGINT, 1::BIGINT));
+----
+must not contain NULLs

@@ -278,24 +278,42 @@ rows.
 `PRAGMA ngram_compact('logs')` merges the posting-list rows that share a key.
 Each refresh appends a new generation of rows rather than rewriting existing
 blobs, so a table that has been refreshed many times reads more rows per probe
-than it needs to. `PRAGMA ngram_compact('logs', purge = true)` additionally
-drops postings that point at rows that no longer exist.
+than it needs to. The ordinary form is shadow-only: it performs zero base-table
+row reads and deliberately retains postings for deleted rows, which fetch and
+recheck already remove from exact results.
+`PRAGMA ngram_compact('logs', purge = true)` additionally drops those dead
+postings.
 
 **On an append-only table, compaction has little to merge.** Each refresh
 generation lands in a fresh range of rowids, so successive generations barely
 share `(gram, segment_no)` keys. Measured on a 92 GiB corpus built in 100
 refreshes, compaction merged 4 % of segment rows and shrank the encoded
-postings by 0.05 %. What it did buy was a stats table rebuilt from 78.8 million
-rows (one per gram per generation) to 4.5 million (one per gram), which is read
-on every probe — so if you have refreshed dozens of times, that is the reason
-to do it, and once is enough.
+postings by 0.05 %. Older builds also needed compaction to fold a stats history
+from 78.8 million rows to 4.5 million; refresh now performs a validated,
+byte-sorted stats-only fold itself, so stats history is no longer a reason to
+compact.
+
+An older format-3 index remains exact, but its unsorted stats may prune poorly
+until the next refresh (including a no-op refresh), compact, or rebuild rewrites
+them. The fold is transactional and filtered lookup skips its deleted MVCC row
+groups, although their file space can remain allocated until a checkpoint.
 
 Compaction is mainly for **delete-heavy or interleaved workloads**. Check
 `fragmented_keys` and `generations` in `ngram_index_stats` before running it,
 and budget disk for the rewrite (the file grows before it shrinks). Reserve
-`purge = true` for after a large `DELETE`: it rewrites every key rather than
-just the fragmented ones, and on a 9 GiB index with nothing to purge that is
-413 s against 9 s for the plain variant.
+`purge = true` for after a large `DELETE`: it rewrites every key and makes one
+base-table pass per selected indexed column, retaining relevant live rowids at
+or below the indexed HWM.
+That one-BIGINT temp and the selected encoded source are spillable, but can use
+substantial temporary disk alongside the packed output and MVCC-old rows. On a
+9 GiB index with nothing to purge, the historical implementation measured 413
+s against 9 s for the plain variant.
+
+Corruption checks follow the data each path reads: a probe validates requested
+gram stats, merge-only compact validates selected segment rows, purge validates
+all segment rows, and the refresh stats fold validates every historical stats
+row it rewrites. Compact rebuilds stats from the resulting segment metadata;
+it does not separately validate superseded stats rows.
 
 ### When to rebuild
 
@@ -459,7 +477,7 @@ SELECT ngram_decode_postings(blob);
 | `ngram_max_candidate_fraction` | `0.01` | A full-result ngram query whose candidate upper bound exceeds this fraction of the table scans instead. Fetching costs ~250–300 ns per candidate at every scale measured, and a parallel scan of the whole table costs ~0.04 s at 1 GB, ~0.35 s at 10 GB and ~3.5 s at 100 GB — putting the break-even at 1.6 %, 1.3 % and 1.1 % of rows. One percent is that crossover, rounded toward scanning. The raw candidate API does not use this fetch-vs-scan policy. |
 | `ngram_max_grams_per_query` | `3` | How many of the needle's rarest grams to probe. Each extra gram costs another posting-list decode, and rarest-first means each one is denser than the last, so total query time is a shallow U with a steep right arm: at 100 GB a rare needle costs 0.47 s at 2, 0.64 s at 3 and 1.75 s at 8. Three sits at the floor while still giving a genuine three-way intersection. |
 | `ngram_max_probe_rowids` | `100000000` | Hard upper bound on posting rowids decoded by one query. Exact query paths scan instead when the estimate exceeds it; `ngram_candidates` returns a resource-limit error. |
-| `ngram_build_partitions` | `0` | How many rowid-range partitions `create_ngram_index`, `ngram_refresh` and `ngram_compact` split their packing pass into. Zero sizes it from `memory_limit`, using a sample of the rows being indexed; raise it if a build runs out of memory on unusually long rows, lower it (to 1) to pack in a single pass. The index it produces is identical whatever you set. |
+| `ngram_build_partitions` | `0` | How many rowid-range partitions `create_ngram_index`, `ngram_refresh` and `ngram_compact` split their packing pass into. Build and refresh size zero from `memory_limit` using a sample; compact instead uses fine segment-aligned ranges without sampling the base. Because range width is rounded down to whole segments, auto can emit up to nearly twice its 4096-range request. An explicit value overrides either policy. Raise it if a build runs out of memory on unusually long rows, or lower it to pack in fewer passes. The index it produces is identical whatever you set. |
 
 All five are session settings; set them per connection.
 

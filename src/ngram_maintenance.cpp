@@ -22,6 +22,7 @@
 #include "ngram/search_core.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 
 namespace duckdb {
@@ -680,6 +681,7 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		auto gram_str = to_string(column.meta.options.gram_size);
 		auto ci_str = column.meta.options.case_insensitive ? "true" : "false";
 		auto packed = ScratchName("refresh_packed");
+		auto folded_stats = ScratchName("refresh_stats");
 		// rows past the high-water mark, excluding this transaction's local
 		// rows: their rowids are reassigned at commit, so indexing them would
 		// record postings for rowids that never exist
@@ -725,12 +727,32 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		script += "INSERT INTO " + segments +
 		          " SELECT gram, segment_no, (SELECT coalesce(" + SystemFunction("max") +
 		          "(generation), 0) + 1 FROM " + segments +
-		          "), postings, rowid_count, min_rowid, max_rowid FROM " + packed + " ORDER BY gram, segment_no;\n";
-		// stats rows are summed per gram by the probe, so appending deltas is
-		// enough; compaction folds them back into one row per gram
-		script += "INSERT INTO " + stats + " SELECT gram, " + SystemFunction("sum") +
-		          "(rowid_count)::BIGINT, " + SystemFunction("count") + "(*)::BIGINT FROM " + packed +
-		          " GROUP BY gram;\n";
+		          "), postings, rowid_count, min_rowid, max_rowid FROM " + packed + " ORDER BY " +
+		          SystemFunction("encode") + "(gram), segment_no;\n";
+		// Append this delta before the validated fold below. Use only the encoded
+		// key for grouping so session collations cannot merge byte-distinct grams.
+		script += "INSERT INTO " + stats + " SELECT " + SystemFunction("decode") + "(gram_key), " +
+		          SystemFunction("sum") + "(rowid_count)::BIGINT, " + SystemFunction("count") +
+		          "(*)::BIGINT FROM (SELECT " + SystemFunction("encode") + "(gram) AS gram_key, rowid_count FROM " +
+		          packed + ") GROUP BY gram_key ORDER BY gram_key;\n";
+		// Refresh generations are individually ordered but DuckDB can place
+		// several small appends in one row group, widening that row group's zone
+		// map to the whole gram domain. Fold stats to one globally ordered row per
+		// gram in this transaction so filtered reads stay independent of history.
+		auto invalid_stats = "gram IS NULL OR row_count IS NULL OR segment_count IS NULL OR row_count <= 0 OR "
+		                     "segment_count <= 0";
+		auto stats_error = SystemFunction("error") + "('ngram: invalid stats row; the index is malformed')";
+		script += "CREATE TEMP TABLE " + folded_stats + " AS SELECT " + SystemFunction("decode") +
+		          "(gram_key) AS gram, " + SystemFunction("sum") + "(checked_row_count)::BIGINT AS row_count, " +
+		          SystemFunction("sum") + "(checked_segment_count)::BIGINT AS segment_count FROM (SELECT " +
+		          SystemFunction("encode") + "(gram) AS gram_key, CASE WHEN " + invalid_stats + " THEN " +
+		          stats_error + " ELSE row_count END AS checked_row_count, CASE WHEN " + invalid_stats + " THEN " +
+		          stats_error + " ELSE segment_count END AS checked_segment_count FROM " + stats +
+		          ") GROUP BY gram_key ORDER BY gram_key;\n";
+		script += "DELETE FROM " + stats + ";\n";
+		script += "INSERT INTO " + stats + " SELECT * FROM " + folded_stats + " ORDER BY " +
+		          SystemFunction("encode") + "(gram);\n";
+		script += "DROP TABLE " + folded_stats + ";\n";
 		// Unbounded, the new mark is the highest committed rowid the partitions
 		// just covered. Bounded, it is bound_end itself — but only once some
 		// committed row past bound_end proves the rowid slots at or below it are
@@ -820,13 +842,11 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 // Merges the segment rows that share a (gram, segment_no) — every refresh
 // appends a new generation, and an index written by an older version of this
 // extension could also hold per-thread partial segments — back into one row
-// per key, and drops postings whose rowid no longer exists. Results never
-// change: readers already union duplicate rows, and a posting for a deleted
-// row is already filtered by recheck.
+// per key. It is shadow-only and retains dead postings; results stay exact
+// because readers already union duplicate rows and recheck filters dead rows.
 //
-// purge := true widens the rewrite from the fragmented keys to every key, so
-// dead postings are removed everywhere rather than only where the merge was
-// going to rewrite the blob anyway.
+// purge := true rewrites every key and consults the base snapshot, removing
+// every posting whose rowid is no longer live.
 //===----------------------------------------------------------------------===//
 
 static string CompactNgramIndexQuery(ClientContext &context, const FunctionParameters &parameters) {
@@ -864,6 +884,9 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		auto segments = shadow + "." + Ident(SegmentsTableName(column.column_name));
 		auto stats = shadow + "." + Ident(StatsTableName(column.column_name));
 		auto keys = ScratchName("compact_keys");
+		auto key_guard = ScratchName("compact_key_guard");
+		auto selected = ScratchName("compact_source");
+		auto live = ScratchName("compact_live");
 		auto packed = ScratchName("compact_packed");
 
 		auto guard_call = MaintenanceGuardCall("ngram_compact", target, column, fingerprint);
@@ -873,49 +896,89 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		} else {
 			script += "INSERT INTO " + guard + " SELECT " + guard_call + ";\n";
 		}
-		script += "CREATE TEMP TABLE " + keys + " AS SELECT gram, segment_no FROM " + segments +
-		          " GROUP BY gram, segment_no" +
+		script += "CREATE TEMP TABLE " + keys + " AS SELECT " + SystemFunction("decode") +
+		          "(gram_key) AS gram, segment_no FROM (SELECT " + SystemFunction("encode") +
+		          "(gram) AS gram_key, segment_no FROM " + segments + ") GROUP BY gram_key, segment_no" +
 		          (purge_everywhere ? "" : " HAVING " + SystemFunction("count") + "(*) > 1") + ";\n";
-		// decode the selected keys, drop postings for rowids that no longer
-		// exist, and re-pack. A rowid is dropped only when the base table has
-		// no such row in this transaction's snapshot, so a live posting can
-		// never be lost; readers on older snapshots still see the pre-compact
-		// segment rows through MVCC. Partitioned by segment_no, the same
-		// boundary the build partitions on, so each key is re-packed whole in
-		// exactly one statement. The estimate covers every posting in the index,
-		// which is what a purging compaction re-encodes; a plain compaction
-		// touches only the fragmented keys and so is over-partitioned rather
-		// than under.
-		auto partitions =
-		    BuildPartitionCount(context, EstimateGramCount(context, *target.entry, column.column_name, 0,
-		                                                   column.meta.hwm_rowid, column.meta.options.gram_size));
-		auto ranges = SegmentAlignedRanges(0, column.meta.hwm_rowid, partitions);
-		for (idx_t i = 0; i < ranges.size(); i++) {
-			script += PackPartitionStatement(
-			    packed, i == 0,
-			    "SELECT gram, segment_no, r FROM " + SystemFunction("ngram_unpack_postings") +
-			        "((SELECT s.gram, s.segment_no, s.postings FROM " +
-			        segments + " s WHERE s.segment_no >= " + to_string(ranges[i].first >> SEGMENT_SHIFT) +
-			        " AND s.segment_no <= " + to_string(ranges[i].second >> SEGMENT_SHIFT) +
-			        " AND EXISTS (SELECT 1 FROM " + keys +
-			        " k WHERE k.gram = s.gram AND k.segment_no = s.segment_no))) WHERE r IN (SELECT rowid FROM " +
-			        base + ")");
+		script += "CREATE TEMP TABLE " + key_guard + " AS SELECT CASE WHEN " + SystemFunction("count") +
+		          "(*) = 0 THEN true ELSE " + SystemFunction("error") +
+		          "('ngram: malformed segments-table key') END AS valid FROM " + keys +
+		          " WHERE gram IS NULL OR segment_no IS NULL OR " + SystemFunction("length") + "(gram) != " +
+		          to_string(column.meta.options.gram_size) +
+		          " OR segment_no < 0 OR segment_no > " +
+		          to_string(column.meta.hwm_rowid < 0 ? -1 : column.meta.hwm_rowid >> SEGMENT_SHIFT) + ";\n";
+		// The persistent table is gram-ordered for query pruning, so scanning it
+		// once per rowid partition multiplies reads. Copy only selected encoded
+		// rows into a spillable segment-ordered source once, before decoding.
+		script += "CREATE TEMP TABLE " + selected +
+		          " AS SELECT s.gram, s.segment_no, s.postings, s.rowid_count, s.min_rowid, s.max_rowid, "
+		          "s.generation::BIGINT AS generation FROM " + segments +
+		          " s WHERE EXISTS (SELECT 1 FROM " + keys +
+		          " k WHERE " + SystemFunction("encode") + "(k.gram) = " + SystemFunction("encode") +
+		          "(s.gram) AND k.segment_no = s.segment_no) ORDER BY s.segment_no, " +
+		          SystemFunction("encode") + "(s.gram);\n";
+		if (purge_everywhere) {
+			// DuckDB v1.5.5 cannot physically prune a base scan on the rowid
+			// pseudo-column. Materialize the relevant live rowids in one pass;
+			// the ordered one-BIGINT temp then prunes each packing range.
+			script += "CREATE TEMP TABLE " + live + " AS SELECT rowid AS r FROM " + base +
+			          " WHERE rowid >= 0 AND rowid <= " + to_string(column.meta.hwm_rowid) +
+			          " AND " + Ident(column.column_name) + " IS NOT NULL" +
+			          " AND EXISTS (SELECT 1 FROM (SELECT DISTINCT segment_no FROM " + keys +
+			          ") k WHERE k.segment_no = rowid >> " + to_string(SEGMENT_SHIFT) + ") ORDER BY r;\n";
 		}
-		script += "DELETE FROM " + segments + " WHERE EXISTS (SELECT 1 FROM " + keys + " k WHERE k.gram = " + segments +
-		          ".gram AND k.segment_no = " + segments + ".segment_no);\n";
+		// Each key is decoded and re-packed wholly in one bounded range. A
+		// purging rowid survives only when the base snapshot put it in `live`;
+		// merge-only compaction deliberately retains dead postings for recheck.
+		// There is no persisted total-pair counter, and consulting the base or
+		// scanning global stats here would merely hide read amplification in
+		// pragma preprocessing. Auto requests up to the shared 4096 partitions;
+		// the segment-aligned floor split emits one range per segment below that
+		// scale and approximately that many ranges above it. An explicit
+		// ngram_build_partitions setting is still honoured.
+		auto partitions = BuildPartitionCount(context, std::numeric_limits<int64_t>::max());
+		auto ranges = SegmentAlignedRanges(0, column.meta.hwm_rowid, partitions, false);
+		for (idx_t i = 0; i < ranges.size(); i++) {
+			auto segment_lo = to_string(ranges[i].first >> SEGMENT_SHIFT);
+			auto segment_hi = to_string(ranges[i].second >> SEGMENT_SHIFT);
+			auto source = "SELECT gram, segment_no, r FROM " + SystemFunction("ngram_unpack_postings") +
+			              "((SELECT gram, segment_no, postings, rowid_count, min_rowid, max_rowid, generation, " +
+			              to_string(column.meta.hwm_rowid) + "::BIGINT AS hwm FROM " + selected +
+			              " WHERE segment_no >= " +
+			              segment_lo + " AND segment_no <= " + segment_hi + "))";
+			if (purge_everywhere) {
+				source += " WHERE r IN (SELECT r FROM " + live + " WHERE r >= " + to_string(ranges[i].first) +
+				          " AND r <= " + to_string(ranges[i].second) + ")";
+			}
+			script += PackPartitionStatement(
+			    packed, i == 0, source);
+		}
+		script += "DELETE FROM " + segments + " WHERE EXISTS (SELECT 1 FROM " + keys + " k WHERE " +
+		          SystemFunction("encode") + "(k.gram) = " + SystemFunction("encode") + "(" + segments +
+		          ".gram) AND k.segment_no = " + segments + ".segment_no);\n";
 		// re-inserted in gram order, so the merged rows prune by zone map for
 		// the probe exactly as the generations they replace did
 		script += "INSERT INTO " + segments +
 		          " SELECT gram, segment_no, 0, postings, rowid_count, min_rowid, max_rowid FROM " + packed +
-		          " ORDER BY gram, segment_no;\n";
+		          " ORDER BY " + SystemFunction("encode") + "(gram), segment_no;\n";
 		// stats are cheap to rebuild exactly (two small columns) and the merge
 		// changed both the per-gram row counts and the segment counts
+		// Rebuild even when there are no selected segment keys: compact is the
+		// manual upgrade path that collapses and byte-orders an old v3 stats
+		// history without requiring another append. No persisted layout marker
+		// justifies making repeated no-key calls cheaper at the cost of a schema.
 		script += "DELETE FROM " + stats + ";\n";
-		script += "INSERT INTO " + stats + " SELECT gram, " + SystemFunction("sum") +
-		          "(rowid_count)::BIGINT, " + SystemFunction("count") + "(*)::BIGINT FROM " + segments +
-		          " GROUP BY gram;\n";
+		script += "INSERT INTO " + stats + " SELECT " + SystemFunction("decode") + "(gram_key), " +
+		          SystemFunction("sum") + "(rowid_count)::BIGINT, " + SystemFunction("count") +
+		          "(*)::BIGINT FROM (SELECT " + SystemFunction("encode") +
+		          "(gram) AS gram_key, rowid_count FROM " + segments + ") GROUP BY gram_key ORDER BY gram_key;\n";
 		script += "UPDATE " + meta + " SET " + FingerprintAssignments(fingerprint, column.column_name) + ";\n";
 		script += "DROP TABLE " + keys + ";\n";
+		script += "DROP TABLE " + key_guard + ";\n";
+		script += "DROP TABLE " + selected + ";\n";
+		if (purge_everywhere) {
+			script += "DROP TABLE " + live + ";\n";
+		}
 		script += "DROP TABLE " + packed + ";\n";
 	}
 	script += "DROP TABLE " + guard + ";\n";

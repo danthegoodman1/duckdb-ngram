@@ -940,49 +940,55 @@ Scope:
 - Make non-purging compaction a shadow-table-only merge. Retaining dead postings is safe
   because fetch/recheck removes them; only `purge = true` should pay to consult the base
   table for liveness.
-- Range-restrict every purging base-table membership scan to the segment interval being
-  rewritten, and verify that all partitions together read the base table approximately
-  once rather than once per generated statement.
-- Profile and remove repeated full scans of the gram-ordered segments table as partition
-  count grows. Choose a bounded, layout-aware source plan using measured rows/bytes read,
-  spill, RSS, and wall time rather than preserving the current statement shape.
-- Replace the full stats-table scan with either physically gram-filterable bounded
-  generations or counts derived from filtered segment metadata. If a stats table remains,
-  add cheap stats-only consolidation before refresh generations make lookup global again.
+- Make purging compaction scan the indexed base prefix once per selected indexed column,
+  retain only relevant live rowids, and range-scan that bounded source from the packing
+  statements. Direct rowid range predicates do not physically prune the v1.5.5 base scan
+  and are therefore not the chosen implementation.
+- Materialize selected encoded segment rows once in segment order so packing ranges do not
+  multiply persistent gram-ordered segment-table scans.
+- Keep byte-sorted one-row-per-gram stats through a validated stats-only fold on every
+  refresh; compaction rebuilds them in byte order from segment metadata. Use a
+  requested-gram zone-map hint in the raw stats reader.
 
 Out of scope:
 - Changing exact query semantics or postings encoding.
 - A background compaction scheduler; this phase makes each requested operation efficient.
 
 Completion gate:
-Non-purging compaction performs zero base-table row reads. Purging compaction performs at
-most one aggregate pass over the relevant base and shadow ranges, independent of the
-memory-driven partition count. Query gram-count lookup reads data proportional to the
-needle grams and their generations, with output identical to current stats sums.
+Non-purging compaction performs zero base-table row reads. Purging compaction performs one
+relevant base-membership pass per selected indexed column, and persistent segment-table
+reads are independent of the memory-driven packing range count. Query gram-count lookup
+reads data proportional to the needle grams and their bounded physical stats layout, with
+output identical to current stats sums.
 
 Testing plan:
 - Profile compact at partition counts 1/8/auto over low/high fragmentation and purge
-  on/off; record base/segments rows and bytes read, peak RSS, spill, and wall time at 1,
-  10, and the existing 100 GB benchmark shape.
+  on/off; record base/segments rows, operator I/O, peak RSS, spill, and wall time.
 - Compare postings and stats before/after each compaction in both directions, including
   deleted rows, partial segments, many generations, rollback, crash, and reopen.
 - Benchmark gram-count lookup over 1/10/100 refresh generations and rare/common needle
   grams; require identical gram choices, candidates, and final results.
+- The scale gate is amended to a real 0.984 GB BLOB-heavy, 100-refresh corpus plus an
+  actual 1.09B-row sparse prefix. The former exercises selected-BLOB/output coexistence
+  and spill; the latter exercises roughly 1,042 generated ranges and a billion-row base
+  pass. Neither is presented as a 100 GB BLOB benchmark, and a 10 GB rebuild was not
+  required because the 1 GB runs already spilled nonlinearly sized temp state.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Scope | Non-purging compaction does not read the base table | Current packing always filters unpacked rowids through `WHERE r IN (SELECT rowid FROM base)` (`src/ngram_maintenance.cpp:766-767`), even when only fragmented keys are merged. Missing: pure shadow merge and updated docs/tests. |
-| Incomplete | Scope | Purging base reads are range-restricted and not multiplied by partitions | Current generated membership subquery has no rowid bounds, inside one statement per range (`src/ngram_maintenance.cpp:755-768`). Missing: range predicate plus profiler evidence that partitions collectively perform about one pass. |
-| Incomplete | Scope | Segment-source reads do not become full-table scans per partition | The source filters `segment_no` while the table is physically ordered by gram, so pruning is not guaranteed; the 100 GB sizing produces roughly 95 packing statements. Missing: operator-profile evidence and a layout-aware bounded replacement. |
-| Incomplete | Scope | Rarest-gram counts avoid a global stats scan | `ReadGramStats` parallel-scans every stats row and filters against the query grams in C++ (`src/ngram_search.cpp:629-680`); refresh appends delta groups (`src/ngram_maintenance.cpp:729-733`) and compaction folds them (`src/ngram_maintenance.cpp:913-916`). Missing: evaluated replacement and generation control. |
-| Incomplete | Work | 13A: Split merge-only and purging compaction plans | Missing: two explicit SQL-generation paths, base-range predicates for purge, and unchanged posting/result proofs. |
-| Incomplete | Work | 13B: Eliminate partition-multiplied segment scans | Missing: profiles at several partition counts, chosen streaming/materialization/layout design, and bounded-memory implementation. |
-| Incomplete | Work | 13C: Prototype filtered stats generations versus segment-derived counts | Missing: A/B measurements, chosen representation, refresh/compact integration, and stats-only consolidation if retained. |
-| Incomplete | Gate | Maintenance and stats reads scale with selected work, not partition/history count | Missing: operator cardinalities, bytes, RSS, spill, and time demonstrating zero base reads for merge-only, near-one-pass purge, and gram-filtered lookup. |
-| Incomplete | Test | Compaction amplification and identity matrix | Missing: purge modes × partitions × fragmentation × scale, with bidirectional posting/stats equality, crash, rollback, and reopen. |
-| Incomplete | Test | Stats-history scaling and query parity matrix | Missing: generation-count curve, chosen-gram identity, candidate identity, and explicit/transparent differential results. |
+| Complete | Scope | Non-purging compaction does not read the base table | The merge plan derives keys and its conservative auto range count entirely from HWM/shadow state, materializes only selected encoded rows, and omits the live-row source. Profiles report **0 base rows** at p1/p8/auto on both 0- and 8-fragmented-key fixtures and on the 4.64M-segment real corpus. A deleted posting remains a candidate after merge and exact recheck removes it; purge removes it. |
+| Complete | Scope | Purging base reads are not multiplied by packing ranges | A measured direct semi-join read 8,388,608 base rows at p1 and 67,108,864 at p8: rowid bounds did not prune the physical v1.5.5 scan. The chosen spillable one-BIGINT live temp scans the base once, restricted to HWM, selected segments, and non-NULL indexed values; valid v3 postings can only originate from those rows. Final real auto-purge scans **11,920,423 base rows once** while 12 range statements read the ordered temp. The sparse 1.09B-row run likewise scans the base exactly once and retains only 1,042 relevant rowids. |
+| Complete | Scope | Segment-source reads do not become persistent full-table scans per partition | Selected encoded rows are copied once into a spillable `(segment_no, byte-gram)`-ordered temp. On the real auto-purge profile, its 12 range scans consume 5,769,777 logical rows for 4,637,233 selected rows (1.244×), rather than 12 persistent scans. The persistent segment table's 16,121,746 cumulative rows are broken across four unavoidable statements: key discovery, selected-source materialization, selected deletion, and stats rebuild; this total is independent of packing range count and is not claimed as one source pass. |
+| Complete | Scope | Rarest-gram counts avoid accumulated global history | `ReadGramStats` applies `OptionalFilter(InFilter)` as a zone-map hint and retains checked byte-exact C++ filtering. Refresh validates every historical stats row it folds, aggregates by encoded gram, and persists one byte-sorted row per gram; compaction instead rebuilds byte-sorted stats from resulting segment metadata. Refresh therefore upgrades an old v3 history without marker/schema state. On the 605,513-gram real history, filtered work after 1/10/100 same-connection folds stays at **122,880 rows/60 chunks** for one ordinary gram and **245,760/120** for the many-gram case; K=1 rare latency is 0.030/0.032/0.047 s and K=8 is 0.196/0.190/0.199 s. Fully deleted MVCC rowgroups remain allocated until checkpoint (about 2.3 GB after 100 folds), but the scanner skips them; the phase does not claim physical history reclamation. |
+| Complete | Work | 13A: Split merge-only and purging compaction plans | Merge uses only the selected shadow source; purge adds one live-rowid temp. Checked unpack validates NULL/key/descriptor/generation/count/min/max, rowid bucket, and HWM before liveness filtering, including an empty-live-temp regression. Selected-only corruption is inspected by merge; purge selects and validates every key. v2 remains drop-only; maintenance requires the v3 guard. |
+| Complete | Work | 13B: Eliminate partition-multiplied segment scans | The ordered selected-source and live-row temps were chosen over direct persistent range scans after A/B profiling. The real p8/auto request emits **12**, not 8, ranges because the segment-aligned floor split may overshoot; auto requests 4096 and emits one range for each of the 12 covered segments. At 1,024 MB, merge spills 1,001,521,184 B and completes in 4.81 s / 2.11 GB RSS; at 1,536 MB, purge spills 4,576,434,848 B and completes in 40.0 s / 2.43 GB RSS. |
+| Complete | Work | 13C: Prototype filtered stats generations versus segment-derived counts | At 1M distinct grams and eight segment rows per gram, K=1 was 2.6–2.9 ms for either source; K=8 was 18.3 ms from stats versus 11.3 ms from segments, but K=1000 was 23 ms/1M stats rows versus 81.5 ms/8M segment rows. Retaining stats wins the unbounded-K shape and preserves existing validation. Per-delta ordering alone was rejected after a real 101-generation history still read nearly every broad coalesced rowgroup. An unconditional validated fold was the smaller bounded solution: a 605,513-distinct real fold is 0.178 s generated-statement time normally and 0.421 s at 96 MB with 141,361,152 B spill; a 4.5M-distinct synthetic aggregate/temp creation is 1.255 s at 96 MB with 296,419,328 B spill (the latter does not measure persistent delete+insert). |
+| Complete | Gate | Maintenance and stats reads scale with selected work, not partition/history count | The final-tree 0.984 GB/100-refresh auto-purge artifact records 22 statements, 12 actual ranges, 33.16 s wall, 9,677,436 KiB max RSS, 16,326,545,408 B DuckDB peak buffer, no spill, 36,962,304/254,541,824 B profiler storage read/write, and one 11,920,423-row base scan. OS input bytes were zero on a warm page cache and are not treated as physical-I/O proof. Merge p1/auto is 3.32/3.18 s with zero base rows. A 1.09B-row, 1,042-segment sparse proxy isolates auto statement overhead: no-key merge emits 1,051 statements in 0.57 s / 68,784 KiB RSS; fragmented merge is 1.19 s / 229,812 KiB. Purge completes in 1.76 s / 311,036 KiB after one 1.09B-row base pass and retains 1,042 live rowids; this is explicitly not a 100 GB BLOB/temp claim. |
+| Complete | Test | Compaction amplification and identity matrix | A preserved 8,388,608-row profile/identity matrix covers low/high fragmentation × p1/p8/auto × merge/purge. Requested p1/8/auto emit 1/8/8 actual ranges on its eight segments; all 12 runs have 0 bidirectional posting differences, 0 stats↔segments differences, and identical 8,388,608 candidates/final rows. High-fragmentation max RSS at p1/p8/auto is 185,484/141,656/135,728 KiB for merge and 728,664/608,044/628,280 KiB for purge; low-fragmentation values are 60,320/61,468/60,336 and 742,144/631,324/604,844 KiB. It also pins deletes, partial/empty/HWM=-1 indexes, NULL transitions, unrelated updates, nocase/case-distinct and multibyte grams, malformed keys/blobs/descriptors/stats, explicit rollback, cancellation with digest/temp cleanup/checkpoint, and reopen. Crash seed 20261317 kills refresh, fragmented merge, purge, and bounded catch-up at four offsets each; the stats count plus two order-independent value digests and posting/search checks accept only exact pre/post boundaries, with 0 failures. |
+| Complete | Test | Stats-history scaling and query parity matrix | The 1/10/100-generation curves cover K=1/default/high, rare/common/missing grams, selected-gram/candidate/final-result parity, high-K memory accounting, binary order under nocase and disabled insertion-order preservation, and relevant corruption. Unrelated malformed stats rows are intentionally outside the filtered probe; refresh's full fold rejects every malformed input atomically, while compact retains its historical behavior of replacing stats from segment metadata. Independent final-tree commands pass: explicit differential `--trials 2 --rows 5000 --seed 20261314` (**1,764/0**), transparent with the same budget and seed 20261315 (**886/0**), normal churn `--rounds 20 --rows 4000 --seed 20261316` (**320/0**, no unmaintainable state or detector report), and strict churn with the same budget, seed 20261318, and `--no-stale-expected` (**320/0/0 detector verdicts**). This phase supersedes the Phase 7/8 historical claims that stats remain unordered/appended until compaction; `README.md` and `benchmarks/RESULTS.md` now describe refresh-time folding and the merge/purge temp-disk tradeoff. |
+| Complete | Test | Final release and sanitizer suites | Final-tree `CCACHE_DISABLE=1 make test_release` passes the deterministic C++ harness and **2,944 assertions / 23 SQL cases** (14.52 s wall, 1,328,720 KiB max RSS). `ASAN_OPTIONS=detect_leaks=0 CCACHE_DISABLE=1 make test_debug` passes the same harness/cases with no ASan/UBSan finding (37:08 wall, 6,400,040 KiB max RSS; leak detection is disabled because LSan cannot run under the ptrace sandbox). Focused cancellation/rollback gates are green. `git diff --check` is clean. |
 
 ## Phase 14: Lifecycle, Observability, and Release Evidence
 

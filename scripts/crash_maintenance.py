@@ -86,7 +86,10 @@ def index_state(db):
     _, out, _ = run(db, "SELECT (SELECT hwm_rowid FROM ngram_main_corpus.meta_s), "
                         "(SELECT count(*) FROM ngram_main_corpus.segments_s), "
                         "(SELECT coalesce(sum(rowid_count), 0) FROM ngram_main_corpus.segments_s), "
-                        "(SELECT count(*) FROM ngram_main_corpus.stats_s);")
+                        "s.n, s.hash_sum, s.hash_xor FROM (SELECT count(*) AS n, "
+                        "coalesce(sum(hash(encode(gram), row_count, segment_count))::VARCHAR, '0') AS hash_sum, "
+                        "coalesce(bit_xor(hash(encode(gram), row_count, segment_count))::VARCHAR, '0') AS hash_xor "
+                        "FROM ngram_main_corpus.stats_s) s;")
     line = [l for l in out.strip().splitlines() if l]
     return line[-1] if line else None
 
@@ -239,7 +242,8 @@ def main():
     tmp = tempfile.mkdtemp(prefix="ngram-crash-")
     failures = []
     try:
-        for pragma in ("PRAGMA ngram_refresh('corpus');", "PRAGMA ngram_compact('corpus', purge = true);"):
+        for pragma in ("PRAGMA ngram_refresh('corpus');", "PRAGMA ngram_compact('corpus');",
+                       "PRAGMA ngram_compact('corpus', purge = true);"):
             pristine = os.path.join(tmp, "pristine.db")
             for suffix in ("", ".wal"):
                 if os.path.exists(pristine + suffix):

@@ -134,6 +134,8 @@ struct ProbePlan {
 	idx_t max_threads = 0;
 	bool admitted = false;
 	string decline_reason;
+	idx_t stats_rows_scanned = 0;
+	idx_t stats_chunks_scanned = 0;
 	atomic<idx_t> decoded_rowids {0};
 	unique_ptr<ProbeMemoryReservation> memory_reservation;
 };

@@ -987,7 +987,7 @@ static void TestQueryCancellation() {
 	Check(con, "SET threads=1");
 	Check(con, "SET ngram_max_candidate_fraction=1.0");
 	Check(con, "CREATE TABLE cancel_rows AS SELECT i::BIGINT id, 'aaaaaaaa payload'::VARCHAR s "
-	           "FROM range(2200000) t(i)");
+	           "FROM range(200000) t(i)");
 	Check(con, "PRAGMA create_ngram_index('cancel_rows', 's')");
 	Check(con, "SET memory_limit='64MB'");
 	unique_ptr<MaterializedQueryResult> result;
@@ -1002,6 +1002,56 @@ static void TestQueryCancellation() {
 	// vacuum fence; the same connection and an exclusive checkpoint remain usable.
 	if (ScalarInt64(con, "SELECT 42") != 42) {
 		throw std::runtime_error("connection unusable after query cancellation");
+	}
+
+	// Both compaction plans are generated multi-statement transactions. Split a
+	// bounded index into valid, disjoint refresh-like generations: this leaves
+	// enough total decode work to interrupt reliably without making one large
+	// blob an uninterruptible sanitizer bottleneck. Then require a byte-sensitive
+	// shadow digest and every scratch table to roll back before reuse.
+	Check(con, "SET memory_limit='512MB'");
+	Check(con, "CREATE TEMP TABLE cancel_split AS SELECT gram, segment_no, generation, "
+	           "struct_extract(segment, 'postings') AS postings, "
+	           "struct_extract(segment, 'rowid_count') AS rowid_count, "
+	           "struct_extract(segment, 'min_rowid') AS min_rowid, "
+	           "struct_extract(segment, 'max_rowid') AS max_rowid FROM ("
+	           "SELECT gram, segment_no, r % 32 AS generation, ngram_pack_segment(r) AS segment "
+	           "FROM ngram_unpack_postings((SELECT gram, segment_no, postings "
+	           "FROM ngram_main_cancel_rows.segments_s)) GROUP BY gram, segment_no, generation)");
+	Check(con, "DELETE FROM ngram_main_cancel_rows.segments_s");
+	Check(con, "INSERT INTO ngram_main_cancel_rows.segments_s SELECT * FROM cancel_split "
+	           "ORDER BY encode(gram), segment_no, generation");
+	Check(con, "DELETE FROM ngram_main_cancel_rows.stats_s");
+	Check(con, "INSERT INTO ngram_main_cancel_rows.stats_s SELECT decode(gram_key), sum(rowid_count)::BIGINT, "
+	           "count(*)::BIGINT FROM (SELECT encode(gram) AS gram_key, rowid_count "
+	           "FROM ngram_main_cancel_rows.segments_s) GROUP BY gram_key ORDER BY gram_key");
+	Check(con, "DROP TABLE cancel_split");
+	auto maintenance_digest = [&]() {
+		return ScalarString(
+		    con,
+		    "SELECT concat("
+		    "(SELECT count(*) || ':' || sum(hash(gram,segment_no,generation,postings,rowid_count,min_rowid,max_rowid)) "
+		    "FROM ngram_main_cancel_rows.segments_s), '|', "
+		    "(SELECT count(*) || ':' || sum(hash(gram,row_count,segment_count)) "
+		    "FROM ngram_main_cancel_rows.stats_s), "
+		    "'|', (SELECT hwm_rowid FROM ngram_main_cancel_rows.meta_s))");
+	};
+	auto before = maintenance_digest();
+	for (auto &pragma : vector<string> {"PRAGMA ngram_compact('cancel_rows')",
+	                                    "PRAGMA ngram_compact('cancel_rows', purge=true)"}) {
+		result.reset();
+		std::thread maintenance([&]() { result = con.Query(pragma); });
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		con.Interrupt();
+		maintenance.join();
+		if (!result || !result->HasError() || result->GetError().find("Interrupt") == string::npos) {
+			throw std::runtime_error(pragma + " did not propagate cancellation");
+		}
+		if (maintenance_digest() != before ||
+		    ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name='temp' AND "
+		                     "table_name LIKE '__ngram_%'") != 0) {
+			throw std::runtime_error(pragma + " left partial shadow state or scratch tables after cancellation");
+		}
 	}
 	Check(con, "FORCE CHECKPOINT");
 }

@@ -13,6 +13,8 @@
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -627,7 +629,8 @@ static void CheckedAtomicAdd(atomic<idx_t> &target, idx_t value) {
 }
 
 static vector<GramStats> ReadGramStats(ClientContext &context, DuckTransaction &tx, DuckTableEntry &stats_entry,
-                                      const vector<string> &grams, idx_t workers) {
+                                      const vector<string> &grams, idx_t workers, idx_t &rows_scanned,
+                                      idx_t &chunks_scanned) {
 	// string_t keys reference the immutable query grams for this scan. Looking
 	// up a stats value therefore allocates no per-row scratch, even when a
 	// malformed/unrelated stats gram is very large.
@@ -642,8 +645,23 @@ static vector<GramStats> ReadGramStats(ClientContext &context, DuckTransaction &
 	AddShadowColumn(stats_entry, "gram", LogicalTypeId::VARCHAR, column_ids, types);
 	AddShadowColumn(stats_entry, "row_count", LogicalTypeId::BIGINT, column_ids, types);
 	AddShadowColumn(stats_entry, "segment_count", LogicalTypeId::BIGINT, column_ids, types);
-	ParallelScanShadowTable(context, tx, stats_entry.GetStorage(), column_ids, types, nullptr, workers,
+	vector<Value> gram_values;
+	gram_values.reserve(grams.size());
+	for (auto &gram : grams) {
+		gram_values.emplace_back(gram);
+	}
+	TableFilterSet filters;
+	// Raw storage scans cannot execute an InFilter directly. OptionalFilter
+	// uses it only for row-group pruning; the map below remains the exact row
+	// filter and accumulator across every visible refresh generation.
+	filters.PushFilter(ColumnIndex(0),
+	                   make_uniq<OptionalFilter>(make_uniq<InFilter>(std::move(gram_values))));
+	atomic<idx_t> scanned_rows {0};
+	atomic<idx_t> scanned_chunks {0};
+	ParallelScanShadowTable(context, tx, stats_entry.GetStorage(), column_ids, types, &filters, workers,
 	                        [&](DataChunk &chunk, idx_t worker) {
+		scanned_rows.fetch_add(chunk.size());
+		scanned_chunks.fetch_add(1);
 		UnifiedVectorFormat gram_format, row_format, segment_format;
 		chunk.data[0].ToUnifiedFormat(chunk.size(), gram_format);
 		chunk.data[1].ToUnifiedFormat(chunk.size(), row_format);
@@ -655,13 +673,15 @@ static vector<GramStats> ReadGramStats(ClientContext &context, DuckTransaction &
 			auto gram_idx = gram_format.sel->get_index(r);
 			auto row_idx = row_format.sel->get_index(r);
 			auto segment_idx = segment_format.sel->get_index(r);
-			if (!gram_format.validity.RowIsValid(gram_idx) || !row_format.validity.RowIsValid(row_idx) ||
-			    !segment_format.validity.RowIsValid(segment_idx)) {
-				throw InvalidInputException("ngram: stats table contains NULLs; the index is malformed");
+			if (!gram_format.validity.RowIsValid(gram_idx)) {
+				continue;
 			}
 			auto entry = gram_index.find(gram_data[gram_idx]);
 			if (entry == gram_index.end()) {
 				continue;
+			}
+			if (!row_format.validity.RowIsValid(row_idx) || !segment_format.validity.RowIsValid(segment_idx)) {
+				throw InvalidInputException("ngram: requested stats row contains NULLs; the index is malformed");
 			}
 			if (row_data[row_idx] <= 0 || segment_data[segment_idx] <= 0) {
 				throw InvalidInputException("ngram: invalid gram row in stats table; the index is malformed");
@@ -671,7 +691,9 @@ static vector<GramStats> ReadGramStats(ClientContext &context, DuckTransaction &
 			CheckedAtomicAdd(totals[entry->second].row_count, rows);
 			CheckedAtomicAdd(totals[entry->second].segment_count, segments);
 		}
-	                        });
+		                        });
+	rows_scanned = scanned_rows.load();
+	chunks_scanned = scanned_chunks.load();
 	vector<GramStats> result(grams.size());
 	for (idx_t gram = 0; gram < grams.size(); gram++) {
 		result[gram].row_count = totals[gram].row_count.load();
@@ -708,10 +730,10 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 	// Both callers supply distinct grams. Account the full needle before
 	// copying it or reading stats, then retain the rarest K. The deliberately
 	// conservative allowance covers string copies, hash nodes/buckets, stats
-	// counters and sort indexes without depending on STL node layouts. Each
-	// stats worker also gets 256 KiB for its scan chunk/state; stats lookup
-	// itself is allocation-free, while ordinary DuckDB allocator buffers are
-	// not charged to BufferManager reservations.
+	// counters, filter values and sort indexes without depending on STL node
+	// layouts. Each stats worker also gets 256 KiB for its scan chunk/state; the
+	// scan's row loop allocates no per-row scratch, while ordinary DuckDB
+	// allocator buffers are not charged to BufferManager reservations.
 	auto memory_budget = ProbeMemoryBudget(context);
 	auto stats_workers = StatsWorkers(context, stats_entry);
 	idx_t preflight_bytes = 4096;
@@ -725,7 +747,9 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 	}
 	for (auto &gram : grams) {
 		idx_t string_bytes;
-		if (!CheckedMultiply(gram.size(), idx_t(2), string_bytes) || !CheckedAdd(preflight_bytes, string_bytes)) {
+		// query gram + stats-filter Value + selected-plan copy (only K are
+		// selected, but charging all grams keeps this a simple upper bound)
+		if (!CheckedMultiply(gram.size(), idx_t(3), string_bytes) || !CheckedAdd(preflight_bytes, string_bytes)) {
 			plan->decline_reason = "probe planning size overflow";
 			return plan;
 		}
@@ -736,7 +760,8 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 	}
 	plan->memory_reservation = make_uniq<ProbeMemoryReservation>(BufferManager::GetBufferManager(context),
 	                                                           preflight_bytes);
-	auto all_stats = ReadGramStats(context, tx, stats_entry, grams, stats_workers);
+	auto all_stats = ReadGramStats(context, tx, stats_entry, grams, stats_workers, plan->stats_rows_scanned,
+	                               plan->stats_chunks_scanned);
 	vector<idx_t> order(grams.size());
 	for (idx_t i = 0; i < order.size(); i++) {
 		order[i] = i;
@@ -1537,6 +1562,8 @@ static InsertionOrderPreservingMap<string> SearchDynamicToString(TableFunctionDy
 		result["Ngram Mode"] = StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
 		                                          state.core.probe->candidate_upper_bound,
 		                                          state.core.probe->decoded_rowids.load());
+		result["Ngram Stats Rows Scanned"] = to_string(state.core.probe->stats_rows_scanned);
+		result["Ngram Stats Chunks Scanned"] = to_string(state.core.probe->stats_chunks_scanned);
 	} else {
 		result["Ngram Mode"] = "full scan fallback: " + state.fallback_reason;
 	}
@@ -1663,6 +1690,8 @@ static InsertionOrderPreservingMap<string> CandidatesDynamicToString(TableFuncti
 	auto &state = input.global_state->Cast<CandidatesGlobalState>();
 	if (state.probe) {
 		result["Ngram Probe Workers"] = to_string(state.probe->max_threads);
+		result["Ngram Stats Rows Scanned"] = to_string(state.probe->stats_rows_scanned);
+		result["Ngram Stats Chunks Scanned"] = to_string(state.probe->stats_chunks_scanned);
 		result["Ngram Decoded Rowids"] = to_string(state.probe->decoded_rowids.load());
 	}
 	return result;

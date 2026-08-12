@@ -133,8 +133,9 @@ SELECT count(*) FROM (
 ----
 0
 
-# results are unchanged by compaction, and the dead posting of the deleted row
-# is gone from the rewritten segments
+# Exact results are unchanged by merge-only compaction. It deliberately does
+# not read the base table, so the dead posting remains a lossy candidate until
+# an explicit purging compaction.
 query I
 SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 ----
@@ -146,7 +147,7 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 query I
 SELECT count(*) FROM ngram_candidates('docs', 's', 'ten') WHERE rowid = 2;
 ----
-0
+1
 
 # compaction is idempotent: a second run finds nothing to merge and changes
 # neither the segment rows nor the answers
@@ -186,11 +187,80 @@ SELECT count(*) FROM ngram_candidates('docs', 's', 'tent') WHERE rowid = 0;
 0
 
 query I
+SELECT count(*) FROM ngram_candidates('docs', 's', 'ten') WHERE rowid = 2;
+----
+0
+
+query I
 SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 ----
 4
 7
 8
+
+# Purge may retain only non-NULL indexed rows in its one-pass live-rowid temp:
+# build/refresh never create NULL postings, indexed updates are delete+append
+# under the v3 guard, and an unrelated-column update preserves rowid.
+statement ok
+CREATE TABLE purge_nulls(id INTEGER, note INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO purge_nulls VALUES (1, 10, 'old needle'), (2, 20, NULL), (3, 30, 'keep needle');
+
+statement ok
+PRAGMA create_ngram_index('purge_nulls', 's');
+
+statement ok
+UPDATE purge_nulls SET s = NULL WHERE id = 1;
+
+statement ok
+UPDATE purge_nulls SET s = 'new needle' WHERE id = 2;
+
+statement ok
+UPDATE purge_nulls SET note = 31 WHERE id = 3;
+
+statement ok
+PRAGMA ngram_refresh('purge_nulls');
+
+query III
+SELECT (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'old')),
+       (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'new')),
+       (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'keep'));
+----
+1	1	1
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA ngram_compact('purge_nulls', purge = true);
+
+query III
+SELECT (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'old')),
+       (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'new')),
+       (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'keep'));
+----
+0	1	1
+
+statement ok
+ROLLBACK;
+
+query III
+SELECT (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'old')),
+       (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'new')),
+       (SELECT count(*) FROM ngram_search('purge_nulls', 'keep'));
+----
+1	1	1
+
+statement ok
+PRAGMA ngram_compact('purge_nulls', purge = true);
+
+query III
+SELECT (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'old')),
+       (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'new')),
+       (SELECT note FROM ngram_search('purge_nulls', 'keep'));
+----
+0	1	31
 
 # a full differential check over the compacted index
 query I
@@ -201,6 +271,248 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Compaction validates every selected shadow row before purging can hide it.
+# This tiny fragmented key pins NULL/malformed keys, descriptors, and the
+# concrete cross-segment posting that previously became silent deletion.
+statement ok
+CREATE TABLE compact_bad(s VARCHAR);
+
+statement ok
+INSERT INTO compact_bad VALUES ('aaa');
+
+statement ok
+PRAGMA create_ngram_index('compact_bad', 's');
+
+statement ok
+INSERT INTO compact_bad VALUES ('aaa');
+
+statement ok
+PRAGMA ngram_refresh('compact_bad');
+
+statement ok
+UPDATE ngram_main_compact_bad.segments_s SET segment_no = NULL WHERE gram = 'aaa';
+
+statement error
+PRAGMA ngram_compact('compact_bad');
+----
+malformed segments-table key
+
+statement ok
+UPDATE ngram_main_compact_bad.segments_s SET segment_no = 0, gram = NULL;
+
+statement error
+PRAGMA ngram_compact('compact_bad', purge = true);
+----
+malformed segments-table key
+
+statement ok
+UPDATE ngram_main_compact_bad.segments_s SET gram = 'aa';
+
+statement error
+PRAGMA ngram_compact('compact_bad');
+----
+malformed segments-table key
+
+statement ok
+UPDATE ngram_main_compact_bad.segments_s SET gram = 'aaa';
+
+statement ok
+UPDATE ngram_main_compact_bad.segments_s
+SET postings = ngram_encode_postings([1048576]::BIGINT[]), rowid_count = 1,
+    min_rowid = 1048576, max_rowid = 1048576
+WHERE generation = 0;
+
+statement error
+PRAGMA ngram_compact('compact_bad');
+----
+outside its declared segment or indexed range
+
+# Purge must validate the selected blob before an empty live-row temp can
+# filter every decoded posting away.
+statement ok
+UPDATE compact_bad SET s = NULL;
+
+statement error
+PRAGMA ngram_compact('compact_bad', purge = true);
+----
+outside its declared segment or indexed range
+
+statement ok
+UPDATE ngram_main_compact_bad.segments_s
+SET postings = ngram_encode_postings([0]::BIGINT[]), rowid_count = 2,
+    min_rowid = 0, max_rowid = 0
+WHERE generation = 0;
+
+statement error
+PRAGMA ngram_compact('compact_bad');
+----
+descriptor disagrees
+
+# All failed scripts are atomic: neither generation was deleted or repaired.
+query II
+SELECT count(*), count(DISTINCT generation) FROM ngram_main_compact_bad.segments_s;
+----
+2	2
+
+# Refresh rewrites the complete stats layout, so it must reject each malformed
+# historical row rather than letting negative and positive generations sum to
+# a plausible aggregate. The generated script remains atomic on that error.
+statement ok
+CREATE TABLE refresh_bad_stats(s VARCHAR);
+
+statement ok
+INSERT INTO refresh_bad_stats VALUES ('aaa');
+
+statement ok
+PRAGMA create_ngram_index('refresh_bad_stats', 's');
+
+statement ok
+UPDATE ngram_main_refresh_bad_stats.stats_s
+SET row_count = -1, segment_count = -1 WHERE encode(gram) = encode('aaa');
+
+statement ok
+INSERT INTO ngram_main_refresh_bad_stats.stats_s VALUES ('aaa', 2, 2);
+
+statement ok
+INSERT INTO refresh_bad_stats VALUES ('aaa');
+
+statement error
+PRAGMA ngram_refresh('refresh_bad_stats');
+----
+invalid stats row
+
+query IIIIIII
+SELECT (SELECT hwm_rowid FROM ngram_main_refresh_bad_stats.meta_s),
+       (SELECT count(*) FROM ngram_main_refresh_bad_stats.segments_s),
+       (SELECT max(generation) FROM ngram_main_refresh_bad_stats.segments_s),
+       (SELECT count(*) FROM ngram_main_refresh_bad_stats.stats_s),
+       (SELECT min(row_count) FROM ngram_main_refresh_bad_stats.stats_s),
+       (SELECT max(row_count) FROM ngram_main_refresh_bad_stats.stats_s),
+       (SELECT sum(row_count) FROM ngram_main_refresh_bad_stats.stats_s);
+----
+0	1	0	2	-1	2	1
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'temp' AND table_name LIKE '__ngram_%';
+----
+0
+
+# Binary grouping/order must not inherit the session collation. Case-distinct
+# grams remain distinct on a case-sensitive index, and a three-codepoint UTF-8
+# gram remains valid through both compaction modes.
+statement ok
+SET default_collation = 'nocase';
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+CREATE TABLE compact_collation(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO compact_collation VALUES (1, 'Aaa'), (2, 'aaa'), (3, 'é日🙂x');
+
+statement ok
+PRAGMA create_ngram_index('compact_collation', 's', case_insensitive = false);
+
+query II
+SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
+       count(*) FILTER (WHERE encode(gram) = encode('aaa'))
+FROM ngram_main_compact_collation.stats_s;
+----
+1	1
+
+query I
+SELECT count(*) FROM (
+	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
+	FROM ngram_main_compact_collation.stats_s)
+WHERE out_of_order;
+----
+0
+
+statement ok
+INSERT INTO compact_collation VALUES (4, 'Aaa'), (5, 'aaa'), (6, 'é日🙂y');
+
+statement ok
+PRAGMA ngram_refresh('compact_collation');
+
+# Refresh folds stats history immediately, retaining byte-distinct grams and
+# binary physical order before compaction folds the segment generation.
+query II
+SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
+       count(*) FILTER (WHERE encode(gram) = encode('aaa'))
+FROM ngram_main_compact_collation.stats_s;
+----
+1	1
+
+query I
+SELECT count(*) FROM (
+	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
+	FROM ngram_main_compact_collation.stats_s)
+WHERE out_of_order;
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT encode(gram) < lag(encode(gram)) OVER (PARTITION BY generation ORDER BY rowid) AS out_of_order
+	FROM ngram_main_compact_collation.segments_s)
+WHERE out_of_order;
+----
+0
+
+statement ok
+PRAGMA ngram_compact('compact_collation');
+
+statement ok
+PRAGMA ngram_compact('compact_collation', purge = true);
+
+query III
+SELECT (SELECT count(*) FROM ngram_search('compact_collation', 'Aaa')),
+       (SELECT count(*) FROM ngram_search('compact_collation', 'aaa')),
+       (SELECT count(*) FROM ngram_search('compact_collation', 'é日🙂'));
+----
+2	2	2
+
+query II
+SELECT row_count, segment_count FROM ngram_main_compact_collation.stats_s
+WHERE encode(gram) = encode('Aaa');
+----
+2	1
+
+query II
+SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
+       count(*) FILTER (WHERE encode(gram) = encode('aaa'))
+FROM ngram_main_compact_collation.segments_s;
+----
+1	1
+
+query I
+SELECT count(*) FROM (
+	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
+	FROM ngram_main_compact_collation.stats_s)
+WHERE out_of_order;
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
+	FROM ngram_main_compact_collation.segments_s)
+WHERE out_of_order;
+----
+0
+
+statement ok
+SET default_collation = 'binary';
+
+statement ok
+RESET preserve_insertion_order;
 
 #===----------------------------------------------------------------------===#
 # observability: what the stats pragma reports about maintenance state
@@ -404,6 +716,95 @@ query I
 SELECT count(*) FROM ngram_candidates('atomic', 's', 'tent');
 ----
 2
+
+# Merge-only compaction joins a surrounding transaction and rolls back as one
+# unit, including its stats rewrite and scratch tables.
+statement ok
+CREATE TEMP TABLE phase13_segments_before AS
+SELECT * FROM ngram_main_atomic.segments_s;
+
+statement ok
+CREATE TEMP TABLE phase13_stats_before AS
+SELECT * FROM ngram_main_atomic.stats_s;
+
+statement ok
+CREATE TEMP TABLE phase13_meta_before AS
+SELECT * FROM ngram_main_atomic.meta_s;
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA ngram_compact('atomic');
+
+query I
+SELECT count(*) FROM (SELECT gram, segment_no FROM ngram_main_atomic.segments_s
+	GROUP BY gram, segment_no HAVING count(*) > 1);
+----
+0
+
+statement ok
+ROLLBACK;
+
+query III
+SELECT (SELECT count(*) FROM (
+	(SELECT * FROM phase13_segments_before EXCEPT SELECT * FROM ngram_main_atomic.segments_s)
+	UNION ALL
+	(SELECT * FROM ngram_main_atomic.segments_s EXCEPT SELECT * FROM phase13_segments_before))),
+       (SELECT count(*) FROM (
+	(SELECT * FROM phase13_stats_before EXCEPT SELECT * FROM ngram_main_atomic.stats_s)
+	UNION ALL
+	(SELECT * FROM ngram_main_atomic.stats_s EXCEPT SELECT * FROM phase13_stats_before))),
+       (SELECT count(*) FROM (
+	(SELECT * FROM phase13_meta_before EXCEPT SELECT * FROM ngram_main_atomic.meta_s)
+	UNION ALL
+	(SELECT * FROM ngram_main_atomic.meta_s EXCEPT SELECT * FROM phase13_meta_before)));
+----
+0	0	0
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'temp' AND table_name LIKE '__ngram_%';
+----
+0
+
+statement ok
+DROP TABLE phase13_segments_before;
+
+statement ok
+DROP TABLE phase13_stats_before;
+
+statement ok
+DROP TABLE phase13_meta_before;
+
+statement ok
+FORCE CHECKPOINT;
+
+# Empty indexes exercise the HWM=-1 and no-key shapes in both compaction plans.
+statement ok
+CREATE TABLE compact_empty(s VARCHAR);
+
+statement ok
+PRAGMA create_ngram_index('compact_empty', 's');
+
+statement ok
+PRAGMA ngram_compact('compact_empty');
+
+statement ok
+PRAGMA ngram_compact('compact_empty', purge = true);
+
+query III
+SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_compact_empty.segments_s),
+       (SELECT count(*) FROM ngram_main_compact_empty.stats_s)
+FROM ngram_main_compact_empty.meta_s;
+----
+-1	0	0
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'temp' AND table_name LIKE '__ngram_%';
+----
+0
 
 #===----------------------------------------------------------------------===#
 # refusals: what maintenance will not do

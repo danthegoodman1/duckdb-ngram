@@ -2,6 +2,7 @@
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/storage/arena_allocator.hpp"
+#include "ngram/index_pragmas.hpp"
 #include "ngram/postings_codec.hpp"
 
 namespace duckdb {
@@ -10,9 +11,11 @@ namespace ngram {
 //! ngram_unpack_postings((SELECT gram, segment_no, postings FROM segments))
 //! reverses the packing: it streams one (gram, segment_no, rowid) row per
 //! posting. Compaction groups its output back through ngram_pack_segment to
-//! merge the segment rows that share a key. It emits at most one output chunk
-//! per call and resumes where it stopped, so a single blob holding more rowids
-//! than fit in a chunk is spread over several calls rather than buffered.
+//! merge the segment rows that share a key. Its eight-column form additionally
+//! checks all persisted descriptor fields and the index high-water mark before
+//! compaction can filter a corrupt posting as dead. It emits at most one output
+//! chunk per call and resumes where it stopped, so a single blob holding more
+//! rowids than fit in a chunk is spread over several calls rather than buffered.
 
 struct UnpackPostingsLocalState : LocalTableFunctionState {
 	//! resume position inside the current input chunk
@@ -26,10 +29,15 @@ struct UnpackPostingsLocalState : LocalTableFunctionState {
 static unique_ptr<FunctionData> UnpackPostingsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	auto &types = input.input_table_types;
-	if (types.size() != 3 || types[0].id() != LogicalTypeId::VARCHAR || types[1].id() != LogicalTypeId::BIGINT ||
-	    types[2].id() != LogicalTypeId::BLOB) {
+	if ((types.size() != 3 && types.size() != 8) || types[0].id() != LogicalTypeId::VARCHAR ||
+	    types[1].id() != LogicalTypeId::BIGINT || types[2].id() != LogicalTypeId::BLOB ||
+	    (types.size() == 8 &&
+	     (types[3].id() != LogicalTypeId::BIGINT || types[4].id() != LogicalTypeId::BIGINT ||
+	      types[5].id() != LogicalTypeId::BIGINT || types[6].id() != LogicalTypeId::BIGINT ||
+	      types[7].id() != LogicalTypeId::BIGINT))) {
 		throw BinderException(
-		    "ngram_unpack_postings expects a table of (gram VARCHAR, segment_no BIGINT, postings BLOB)");
+		    "ngram_unpack_postings expects a table of (gram VARCHAR, segment_no BIGINT, postings BLOB) or its "
+		    "checked eight-column form");
 	}
 	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
 	names = {"gram", "segment_no", "r"};
@@ -51,13 +59,27 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
                                                  DataChunk &input, DataChunk &output) {
 	auto &state = data_p.local_state->Cast<UnpackPostingsLocalState>();
 
-	UnifiedVectorFormat gram_format, segment_format, blob_format;
+	UnifiedVectorFormat gram_format, segment_format, blob_format, count_format, min_format, max_format, generation_format,
+	    hwm_format;
 	input.data[0].ToUnifiedFormat(input.size(), gram_format);
 	input.data[1].ToUnifiedFormat(input.size(), segment_format);
 	input.data[2].ToUnifiedFormat(input.size(), blob_format);
+	auto checked = input.ColumnCount() == 8;
+	if (checked) {
+		input.data[3].ToUnifiedFormat(input.size(), count_format);
+		input.data[4].ToUnifiedFormat(input.size(), min_format);
+		input.data[5].ToUnifiedFormat(input.size(), max_format);
+		input.data[6].ToUnifiedFormat(input.size(), generation_format);
+		input.data[7].ToUnifiedFormat(input.size(), hwm_format);
+	}
 	auto grams = UnifiedVectorFormat::GetData<string_t>(gram_format);
 	auto segments = UnifiedVectorFormat::GetData<int64_t>(segment_format);
 	auto blobs = UnifiedVectorFormat::GetData<string_t>(blob_format);
+	auto counts = checked ? UnifiedVectorFormat::GetData<int64_t>(count_format) : nullptr;
+	auto minima = checked ? UnifiedVectorFormat::GetData<int64_t>(min_format) : nullptr;
+	auto maxima = checked ? UnifiedVectorFormat::GetData<int64_t>(max_format) : nullptr;
+	auto generations = checked ? UnifiedVectorFormat::GetData<int64_t>(generation_format) : nullptr;
+	auto hwms = checked ? UnifiedVectorFormat::GetData<int64_t>(hwm_format) : nullptr;
 
 	auto out_gram = FlatVector::GetData<string_t>(output.data[0]);
 	auto out_segment = FlatVector::GetData<int64_t>(output.data[1]);
@@ -69,14 +91,38 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 		auto gram_idx = gram_format.sel->get_index(row);
 		auto segment_idx = segment_format.sel->get_index(row);
 		auto blob_idx = blob_format.sel->get_index(row);
+		auto count_idx = checked ? count_format.sel->get_index(row) : 0;
+		auto min_idx = checked ? min_format.sel->get_index(row) : 0;
+		auto max_idx = checked ? max_format.sel->get_index(row) : 0;
+		auto generation_idx = checked ? generation_format.sel->get_index(row) : 0;
+		auto hwm_idx = checked ? hwm_format.sel->get_index(row) : 0;
 		if (!gram_format.validity.RowIsValid(gram_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
-		    !blob_format.validity.RowIsValid(blob_idx)) {
+		    !blob_format.validity.RowIsValid(blob_idx) ||
+		    (checked && (!count_format.validity.RowIsValid(count_idx) || !min_format.validity.RowIsValid(min_idx) ||
+		                 !max_format.validity.RowIsValid(max_idx) ||
+		                 !generation_format.validity.RowIsValid(generation_idx) ||
+		                 !hwm_format.validity.RowIsValid(hwm_idx)))) {
 			throw InvalidInputException("ngram_unpack_postings: input must not contain NULLs");
 		}
 		if (!state.row_decoded) {
 			state.rowids.clear();
 			state.rowid_offset = 0;
 			DecodePostings(blobs[blob_idx].GetData(), blobs[blob_idx].GetSize(), state.rowids);
+			if (checked) {
+				for (auto rowid : state.rowids) {
+					if (rowid < 0 || segments[segment_idx] < 0 ||
+					    (rowid >> SEGMENT_SHIFT) != segments[segment_idx] || rowid > hwms[hwm_idx]) {
+						throw InvalidInputException(
+						    "ngram_unpack_postings: posting rowid lies outside its declared segment or indexed range");
+					}
+				}
+				if (counts[count_idx] <= 0 || NumericCast<idx_t>(counts[count_idx]) != state.rowids.size() ||
+				    state.rowids.empty() || minima[min_idx] != state.rowids.front() ||
+				    maxima[max_idx] != state.rowids.back() || generations[generation_idx] < 0) {
+					throw InvalidInputException(
+					    "ngram_unpack_postings: segment descriptor disagrees with its postings blob");
+				}
+			}
 			state.row_decoded = true;
 		}
 		while (state.rowid_offset < state.rowids.size()) {

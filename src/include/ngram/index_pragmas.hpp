@@ -84,8 +84,9 @@ constexpr int64_t LOCAL_ROWID_START = 36028797018960000LL;
 // per key — the same rows, byte for byte, the ordered packer produced.
 //===----------------------------------------------------------------------===//
 
-//! Rowid ranges (inclusive) splitting [lo, hi] into at most `partitions`
-//! segment-aligned pieces. Always returns at least one range.
+//! Rowid ranges (inclusive) splitting [lo, hi] into approximately `partitions`
+//! segment-aligned pieces. Floor-sized ranges can overshoot that request when
+//! the segment count is not divisible by it. Always returns at least one range.
 //!
 //! With `open_ended` (the default) the last range runs to LOCAL_ROWID_START - 1
 //! so that rows committed between the pragma callback and the statement are

@@ -361,6 +361,24 @@ SELECT count(*) FROM bad_stats WHERE contains(s, 'aaaa');
 ----
 stats describe more segment rows than exist
 
+# Stats pruning is advisory: the C++ map remains the exact selected-gram
+# filter. Corruption in an unrelated gram is not on this query's read path,
+# while the same row is still fatal as soon as its gram is requested.
+statement ok
+UPDATE ngram_main_bad_stats.stats_s
+SET row_count = NULL
+WHERE gram = 'aaa';
+
+query I
+SELECT count(*) FROM ngram_search('bad_stats', 'bad');
+----
+0
+
+statement error
+SELECT count(*) FROM ngram_search('bad_stats', 'aaaa');
+----
+requested stats row contains NULLs
+
 # A forged generation aggregate above the actual partial-segment capacity is
 # also classified before any work/memory decline or blob decode.
 statement ok

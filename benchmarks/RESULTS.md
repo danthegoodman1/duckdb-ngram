@@ -402,6 +402,28 @@ classes, up to 1.9× the numbers above, with identical candidate sets.
 `bench_latency.py` does one warmup and then nine timed runs, which is enough to
 warm a 1 GB index and not enough to warm a 9 GB one from cold.
 
+**Current Phase-13 maintenance profile.** A 0.984 GB, 11,920,423-row corpus
+with 100 refreshes held 4,637,233 segment rows, 3,273,033 stats rows, and
+787,852,857 postings in 948 MB of blobs. Merge-only compact took 3.32 s at one
+requested range and 3.18 s in auto mode, with zero base-table rows read. Auto
+requested 4,096 ranges but segment alignment emitted 12 one-segment ranges;
+purge scanned the base's 11,920,423 rows exactly once and took 33.16 s with
+9,677,436 KiB maximum RSS. Every mode ended with identical posting/stat sums
+and exact results. Under tighter limits, requested-8 (also 12 actual ranges)
+merge spilled 1,001,521,184 bytes at 1,024 MB and finished in 4.81 s; purge
+spilled 4,576,434,848 bytes at 1,536 MB and finished in 40.0 s.
+
+Refresh now folds stats to one validated byte-sorted row per gram. On the
+605,513-gram fixture, one requested gram scanned 122,880 rows/60 chunks after
+1, 10, and 100 same-connection folds; K=8 latency was 0.196/0.190/0.199 s.
+Deleted MVCC versions still occupied about 2.3 GB after 100 folds, but did not
+increase filtered scan work. Their cleanup is left to DuckDB's normal
+checkpoint/MVCC lifecycle; this layout does not promise that the file shrinks.
+
+**Historical pre-Phase-13 compaction result.** The posting-layout numbers below
+remain useful, but its stats guidance is superseded: current refresh validates
+and folds stats to one byte-sorted row per gram on every call.
+
 **Compaction has almost nothing to do on an append-only workload.** Each
 refresh generation lands in a fresh rowid range, so generations barely share
 `(gram, segment_no)` keys. At 10 GB, 77,275 of 24,992,211 segment rows were
@@ -410,17 +432,17 @@ with 311.6 GB of spill and merged 258,732,511 segment rows down to 248,445,026
 — **4 % fewer rows for 44 % of the time the whole index took to build**, and
 the encoded payload shrank by 41.9 MB out of 85.3 GiB (0.05 %). It did rebuild
 the stats table from 78,832,107 delta rows (one per gram per generation) to
-4,509,928 (one per gram), which is what makes the rarest-first probe read less.
+4,509,928 (one per gram), which made the rarest-first probe read less in that
+implementation.
 Postings were byte-for-byte identical before and after (72,434,741,725 either
 way).
 
-The practical reading, which the README repeats: **compaction is for
+The practical reading remains: **compaction is for
 delete-heavy or interleaved workloads, not routine post-ingest hygiene.** After
 a pure append-and-refresh sequence it costs hours to reclaim single-digit
 percentages — minutes rather than the hours it took before Phase 7, but still
-disproportionate to what it reclaims. The one thing worth having from it — a stats table with one row
-per gram instead of one per gram per generation — is a small part of the work
-it does.
+disproportionate to what it reclaims. Current refresh already performs the
+stats-only fold; compaction is not needed for that benefit.
 
 The compacted database file is *larger* than the pre-compaction one
 (181.97 GiB vs 172.54 GiB) because the rewrite leaves the superseded blocks
@@ -428,8 +450,11 @@ free inside the file rather than returning them to the filesystem. Plan for
 that headroom before running it.
 
 `purge = true` widens the rewrite from fragmented keys to every key, so that
-postings pointing at deleted rows are dropped everywhere rather than only where
-a merge was rewriting the blob anyway. At 10 GB that is **413.4 s** against
+postings pointing at deleted rows are dropped everywhere; merge-only
+compaction does not consult the base and retains them for exact recheck. Current
+purge materializes relevant live rowids once into a spillable BIGINT temp, so
+its temporary disk can be substantial. At 10 GB the historical implementation
+was **413.4 s** against
 8.9 s for the plain variant — 46× the cost, on a corpus with no deletes to
 purge (Phase 6 measured the same pair at 3599.6 s and 15.8 s). Reach for it
 after a large `DELETE`, not otherwise.

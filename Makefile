@@ -15,8 +15,8 @@ test_reldebug_internal: ngram_checkpoint_gap_reldebug
 
 .PHONY: ngram_checkpoint_gap_release ngram_checkpoint_gap_debug ngram_checkpoint_gap_reldebug
 ngram_checkpoint_gap_release:
-	cmake --build build/release --config Release --target run_ngram_checkpoint_gap_test
+	cmake --build build/release --config Release --target run_ngram_checkpoint_gap_test unittest
 ngram_checkpoint_gap_debug:
-	cmake --build build/debug --config Debug --target run_ngram_checkpoint_gap_test
+	cmake --build build/debug --config Debug --target run_ngram_checkpoint_gap_test unittest
 ngram_checkpoint_gap_reldebug:
-	cmake --build build/reldebug --config RelWithDebInfo --target run_ngram_checkpoint_gap_test
+	cmake --build build/reldebug --config RelWithDebInfo --target run_ngram_checkpoint_gap_test unittest

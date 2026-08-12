@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <thread>
 #if defined(__linux__)
 #include <sys/wait.h>
 #endif
@@ -979,6 +980,32 @@ static void TestCleanShutdownSeal(const string &path) {
 	}
 }
 
+static void TestQueryCancellation() {
+	DuckDB db(nullptr);
+	LoadNgram(db);
+	Connection con(db);
+	Check(con, "SET threads=1");
+	Check(con, "SET ngram_max_candidate_fraction=1.0");
+	Check(con, "CREATE TABLE cancel_rows AS SELECT i::BIGINT id, 'aaaaaaaa payload'::VARCHAR s "
+	           "FROM range(2200000) t(i)");
+	Check(con, "PRAGMA create_ngram_index('cancel_rows', 's')");
+	Check(con, "SET memory_limit='64MB'");
+	unique_ptr<MaterializedQueryResult> result;
+	std::thread worker([&]() { result = con.Query("SELECT sum(id) FROM ngram_search('cancel_rows', 'aaaa')"); });
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	con.Interrupt();
+	worker.join();
+	if (!result || !result->HasError() || result->GetError().find("Interrupt") == string::npos) {
+		throw std::runtime_error("bounded query did not propagate cancellation");
+	}
+	// Cancellation must release both the hard memory reservation and shared
+	// vacuum fence; the same connection and an exclusive checkpoint remain usable.
+	if (ScalarInt64(con, "SELECT 42") != 42) {
+		throw std::runtime_error("connection unusable after query cancellation");
+	}
+	Check(con, "FORCE CHECKPOINT");
+}
+
 int main(int argc, char **argv) {
 	try {
 		if (argc == 3 && string(argv[1]) == "--wal-child") {
@@ -1007,6 +1034,7 @@ int main(int argc, char **argv) {
 		TestUnboundCheckpointSeal(argv[0], unique + ".seal");
 		TestCleanShutdownSeal(unique + ".clean");
 		TestIncompatibleGuardQuarantine(unique + ".quarantine");
+		TestQueryCancellation();
 		RemoveDatabase(unique + ".creation");
 		RemoveDatabase(unique + ".protectors");
 		RemoveDatabase(unique + ".vacuum");

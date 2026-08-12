@@ -174,9 +174,9 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 
 # DROP TABLE leaves the shadow schema behind, but a same-name replacement does
 # not inherit the exact native guard incarnation recorded by format-3 meta.
-# Within the running instance the table oid also proves replacement. Explicit
-# search therefore refuses here; after reopen, missing/mismatched guard state
-# still forces an exhaustive scan rather than trusting the dead postings.
+# Within the running instance the table oid also proves replacement. Full-
+# result search therefore takes an exhaustive scan rather than trusting the
+# dead postings; maintenance still refuses to extend the stale index.
 statement ok
 CREATE TABLE reborn(id INTEGER, s VARCHAR);
 
@@ -200,10 +200,10 @@ SELECT count(*) FROM reborn WHERE contains(lower(s), 'tent');
 ----
 1
 
-statement error
+query I
 SELECT count(*) FROM ngram_search('reborn', 'tent');
 ----
-the table was dropped and re-created
+1
 
 statement error
 PRAGMA ngram_refresh('reborn');

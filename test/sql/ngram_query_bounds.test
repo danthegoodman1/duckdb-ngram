@@ -1,0 +1,519 @@
+# name: test/sql/ngram_query_bounds.test
+# description: bounded query admission, projection pushdown, and fatal probe errors
+# group: [sql]
+
+require ngram
+
+#===----------------------------------------------------------------------===#
+# Projection-aware shared executor
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE projected(
+	id BIGINT,
+	nested STRUCT(x INTEGER, y VARCHAR),
+	pad1 VARCHAR,
+	s VARCHAR,
+	pad2 VARCHAR,
+	z BIGINT
+);
+
+statement ok
+INSERT INTO projected VALUES
+	(1, {'x': 10, 'y': 'one'}, 'unused one', 'first tent', 'also unused', 100),
+	(2, {'x': 20, 'y': 'two'}, 'unused two', 'nothing', 'also unused', 200),
+	(3, {'x': 30, 'y': 'three'}, 'unused three', 'second tent', 'also unused', 300);
+
+statement ok
+PRAGMA create_ngram_index('projected', 's');
+
+statement ok
+SET ngram_max_candidate_fraction = 1.0;
+
+query I
+SELECT count(*) FROM ngram_search('projected', 'tent');
+----
+2
+
+query IIII
+SELECT z, id, id, nested.x FROM ngram_search('projected', 'tent') ORDER BY id;
+----
+100	1	1	10
+300	3	3	30
+
+# All-column output remains identical while narrower projections above do not
+# fetch the two padding columns.
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM ngram_search('projected', 'tent')
+	 EXCEPT ALL SELECT * FROM projected WHERE contains(lower(s), 'tent'))
+	UNION ALL
+	(SELECT * FROM projected WHERE contains(lower(s), 'tent')
+	 EXCEPT ALL SELECT * FROM ngram_search('projected', 'tent'))
+);
+----
+0
+
+# Dynamic profiling reports the storage layout, including the hidden indexed
+# column required for recheck. count(*) uses the unqueryable EMPTY virtual
+# column, so only s is fetched.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('projected', 'tent');
+----
+analyzed_plan	<REGEX>:.*"Ngram Storage Columns": "s".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ngram_search('projected', 'tent');
+----
+analyzed_plan	<REGEX>:.*"Ngram Storage Columns": "id, s".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT nested.x FROM ngram_search('projected', 'tent');
+----
+analyzed_plan	<REGEX>:.*"Ngram Storage Columns": "nested \(extract\), s".*
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+query I
+SELECT count(*) FROM projected WHERE contains(s, 'tent');
+----
+2
+
+query IIII
+SELECT z, id, id, nested.x FROM projected WHERE contains(s, 'tent') ORDER BY id;
+----
+100	1	1	10
+300	3	3	30
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM projected WHERE contains(s, 'tent');
+----
+analyzed_plan	<REGEX>:.*"Ngram Storage Columns": "s".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT nested.x FROM projected WHERE contains(s, 'tent');
+----
+analyzed_plan	<REGEX>:.*"Ngram Storage Columns": "s, nested \(extract\)".*
+
+# Rarest-K selection examines every distinct needle gram before truncating.
+# abc/bcd/cde occur in every row; only def occurs once.
+statement ok
+CREATE TABLE rarest(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO rarest SELECT i, 'abc bcd cde' FROM range(100) t(i);
+
+statement ok
+INSERT INTO rarest VALUES (100, 'abcdef');
+
+statement ok
+PRAGMA create_ngram_index('rarest', 's');
+
+statement ok
+SET ngram_max_grams_per_query = 1;
+
+query I
+SELECT rowid FROM ngram_candidates('rarest', 's', 'abcdef');
+----
+100
+
+statement ok
+RESET ngram_max_grams_per_query;
+
+# An unbounded user K still walks the sorted per-segment descriptor range once,
+# in gram order. This one-row posting shape exercises 34 distinct grams.
+statement ok
+CREATE TABLE high_k(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO high_k VALUES (1, '0123456789abcdefghijklmnopqrstuvwxyz'), (2, 'no match');
+
+statement ok
+PRAGMA create_ngram_index('high_k', 's');
+
+statement ok
+SET ngram_max_grams_per_query = 1000;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM ngram_search('high_k', '0123456789abcdefghijklmnopqrstuvwxyz');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index \(<= 1 candidates, 34 decoded rowids\)".*
+
+query I
+SELECT rowid FROM ngram_candidates('high_k', 's', '0123456789abcdefghijklmnopqrstuvwxyz');
+----
+0
+
+statement ok
+RESET ngram_max_grams_per_query;
+
+#===----------------------------------------------------------------------===#
+# Admission before decode: hard-work and memory policies
+#===----------------------------------------------------------------------===#
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE dense AS
+SELECT i::BIGINT AS id, 'aaaaaaaa common payload'::VARCHAR AS s
+FROM range(250000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('dense', 's');
+
+statement ok
+SET ngram_max_probe_rowids = 100;
+
+# Full-result functions select a scan before opening the dense postings blob.
+query I
+SELECT count(*) FROM ngram_search('dense', 'aaaa');
+----
+250000
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('dense', 'aaaa');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: decoded-rowid work budget exceeded".*
+
+statement error
+SELECT count(*) FROM ngram_candidates('dense', 's', 'aaaa');
+----
+ngram_candidates: decoded-rowid work budget exceeded
+
+query I
+SELECT count(*) FROM dense WHERE contains(s, 'aaaa');
+----
+250000
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM dense WHERE contains(s, 'aaaa');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: decoded-rowid work budget exceeded".*
+
+statement ok
+RESET ngram_max_probe_rowids;
+
+# Three equally dense grams exercise the K>1 peak: current candidates, the
+# next posting list, and intersection output coexist. It fits an 8 MiB query
+# budget but is rejected before decode when that budget falls to 6 MiB.
+statement ok
+SET memory_limit = '32MB';
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('dense', 'common');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index \(<= 250000 candidates, 750000 decoded rowids\)".*
+
+query I
+SELECT count(*) FROM ngram_candidates('dense', 's', 'common');
+----
+250000
+
+statement ok
+SET memory_limit = '24MB';
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('dense', 'common');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: one posting segment exceeds query memory budget".*
+
+statement error
+SELECT count(*) FROM ngram_candidates('dense', 's', 'common');
+----
+ngram_candidates: one posting segment exceeds query memory budget
+
+# The single-segment decode would need roughly 2 MiB of rowid storage. With a
+# 2 MiB query budget (one quarter of this memory_limit) both full-result paths
+# scan, while the candidate-only API reports the governing budget.
+statement ok
+SET memory_limit = '8MB';
+
+query I
+SELECT count(*) FROM ngram_search('dense', 'aaaa');
+----
+250000
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('dense', 'aaaa');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: one posting segment exceeds query memory budget".*
+
+statement error
+SELECT count(*) FROM ngram_candidates('dense', 's', 'aaaa');
+----
+ngram_candidates: one posting segment exceeds query memory budget
+
+query I
+SELECT count(*) FROM dense WHERE contains(s, 'aaaa');
+----
+250000
+
+statement ok
+SET memory_limit = '1GB';
+
+#===----------------------------------------------------------------------===#
+# Expected availability fallback versus fatal malformed-index errors
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE unavailable(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO unavailable VALUES (1, 'a tent'), (2, 'nothing');
+
+statement ok
+PRAGMA create_ngram_index('unavailable', 's');
+
+statement ok
+PREPARE unavailable_query AS SELECT id FROM ngram_search('unavailable', 'tent');
+
+statement ok
+DROP TABLE ngram_main_unavailable.segments_s;
+
+# Missing shadow storage is an expected execution-time availability decline.
+query I
+EXECUTE unavailable_query;
+----
+1
+
+query I
+SELECT id FROM unavailable WHERE contains(s, 'tent');
+----
+1
+
+# An index built on an empty table has HWM=-1. A later matching row is an
+# exhaustive storage scan, not a candidate fetch under the vacuum fence.
+statement ok
+CREATE TABLE empty_tail(id INTEGER, s VARCHAR);
+
+statement ok
+PRAGMA create_ngram_index('empty_tail', 's');
+
+statement ok
+INSERT INTO empty_tail VALUES (1, 'a tent'), (2, 'nothing');
+
+query I
+SELECT id FROM empty_tail WHERE contains(s, 'tent');
+----
+1
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM empty_tail WHERE contains(s, 'tent');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index \(<= 0 candidates, 0 decoded rowids\)".*
+
+# A present HWM is either the empty sentinel -1 or a committed DuckDB rowid.
+statement ok
+CREATE TABLE bad_hwm(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO bad_hwm VALUES (1, 'aaaa'), (2, 'nothing');
+
+statement ok
+PRAGMA create_ngram_index('bad_hwm', 's');
+
+statement ok
+UPDATE ngram_main_bad_hwm.meta_s SET hwm_rowid = -2;
+
+statement error
+SELECT count(*) FROM ngram_search('bad_hwm', 'aaaa');
+----
+hwm_rowid -2
+
+statement error
+SELECT count(*) FROM bad_hwm WHERE contains(s, 'aaaa');
+----
+hwm_rowid -2
+
+statement ok
+UPDATE ngram_main_bad_hwm.meta_s SET hwm_rowid = 36028797018960000;
+
+statement error
+SELECT count(*) FROM ngram_candidates('bad_hwm', 's', 'aaaa');
+----
+hwm_rowid 36028797018960000
+
+# Impossible stats fragmentation is corruption, not a resource fallback.
+statement ok
+CREATE TABLE bad_stats(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO bad_stats VALUES (1, 'aaaa'), (2, 'aaaa');
+
+statement ok
+PRAGMA create_ngram_index('bad_stats', 's');
+
+statement ok
+UPDATE ngram_main_bad_stats.stats_s
+SET row_count = 1000000, segment_count = 1000000
+WHERE gram = 'aaa';
+
+statement error
+SELECT count(*) FROM ngram_search('bad_stats', 'aaaa');
+----
+stats describe more segment rows than exist
+
+statement error
+SELECT count(*) FROM bad_stats WHERE contains(s, 'aaaa');
+----
+stats describe more segment rows than exist
+
+# A forged generation aggregate above the actual partial-segment capacity is
+# also classified before any work/memory decline or blob decode.
+statement ok
+CREATE TABLE bad_capacity(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO bad_capacity VALUES (1, 'aaaa'), (2, 'aaaa');
+
+statement ok
+PRAGMA create_ngram_index('bad_capacity', 's');
+
+statement ok
+UPDATE ngram_main_bad_capacity.stats_s SET row_count = 3 WHERE gram = 'aaa';
+
+statement ok
+UPDATE ngram_main_bad_capacity.segments_s SET rowid_count = 3 WHERE gram = 'aaa';
+
+statement error
+SELECT count(*) FROM ngram_search('bad_capacity', 'aaaa');
+----
+gram posting count exceeds its segment rowid range
+
+statement error
+SELECT count(*) FROM bad_capacity WHERE contains(s, 'aaaa');
+----
+gram posting count exceeds its segment rowid range
+
+# A resource decline in an earlier segment must not hide structural corruption
+# in a later one. NULL rows make this cross-boundary fixture cheap to build.
+statement ok
+CREATE TABLE late_bad AS
+SELECT i::INTEGER AS id,
+	CASE WHEN i IN (0, 1, 1048576) THEN 'aaaa'::VARCHAR ELSE NULL::VARCHAR END AS s
+FROM range(1048578) t(i);
+
+statement ok
+PRAGMA create_ngram_index('late_bad', 's');
+
+# Candidate-only execution owns one segment workspace even when the scheduler
+# has many threads and the manifest spans multiple segments.
+statement ok
+SET threads = 24;
+
+# Both exact adapters consume the two manifest segments concurrently while
+# preserving global rowid order.
+query I
+SELECT id FROM ngram_search('late_bad', 'aaaa');
+----
+0
+1
+1048576
+
+query I
+SELECT id FROM late_bad WHERE contains(s, 'aaaa');
+----
+0
+1
+1048576
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('late_bad', 'aaaa');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index \(<= 3 candidates, 3 decoded rowids\)".*
+
+statement ok
+SET memory_limit = '16MB';
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_candidates('late_bad', 's', 'aaaa');
+----
+analyzed_plan	<REGEX>:.*"Ngram Probe Workers": "1".*
+
+statement ok
+SET threads = 1;
+
+statement ok
+SET memory_limit = '1GB';
+
+statement ok
+UPDATE ngram_main_late_bad.stats_s SET row_count = 5 WHERE gram = 'aaa';
+
+statement ok
+UPDATE ngram_main_late_bad.segments_s SET rowid_count = 3 WHERE gram = 'aaa' AND segment_no = 1;
+
+statement ok
+SET ngram_max_probe_rowids = 1;
+
+statement error
+SELECT count(*) FROM ngram_search('late_bad', 'aaaa');
+----
+gram posting count exceeds its segment rowid range
+
+statement error
+SELECT count(*) FROM late_bad WHERE contains(s, 'aaaa');
+----
+gram posting count exceeds its segment rowid range
+
+statement ok
+RESET ngram_max_probe_rowids;
+
+# Blob/manifest corruption propagates from the shared decoder on both paths.
+statement ok
+CREATE TABLE bad_blob(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO bad_blob VALUES (1, 'aaaa'), (2, 'aaaa');
+
+statement ok
+PRAGMA create_ngram_index('bad_blob', 's');
+
+statement ok
+UPDATE ngram_main_bad_blob.segments_s SET postings = 'bad'::BLOB WHERE gram = 'aaa';
+
+statement error
+SELECT count(*) FROM ngram_search('bad_blob', 'aaaa');
+----
+unknown postings blob format
+
+statement error
+SELECT count(*) FROM bad_blob WHERE contains(s, 'aaaa');
+----
+unknown postings blob format
+
+# At optimizer time, a present object of the wrong type is malformed; only a
+# truly absent meta table is an ordinary rewrite decline.
+statement ok
+CREATE TABLE wrong_meta(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO wrong_meta VALUES (1, 'aaaa');
+
+statement ok
+PRAGMA create_ngram_index('wrong_meta', 's');
+
+statement ok
+DROP TABLE ngram_main_wrong_meta.meta_s;
+
+statement ok
+CREATE VIEW ngram_main_wrong_meta.meta_s AS SELECT 1 AS not_meta;
+
+statement error
+SELECT count(*) FROM wrong_meta WHERE contains(s, 'aaaa');
+----
+wrong catalog type
+
+statement ok
+RESET ngram_auto_accelerate;
+
+statement ok
+RESET ngram_max_candidate_fraction;
+
+statement ok
+RESET threads;
+
+statement ok
+RESET memory_limit;

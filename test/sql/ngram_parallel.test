@@ -314,8 +314,8 @@ SET ngram_auto_accelerate=false
 
 endloop
 
-# a needle whose grams span several segments, probed after a refresh has added
-# a second generation: the per-segment merge path, at several thread counts
+# A needle whose grams span multiple generation blobs within this one segment:
+# the generation-merge path after refresh, at several thread counts.
 statement ok
 SET threads=1
 

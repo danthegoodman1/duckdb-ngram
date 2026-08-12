@@ -89,6 +89,14 @@ void DecodePostings(const char *data, idx_t size, vector<int64_t> &result) {
 	}
 }
 
+idx_t PostingsCount(const char *data, idx_t size) {
+	if (size == 0 || static_cast<uint8_t>(data[0]) != POSTINGS_FORMAT_VERSION) {
+		throw InvalidInputException("ngram: unknown postings blob format");
+	}
+	idx_t pos = 1;
+	return NumericCast<idx_t>(ReadVarint(data, size, pos));
+}
+
 static void EncodePostingsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
 

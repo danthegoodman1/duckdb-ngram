@@ -119,9 +119,10 @@ the unsafe latch.
 
 There is no list of dirty groups or repeated overlay work. One boolean selects
 one scan, so 1, 10, 100, or 1,000 uncertain events have the same query-plan
-shape and bounded state. Proven table/meta identity corruption may instead make
-the explicit APIs raise before returning; the transparent path still leaves or
-chooses a sequential scan.
+shape and bounded state. Proven table/meta identity staleness also makes both
+full-result paths scan; the candidate-only and maintenance APIs raise because
+they have no equivalent exhaustive fallback. A present malformed shadow object
+is corruption and always propagates rather than being treated as unavailable.
 
 Recovery is explicit:
 

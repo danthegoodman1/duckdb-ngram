@@ -160,7 +160,10 @@ and reuse latch. Behavior is fail closed:
 | --- | --- | --- | --- | --- |
 | Guard proves the indexed prefix safe | postings + live recheck + disjoint tail | `NGRAM_INDEX_SCAN` | posting candidates in the prefix | refresh/compact allowed |
 | Guard is missing, replaced, incompatible, unbound with replay, or cannot exclude rowid reuse | one full live-table scan | one sequential-scan fallback | every visible rowid through the recorded mark | refuse; rebuild required |
-| Table/meta identity is provably wrong | raise before returning | sequential-scan fallback | raise | refuse; rebuild required |
+| Valid meta proves the base-table identity/fingerprint stale | one full live-table scan | sequential-scan fallback | raise | refuse; rebuild required |
+
+A malformed, wrong-kind, or colliding meta/shadow object is corruption rather
+than staleness and raises on every path.
 
 `ngram_index_stats.stale_reason` explains the latter two states. The unsafe
 state is intentionally conservative: a later UNIQUE index can reject a commit
@@ -388,14 +391,26 @@ SELECT * FROM ngram_search('table', 'needle', col := 'column');
 SELECT rowid FROM ngram_candidates('table', 'column', 'needle');
 ```
 
-`ngram_search` returns whole rows, exactly and completely. `col` is only needed
-when a table has indexes on more than one column. (The parameter is `col`, not
-`column`, because `column` is a reserved word.)
+`ngram_search` returns rows exactly and completely. DuckDB pushes its parent
+projection into the function: only requested fields plus the indexed `VARCHAR`
+needed for recheck are fetched (`count(*)` fetches just that recheck column).
+`col` is only needed when a table has indexes on more than one column. (The
+parameter is `col`, not `column`, because `column` is a reserved word.)
 
 `ngram_candidates` is the raw, lossy candidate set: a superset of the true
 matches **among indexed rows only**. It does not recheck and it does not cover
 the tail. It exists for inspection and for building your own pipelines; if you
-use it, you own the recheck and the tail scan.
+use it, you own the recheck and the tail scan. Candidates stream one rowid
+segment at a time. If the pre-decode work or memory admission check fails, this
+candidate-only API returns a resource-limit error instead of allocating an
+unbounded posting list.
+
+Both exact query paths inspect posting counts before opening a postings blob.
+They reserve a bounded manifest and per-worker segment workspace against
+DuckDB's memory limit, decode/intersect/fetch one segment at a time, and scan
+instead if the estimated work, memory, or candidate density is too high. The
+probe budget for one query is the smaller of one quarter of `memory_limit` and
+256 MiB; `EXPLAIN ANALYZE` reports the selected mode and decoded rowid count.
 
 ### Transparent acceleration
 
@@ -418,7 +433,7 @@ EXPLAIN SELECT * FROM logs WHERE message LIKE '%reset%';
 -- ... NGRAM_INDEX_SCAN  Table: logs  Ngram Column: message  Ngram Needles: reset
 
 EXPLAIN ANALYZE SELECT * FROM logs WHERE message LIKE '%reset%';
--- ... Ngram Mode: index (1423 candidates)
+-- ... Ngram Mode: index (<= 1423 candidates, 9012 decoded rowids)
 -- or   Ngram Mode: full scan fallback: candidate fraction exceeded
 ```
 
@@ -440,16 +455,20 @@ SELECT ngram_decode_postings(blob);
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `ngram_auto_accelerate` | `false` | Whether plain `LIKE`/`contains`/`ILIKE` may be rewritten to use the index. Rewrites are exhaustive, including guard-driven full-scan fallback. It remains opt-in until the next phase bounds candidate materialization and consolidates the explicit/transparent engines. |
-| `ngram_max_candidate_fraction` | `0.01` | An accelerated scan that would fetch more than this fraction of the table as candidates abandons the index and scans instead. Fetching costs ~250–300 ns per candidate at every scale measured, and a parallel scan of the whole table costs ~0.04 s at 1 GB, ~0.35 s at 10 GB and ~3.5 s at 100 GB — putting the break-even at 1.6 %, 1.3 % and 1.1 % of rows. One percent is that crossover, rounded toward scanning. |
+| `ngram_auto_accelerate` | `false` | Whether plain `LIKE`/`contains`/`ILIKE` may be rewritten to use the index. Rewrites are exhaustive and resource-bounded, including guard-, work-, memory-, and density-driven full-scan fallback. It remains opt-in so enabling the extension does not silently change query plans. |
+| `ngram_max_candidate_fraction` | `0.01` | A full-result ngram query whose candidate upper bound exceeds this fraction of the table scans instead. Fetching costs ~250–300 ns per candidate at every scale measured, and a parallel scan of the whole table costs ~0.04 s at 1 GB, ~0.35 s at 10 GB and ~3.5 s at 100 GB — putting the break-even at 1.6 %, 1.3 % and 1.1 % of rows. One percent is that crossover, rounded toward scanning. The raw candidate API does not use this fetch-vs-scan policy. |
 | `ngram_max_grams_per_query` | `3` | How many of the needle's rarest grams to probe. Each extra gram costs another posting-list decode, and rarest-first means each one is denser than the last, so total query time is a shallow U with a steep right arm: at 100 GB a rare needle costs 0.47 s at 2, 0.64 s at 3 and 1.75 s at 8. Three sits at the floor while still giving a genuine three-way intersection. |
+| `ngram_max_probe_rowids` | `100000000` | Hard upper bound on posting rowids decoded by one query. Exact query paths scan instead when the estimate exceeds it; `ngram_candidates` returns a resource-limit error. |
 | `ngram_build_partitions` | `0` | How many rowid-range partitions `create_ngram_index`, `ngram_refresh` and `ngram_compact` split their packing pass into. Zero sizes it from `memory_limit`, using a sample of the rows being indexed; raise it if a build runs out of memory on unusually long rows, lower it (to 1) to pack in a single pass. The index it produces is identical whatever you set. |
 
-All four are session settings; set them per connection.
+All five are session settings; set them per connection.
 
-**Raising or lowering these never changes your results**, only the time taken.
-Probing fewer grams can only widen the candidate set, and every candidate is
-rechecked; the selectivity gate only chooses between two exhaustive strategies.
+**For exact/full-result queries, raising or lowering these never changes the
+rows returned**, only the strategy and time taken. Probing fewer grams can only
+widen the candidate set, every candidate is rechecked, and resource gates
+choose between two exhaustive strategies. For the deliberately lossy
+`ngram_candidates`, `ngram_max_grams_per_query` can change the (still safe)
+superset and a resource gate changes rows into a pre-decode error.
 
 Worth tuning by hand if your data is unusual:
 

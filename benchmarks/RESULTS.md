@@ -646,6 +646,64 @@ pass.
 
 ---
 
+## Phase 12 bounded-query smoke measurement
+
+This is a resource-bound check, not a replacement for the corpus benchmark
+above. On the same machine (Intel Core Ultra 9 285, 24 cores, 125 GiB RAM), a
+fresh DuckDB v1.5.5 process queried a persisted 2.2-million-row table where
+every value contains the single distinct gram `aaa`. The posting list spans
+three 2²⁰-rowid segments. Each row below is one `/usr/bin/time` observation
+against the Phase 12 working tree based on `3070c16`; page cache was warm and
+`threads=1` so the numbers isolate admission/retained memory rather than claim
+stable latency.
+
+The fixture and every observation are reproducible from the repository root
+without a benchmark framework. Build the current extension, use a fresh
+database, and create the table in a separate invocation from the pragma (the
+pragma is preprocessed before earlier statements in the same `-c` batch):
+
+```sh
+CCACHE_DISABLE=1 cmake --build build/release --config Release --target duckdb ngram_loadable_extension
+phase12_cli="$PWD/build/release/duckdb"
+phase12_ext="$PWD/build/release/extension/ngram/ngram.duckdb_extension"
+phase12_tmp_dir="$(mktemp -d)"
+phase12_db="$phase12_tmp_dir/dense.duckdb"
+"$phase12_cli" -unsigned "$phase12_db" -c "CREATE TABLE dense AS SELECT i::BIGINT id, 'aaaaaaaa'::VARCHAR s FROM range(2200000) t(i);"
+"$phase12_cli" -unsigned "$phase12_db" -c "LOAD '$phase12_ext'; SET threads=1; PRAGMA create_ngram_index('dense', 's'); CHECKPOINT;"
+/usr/bin/time -f 'wall=%e rss_kb=%M' "$phase12_cli" -unsigned "$phase12_db" -c "LOAD '$phase12_ext'; SET threads=1; SET memory_limit='64MB'; SET ngram_max_candidate_fraction=1.0; EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('dense', 'aaaa');"
+/usr/bin/time -f 'wall=%e rss_kb=%M' "$phase12_cli" -unsigned "$phase12_db" -c "LOAD '$phase12_ext'; SET threads=1; SET memory_limit='64MB'; SELECT count(*) FROM ngram_candidates('dense', 's', 'aaaa');"
+/usr/bin/time -f 'wall=%e rss_kb=%M' "$phase12_cli" -unsigned "$phase12_db" -c "LOAD '$phase12_ext'; SET threads=1; SET memory_limit='16MB'; SET ngram_max_candidate_fraction=1.0; EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('dense', 'aaaa');"
+/usr/bin/time -f 'wall=%e rss_kb=%M' "$phase12_cli" -unsigned "$phase12_db" -c "LOAD '$phase12_ext'; SET threads=1; SET memory_limit='64MB'; SET ngram_max_candidate_fraction=1.0; SET ngram_max_probe_rowids=1000000; EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('dense', 'aaaa');"
+/usr/bin/time -f 'wall=%e rss_kb=%M' "$phase12_cli" -unsigned "$phase12_db" -c "LOAD '$phase12_ext'; SET threads=1; SET memory_limit='64MB'; SELECT count(*) FROM dense WHERE contains(s, 'aaaa');"
+/usr/bin/time -f 'wall=%e rss_kb=%M' "$phase12_cli" -unsigned "$phase12_db" -c "LOAD '$phase12_ext'; SET threads=1; SET memory_limit='16MB'; SELECT count(*) FROM ngram_candidates('dense', 's', 'aaaa');"
+```
+
+| Mode | Limits | Result | Wall | Peak RSS | DuckDB peak buffer |
+| --- | --- | ---: | ---: | ---: | ---: |
+| admitted exact `ngram_search` | `memory_limit=64MB`, fraction gate disabled | 2,200,000 | 0.41 s | 39.5 MB | 24.1 MB |
+| admitted streaming `ngram_candidates` | `memory_limit=64MB` | 2,200,000 | 0.04 s | 39.0 MB | — |
+| pre-decode memory fallback | `memory_limit=16MB` | 2,200,000 | 0.08 s | 28.1 MB | 2.88 MB |
+| pre-decode work fallback | `memory_limit=64MB`, `ngram_max_probe_rowids=1000000` | 2,200,000 | 0.09 s | 27.7 MB | — |
+| plain scan reference | `memory_limit=64MB` | 2,200,000 | 0.01 s | 27.1 MB | — |
+
+The 64 MB run reported `index (<= 2200000 candidates, 2200000 decoded
+rowids)`. The 16 MB run reported `full scan fallback: one posting segment
+exceeds query memory budget`; the candidate-only call under the same limit
+raised that reason before decoding. Thus the admitted dense case retains one
+segment workspace, not all 2.2 million rowids. For the 1.09-billion-row
+benchmark shape the same gram would span about 1,042 segments while the
+per-worker rowid workspace remains one segment (about 8.25 MiB including the
+fixed decoder allowance); at the shipped 100-million-rowid work limit it is
+rejected before any blob decode instead.
+
+The executable's resident baseline is included in RSS, so RSS is intentionally
+not equal to the probe reservation. The SQL regression at
+`test/sql/ngram_query_bounds.test` pins the decisions, exact counts, decoded
+work reporting, projection layouts, candidate error, and corruption
+classification under an 8 MB limit.
+
+---
+
 ## 3. Tuning sweeps
 
 Two defaults changed on this evidence; two were confirmed. In every sweep the

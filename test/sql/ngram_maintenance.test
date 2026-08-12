@@ -466,19 +466,19 @@ PRAGMA ngram_index_stats('versioned');
 ----
 format_version
 
-# the transparent path declines instead of failing the user's query
+# Present incompatible meta is malformed index state on every query path.
 statement ok
 SET ngram_auto_accelerate = true;
 
-query I
+statement error
 SELECT count(*) FROM versioned WHERE s LIKE '%tent%';
 ----
-1
+format_version
 
-query II
+statement error
 EXPLAIN SELECT count(*) FROM versioned WHERE s LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+format_version
 
 statement ok
 SET ngram_auto_accelerate = false;

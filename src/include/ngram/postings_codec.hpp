@@ -29,6 +29,10 @@ string EncodePostings(vector<int64_t> &rowids);
 //! malformed or unknown-version blob.
 void DecodePostings(const char *data, idx_t size, vector<int64_t> &result);
 
+//! Read and validate the format byte and encoded row count without decoding
+//! rowids. Callers use this to admit memory before growing a result vector.
+idx_t PostingsCount(const char *data, idx_t size);
+
 void RegisterPostingsCodec(ExtensionLoader &loader);
 void RegisterPackPostings(ExtensionLoader &loader);
 

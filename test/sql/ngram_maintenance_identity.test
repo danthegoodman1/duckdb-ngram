@@ -198,8 +198,9 @@ PRAGMA drop_ngram_index('side.main.docs', 's');
 statement ok
 PRAGMA create_ngram_index('side.main.docs', 's');
 
-# a real re-creation inside the new incarnation is still proof: the rebuild
-# above recorded the new identity, so the oids are comparable again
+# A real re-creation inside the new incarnation is still proof: the rebuild
+# above recorded the new identity, so the oids are comparable again. Exact
+# search scans the replacement rather than trusting stale postings.
 statement ok
 DROP TABLE side.docs;
 
@@ -209,10 +210,10 @@ CREATE TABLE side.docs(id INTEGER, s VARCHAR);
 statement ok
 INSERT INTO side.docs VALUES (1, 'a tent');
 
-statement error
+query I
 SELECT count(*) FROM ngram_search('side.main.docs', 'tent');
 ----
-dropped and re-created
+1
 
 statement ok
 PRAGMA drop_ngram_index('side.main.docs', 's');

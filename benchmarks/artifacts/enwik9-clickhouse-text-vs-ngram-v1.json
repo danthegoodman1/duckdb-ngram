@@ -1,0 +1,401 @@
+{
+  "clickhouse_plans": {
+    "common": "Output: count()\n\nAggregating\n\u2502  Keys:\n\u2502  Aggregates: count()\n\u2502  Skip merging: 0\n\u2514\u2500\u2500ReadFromMergeTree (default.docs)\n      Read type: Default\n      Parts: 5 | Granules: 1336\n      Output: Empty\n      Prewhere filter\n      Prewhere filter column:  text LIKE \\'%the%\\' AND __text_index_text_ngram_like_aadb1b3d2d83a0666f1bc25f1b609f8d\n      Indexes:\n        PrimaryKey\n          Condition: true\n          Parts: 5/5\n          Granules: 1336/1336\n        Skip\n          Name: text_ngram\n          Description: text GRANULARITY 100000000\n          Condition: (mode: All; tokens: [\"the\"])\n          Parts: 5/5\n          Granules: 1336/1336\n        Ranges: 5\n",
+    "moderate": "Output: count()\n\nAggregating\n\u2502  Keys:\n\u2502  Aggregates: count()\n\u2502  Skip merging: 0\n\u2514\u2500\u2500ReadFromMergeTree (default.docs)\n      Read type: Default\n      Parts: 5 | Granules: 1332\n      Output: Empty\n      Prewhere filter\n      Prewhere filter column:  text LIKE \\'%Wikipedia:%\\' AND __text_index_text_ngram_like_b426f680f8992962309821e2b9fef928\n      Indexes:\n        PrimaryKey\n          Condition: true\n          Parts: 5/5\n          Granules: 1336/1336\n        Skip\n          Name: text_ngram\n          Description: text GRANULARITY 100000000\n          Condition: (mode: All; tokens: [\"Wik\", \"dia\", \"edi\", \"ia:\", \"iki\", \"ipe\", \"kip\", \"ped\"])\n          Parts: 5/5\n          Granules: 1332/1336\n        Ranges: 9\n",
+    "rare": "Output: count()\n\nAggregating\n\u2502  Keys:\n\u2502  Aggregates: count()\n\u2502  Skip merging: 0\n\u2514\u2500\u2500ReadFromMergeTree (default.docs)\n      Read type: Default\n      Parts: 1 | Granules: 1\n      Output: Empty\n      Prewhere filter\n      Prewhere filter column:  text LIKE \\'%supercalifragilistic%\\' AND __text_index_text_ngram_like_230415248e9566e1093463071adee8f9\n      Indexes:\n        PrimaryKey\n          Condition: true\n          Parts: 5/5\n          Granules: 1336/1336\n        Skip\n          Name: text_ngram\n          Description: text GRANULARITY 100000000\n          Condition: (mode: All; tokens: [\"agi\", \"ali\", \"cal\", \"erc\", \"fra\", \"gil\", \"ifr\", \"ili\", \"ist\", \"lif\", \"lis\", \"per\", \"rag\", \"rca\", \"sti\", \"sup\", \"tic\", \"upe\"])\n          Parts: 1/5\n          Granules: 1/1336\n        Ranges: 1\n"
+  },
+  "corpus": {
+    "normalized_bytes": 2071799070,
+    "normalized_sha256": "f9e4a271a2350049ba5e6a75d8d32977de65cea995a505d67875a7627b46385c",
+    "rows": 10920423,
+    "text_bytes": 986852975
+  },
+  "created_utc": "2026-08-12T21:19:28Z",
+  "machine": {
+    "architecture": "x86_64",
+    "kernel": "7.0.0-27-generic",
+    "logical_cpus": 24
+  },
+  "queries": [
+    {
+      "count": 1,
+      "engine": "duckdb",
+      "mode": "indexed",
+      "query": "rare",
+      "wall_ns": [
+        9000000,
+        8000000,
+        7000000,
+        9000000,
+        9000000,
+        6000000,
+        6000000,
+        6000000,
+        8000000,
+        6000000
+      ]
+    },
+    {
+      "count": 1,
+      "engine": "duckdb",
+      "mode": "scan",
+      "query": "rare",
+      "wall_ns": [
+        39000000,
+        41000000,
+        40000000,
+        41000000,
+        43000000,
+        41000000,
+        40000000,
+        41000000,
+        40000000,
+        40000000
+      ]
+    },
+    {
+      "count": 26068,
+      "engine": "duckdb",
+      "mode": "indexed",
+      "query": "moderate",
+      "wall_ns": [
+        14000000,
+        15000000,
+        14000000,
+        16000000,
+        14000000,
+        15000000,
+        17000000,
+        15000000,
+        15000000,
+        15000000
+      ]
+    },
+    {
+      "count": 26068,
+      "engine": "duckdb",
+      "mode": "scan",
+      "query": "moderate",
+      "wall_ns": [
+        27000000,
+        27000000,
+        27000000,
+        27000000,
+        27000000,
+        27000000,
+        28000000,
+        28000000,
+        26000000,
+        27000000
+      ]
+    },
+    {
+      "count": 1963067,
+      "engine": "duckdb",
+      "mode": "indexed",
+      "query": "common",
+      "wall_ns": [
+        41000000,
+        42000000,
+        42000000,
+        41000000,
+        42000000,
+        43000000,
+        41000000,
+        42000000,
+        45000000,
+        43000000
+      ]
+    },
+    {
+      "count": 1963067,
+      "engine": "duckdb",
+      "mode": "scan",
+      "query": "common",
+      "wall_ns": [
+        37000000,
+        37000000,
+        36000000,
+        36000000,
+        38000000,
+        37000000,
+        36000000,
+        37000000,
+        37000000,
+        37000000
+      ]
+    },
+    {
+      "count": 1,
+      "engine": "clickhouse",
+      "mode": "indexed",
+      "query": "rare",
+      "wall_ns": [
+        13549941,
+        12689048,
+        13686904,
+        12895186,
+        11447504,
+        12235776,
+        11138999,
+        9792022,
+        10744013,
+        10819543
+      ]
+    },
+    {
+      "count": 1,
+      "engine": "clickhouse",
+      "mode": "scan",
+      "query": "rare",
+      "wall_ns": [
+        40340982,
+        42991089,
+        42774738,
+        40772390,
+        43557711,
+        41107504,
+        39239433,
+        39070790,
+        40091317,
+        40915783
+      ]
+    },
+    {
+      "count": 26068,
+      "engine": "clickhouse",
+      "mode": "indexed",
+      "query": "moderate",
+      "wall_ns": [
+        65863728,
+        65421257,
+        66587802,
+        65007849,
+        64756746,
+        65742362,
+        64716990,
+        65542342,
+        63691987,
+        65135617
+      ]
+    },
+    {
+      "count": 26068,
+      "engine": "clickhouse",
+      "mode": "scan",
+      "query": "moderate",
+      "wall_ns": [
+        41797141,
+        39417616,
+        42694312,
+        43352612,
+        42388141,
+        43153031,
+        43713717,
+        42039119,
+        42507317,
+        40699530
+      ]
+    },
+    {
+      "count": 1963067,
+      "engine": "clickhouse",
+      "mode": "indexed",
+      "query": "common",
+      "wall_ns": [
+        96466730,
+        92291141,
+        92090239,
+        92222141,
+        92059803,
+        93620542,
+        94012051,
+        95201663,
+        96862149,
+        93114937
+      ]
+    },
+    {
+      "count": 1963067,
+      "engine": "clickhouse",
+      "mode": "scan",
+      "query": "common",
+      "wall_ns": [
+        43008837,
+        42897424,
+        44169839,
+        40952002,
+        42672251,
+        40578981,
+        41144664,
+        41411242,
+        40854416,
+        42396269
+      ]
+    }
+  ],
+  "schema": "duckdb-ngram-clickhouse-text-quick-v1",
+  "scope": "same-machine point of reference; 3 fresh load/build reps and 10 warm query samples",
+  "settings": {
+    "clickhouse_index": "text(tokenizer = ngrams(3))",
+    "duckdb_index": "gram=3, case_insensitive=false",
+    "memory_limit": "48GiB",
+    "query_samples": 10,
+    "repetitions": 3,
+    "threads": 24
+  },
+  "stages": [
+    {
+      "base_allocated_bytes": 739262464,
+      "base_bytes": 739258368,
+      "build_ns": 7743675107,
+      "engine": "duckdb",
+      "index_bytes": 1068236800,
+      "indexed_allocated_bytes": 1807499264,
+      "indexed_bytes": 1807495168,
+      "load_ns": 2743698740,
+      "repetition": 1
+    },
+    {
+      "base_allocated_bytes": 663076864,
+      "base_bytes": 577563379,
+      "base_filesystem": {
+        "allocated_bytes": 663076864,
+        "apparent_bytes": 662507941
+      },
+      "base_logical": {
+        "index_compressed_bytes": 0,
+        "index_marks_bytes": 0,
+        "index_uncompressed_bytes": 0,
+        "rows": 10920423,
+        "table_compressed_bytes": 577544309,
+        "table_on_disk_bytes": 577563379,
+        "table_uncompressed_bytes": 1161579743
+      },
+      "build_ns": 17986035362,
+      "engine": "clickhouse",
+      "index_bytes": 1412423529,
+      "indexed_allocated_bytes": 2992230400,
+      "indexed_bytes": 1989986908,
+      "indexed_filesystem": {
+        "allocated_bytes": 2992230400,
+        "apparent_bytes": 2991345920
+      },
+      "indexed_logical": {
+        "index_compressed_bytes": 1412437197,
+        "index_marks_bytes": 504,
+        "index_uncompressed_bytes": 1414540189,
+        "rows": 10920423,
+        "table_compressed_bytes": 577527761,
+        "table_on_disk_bytes": 1989986908,
+        "table_uncompressed_bytes": 1161579743
+      },
+      "load_ns": 1299061524,
+      "repetition": 1
+    },
+    {
+      "base_allocated_bytes": 662028288,
+      "base_bytes": 577563379,
+      "base_filesystem": {
+        "allocated_bytes": 662028288,
+        "apparent_bytes": 661459365
+      },
+      "base_logical": {
+        "index_compressed_bytes": 0,
+        "index_marks_bytes": 0,
+        "index_uncompressed_bytes": 0,
+        "rows": 10920423,
+        "table_compressed_bytes": 577544309,
+        "table_on_disk_bytes": 577563379,
+        "table_uncompressed_bytes": 1161579743
+      },
+      "build_ns": 16711537638,
+      "engine": "clickhouse",
+      "index_bytes": 1413226541,
+      "indexed_allocated_bytes": 2959859712,
+      "indexed_bytes": 1990789920,
+      "indexed_filesystem": {
+        "allocated_bytes": 2959859712,
+        "apparent_bytes": 2958901152
+      },
+      "indexed_logical": {
+        "index_compressed_bytes": 1413218797,
+        "index_marks_bytes": 630,
+        "index_uncompressed_bytes": 1415533000,
+        "rows": 10920423,
+        "table_compressed_bytes": 577548489,
+        "table_on_disk_bytes": 1990789920,
+        "table_uncompressed_bytes": 1161579743
+      },
+      "load_ns": 1282243022,
+      "repetition": 2
+    },
+    {
+      "base_allocated_bytes": 734806016,
+      "base_bytes": 734801920,
+      "build_ns": 7598023764,
+      "engine": "duckdb",
+      "index_bytes": 1068761088,
+      "indexed_allocated_bytes": 1803567104,
+      "indexed_bytes": 1803563008,
+      "load_ns": 1641301310,
+      "repetition": 2
+    },
+    {
+      "base_allocated_bytes": 734543872,
+      "base_bytes": 734539776,
+      "build_ns": 7593519202,
+      "engine": "duckdb",
+      "index_bytes": 1067712512,
+      "indexed_allocated_bytes": 1802256384,
+      "indexed_bytes": 1802252288,
+      "load_ns": 3309011267,
+      "repetition": 3
+    },
+    {
+      "base_allocated_bytes": 667271168,
+      "base_bytes": 577563379,
+      "base_filesystem": {
+        "allocated_bytes": 667271168,
+        "apparent_bytes": 666702245
+      },
+      "base_logical": {
+        "index_compressed_bytes": 0,
+        "index_marks_bytes": 0,
+        "index_uncompressed_bytes": 0,
+        "rows": 10920423,
+        "table_compressed_bytes": 577544309,
+        "table_on_disk_bytes": 577563379,
+        "table_uncompressed_bytes": 1161579743
+      },
+      "build_ns": 16761164024,
+      "engine": "clickhouse",
+      "index_bytes": 1413226541,
+      "indexed_allocated_bytes": 2959867904,
+      "indexed_bytes": 1990789920,
+      "indexed_filesystem": {
+        "allocated_bytes": 2959867904,
+        "apparent_bytes": 2958901152
+      },
+      "indexed_logical": {
+        "index_compressed_bytes": 1413218797,
+        "index_marks_bytes": 630,
+        "index_uncompressed_bytes": 1415533000,
+        "rows": 10920423,
+        "table_compressed_bytes": 577548489,
+        "table_on_disk_bytes": 1990789920,
+        "table_uncompressed_bytes": 1161579743
+      },
+      "load_ns": 1303579758,
+      "repetition": 3
+    }
+  ],
+  "versions": {
+    "clickhouse": "ClickHouse local version 26.7.3.19 (official build).",
+    "clickhouse_sha256": "d2a2611ed56bc6d1544fafe8ece7e888ae2af6e13ea7095993a5105d8c74d4f3",
+    "duckdb": "v1.5.5",
+    "duckdb_sha256": "72da7e2299ea874da3cb2595793a9f3805623180705ad526b347817f41c01d36",
+    "source_commit": "2f4e597a86d0df324863d1cce7ba0b1735c2da40",
+    "tool_sha256": "4c0d4d0c004de84346b77683a579663f3d6d20e6ce6774fb796c7ceedc08b6c4"
+  }
+}

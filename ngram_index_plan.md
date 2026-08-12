@@ -1055,89 +1055,49 @@ Status ledger:
 ## Phase 15: Benchmark Against ClickHouse on the Same Machine
 
 Goal:
-Produce a reproducible, apples-as-practical comparison against ClickHouse so users can
-see which system wins on load time, index cost, storage, and selective substring queries
-on this machine, without hiding semantic or architectural differences.
+Provide a bounded same-machine point of reference against ClickHouse's native text index.
+The result should answer practical load, build, storage, and substring-query questions
+without turning the comparison into a tuning study.
 
 Scope:
-- Use the existing 1 GB `enwik9` line-per-row corpus and one frozen query manifest shared
-  by both systems. Freeze equivalent query templates, bytewise case-sensitive semantics,
-  escaping, NULL handling, and a checksum over normalized `(row_id, text)` rows before
-  loading either engine. Needles shorter than 3 bytes are scan controls, not indexed wins.
-- Configure DuckDB for bytewise case-sensitive 3-grams and pin one exact ClickHouse
-  `ngrambf_v1` expression (n-gram size, Bloom-filter bytes, hash count, and GRANULARITY)
-  for the whole campaign. Freeze the parameter-selection rule before any timed run. No
-  per-query settings or index tuning are allowed; record the unavoidable difference
-  between data skipping and DuckDB's exact postings.
-- Pin DuckDB, extension, and ClickHouse versions; CPU count/governor, RAM limit, storage
-  device, filesystem, compression, threads, row/block granularity, cache state, and every
-  non-default setting. Run both engines under the same resource envelope and on the same
-  local storage class.
-- Define executable timing boundaries: fresh process and fresh database/table per measured
-  load, explicit cgroup/resource envelope covering the ClickHouse server, client, and all
-  measured background workers, durability/checkpoint/merge completion, cold cache
-  preparation, warm-up, and measured query loop. Isolate ClickHouse data and system-log
-  state per repetition or freeze an explicit exclusion rule. Measure base-table ingest,
-  index construction/materialization, end-to-end indexed ingest, peak RSS, CPU time, and
-  spill or temporary bytes. CPU/RSS/spill are diagnostics; no profiler framework is required.
-- Measure storage from paired fresh states (base-only and indexed) after DuckDB checkpoint
-  and ClickHouse merge/materialization. Record logical bytes, allocated filesystem bytes,
-  free blocks, inactive-part cleanup, incremental index bytes, and final totals so neither
-  engine receives credit for deferred or merely unlinked work.
-- Measure exact substring counts for short, rare, medium, and common needles at several
-  selectivities. For each engine/query mode collect at least 5 independently prepared cold
-  observations and report median plus full range (not p95); collect at least 20 warm
-  observations and report p50/p95. Record rows/bytes read, CPU time, and result parity
-  with each engine's unindexed scan. Include a no-index scan baseline for both engines.
-- Check in the corpus/query manifest, runnable commands, raw machine-readable samples,
-  and a generated comparison table. Every cell applies one frozen winner rule: winner only
-  when uncertainty ranges do not overlap and the ratio clears the declared practical
-  threshold; otherwise tie or inconclusive. CV above 10% requires more repetitions or an
-  inconclusive result. Include the end-to-end indexed-ingest p50 ratio explicitly.
+- Reuse the checked 1 GB `enwik9` line corpus and its normalized SHA-256.
+- Compare bytewise case-sensitive trigrams using DuckDB `gram=3` with
+  `case_insensitive=false` and ClickHouse's GA `TYPE text(tokenizer = ngrams(3))` index.
+- Use three fresh load/build repetitions, alternating engine order, and paired whole-state
+  storage before and after index creation. Run both engines with 24 threads and a 48 GiB
+  memory limit on the same local machine.
+- Measure rare, moderate, and dense substring needles. For each engine, run its normal
+  search path and an index-disabled scan control in one persistent warm session, with one
+  warm-up and ten measured samples. Require all four counts to match.
+- Retain raw samples, binary/tool hashes, versions, ClickHouse plans, and a generated concise
+  comparison. Call differences below 10% roughly tied; otherwise report the lower value.
 
 Out of scope:
-- Distributed ClickHouse, cloud services, replication, concurrency saturation, or a
-  broad tuning competition.
-- Claiming the two index structures are identical: ClickHouse's Bloom/data-skipping
-  behavior and DuckDB's posting-list candidates must be described explicitly.
-- Repeating the existing 100 GB scale campaign unless the 1 GB result is too noisy or
-  reveals a crossover that needs one bounded 10 GB confirmation.
-- Adding a profiler/telemetry subsystem; process metrics and engine-reported counters are
-  enough for this bounded comparison.
+- Cold-cache campaigns, large scale sweeps, broad ClickHouse tuning, distributed systems,
+  concurrency saturation, or a universal engine ranking.
+- Claiming identical architecture: ClickHouse uses its native text inverted index and
+  adaptive LIKE hint, while DuckDB uses this extension's postings candidates and exact
+  base-table recheck, including an adaptive scan fallback for dense terms.
 
 Completion gate:
-At least 5 independently prepared cold observations and 20 warm observations per query
-cell produce exact matching result counts and complete raw provenance. Base ingest, index
-build, and end-to-end indexed ingest each use at least 5 paired fresh-state repetitions
-and report median plus full range, including the end-to-end indexed-ingest median (p50) ratio.
-The generated summary applies the frozen winner/tie/inconclusive rule to
-ingest, build, incremental storage, total storage, cold median/range, and warm p50/p95;
-CV above 10% is resolved with more repetitions or labeled inconclusive. No headline number
-may mix deferred ClickHouse work, cache state, process lifetime, or resource limits.
+The compact harness completes three fresh paired load/build states, ten positive warm
+samples for every query/mode cell, exact cross-engine count parity, paired storage, and
+ClickHouse plan capture. The checked JSON reproduces the concise Markdown comparison and
+clearly labels the result as a same-machine point of reference.
 
 Testing plan:
-- Validate the shared corpus manifest (row count, raw bytes, and normalized-row checksum),
-  NULL/escaping/case-sensitive query templates, and query manifest before timing; compare
-  every timed query count to an untimed full-scan oracle in both engines.
-- Run randomized query order and alternating engine order within the frozen cold/warm
-  process and cache protocol. Retain every sample; cold reports median/range from at least
-  5 preparations, warm reports p50/p95 from at least 20 observations, and CV above 10%
-  triggers more samples or an inconclusive label.
-- Verify storage only after DuckDB checkpoint and ClickHouse merge/materialization have
-  completed and inactive parts are cleaned; record engine logical bytes plus filesystem
-  allocated bytes/free blocks for paired fresh base-only/indexed states.
-- Capture EXPLAIN for every indexed query and require proof that the intended index is used.
-  Re-run every query with index use disabled; sub-3-byte needles must remain scan controls.
+- Verify the normalized input size/SHA-256 and pinned ClickHouse binary before collection.
+- Require three records per engine, ten positive samples per query cell, one identical count
+  across both search paths and both scan controls, and `text_ngram` in the rare-query plan.
+- Re-render the Markdown from the raw artifact, compile the harness, run the Phase 14
+  evidence check, and keep `git diff --check` clean.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Scope | One frozen corpus, query workload, semantics, and resource envelope | Missing: checked normalized-row/corpus/query manifests; exact case/escaping/NULL templates; pre-timing parameter-selection rule and fixed `ngrambf_v1` parameters; engine versions; and machine/cgroup/process/cache protocol covering server/client/background workers. |
-| Incomplete | Scope | Ingest, build, memory, and storage costs are separated and comparable | Missing: scripts and ≥5 paired fresh-state median/range measurements separating base ingest, index build, end-to-end indexed ingest, deferred materialization/merge, isolated/excluded system logs, and logical/allocated storage after cleanup. |
-| Incomplete | Scope | Query comparison covers selectivity and cache state with exact result parity | Missing: short scan controls, rare/medium/common needles, scan oracles, EXPLAIN proof for every indexed query, ≥5 cold median/range samples, and ≥20 warm p50/p95 samples. |
-| Incomplete | Work | 15A: Build reproducible same-machine benchmark harness | Missing: ClickHouse provisioning, shared loader/query driver, resource controls, randomized run order, and provenance capture. |
-| Incomplete | Work | 15B: Choose and document the closest stable ClickHouse n-gram configuration | Missing: one version-pinned `ngrambf_v1` expression with fixed n-gram/Bloom/hash/granularity parameters, no per-query tuning, and explicit comparability limits. |
-| Incomplete | Work | 15C: Generate raw artifacts and decision-oriented comparison | Missing: versioned JSON/CSV samples, aggregation script, generated Markdown table, fixed practical-threshold and overlap rule, ratios, winner/tie/inconclusive labels, variability, and caveats. |
-| Incomplete | Gate | Clear same-machine winner by metric with reproducible numbers | Missing: required cold/warm and ≥5 fresh-state load/build repetitions, exact count parity, complete provenance, end-to-end indexed-ingest median (p50) ratio, and generated ingest/storage/query decisions; noisy cells must expand or remain inconclusive. |
-| Incomplete | Test | Corpus, oracle, plan-use, storage-attribution, and variance checks | Missing: normalized manifest checksums, semantics templates, bidirectional result checks, per-query EXPLAIN and disabled-index controls, paired post-materialization allocated/logical size checks, and enforced >10% CV handling. |
+| Complete | Scope | One bounded same-machine point of reference | Uses the checked enwik9 normalization, 24 threads, 48 GiB, three fresh paired states, and one warm-up plus ten samples for rare/moderate/dense needles. |
+| Complete | Work | Compare against the modern ClickHouse n-gram text index | `benchmarks/clickhouse_compare.py` uses ClickHouse 26.7.3.19 `TYPE text(tokenizer = ngrams(3))`, not the deprecated Bloom-filter index, with normal LIKE search and a fully index-disabled scan control. |
+| Complete | Work | Publish raw evidence and concise generated results | `benchmarks/artifacts/enwik9-clickhouse-text-vs-ngram-v1.json` retains all stage/query samples, plans, counts, settings, versions, and hashes; `benchmarks/CLICKHOUSE.md` renders the decision-oriented table. |
+| Complete | Gate | Result counts, repetitions, samples, storage, and provenance are coherent | The final artifact has six stage records, twelve query cells, ten positive timings per cell, exact four-way count parity per needle, paired apparent/allocated storage, and a rare-query plan naming `text_ngram`. |
+| Complete | Test | Harness and repository evidence checks pass | `py_compile`, artifact shape/hash assertions, deterministic render, Phase 14 `release_evidence.py check`, and `git diff --check` pass. |

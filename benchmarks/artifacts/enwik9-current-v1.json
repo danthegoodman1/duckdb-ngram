@@ -1,0 +1,1224 @@
+{
+  "benchmark_id": "enwik9-current-v1",
+  "corpus": {
+    "archive_sha256": "99cdb5ac84392252d3f0912ccedd195bc95bd80cbef3b0cdf2eee4ad9a3b7a51",
+    "canonical_sha256": "a61e824ea0ffd09f1e7bc0e6934785b9d8a4a4172cbba4d97e6dbfc82c354c85",
+    "raw_sha256": "159b85351e5f76e60cbe32e04c677847a9ecba3adc79addab6f4c6c7aa3744bc",
+    "rows": 10920423,
+    "text_bytes": 986852975
+  },
+  "created_utc": "2026-08-12T14:58:21Z",
+  "engine": {
+    "build_commit": "b6a388c8c39f6e51de44a8365e871a517914bc4d",
+    "cli_sha256": "da0577df3345b8129606d6c859ce76dc5ba104a909defb02cd4bda65a1147b0f",
+    "digest_sha256": "1f14f9a55a343905f7ffc31c3fa96bb4e30047cfe90fa1df8895f27d726c3513",
+    "engine_commit": "b6a388c8c39f6e51de44a8365e871a517914bc4d",
+    "extension_version": "b6a388c",
+    "tool_sha256": "eb21b836d3e0724ae3260fe41248d74e148af1a1dbf067efbba929fc6ab85e4c"
+  },
+  "machine": {
+    "architecture": "x86_64",
+    "c_compiler": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+    "c_flags": "-O3 -DNDEBUG",
+    "cmake": "cmake version 4.2.3",
+    "compiler_launcher": "ccache version 4.12.3",
+    "cpu_model": "Intel(R) Core(TM) Ultra 9 285",
+    "cxx_compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+    "cxx_flags": "-O3 -DNDEBUG",
+    "device_model": "Micron MTFDKBA2T0TGD-2BK15ABLT",
+    "filesystem": "/dev/nvme0n1p2 ext4 rw,relatime",
+    "gnu_time": "time (GNU Time) UNKNOWN",
+    "governors": "powersave",
+    "kernel": "7.0.0-27-generic",
+    "linker": "GNU ld (GNU Binutils for Ubuntu) 2.46",
+    "logical_cpus": 24,
+    "make": "GNU Make 4.4.1",
+    "memory_bytes": 134368976896,
+    "mount": "/",
+    "ninja": "1.13.2",
+    "os": "Linux",
+    "python": "3.14.4",
+    "rotational": false
+  },
+  "protocol": {
+    "build_argv": [
+      "make",
+      "GEN=ninja",
+      "release"
+    ],
+    "build_sql": "SET threads=24; SET memory_limit='48GiB'; SET preserve_insertion_order=true;\nPRAGMA create_ngram_index(\n    'docs', 'text', gram=3, case_insensitive=false);\nCHECKPOINT;\n",
+    "build_state_columns": [
+      "column_name",
+      "gram_size",
+      "case_insensitive",
+      "hwm_rowid",
+      "table_max_rowid",
+      "remaining_tail",
+      "distinct_grams",
+      "segments",
+      "fragmented_keys",
+      "generations",
+      "posting_entries",
+      "postings_bytes",
+      "stale_reason",
+      "registry_row"
+    ],
+    "candidate_sql": "SELECT count(*) FROM ngram_candidates('docs', 'text', decode(unhex(<HEX>)));",
+    "corpus_source": {
+      "archive_bytes": 322592222,
+      "archive_member": "enwik9",
+      "archive_url": "https://www.mattmahoney.net/dc/enwik9.zip",
+      "contract": "strict UTF-8; split LF; drop empty; preserve CR/bytes; zero-based IDs",
+      "input_format": "id-tab-utf8hex-lf-v1",
+      "normalization": "enwik9-lines-v1",
+      "page": "https://www.mattmahoney.net/dc/textdata.html",
+      "raw_bytes": 1000000000,
+      "raw_md5": "e206c3450ac99950df65bf70ef61a12d",
+      "raw_sha1": "2996e86fb978f93cca8f566cc56998923e7fe581",
+      "reuse_urls": [
+        "https://dumps.wikimedia.org/legal.html",
+        "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use"
+      ]
+    },
+    "count_sql": "SELECT count(*), min(id), max(id), count(DISTINCT id), sum(octet_length(encode(text))) FROM docs;",
+    "digest_contracts": {
+      "engine": "SHA256(sorted tracked src plus CMakeLists.txt, Makefile, extension_config.cmake, vcpkg.json blob hashes + gitlinks + DuckDB source ID)",
+      "relation": "SHA256(domain enwik9-lines-v1\\0 + per row LE64(id)+LE64(UTF8 bytes)+bytes)"
+    },
+    "engine_pins": {
+      "ci_gitlink": "72e76e99cd7fee45a99739cd118ec2db64e034ec",
+      "duckdb_gitlink": "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa",
+      "duckdb_source": "d8cdaa33",
+      "duckdb_version": "v1.5.5",
+      "engine_commit": "b6a388c8c39f6e51de44a8365e871a517914bc4d"
+    },
+    "explain_sql": "EXPLAIN ANALYZE SELECT count(*) FROM ngram_search('docs', decode(unhex(<HEX>)), col := 'text');",
+    "load_sql": "SET threads=24; SET memory_limit='48GiB'; SET preserve_insertion_order=true;\nCREATE TABLE docs(id BIGINT, text VARCHAR);\nINSERT INTO docs\nSELECT id, decode(unhex(payload))\nFROM read_csv(<INPUT>, delim='\\t', quote='', escape='', header=false,\n              columns={'id':'BIGINT','payload':'VARCHAR'}, new_line='\\n', strict_mode=true);\nCHECKPOINT;\n",
+    "load_state_columns": [
+      "rows",
+      "min_id",
+      "max_id",
+      "distinct_ids",
+      "text_bytes",
+      "relation_sha256"
+    ],
+    "measurement_contracts": {
+      "order_cache": "normalize; load (transport cache possible across pairs); relation identity; build (source cache possible); parity/EXPLAIN; query warmups/samples",
+      "rss": "GNU time -v max RSS KiB*1024 (process high-water)",
+      "stage_wall": "monotonic_ns around subprocess lifecycle",
+      "statistics": "stage n=3: median/min/max, no p95; query n=21: nearest-rank p50/p95/min/max; ratios use raw medians; Decimal ROUND_HALF_UP",
+      "storage": "post-CHECKPOINT DB/WAL st_size and st_blocks*512; paired whole-DB delta",
+      "temp": "peak apparent st_size in DB.tmp sampled every 100ms; may miss brief spill"
+    },
+    "needles": [
+      [
+        "rare",
+        "737570657263616c6966726167696c6973746963"
+      ],
+      [
+        "moderate",
+        "57696b6970656469613a"
+      ],
+      [
+        "dense",
+        "746865"
+      ]
+    ],
+    "oracle_argv": [
+      "build/release/duckdb",
+      "-readonly",
+      "<OUTPUT_MODE>",
+      "<DATABASE>",
+      "-c",
+      "<SQL>"
+    ],
+    "pairs": 3,
+    "parity_columns": [
+      "index_minus_scan",
+      "scan_minus_index"
+    ],
+    "parity_sql": "WITH indexed AS (SELECT id FROM ngram_search('docs', decode(unhex(<HEX>)), col := 'text')), scanned AS (SELECT id FROM docs WHERE contains(text, decode(unhex(<HEX>)))) SELECT (SELECT count(*) FROM (SELECT id FROM indexed EXCEPT ALL SELECT id FROM scanned)) AS index_minus_scan, (SELECT count(*) FROM (SELECT id FROM scanned EXCEPT ALL SELECT id FROM indexed)) AS scan_minus_index;",
+    "process_env": {
+      "CCACHE_DISABLE": "1",
+      "HOME": "<REPO>",
+      "LC_ALL": "C",
+      "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "TZ": "UTC"
+    },
+    "query_argv": [
+      "build/release/duckdb",
+      "-readonly",
+      "<DATABASE>"
+    ],
+    "query_repeats_per_cell": 21,
+    "query_sample_columns": [
+      "query_id",
+      "variant",
+      "wall_ms",
+      "exact_count"
+    ],
+    "query_seed": 20261402,
+    "query_timer_resolution_ms": 1,
+    "query_warmups_per_cell": 1,
+    "raw_units": {
+      "rss_bytes": "bytes",
+      "sampled_peak_temp_bytes": "bytes",
+      "wall_ns": "ns"
+    },
+    "registry_columns": [
+      "database_name",
+      "kind",
+      "index_ref",
+      "schema_name",
+      "table_name",
+      "column_name",
+      "storage_schema",
+      "format_version",
+      "status",
+      "reason"
+    ],
+    "relation_argv": [
+      "build/release/duckdb",
+      "-readonly",
+      "<DATABASE>"
+    ],
+    "scan_sql": "SELECT count(*) FROM docs WHERE contains(text, decode(unhex(<HEX>)));",
+    "search_sql": "SELECT count(*) FROM ngram_search('docs', decode(unhex(<HEX>)), col := 'text');",
+    "settings": {
+      "auto_accelerate": false,
+      "build_partitions": 0,
+      "candidate_fraction": "0.01",
+      "case_insensitive": false,
+      "gram_size": 3,
+      "max_grams": 3,
+      "memory_limit": "48.0 GiB",
+      "preserve_insertion_order": true,
+      "probe_rowids": 100000000,
+      "threads": 24
+    },
+    "stats_columns": [
+      "column_name",
+      "gram_size",
+      "case_insensitive",
+      "hwm_rowid",
+      "table_max_rowid",
+      "remaining_tail",
+      "distinct_grams",
+      "segments",
+      "fragmented_keys",
+      "generations",
+      "posting_entries",
+      "postings_bytes",
+      "stale_reason"
+    ],
+    "storage_columns": [
+      "db_apparent_bytes",
+      "db_allocated_bytes",
+      "wal_apparent_bytes",
+      "wal_allocated_bytes"
+    ],
+    "temp_poll_ms": 100,
+    "timed_stage_argv": [
+      "/usr/bin/time",
+      "-v",
+      "-o",
+      "<RSS_FILE>",
+      "build/release/duckdb",
+      "<DATABASE>"
+    ]
+  },
+  "query_cells": [
+    {
+      "candidates": 12,
+      "explain": "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\u2502\n\u2502\u2502    Query Profiling Information    \u2502\u2502\n\u2502\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n EXPLAIN ANALYZE SELECT count(*) FROM ngram_search('docs', decode(unhex('737570657263616c6966726167696c6973746963')), col := 'text');\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\u2502\n\u2502\u2502              Total Time: 0.0126s             \u2502\u2502\n\u2502\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502           QUERY           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502      EXPLAIN_ANALYZE      \u2502\n\u2502    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500   \u2502\n\u2502                           \u2502\n\u2502           0 rows          \u2502\n\u2502           0.00s           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502    UNGROUPED_AGGREGATE    \u2502\n\u2502    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500   \u2502\n\u2502        Aggregates:        \u2502\n\u2502        count_star()       \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502           1 row           \u2502\n\u2502           0.00s           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502         TABLE_SCAN        \u2502\n\u2502    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500   \u2502\n\u2502        Table: docs        \u2502\n\u2502     Ngram Column: text    \u2502\n\u2502                           \u2502\n\u2502       Ngram Needle:       \u2502\n\u2502    supercalifragilistic   \u2502\n\u2502                           \u2502\n\u2502   Ngram Storage Columns:  \u2502\n\u2502            text           \u2502\n\u2502                           \u2502\n\u2502        Ngram Mode:        \u2502\n\u2502 index (<= 1112 candidates,\u2502\n\u2502    21267 decoded rowids)  \u2502\n\u2502                           \u2502\n\u2502 Ngram Stats Rows Scanned: \u2502\n\u2502           245760          \u2502\n\u2502                           \u2502\n\u2502Ngram Stats Chunks Scanned:\u2502\n\u2502            120            \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502           1 row           \u2502\n\u2502           0.03s           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n",
+      "matches": 1,
+      "mode": "index",
+      "needle_hex": "737570657263616c6966726167696c6973746963",
+      "parity": [
+        0,
+        0
+      ],
+      "query_id": "rare"
+    },
+    {
+      "candidates": 26381,
+      "explain": "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\u2502\n\u2502\u2502    Query Profiling Information    \u2502\u2502\n\u2502\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n EXPLAIN ANALYZE SELECT count(*) FROM ngram_search('docs', decode(unhex('57696b6970656469613a')), col := 'text');\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\u2502\n\u2502\u2502              Total Time: 0.0566s             \u2502\u2502\n\u2502\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502           QUERY           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502      EXPLAIN_ANALYZE      \u2502\n\u2502    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500   \u2502\n\u2502                           \u2502\n\u2502           0 rows          \u2502\n\u2502           0.00s           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502    UNGROUPED_AGGREGATE    \u2502\n\u2502    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500   \u2502\n\u2502        Aggregates:        \u2502\n\u2502        count_star()       \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502           1 row           \u2502\n\u2502           0.00s           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502         TABLE_SCAN        \u2502\n\u2502    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500   \u2502\n\u2502        Table: docs        \u2502\n\u2502     Ngram Column: text    \u2502\n\u2502                           \u2502\n\u2502       Ngram Needle:       \u2502\n\u2502         Wikipedia:        \u2502\n\u2502                           \u2502\n\u2502   Ngram Storage Columns:  \u2502\n\u2502            text           \u2502\n\u2502                           \u2502\n\u2502        Ngram Mode:        \u2502\n\u2502 index (<= 32108 candidates\u2502\n\u2502  , 115014 decoded rowids) \u2502\n\u2502                           \u2502\n\u2502 Ngram Stats Rows Scanned: \u2502\n\u2502           245760          \u2502\n\u2502                           \u2502\n\u2502Ngram Stats Chunks Scanned:\u2502\n\u2502            120            \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502        26,068 rows        \u2502\n\u2502           0.46s           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n",
+      "matches": 26068,
+      "mode": "index",
+      "needle_hex": "57696b6970656469613a",
+      "parity": [
+        0,
+        0
+      ],
+      "query_id": "moderate"
+    },
+    {
+      "candidates": 1963067,
+      "explain": "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\u2502\n\u2502\u2502    Query Profiling Information    \u2502\u2502\n\u2502\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n EXPLAIN ANALYZE SELECT count(*) FROM ngram_search('docs', decode(unhex('746865')), col := 'text');\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\u2502\n\u2502\u2502              Total Time: 0.117s              \u2502\u2502\n\u2502\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502           QUERY           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502      EXPLAIN_ANALYZE      \u2502\n\u2502    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500   \u2502\n\u2502                           \u2502\n\u2502           0 rows          \u2502\n\u2502           0.00s           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502    UNGROUPED_AGGREGATE    \u2502\n\u2502    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500   \u2502\n\u2502        Aggregates:        \u2502\n\u2502        count_star()       \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502           1 row           \u2502\n\u2502           0.00s           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502         TABLE_SCAN        \u2502\n\u2502    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500   \u2502\n\u2502        Table: docs        \u2502\n\u2502     Ngram Column: text    \u2502\n\u2502     Ngram Needle: the     \u2502\n\u2502                           \u2502\n\u2502   Ngram Storage Columns:  \u2502\n\u2502            text           \u2502\n\u2502                           \u2502\n\u2502        Ngram Mode:        \u2502\n\u2502    full scan fallback:    \u2502\n\u2502     candidate fraction    \u2502\n\u2502          exceeded         \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502                           \u2502\n\u2502       1,963,067 rows      \u2502\n\u2502           2.48s           \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n",
+      "matches": 1963067,
+      "mode": "full-scan-fallback",
+      "needle_hex": "746865",
+      "parity": [
+        0,
+        0
+      ],
+      "query_id": "dense"
+    }
+  ],
+  "query_samples": [
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      16,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      31,
+      26068
+    ],
+    [
+      "dense",
+      "ngram_search",
+      45,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "rare",
+      "scan",
+      44,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      43,
+      1963067
+    ],
+    [
+      "rare",
+      "scan",
+      44,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      6,
+      1
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      17,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      30,
+      26068
+    ],
+    [
+      "dense",
+      "ngram_search",
+      45,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "moderate",
+      "scan",
+      29,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "dense",
+      "scan",
+      38,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      43,
+      1963067
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      29,
+      26068
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      45,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      42,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "moderate",
+      "scan",
+      29,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      14,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      29,
+      26068
+    ],
+    [
+      "dense",
+      "ngram_search",
+      44,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "moderate",
+      "scan",
+      30,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "dense",
+      "scan",
+      38,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      43,
+      1963067
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      47,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "moderate",
+      "scan",
+      28,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      27,
+      26068
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "dense",
+      "ngram_search",
+      45,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      38,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      44,
+      1963067
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      27,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      29,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "dense",
+      "scan",
+      40,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      45,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      44,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      37,
+      1963067
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      44,
+      1
+    ],
+    [
+      "dense",
+      "ngram_search",
+      46,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      38,
+      1963067
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      28,
+      26068
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      43,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      43,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      44,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      38,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      44,
+      1963067
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      30,
+      26068
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      45,
+      1
+    ],
+    [
+      "moderate",
+      "scan",
+      28,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      28,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      14,
+      26068
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      44,
+      1
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      44,
+      1963067
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "moderate",
+      "scan",
+      29,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      14,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      30,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      29,
+      26068
+    ],
+    [
+      "dense",
+      "ngram_search",
+      45,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      44,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      38,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      45,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      39,
+      1963067
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ],
+    [
+      "dense",
+      "scan",
+      38,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      45,
+      1963067
+    ],
+    [
+      "dense",
+      "scan",
+      40,
+      1963067
+    ],
+    [
+      "dense",
+      "ngram_search",
+      45,
+      1963067
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      44,
+      1
+    ],
+    [
+      "moderate",
+      "scan",
+      29,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      14,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      15,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      28,
+      26068
+    ],
+    [
+      "moderate",
+      "scan",
+      28,
+      26068
+    ],
+    [
+      "moderate",
+      "ngram_search",
+      16,
+      26068
+    ],
+    [
+      "rare",
+      "ngram_search",
+      7,
+      1
+    ],
+    [
+      "rare",
+      "scan",
+      43,
+      1
+    ]
+  ],
+  "runs": [
+    {
+      "pair": 1,
+      "rss_bytes": 2966904832,
+      "sampled_peak_temp_bytes": 0,
+      "stage": "load",
+      "state": [
+        10920423,
+        0,
+        10920422,
+        10920423,
+        986852975,
+        "a61e824ea0ffd09f1e7bc0e6934785b9d8a4a4172cbba4d97e6dbfc82c354c85"
+      ],
+      "storage": [
+        724316160,
+        724320256,
+        0,
+        0
+      ],
+      "wall_ns": 2400581329
+    },
+    {
+      "pair": 1,
+      "rss_bytes": 12618412032,
+      "sampled_peak_temp_bytes": 0,
+      "stage": "build",
+      "state": [
+        "text",
+        3,
+        false,
+        10920422,
+        10920422,
+        0,
+        801851,
+        2715056,
+        0,
+        1,
+        720789909,
+        888864572,
+        null,
+        [
+          "run-1",
+          "registered",
+          "27e4e8ed-cacd-43f9-b92f-f8dac8b9d1cc",
+          "main",
+          "docs",
+          "text",
+          "__ngram_idx_27e4e8ed_cacd_43f9_b92f_f8dac8b9d1cc",
+          3,
+          "READY",
+          null
+        ]
+      ],
+      "storage": [
+        1792552960,
+        1792557056,
+        0,
+        0
+      ],
+      "wall_ns": 7941310958
+    },
+    {
+      "pair": 2,
+      "rss_bytes": 2755608576,
+      "sampled_peak_temp_bytes": 0,
+      "stage": "load",
+      "state": [
+        10920423,
+        0,
+        10920422,
+        10920423,
+        986852975,
+        "a61e824ea0ffd09f1e7bc0e6934785b9d8a4a4172cbba4d97e6dbfc82c354c85"
+      ],
+      "storage": [
+        732966912,
+        732971008,
+        0,
+        0
+      ],
+      "wall_ns": 2298655327
+    },
+    {
+      "pair": 2,
+      "rss_bytes": 12863098880,
+      "sampled_peak_temp_bytes": 0,
+      "stage": "build",
+      "state": [
+        "text",
+        3,
+        false,
+        10920422,
+        10920422,
+        0,
+        801851,
+        2715056,
+        0,
+        1,
+        720789909,
+        888864572,
+        null,
+        [
+          "run-2",
+          "registered",
+          "58ddb253-f5f1-41c4-b1ce-eb1ddc187fad",
+          "main",
+          "docs",
+          "text",
+          "__ngram_idx_58ddb253_f5f1_41c4_b1ce_eb1ddc187fad",
+          3,
+          "READY",
+          null
+        ]
+      ],
+      "storage": [
+        1801990144,
+        1801994240,
+        0,
+        0
+      ],
+      "wall_ns": 7833639736
+    },
+    {
+      "pair": 3,
+      "rss_bytes": 2881470464,
+      "sampled_peak_temp_bytes": 0,
+      "stage": "load",
+      "state": [
+        10920423,
+        0,
+        10920422,
+        10920423,
+        986852975,
+        "a61e824ea0ffd09f1e7bc0e6934785b9d8a4a4172cbba4d97e6dbfc82c354c85"
+      ],
+      "storage": [
+        732704768,
+        732708864,
+        0,
+        0
+      ],
+      "wall_ns": 2170099424
+    },
+    {
+      "pair": 3,
+      "rss_bytes": 12585984000,
+      "sampled_peak_temp_bytes": 0,
+      "stage": "build",
+      "state": [
+        "text",
+        3,
+        false,
+        10920422,
+        10920422,
+        0,
+        801851,
+        2715056,
+        0,
+        1,
+        720789909,
+        888864572,
+        null,
+        [
+          "run-3",
+          "registered",
+          "ce467ea3-7736-471b-827c-a874f073c5a2",
+          "main",
+          "docs",
+          "text",
+          "__ngram_idx_ce467ea3_7736_471b_827c_a874f073c5a2",
+          3,
+          "READY",
+          null
+        ]
+      ],
+      "storage": [
+        1801728000,
+        1801732096,
+        0,
+        0
+      ],
+      "wall_ns": 7780555341
+    }
+  ],
+  "schema": 1,
+  "settings": {
+    "auto_accelerate": false,
+    "build_partitions": 0,
+    "candidate_fraction": "0.01",
+    "case_insensitive": false,
+    "gram_size": 3,
+    "max_grams": 3,
+    "memory_limit": "48.0 GiB",
+    "preserve_insertion_order": true,
+    "probe_rowids": 100000000,
+    "threads": 24
+  }
+}

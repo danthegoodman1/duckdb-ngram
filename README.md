@@ -286,12 +286,8 @@ postings.
 
 **On an append-only table, compaction has little to merge.** Each refresh
 generation lands in a fresh range of rowids, so successive generations barely
-share `(gram, segment_no)` keys. Measured on a 92 GiB corpus built in 100
-refreshes, compaction merged 4 % of segment rows and shrank the encoded
-postings by 0.05 %. Older builds also needed compaction to fold a stats history
-from 78.8 million rows to 4.5 million; refresh now performs a validated,
-byte-sorted stats-only fold itself, so stats history is no longer a reason to
-compact.
+share `(gram, segment_no)` keys. Refresh performs a validated, byte-sorted
+stats-only fold itself, so stats history is no longer a reason to compact.
 
 An older format-3 index remains exact, but its unsorted stats may prune poorly
 until the next refresh (including a no-op refresh), compact, or rebuild rewrites
@@ -304,10 +300,9 @@ and budget disk for the rewrite (the file grows before it shrinks). Reserve
 `purge = true` for after a large `DELETE`: it rewrites every key and makes one
 base-table pass per selected indexed column, retaining relevant live rowids at
 or below the indexed HWM.
-That one-BIGINT temp and the selected encoded source are spillable, but can use
-substantial temporary disk alongside the packed output and MVCC-old rows. On a
-9 GiB index with nothing to purge, the historical implementation measured 413
-s against 9 s for the plain variant.
+That one-BIGINT temp and the selected encoded source are spillable, and can use
+substantial temporary disk alongside the packed output and MVCC-old rows.
+Purging is consequently much more expensive than a merge-only compaction.
 
 Corruption checks follow the data each path reads: a probe validates requested
 gram stats, merge-only compact validates selected segment rows, purge validates
@@ -514,8 +509,8 @@ SELECT ngram_decode_postings(blob);
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `ngram_auto_accelerate` | `false` | Whether plain `LIKE`/`contains`/`ILIKE` may be rewritten to use the index. Rewrites are exhaustive and resource-bounded, including guard-, work-, memory-, and density-driven full-scan fallback. It remains opt-in so enabling the extension does not silently change query plans. |
-| `ngram_max_candidate_fraction` | `0.01` | A full-result ngram query whose candidate upper bound exceeds this fraction of the table scans instead. Fetching costs ~250–300 ns per candidate at every scale measured, and a parallel scan of the whole table costs ~0.04 s at 1 GB, ~0.35 s at 10 GB and ~3.5 s at 100 GB — putting the break-even at 1.6 %, 1.3 % and 1.1 % of rows. One percent is that crossover, rounded toward scanning. The raw candidate API does not use this fetch-vs-scan policy. |
-| `ngram_max_grams_per_query` | `3` | How many of the needle's rarest grams to probe. Each extra gram costs another posting-list decode, and rarest-first means each one is denser than the last, so total query time is a shallow U with a steep right arm: at 100 GB a rare needle costs 0.47 s at 2, 0.64 s at 3 and 1.75 s at 8. Three sits at the floor while still giving a genuine three-way intersection. |
+| `ngram_max_candidate_fraction` | `0.01` | A full-result ngram query whose candidate upper bound exceeds this fraction of the table scans instead. This bounds fetch-and-recheck work after the probe; the raw candidate API does not use this fetch-vs-scan policy. |
+| `ngram_max_grams_per_query` | `3` | How many of the needle's rarest grams to probe. Each extra gram costs another posting-list decode but can narrow the candidate set; the default balances those costs for natural-language text. |
 | `ngram_max_probe_rowids` | `100000000` | Hard upper bound on posting rowids decoded by one query. Exact query paths scan instead when the estimate exceeds it; `ngram_candidates` returns a resource-limit error. |
 | `ngram_build_partitions` | `0` | How many rowid-range partitions `create_ngram_index`, `ngram_refresh` and `ngram_compact` split their packing pass into. Build and refresh size zero from `memory_limit` using a sample; compact instead uses fine segment-aligned ranges without sampling the base. Because range width is rounded down to whole segments, auto can emit up to nearly twice its 4096-range request. An explicit value overrides either policy. Raise it if a build runs out of memory on unusually long rows, or lower it to pack in fewer passes. The index it produces is identical whatever you set. |
 
@@ -534,88 +529,72 @@ Worth tuning by hand if your data is unusual:
   intersection needs more grams to bite. Try `ngram_max_grams_per_query = 4`
   or higher, and consider `gram = 4` at build time.
 - **Long, highly distinctive needles** get nothing from extra grams — the first
-  two already isolate the answer. `ngram_max_grams_per_query = 2` is measurably
-  the fastest setting on natural-language corpora.
+  few may already isolate the answer, so raising the probe budget can add work
+  without narrowing the candidate set.
 - **A table that is mostly matches** for your typical needle should not use the
   index at all; that is what the gate is for, and lowering
   `ngram_max_candidate_fraction` further makes it give up sooner.
-
-The measured rationale for the defaults, and the sweeps behind them, are in
-[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
 ---
 
 ## Performance expectations
 
-Substring search is not an interactive-latency feature. The design target is
-*hundreds of milliseconds for a selective needle over a very large corpus*, and
-the shape of the result is: **the rarer the needle, the bigger the win.**
+<!-- BEGIN NGRAM RELEASE EVIDENCE -->
+### Checked bounded benchmark
 
-| Needle class | Share of rows matched | What to expect |
-| --- | --- | --- |
-| Rare | ≲ 1 in 10⁵ | The win, and it widens as the corpus grows: measured 3.9× at 1 GB, 18× at 10 GB, 33× at 100 GB against a 24-thread scan of the same query. |
-| Moderate | ~0.1 % – 1 % | A modest win — 2.7× at 10 GB, 2.8× at 100 GB — and roughly a wash on a small table where a parallel scan is already fast. |
-| Dense | ≳ 1 % | No win. Fetching millions of individual rows costs more than streaming the column. This is what `ngram_max_candidate_fraction` exists to prevent; leave it on. |
+Same-machine observations; queries are warm-cache for a **non-default case-sensitive trigram
+index** over nonempty line-per-row `enwik9`. These are not cold-cache, large-scale, or
+shipped-default claims. Raw evidence: [`benchmarks/artifacts/enwik9-current-v1.json`](benchmarks/artifacts/enwik9-current-v1.json).
 
-Concretely, on a 92 GiB corpus of English text (24 cores) a rare-needle query
-is **0.13 s warm / 0.71 s cold** at the default settings, against 4.2 s / 16.4 s
-for the parallel scan it replaces.
+- Engine commit: `b6a388c8c39f`; build commit: `b6a388c8c39f`; DuckDB v1.5.5 / source d8cdaa33;
+  static-extension release CLI.
+- Corpus: 10,920,423 rows, 0.919 GiB of UTF-8 text; three fresh load/build pairs.
+- Timed load—fresh CLI and absent DB through create, hex decode, insert, CHECKPOINT—was
+  2.299 s median (2.170–2.401 s). Timed index build—fresh CLI through create-index and
+  CHECKPOINT—was 7.834 s median (7.781–7.941 s), 120.14 MiB/s of source text.
+- Paired whole-database size increase: 0.996 GiB apparent, 0.996 GiB allocated
+  (median); 1.083× source bytes. This whole-DB effect includes allocator/checkpoint effects.
+- Build-process max RSS: 11.752 GiB median. Sampled peak temp apparent file bytes: 0.000 GiB
+  median, polled every 100 ms; zero means none observed, not proof that no brief spill occurred.
+  Acquisition, normalization, relation/stat checks, EXPLAIN, and parity are untimed. Loads may
+  read cached transport pages; builds follow relation identity and may read cached source pages.
 
-**The fetch is the floor, and it tracks how many candidates you have.** A query
-costs the index probe plus the fetch-and-recheck of whatever it finds. The
-probe reads and decodes one posting list per gram, and those lists grow with
-the corpus however selective your needle is — but the probe runs across all
-your cores, so at 100 GB a needle matching 88 rows in 1.09 billion spends
-0.045 s of its 0.125 s there. The rest is fetching rows.
-`ngram_max_grams_per_query` is still the lever over the probe: the same query
-costs more at 8 grams than at the default 3.
+| needle class | ngram_search mode | exact matches | candidates | ngram_search p50 / p95 / range | scan p50 / p95 / range | scan ÷ search p50 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| rare | index | 1 | 12 | 7 / 7 ms / 6–7 ms | 43 / 45 ms / 42–47 ms | 6.14× |
+| moderate | index | 26,068 | 26,381 | 15 / 16 ms / 14–17 ms | 29 / 30 ms / 27–31 ms | 1.93× |
+| dense | full-scan-fallback | 1,963,067 | 1,963,067 | 44 / 45 ms / 43–46 ms | 39 / 40 ms / 37–40 ms | 0.89× |
 
-Two consequences worth planning around:
+The timed campaign adds one warmup per variant after untimed parity/EXPLAIN executions, then
+twenty-one measured observations per variant using a fixed-seed interleaving on one connection.
+Timer resolution is one millisecond. Exact ngram_search and scan counts match every observation;
+candidate counts are a separately measured lossy superset.
+Validate checked source/tool provenance, then check generated documentation:
 
-- **A needle's cost tracks its densest gram, not its rarity.** `Ethelred` is
-  eight characters, so all of its grams get probed including `the`. A longer
-  needle is cheaper, because rarest-first has dense grams it can drop.
-- **Cold costs about 6× warm once the index outgrows RAM**, and that is where
-  large deployments live: at 100 GB, 0.71 s cold against 0.13 s warm, of which
-  0.30 s is reading posting blobs and ~0.46 s is a thousand random row reads.
-  Both are disk. Size RAM against the working set, not the corpus.
+```sh
+python3 benchmarks/release_evidence.py validate --artifact benchmarks/artifacts/enwik9-current-v1.json
+python3 benchmarks/release_evidence.py check
+```
 
-Full numbers — build cost, index size, p50/p95 per class warm and cold at 1,
-10 and 100 GB, plus a terabyte extrapolation with its assumptions — are in
-[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md), together with the scripts
-that produce them.
+Optional `--binary` validation requires the exact CLI/SHA recorded for the artifact build commit;
+an arbitrary later rebuild is rejected.
 
-**Index size.** Expect the index to be roughly the size of the text it indexes
-(0.7×–1.1× on disk for real text; more for high-entropy content like hex dumps).
-This is normal for an exhaustive trigram index — PostgreSQL's `pg_trgm` GIN
-indexes land in the same range. Plan disk accordingly: a 100 GB corpus wants
-about 100 GB for the index.
+For a fresh independent run:
 
-**Build cost.** The build runs through DuckDB's own engine, so it is parallel.
-Expect roughly **1 GB of text per second** on 24 cores: measured 8.1 s to index
-a 0.92 GiB corpus and 38.7 s for a 4.6 GiB one, with no spill at any memory
-limit that completes. Refresh costs the same per byte of *tail*, independently
-of how large the index already is.
+```sh
+python3 benchmarks/release_evidence.py collect --output-root ./release-evidence-work \
+  --artifact ./release-evidence-rerun.json
+python3 benchmarks/release_evidence.py validate --artifact ./release-evidence-rerun.json \
+  --binary build/release/duckdb
+```
 
-Memory is the constraint worth planning for, not disk. The packing pass holds
-one partition of the pair stream in memory at a time and sizes those partitions
-against `memory_limit`, so a tighter limit means more partitions rather than
-spilling — 9.2 GiB of text indexes in one statement in 78 s at
-`memory_limit='48GB'` and 137 s at `'8GB'`. The floor is structural: postings
-are bucketed into 2²⁰-rowid segments and a segment cannot be split, so about
-100 MB of text is the smallest unit the packer can group, and a limit under
-~6 GB will fail with an out-of-memory error rather than run slowly. That
-failure is clean — the pragma's transaction rolls back and leaves no index
-behind. `SET ngram_build_partitions = N` overrides the sizing if you need to.
-
-Building incrementally — load a chunk, `create_ngram_index`, then append and
-`ngram_refresh` per chunk — is still the recommendation for a very large
-corpus, because a single statement has to hold its whole packed output before
-writing it. `benchmarks/bench_build.py` does exactly this and is the reference
-for how. When the rows arrive faster than that, or already have,
-`PRAGMA ngram_refresh('t', max_rows)` in a loop bounds the same work from the
-other end: each call is its own transaction and its own bounded packing pass,
-so peak memory and crash exposure both follow the bound rather than the tail.
+`enwik9` is the first billion bytes of the March 2006 English Wikipedia dump, obtained from
+[Matt Mahoney's canonical benchmark page](https://www.mattmahoney.net/dc/textdata.html). It is attributable to English Wikipedia
+contributors. SHA-256 values were freshly observed; raw MD5/SHA-1 are published there. The
+corpus is not redistributed or licensed by this repository's MIT license; do not assume
+public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.org/legal.html) and the
+[Wikimedia Terms of Use](https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use).
+<!-- END NGRAM RELEASE EVIDENCE -->
 
 ---
 

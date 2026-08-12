@@ -1,0 +1,165 @@
+name: Linux Correctness
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-correctness:
+    name: Release suite and fixed-seed checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CCACHE_DISABLE: 1
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      PYTHONHASHSEED: 0
+    steps:
+      - name: Check out pinned sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify submodule pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-tree HEAD duckdb | awk '{print $3}')" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          test "$(git ls-tree HEAD extension-ci-tools | awk '{print $3}')" = 72e76e99cd7fee45a99739cd118ec2db64e034ec
+          test "$(git -C duckdb rev-parse HEAD)" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          test "$(git -C extension-ci-tools rev-parse HEAD)" = 72e76e99cd7fee45a99739cd118ec2db64e034ec
+          submodule_status="$(git submodule status --recursive)"
+          printf '%s\n' "$submodule_status"
+          ! printf '%s\n' "$submodule_status" | grep -Eq '^[-+U]'
+
+      - name: Build release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e build/release
+          timeout 1200s make release GEN=ninja
+
+      - name: Run release and evidence gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 600s make test_release
+          timeout 600s python3 benchmarks/release_evidence.py check
+          timeout 600s python3 benchmarks/release_evidence.py test --binary build/release/duckdb
+
+      - name: Run fixed-seed differential and churn gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 600s python3 scripts/differential_search.py --duckdb build/release/duckdb --trials 2 --rows 5000 --seed 20261314
+          timeout 600s python3 scripts/differential_search.py --duckdb build/release/duckdb --transparent --trials 2 --rows 5000 --seed 20261315
+          timeout 600s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 20 --rows 4000 --seed 20261316
+          timeout 600s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 20 --rows 4000 --seed 20261318 --no-stale-expected
+
+  debug-sanitizers:
+    name: Focused ASAN, UBSAN, and race checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CCACHE_DISABLE: 1
+      CMAKE_BUILD_PARALLEL_LEVEL: 1
+      PYTHONHASHSEED: 0
+    steps:
+      - name: Check out pinned sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify submodule pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-tree HEAD duckdb | awk '{print $3}')" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          test "$(git ls-tree HEAD extension-ci-tools | awk '{print $3}')" = 72e76e99cd7fee45a99739cd118ec2db64e034ec
+          test "$(git -C duckdb rev-parse HEAD)" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          test "$(git -C extension-ci-tools rev-parse HEAD)" = 72e76e99cd7fee45a99739cd118ec2db64e034ec
+          submodule_status="$(git submodule status --recursive)"
+          printf '%s\n' "$submodule_status"
+          ! printf '%s\n' "$submodule_status" | grep -Eq '^[-+U]'
+
+      - name: Build focused sanitizer targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e build/ci-debug
+          timeout 600s cmake -G Ninja \
+            -DEXTENSION_STATIC_BUILD=1 \
+            -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
+            -DUNITTEST_ROOT_DIRECTORY="$GITHUB_WORKSPACE" \
+            -DENABLE_UNITTEST_CPP_TESTS=FALSE \
+            -DENABLE_EXTENSION_AUTOLOADING=OFF \
+            -DENABLE_EXTENSION_AUTOINSTALL=OFF \
+            -DBUILD_SHELL=OFF \
+            -DSKIP_EXTENSIONS=parquet \
+            -DREDUCE_SYMBOLS=ON \
+            -DENABLE_SANITIZER=ON \
+            -DENABLE_UBSAN=ON \
+            -DDUCKDB_DEBUG_LINK_JOBS=1 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -S duckdb -B build/ci-debug
+          timeout 1800s cmake --build build/ci-debug --target unittest ngram_checkpoint_gap_test
+
+      - name: Verify sanitizer configuration and linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+          for expected in \
+            CMAKE_BUILD_TYPE:STRING=Debug \
+            ENABLE_SANITIZER:BOOL=ON \
+            ENABLE_UBSAN:BOOL=ON \
+            EXTENSION_STATIC_BUILD:BOOL=1 \
+            BUILD_SHELL:BOOL=OFF \
+            REDUCE_SYMBOLS:UNINITIALIZED=ON \
+            SKIP_EXTENSIONS:UNINITIALIZED=parquet \
+            DUCKDB_DEBUG_LINK_JOBS:STRING=1
+          do
+            grep -Fx -- "$expected" build/ci-debug/CMakeCache.txt
+          done
+          ninja -C build/ci-debug -t commands test/unittest | tail -n 1 > "$RUNNER_TEMP/unittest-link.txt"
+          ninja -C build/ci-debug -t commands extension/ngram/ngram_checkpoint_gap_test | tail -n 1 > "$RUNNER_TEMP/race-link.txt"
+          for required in -O0 -DDEBUG -g1 -gsplit-dwarf -fsanitize=address -fsanitize=undefined -fno-sanitize-recover=all extension/ngram/libngram_extension.a
+          do
+            grep -F -- "$required" "$RUNNER_TEMP/unittest-link.txt" >/dev/null
+            grep -F -- "$required" "$RUNNER_TEMP/race-link.txt" >/dev/null
+          done
+          test -x build/ci-debug/test/unittest
+          test -x build/ci-debug/extension/ngram/ngram_checkpoint_gap_test
+          unit_ldd="$(ldd build/ci-debug/test/unittest)"
+          race_ldd="$(ldd build/ci-debug/extension/ngram/ngram_checkpoint_gap_test)"
+          printf '%s\n' "$unit_ldd" | grep -F 'libasan.so' >/dev/null
+          printf '%s\n' "$unit_ldd" | grep -F 'libubsan.so' >/dev/null
+          printf '%s\n' "$race_ldd" | grep -F 'libasan.so' >/dev/null
+          printf '%s\n' "$race_ldd" | grep -F 'libubsan.so' >/dev/null
+          race_duckdb="$(printf '%s\n' "$race_ldd" | awk '$1 == "libduckdb.so" {print $3}')"
+          test "$race_duckdb" = "$GITHUB_WORKSPACE/build/ci-debug/src/libduckdb.so"
+
+      - name: Run focused sanitizer and race gates
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          timeout 600s build/ci-debug/test/unittest 'test/sql/ngram_lifecycle.test'
+          timeout 600s build/ci-debug/test/unittest 'test/sql/ngram_search.test'
+          timeout 600s build/ci-debug/test/unittest 'test/sql/ngram_rewrite.test'
+          timeout 600s build/ci-debug/test/unittest 'test/sql/ngram_maintenance.test'
+          race_db="$RUNNER_TEMP/ngram-checkpoint-gap.db"
+          test ! -e "$race_db"
+          timeout 600s build/ci-debug/extension/ngram/ngram_checkpoint_gap_test "$race_db"

@@ -98,7 +98,9 @@ The point of this test is that a **stock** DuckDB binary — not this repo's
 build, which links the extension statically — can install the distributable
 artifact from a repository and use it.
 
-Revalidated on 2026-08-11 with the current format-3 artifact and the official
+Revalidated on 2026-08-12 with the current format-3/opaque-registry artifact
+(SHA-256 `b60144ff2c4fe56459b565b7c3479a494a4add40228c071277197eb7873eb1e8`)
+and the official
 v1.5.5 CLI (`d8cdaa33fd`, SHA-256
 `3d33b1df037cb049155c393778df7853fafb23e9d49d7c9cacdde4dd67155788`).
 The run used a fresh temporary `extension_directory`, `FORCE INSTALL ngram`
@@ -106,7 +108,12 @@ from the repository layout below, and `LOAD ngram`; it reported
 `install_mode=REPOSITORY`. A guard-backed create survived reopen; a covered
 `UPDATE` plus tail `INSERT` then produced exactly two search matches, and a
 second loaded reopen ran public drop with two base rows and zero remaining
-meta tables. A separate checkpoint/reopen pass reported `stale_reason=NULL`.
+opaque storage. A separate checkpoint/reopen pass reported `READY`; an
+extension-free process read the guarded base and rejected DML, then a loaded
+reopen found both the indexed row and a new tail row. Dropping a second base
+reported its allocation `ORPHAN`; catalog-qualified ID drop removed its row
+and opaque schema. Dropping the live ID removed its guard/storage without
+touching two base rows, after which table rename succeeded.
 
 ```sh
 # 1. a stock v1.5.5 CLI
@@ -181,7 +188,11 @@ busy-spin in the unknown-index binder, so do not attempt extension-free DML:
 
 ```
 SELECT count(*) FROM logs;                              -- 5000
-SELECT count(*) FROM ngram_main_logs.segments_message;  -- 1124
+SET VARIABLE logs_index_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                                  FROM __ngram.registry
+                                  WHERE table_name = 'logs' AND column_name = 'message');
+SELECT count(*) FROM query('SELECT * FROM ' || quote_ident(getvariable('logs_index_schema')) || '.segments');
+                                                           -- 1124
 INSERT INTO logs VALUES (99999, 'requires the extension');
 -- Binder Error mentioning unknown index type NGRAM_ROWID_GUARD
 SELECT * FROM ngram_search('logs','reset');

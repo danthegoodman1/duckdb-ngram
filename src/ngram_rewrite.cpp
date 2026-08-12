@@ -118,7 +118,7 @@ struct NgramScanBindData : public TableFunctionData {
 	string catalog_name;
 	string schema_name;
 	string table_name;
-	string shadow_schema;
+	IndexLocation location;
 	//! The indexed column the needles probe.
 	string column_name;
 	//! Literals to probe; every pushed filter is still applied in full to each
@@ -132,7 +132,7 @@ struct NgramScanBindData : public TableFunctionData {
 	optional_ptr<TableCatalogEntry> table;
 
 	ShadowTarget Target() const {
-		return ShadowTarget {schema_name, table_name, column_name, shadow_schema};
+		return ShadowTarget {schema_name, table_name, column_name, location.shadow_schema};
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
@@ -354,14 +354,16 @@ static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet
 //! when the index cannot be used, in which case the caller falls back to a
 //! full scan — the index is an optimization, never a correctness dependency.
 static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind, NgramScanGlobalState &state) {
-	auto meta = TryResolveExistingTable(context, bind.catalog_name, bind.shadow_schema, MetaTableName(bind.column_name),
-	                                    "ngram index meta table");
-	if (!meta) {
+	auto &base = ResolveExistingTable(context, bind.catalog_name, bind.schema_name, bind.table_name, "table");
+	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name,
+	                       ShadowSchemaName(bind.schema_name, bind.table_name), &base};
+	if (!IndexLocationAvailable(context, target, bind.location)) {
 		state.fallback_reason = "index unavailable";
 		return false;
 	}
-	auto info = ReadMeta(context, *state.core.tx, *meta, bind.Target());
-	auto &base = ResolveExistingTable(context, bind.catalog_name, bind.schema_name, bind.table_name, "table");
+	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
+	                                bind.location.MetaTable(), "ngram index meta table");
+	auto info = ReadMeta(context, *state.core.tx, meta, bind.Target());
 	if (!CertainStaleReason(info, ComputeTableFingerprint(context, base)).empty()) {
 		// a plain LIKE must return every matching row: a proven-stale index
 		// cannot, so the scan degrades instead of erroring the user's query
@@ -393,9 +395,10 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 			}
 		}
 	}
-	auto segments = TryResolveExistingTable(context, bind.catalog_name, bind.shadow_schema,
-	                                        SegmentsTableName(bind.column_name), "ngram index segments table");
-	auto stats = TryResolveExistingTable(context, bind.catalog_name, bind.shadow_schema, StatsTableName(bind.column_name),
+	auto segments = TryResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
+	                                        bind.location.SegmentsTable(), "ngram index segments table");
+	auto stats = TryResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
+	                                     bind.location.StatsTable(),
 	                                     "ngram index stats table");
 	if (!segments || !stats) {
 		state.fallback_reason = "index unavailable";
@@ -610,7 +613,9 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 	auto &columns = table->GetColumns();
 	auto catalog_name = table->ParentCatalog().GetName();
 	auto schema_name = table->ParentSchema().name;
-	auto shadow_schema = ShadowSchemaName(schema_name, table->name);
+	ResolvedTarget resolved {catalog_name, schema_name, table->name, string(), ShadowSchemaName(schema_name, table->name),
+	                         table};
+	auto locations = ExistingIndexes(context, resolved, true);
 
 	auto &transaction = DuckTransaction::Get(context, table->ParentCatalog());
 	for (auto &entry : get.table_filters.filters) {
@@ -626,20 +631,27 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		if (needles.empty()) {
 			continue;
 		}
-		// an ngram index on this column? (EntryLookupInfo holds a reference,
-		// so the name must outlive the lookup)
-		auto meta_name = MetaTableName(column.Name());
-		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, meta_name);
-		auto meta = Catalog::GetEntry(context, catalog_name, shadow_schema, lookup, OnEntryNotFound::RETURN_NULL);
-		if (!meta) {
+		IndexLocation location;
+		bool found = false;
+		for (auto &candidate : locations) {
+			if (StringUtil::CIEquals(candidate.column_name, column.Name())) {
+				if (found) {
+					return;
+				}
+				location = candidate;
+				found = true;
+			}
+		}
+		if (!found) {
 			continue;
 		}
-		if (meta->type != CatalogType::TABLE_ENTRY || !meta->Cast<TableCatalogEntry>().IsDuckTable()) {
-			throw InvalidInputException("ngram: index meta object %s.%s has the wrong catalog type; the index is malformed",
-			                            shadow_schema, meta_name);
+		if (!IndexLocationAvailable(context, resolved, location)) {
+			continue;
 		}
-		ShadowTarget target {schema_name, table->name, column.Name(), shadow_schema};
-		auto info = ReadMeta(context, transaction, meta->Cast<DuckTableEntry>(), target);
+		auto &meta = ResolveExistingTable(context, catalog_name, location.shadow_schema, location.MetaTable(),
+		                                  "ngram index meta table");
+		ShadowTarget target {schema_name, table->name, column.Name(), location.shadow_schema};
+		auto info = ReadMeta(context, transaction, meta, target);
 		if (!CertainStaleReason(info, ComputeTableFingerprint(context, *table)).empty()) {
 			// the index provably no longer describes this table; a LIKE must
 			// still return every matching row, so leave the seq scan in place
@@ -658,7 +670,7 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		bind->catalog_name = catalog_name;
 		bind->schema_name = schema_name;
 		bind->table_name = table->name;
-		bind->shadow_schema = shadow_schema;
+		bind->location = location;
 		bind->column_name = column.Name();
 		bind->needles = std::move(usable);
 		for (auto &col : columns.Logical()) {

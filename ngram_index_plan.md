@@ -1001,9 +1001,11 @@ Scope:
 - Add a durable ordinary-table registry with opaque index IDs. Derive new shadow object
   names from the ID rather than user identifiers, and expose list/status/drop-by-ID APIs
   that continue to work when the base table or indexed column is absent.
-- Define rename and orphan handling: case-insensitive lookup, safe rebind when current
-  catalog identity proves it is the same table, rebuild when identity cannot be proven,
-  and legacy-index discovery/drop during the format transition.
+- Define rename and orphan handling around DuckDB v1.5.5's host constraints. A physical
+  rowid-guard dependency refuses table and column rename (including case-only rename),
+  while moving a table between schemas and renaming a schema are not implemented by the
+  host. The supported workflow is drop by stable ID, rename, then rebuild; retain
+  case-insensitive API lookup and legacy-index discovery/drop during the format transition.
 - Emit versioned machine-readable benchmark artifacts containing commit, DuckDB version,
   corpus manifest, settings, hardware, commands, and raw samples. Generate README and
   `benchmarks/RESULTS.md` tables/claims from those artifacts with consistency checks.
@@ -1017,15 +1019,19 @@ Out of scope:
   dedicated hardware and verified cheaply in CI.
 
 Completion gate:
-Every shadow allocation can be listed and dropped by stable ID even after base drop or
-rename, and no pair of valid identifiers can alias a new index's storage. Every numeric
+Every structurally valid allocation created by the extension can be listed and dropped by
+stable ID even after base drop; stable-ID drop removes the host dependency before rename,
+after which the index can be rebuilt. No pair of valid identifiers can alias a new index's
+storage. Identifiable malformed, dangling, or foreign-object corruption is listed with a
+reason but drop fails closed with manual-repair guidance. Every numeric
 README/RESULTS claim is traceable to a checked artifact for the current implementation,
 and the correctness CI lane is green in addition to the platform matrix.
 
 Testing plan:
-- Cover schema/table/column rename (including case-only), drop, drop-and-recreate,
+- Cover host refusal of table/column rename (including case-only), the distinct
+  not-implemented schema-move/schema-rename errors, drop, drop-and-recreate,
   `CREATE OR REPLACE`, detach/attach, reopen, colliding legacy names, two indexed columns,
-  orphan listing/drop, safe/unsafe rebind, and upgrade/rebuild behavior.
+  orphan listing/drop, case-varied API spelling, and drop-by-ID/rename/rebuild behavior.
 - Add golden tests for artifact schema and generated Markdown; deliberately mix commits,
   defaults, or old/new benchmark stages and require generation to fail.
 - Run the new CI commands locally and pin their exact bounded seed/corpus budgets; retain a
@@ -1036,14 +1042,14 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Incomplete | Scope | Opaque registry makes indexes discoverable and removable independently of the base name | Current `ShadowSchemaName` is name-derived and explicitly non-injective (`src/index_pragmas.cpp:29,113-116`); `drop_ngram_index` first resolves the live base target (`src/index_pragmas.cpp:427-433`). Dropping the base therefore leaves storage the public drop API cannot address. Missing: registry and ID-based APIs. |
-| Incomplete | Scope | Rename, orphan, legacy, and rebind semantics are explicit and safe | Missing: lifecycle state machine and transition support. Review reproductions found case-only rename breaking search/drop and base drop leaving an orphan; exact owner comparisons are also tracked in Phase 10. |
+| Incomplete | Scope | Rename, orphan, and legacy semantics are explicit and safe | DuckDB v1.5.5 refuses table/column rename while the physical rowid guard exists (including case-only rename); table schema moves and schema rename are host-not-implemented. Missing: orphan lifecycle support, the documented drop-by-ID/rename/rebuild workflow, and legacy transition tests. |
 | Incomplete | Scope | Performance documentation is generated from versioned artifacts | No machine-readable result artifacts are checked in. README says 0.92 GiB indexed in 8.1 s is “roughly 1 GB ... per second” (`README.md:530-533`, actually about 0.11 GiB/s), while the TB table still extrapolates the superseded 208–211 s/replica build and old compaction/probe figures (`benchmarks/RESULTS.md:878-907`). |
 | Incomplete | Scope | CI has a dedicated correctness/sanitizer/race lane | `.github/workflows/MainDistributionPipeline.yml` invokes distribution and format/tidy workflows only. Missing: Linux DEBUG/ASAN/UBSan and focused differential/churn/race jobs. |
-| Incomplete | Work | 14A: Introduce opaque index identity, registry, and lifecycle APIs | Missing: registry schema, ID generation, lookup/list/drop/rebind APIs, ordinary-table persistence proof, and legacy discovery/rebuild policy. |
+| Incomplete | Work | 14A: Introduce opaque index identity, registry, and lifecycle APIs | Missing: registry schema, ID generation, catalog-qualified lookup/list/drop-by-ID APIs, ordinary-table persistence proof, host rename-refusal contract, and legacy discovery/rebuild policy. A public rebind API is deliberately omitted because v1.5.5 exposes no reachable safe rename transition while the guard exists. |
 | Incomplete | Work | 14B: Add benchmark artifact schema and documentation generator | Missing: raw artifact format, provenance validation, checked generator output, and correction of the inconsistent throughput/TB claims. |
 | Incomplete | Work | 14C: Add bounded correctness CI and release-evidence checks | Missing: workflow/jobs, runtime budgets, artifact-consistency check, deterministic race target, and fixed seeds. |
 | Incomplete | Gate | Lifecycle is leak-free/collision-free and release claims are traceable | Missing: orphan/rename matrix, storage-collision proof, generated-doc diff check, artifact provenance, and green correctness CI. |
-| Incomplete | Test | Registry and lifecycle transition matrix | Missing: rename/drop/recreate/detach/reopen/collision/rebind/legacy tests across one and multiple indexed columns. |
+| Incomplete | Test | Registry and lifecycle transition matrix | Missing: host rename refusal, drop/recreate/detach/reopen/collision/orphan/legacy and drop-by-ID/rename/rebuild tests across one and multiple indexed columns. |
 | Incomplete | Test | Artifact-generation and correctness-CI gates | Missing: golden/stale-artifact tests, local CI transcript, DEBUG/ASAN/UBSan result, deterministic maintenance race, and bounded differential/churn evidence. |
 
 ## Phase 15: Benchmark Against ClickHouse on the Same Machine

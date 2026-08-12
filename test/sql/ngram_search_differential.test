@@ -28,6 +28,10 @@ FROM range(5000) t(i);
 statement ok
 PRAGMA create_ngram_index('corpus', 's');
 
+statement ok
+SET VARIABLE corpus_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                              FROM __ngram.registry WHERE table_name='corpus' AND column_name='s');
+
 # grow a tail past the high-water mark with the same generator
 statement ok
 INSERT INTO corpus
@@ -78,7 +82,8 @@ foreach needle tent TENT öft cent d41d8 ffff city
 query I
 SELECT count(*) FROM (
 	SELECT rowid FROM corpus
-	WHERE contains(lower(s), lower('${needle}')) AND rowid <= (SELECT hwm_rowid FROM ngram_main_corpus.meta_s)
+	WHERE contains(lower(s), lower('${needle}')) AND rowid <=
+	      (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('corpus_schema') || '.meta'))
 	EXCEPT SELECT rowid FROM ngram_candidates('corpus', 's', '${needle}'));
 ----
 0

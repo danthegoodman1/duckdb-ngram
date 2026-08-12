@@ -12,35 +12,45 @@ CREATE TABLE big AS SELECT i::VARCHAR AS s FROM range(1150000) t(i);
 statement ok
 PRAGMA create_ngram_index('big', 's');
 
+statement ok
+SET VARIABLE big_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                           FROM __ngram.registry WHERE table_name = 'big');
+
 # the index is exactly the brute-force extraction (both directions)
 query I
 SELECT count(*) FROM (
-	(SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_big.segments_s
+	(SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	 FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments')
 	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM big WHERE s IS NOT NULL)
 	UNION ALL
 	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM big WHERE s IS NOT NULL
-	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_big.segments_s)
+	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	 FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments'))
 );
 ----
 0
 
 # rowids 0..1149999 span exactly two rowid >> 20 buckets
 query I
-SELECT count(DISTINCT segment_no) FROM ngram_main_big.segments_s;
+SELECT count(DISTINCT segment_no) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments');
 ----
 2
 
 # stats totals agree with the segments table
 query I
-SELECT (SELECT sum(row_count) FROM ngram_main_big.stats_s) = (SELECT sum(rowid_count) FROM ngram_main_big.segments_s)
-   AND (SELECT count(*) FROM ngram_main_big.stats_s) = (SELECT count(DISTINCT gram) FROM ngram_main_big.segments_s)
-   AND (SELECT sum(segment_count) FROM ngram_main_big.stats_s) = (SELECT count(*) FROM ngram_main_big.segments_s);
+SELECT (SELECT sum(row_count) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.stats')) =
+       (SELECT sum(rowid_count) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments'))
+   AND (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.stats')) =
+       (SELECT count(DISTINCT gram) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments'))
+   AND (SELECT sum(segment_count) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.stats')) =
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments'));
 ----
 true
 
 # hwm covers all rows
 query I
-SELECT hwm_rowid = (SELECT max(rowid) FROM big) FROM ngram_main_big.meta_s;
+SELECT hwm_rowid = (SELECT max(rowid) FROM big)
+FROM query('SELECT * FROM ' || getvariable('big_schema') || '.meta');
 ----
 true
 
@@ -69,7 +79,11 @@ statement ok
 PRAGMA create_ngram_index('parts', 's');
 
 statement ok
-CREATE TABLE snapshot_one AS SELECT * FROM ngram_main_parts.segments_s;
+SET VARIABLE parts_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name = 'parts');
+
+statement ok
+CREATE TABLE snapshot_one AS FROM query('SELECT * FROM ' || getvariable('parts_schema') || '.segments');
 
 query I
 SELECT count(DISTINCT segment_no) FROM snapshot_one;
@@ -86,7 +100,11 @@ statement ok
 PRAGMA create_ngram_index('parts', 's');
 
 statement ok
-CREATE TABLE snapshot_three AS SELECT * FROM ngram_main_parts.segments_s;
+SET VARIABLE parts_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name = 'parts');
+
+statement ok
+CREATE TABLE snapshot_three AS FROM query('SELECT * FROM ' || getvariable('parts_schema') || '.segments');
 
 # every column of every segment row, both directions: three partitions produce
 # the same bytes as one
@@ -108,7 +126,8 @@ true
 # is what lets the probe's `gram = ?` filter skip row groups by zone map
 query I
 SELECT count(*) FROM (
-	SELECT gram < lag(gram) OVER (ORDER BY rowid) AS out_of_order FROM ngram_main_parts.segments_s)
+	SELECT gram < lag(gram) OVER (ORDER BY rowid) AS out_of_order
+	FROM query('SELECT gram, rowid FROM ' || getvariable('parts_schema') || '.segments'))
 WHERE out_of_order;
 ----
 0
@@ -122,11 +141,17 @@ SET threads = 1;
 statement ok
 PRAGMA create_ngram_index('parts', 's');
 
+statement ok
+SET VARIABLE parts_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name = 'parts');
+
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM snapshot_one EXCEPT SELECT * FROM ngram_main_parts.segments_s)
+	(SELECT * FROM snapshot_one EXCEPT
+	 SELECT * FROM query('SELECT * FROM ' || getvariable('parts_schema') || '.segments'))
 	UNION ALL
-	(SELECT * FROM ngram_main_parts.segments_s EXCEPT SELECT * FROM snapshot_one));
+	(SELECT * FROM query('SELECT * FROM ' || getvariable('parts_schema') || '.segments')
+	 EXCEPT SELECT * FROM snapshot_one));
 ----
 0
 
@@ -181,13 +206,18 @@ CREATE TABLE mem_corpus AS SELECT md5(i::VARCHAR) AS s FROM range(200000) t(i);
 statement ok
 PRAGMA create_ngram_index('mem_corpus', 's');
 
+statement ok
+SET VARIABLE mem_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                           FROM __ngram.registry WHERE table_name = 'mem_corpus');
+
 query I
-SELECT count(*) > 0 FROM ngram_main_mem_corpus.stats_s;
+SELECT count(*) > 0 FROM query('SELECT * FROM ' || getvariable('mem_schema') || '.stats');
 ----
 true
 
 query I
-SELECT hwm_rowid = (SELECT max(rowid) FROM mem_corpus) FROM ngram_main_mem_corpus.meta_s;
+SELECT hwm_rowid = (SELECT max(rowid) FROM mem_corpus)
+FROM query('SELECT * FROM ' || getvariable('mem_schema') || '.meta');
 ----
 true
 

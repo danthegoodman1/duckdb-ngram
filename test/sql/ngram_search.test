@@ -26,6 +26,10 @@ INSERT INTO docs(id, s) VALUES
 statement ok
 PRAGMA create_ngram_index('docs', 's');
 
+statement ok
+SET VARIABLE docs_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                            FROM __ngram.registry WHERE table_name='docs' AND column_name='s');
+
 # rows inserted after the build sit past the high-water mark and must still be found
 statement ok
 INSERT INTO docs(id, s) VALUES (12, 'tail tent row'), (13, 'tail noise'), (14, NULL);
@@ -53,7 +57,8 @@ SELECT rowid FROM ngram_candidates('docs', 's', 'tent') ORDER BY rowid;
 # candidates are a superset of the true matches among indexed rows
 query I
 SELECT count(*) FROM (
-	SELECT rowid FROM docs WHERE contains(lower(s), 'tent') AND rowid <= (SELECT hwm_rowid FROM ngram_main_docs.meta_s)
+	SELECT rowid FROM docs WHERE contains(lower(s), 'tent') AND rowid <=
+	      (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.meta'))
 	EXCEPT SELECT rowid FROM ngram_candidates('docs', 's', 'tent'));
 ----
 0
@@ -349,14 +354,18 @@ INSERT INTO cased VALUES (1, 'a tent'), (2, 'nothing');
 statement ok
 PRAGMA create_ngram_index('cased', 'S');
 
+statement ok
+SET VARIABLE cased_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name='cased' AND column_name='s');
+
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE schema_name = 'ngram_main_cased' AND table_name IN ('meta_s', 'segments_s', 'stats_s');
+WHERE schema_name = getvariable('cased_schema') AND table_name IN ('meta', 'segments', 'stats');
 ----
 3
 
 query I
-SELECT column_name FROM ngram_main_cased.meta_s;
+SELECT column_name FROM query('SELECT * FROM ' || getvariable('cased_schema') || '.meta');
 ----
 s
 
@@ -384,7 +393,7 @@ statement ok
 PRAGMA drop_ngram_index('CASED', 's');
 
 query I
-SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_cased';
+SELECT count(*) FROM __ngram.registry WHERE table_name='cased' AND column_name='s';
 ----
 0
 
@@ -398,8 +407,13 @@ INSERT INTO cased2 VALUES (1, 'another tent');
 statement ok
 PRAGMA create_ngram_index('cased2', 's');
 
+statement ok
+SET VARIABLE cased2_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                              FROM __ngram.registry WHERE table_name='cased2' AND column_name='S');
+
 query I
-SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_cased2' AND table_name = 'meta_S';
+SELECT count(*) FROM duckdb_tables()
+WHERE schema_name = getvariable('cased2_schema') AND table_name = 'meta';
 ----
 1
 
@@ -411,8 +425,7 @@ SELECT id FROM ngram_search('cased2', 'tent', col := 's');
 statement ok
 PRAGMA drop_ngram_index('cased2', 'S');
 
-# shadow-schema collision: searching through a colliding schema name must not
-# answer from the foreign index
+# UUID allocation removes the old non-injective shadow-schema collision.
 statement ok
 CREATE SCHEMA a;
 
@@ -437,14 +450,22 @@ PRAGMA create_ngram_index('a.b_c', 's');
 statement error
 SELECT * FROM ngram_search('a_b.c', 'tent');
 ----
-shadow schema collision
+no ngram index exists
 
 statement error
 SELECT * FROM ngram_candidates('a_b.c', 's', 'tent');
 ----
-shadow schema collision
+no ngram index exists
+
+statement ok
+PRAGMA create_ngram_index('a_b.c', 's');
 
 query I
 SELECT s FROM ngram_search('a.b_c', 'tent');
 ----
 hello tent
+
+query I
+SELECT s FROM ngram_search('a_b.c', 'tent');
+----
+goodbye tent

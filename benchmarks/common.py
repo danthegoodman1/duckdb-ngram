@@ -132,6 +132,31 @@ def run_sql(db_path, sql, timeout=None, settings=None, check=True, meter=True):
     return result
 
 
+_NGRAM_STORAGE_SCHEMA = re.compile(
+    r"^__ngram_idx_[0-9a-f]{8}_[0-9a-f]{4}_4[0-9a-f]{3}_[89ab][0-9a-f]{3}_[0-9a-f]{12}$"
+)
+_NGRAM_INDEX_REF = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+
+
+def ngram_storage_schema(db_path, table, column, settings=None):
+    """Resolve one validated primary-catalog allocation through the public observer."""
+    catalog = run_sql(db_path, "SELECT current_database();", settings=settings, meter=False).scalar()
+    rows = [
+        row for row in run_sql(db_path, "PRAGMA ngram_indexes;", settings=settings, meter=False).rows
+        if len(row) == 10 and row[0] == catalog and row[1] == "registered" and row[3] == "main"
+        and row[4] == table and row[5] == column and row[7] == "3" and row[8] == "READY"
+    ]
+    if len(rows) != 1:
+        raise RuntimeError("expected one canonical registered ngram allocation for main.%s.%s" % (table, column))
+    index_ref, storage = rows[0][2], rows[0][6]
+    if (not _NGRAM_INDEX_REF.fullmatch(index_ref) or not _NGRAM_STORAGE_SCHEMA.fullmatch(storage)
+            or storage != "__ngram_idx_" + index_ref.replace("-", "_")):
+        raise RuntimeError("public ngram allocation identity is not canonical for main.%s.%s" % (table, column))
+    return storage
+
+
 def drop_caches():
     """Evict the page cache so the next read is a real disk read.
 

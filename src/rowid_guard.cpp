@@ -698,8 +698,9 @@ static void RowIdGuardValidateFunction(DataChunk &args, ExpressionState &state, 
 		                                   "ngram index base table");
 		auto column_name = args.GetValue(3, row).ToString();
 		auto shadow_schema = args.GetValue(4, row).ToString();
+		auto meta_name = args.GetValue(9, row).ToString();
 		auto &meta_table = ResolveExistingTable(context, args.GetValue(0, row).ToString(), shadow_schema,
-		                                          MetaTableName(column_name), "ngram index meta table");
+		                                          meta_name, "ngram index meta table");
 		auto expected_format = args.GetValue(5, row).GetValue<int64_t>();
 		if (NumericCast<int64_t>(meta_table.oid) != args.GetValue(6, row).GetValue<int64_t>()) {
 			throw InvalidInputException("ngram meta table changed while drop_ngram_index was prepared");
@@ -747,7 +748,8 @@ void RegisterRowIdGuard(ExtensionLoader &loader) {
 	auto validate = ScalarFunction(NGRAM_ROWID_GUARD_VALIDATE,
 	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
-	                                LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                LogicalType::VARCHAR},
 	                               LogicalType::BOOLEAN, RowIdGuardValidateFunction);
 	validate.stability = FunctionStability::VOLATILE;
 	validate.SetFallible();

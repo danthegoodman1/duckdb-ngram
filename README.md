@@ -367,6 +367,10 @@ PRAGMA ngram_index_stats('logs');
 PRAGMA create_ngram_index('table', 'column');
 PRAGMA create_ngram_index('table', 'column', gram = 3, case_insensitive = true);
 PRAGMA drop_ngram_index('table', 'column');
+
+PRAGMA ngram_indexes;
+PRAGMA ngram_index_status('database_name', 'index_ref');
+PRAGMA drop_ngram_index_by_id('database_name', 'index_ref');
 ```
 
 `gram` is the number of characters per gram (default 3). Larger grams are more
@@ -376,6 +380,42 @@ accept shorter needles but propose far more candidates.
 Indexes are supported on `VARCHAR` columns of DuckDB base tables. Views,
 temporary tables, tables in foreign catalogs (SQLite, Postgres, …), tables with
 generated columns, and tables with a user column named `rowid` are rejected.
+
+Each new index receives a canonical UUIDv4 `index_ref` and its own opaque
+storage schema. `PRAGMA ngram_indexes` lists registered indexes and
+pre-registry legacy allocations across attached DuckDB catalogs. Use the
+catalog-qualified status/drop forms whenever the base table or indexed column
+has disappeared; copied attached databases may legitimately contain the same
+UUID, so the catalog name is part of the public identity.
+
+Lifecycle status is deliberately conservative:
+
+| Status | Meaning |
+| --- | --- |
+| `READY` | Exact storage, owner, and rowid guard validate; indexed reads may accelerate. |
+| `SCAN_ONLY` | The allocation is owned but identity/guard safety is uncertain; exhaustive queries scan. |
+| `ORPHAN` | The recorded base table or column is absent. Stable-ID drop remains available. |
+| `REPLACED` | Same-session identity proves a different table now occupies the recorded name. Stable-ID drop never touches it. |
+| `LEGACY_REBUILD` | A pre-registry v2 allocation is visible and drop-only. |
+| `UNREGISTERED` | Structurally valid opaque v3 storage lost its registry row and can be removed by its derived UUID. |
+| `MISSING_STORAGE` / `MALFORMED` | Required proof is missing or catalog objects are corrupt. Drop fails closed with manual-repair guidance. |
+
+DuckDB v1.5.5 refuses table and indexed-column rename while the physical guard
+exists, including case-only rename. Moving a table between schemas and renaming
+a schema are host-not-implemented. The supported workflow is therefore:
+
+```sql
+PRAGMA ngram_indexes;  -- save database_name + index_ref
+PRAGMA drop_ngram_index_by_id('database_name', 'index_ref');
+ALTER TABLE old_name RENAME TO new_name;
+PRAGMA create_ngram_index('new_name', 'column');
+```
+
+The registry and opaque schemas are extension-owned ordinary catalog objects.
+Do not edit them directly. Identifiable corruption remains observable, but
+there is intentionally no force-drop or rebind API: without an exact meta/guard
+proof, automated cleanup could delete a replacement object or strand a live
+guard.
 
 ### Maintenance
 
@@ -594,7 +634,9 @@ so peak memory and crash exposure both follow the bound rather than the tail.
   to trust the custom index internals.
 - A first build invalidates DuckDB's reservoir sample and may make overlapping
   writers retry. Guard dependencies restrict column/table rename and dependent
-  DROP/ALTER operations until the ngram index is dropped.
+  DROP/ALTER operations until the ngram index is dropped. On v1.5.5, table
+  schema moves and schema rename are not implemented; use stable-ID drop,
+  rename, then rebuild.
 - One index per (table, column). Multi-column indexes do not exist; build one
   index per column you search.
 - Temporary tables and non-DuckDB catalogs are not supported.

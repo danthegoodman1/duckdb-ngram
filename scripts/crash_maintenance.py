@@ -36,8 +36,10 @@ Exit code 0 iff every reopened database passed.
 """
 
 import argparse
+import csv
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -64,6 +66,24 @@ def run(db, script, allow_error=False, timeout=900):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def storage_schema(db):
+    _, catalog_out, _ = run(db, "SELECT current_database();")
+    catalog = next(csv.reader(catalog_out.splitlines()))[0]
+    _, out, _ = run(db, "PRAGMA ngram_indexes;")
+    rows = [row for row in csv.reader(out.splitlines())
+            if len(row) == 10 and row[0] == catalog and row[1] == "registered"
+            and row[3:6] == ["main", "corpus", "s"] and row[7] == "3"
+            and row[8] in ("READY", "SCAN_ONLY")]
+    if len(rows) != 1:
+        raise RuntimeError("expected one canonical registered corpus.s allocation")
+    index_ref, schema = rows[0][2], rows[0][6]
+    if (not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", index_ref)
+            or not re.fullmatch(r"__ngram_idx_[0-9a-f]{8}_[0-9a-f]{4}_4[0-9a-f]{3}_[89ab][0-9a-f]{3}_[0-9a-f]{12}", schema)
+            or schema != "__ngram_idx_" + index_ref.replace("-", "_")):
+        raise RuntimeError("public corpus.s allocation identity is not canonical")
+    return schema
+
+
 def build_corpus(db, rng, rows):
     values = []
     for i in range(rows):
@@ -83,13 +103,14 @@ def append_tail(db, rng, start, rows):
 
 def index_state(db):
     """The facts a half-applied maintenance operation would disagree on."""
-    _, out, _ = run(db, "SELECT (SELECT hwm_rowid FROM ngram_main_corpus.meta_s), "
-                        "(SELECT count(*) FROM ngram_main_corpus.segments_s), "
-                        "(SELECT coalesce(sum(rowid_count), 0) FROM ngram_main_corpus.segments_s), "
+    storage = storage_schema(db)
+    _, out, _ = run(db, "SELECT (SELECT hwm_rowid FROM {0}.meta), "
+                        "(SELECT count(*) FROM {0}.segments), "
+                        "(SELECT coalesce(sum(rowid_count), 0) FROM {0}.segments), "
                         "s.n, s.hash_sum, s.hash_xor FROM (SELECT count(*) AS n, "
                         "coalesce(sum(hash(encode(gram), row_count, segment_count))::VARCHAR, '0') AS hash_sum, "
                         "coalesce(bit_xor(hash(encode(gram), row_count, segment_count))::VARCHAR, '0') AS hash_xor "
-                        "FROM ngram_main_corpus.stats_s) s;")
+                        "FROM {0}.stats) s;".format(storage))
     line = [l for l in out.strip().splitlines() if l]
     return line[-1] if line else None
 
@@ -97,9 +118,10 @@ def index_state(db):
 def postings_digest(db):
     """The decoded index itself: every (gram, rowid) posting, summarised so two
     databases can be compared without materialising both."""
+    storage = storage_schema(db)
     _, out, _ = run(db, "SELECT count(*), coalesce(sum(hash(gram || ':' || r))::VARCHAR, '0') "
                         "FROM ngram_unpack_postings("
-                        "(SELECT gram, segment_no, postings FROM ngram_main_corpus.segments_s));")
+                        "(SELECT gram, segment_no, postings FROM {0}.segments));".format(storage))
     line = [l for l in out.strip().splitlines() if l]
     return line[-1] if line else None
 

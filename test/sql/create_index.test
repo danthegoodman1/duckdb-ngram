@@ -19,45 +19,53 @@ INSERT INTO docs VALUES
 statement ok
 PRAGMA create_ngram_index('docs', 's');
 
+statement ok
+SET VARIABLE docs_s_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                              FROM __ngram.registry WHERE table_name = 'docs' AND column_name = 's');
+
 # shadow tables exist
 query I
-SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = getvariable('docs_s_schema');
 ----
 3
 
 # options round-trip through the meta table
 query IIIIII
 SELECT format_version, schema_name, table_name, column_name, gram_size, case_insensitive
-FROM ngram_main_docs.meta_s;
+FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.meta');
 ----
 3	main	docs	s	3	true
 
 # hwm covers all rows at build time
 query I
-SELECT hwm_rowid = (SELECT max(rowid) FROM docs) FROM ngram_main_docs.meta_s;
+SELECT hwm_rowid = (SELECT max(rowid) FROM docs)
+FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.meta');
 ----
 true
 
 # the index is exactly the brute-force extraction (both directions)
 query I
 SELECT count(*) FROM (
-	(SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_docs.segments_s
+	(SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	 FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.segments')
 	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL)
 	UNION ALL
 	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL
-	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid FROM ngram_main_docs.segments_s)
+	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	 FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.segments'))
 );
 ----
 0
 
 # stats agree with the segments table
 query I
-SELECT count(*) FROM ngram_main_docs.stats_s;
+SELECT count(*) FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.stats');
 ----
 44
 
 query II
-SELECT row_count, segment_count FROM ngram_main_docs.stats_s WHERE gram = 'hel';
+SELECT row_count, segment_count
+FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.stats') WHERE gram = 'hel';
 ----
 2	1
 
@@ -113,7 +121,7 @@ statement ok
 PRAGMA create_ngram_index('docs', 't', gram = 2, case_insensitive = false);
 
 query I
-SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
+SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE '__ngram_idx_%';
 ----
 6
 
@@ -128,7 +136,7 @@ statement ok
 PRAGMA drop_ngram_index('docs', 's');
 
 query I
-SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'ngram_main_docs';
+SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE '__ngram_idx_%';
 ----
 3
 
@@ -142,7 +150,7 @@ statement ok
 PRAGMA drop_ngram_index('docs', 't');
 
 query I
-SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_docs';
+SELECT count(*) FROM duckdb_schemas() WHERE schema_name LIKE '__ngram_idx_%';
 ----
 0
 
@@ -211,42 +219,9 @@ statement ok
 PRAGMA drop_ngram_index('orphan', 'PAYLOAD');
 
 query I
-SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_orphan';
+SELECT count(*) FROM __ngram.registry WHERE table_name = 'orphan';
 ----
 0
-
-# the ownership guard is not vacuous: a meta table with no row is refused
-# rather than silently passing the check
-statement ok
-CREATE TABLE guarded(s VARCHAR);
-
-statement ok
-INSERT INTO guarded VALUES ('a tent');
-
-statement ok
-PRAGMA create_ngram_index('guarded', 's');
-
-statement ok
-CREATE TEMP TABLE guarded_meta AS SELECT * FROM ngram_main_guarded.meta_s;
-
-statement ok
-DELETE FROM ngram_main_guarded.meta_s;
-
-statement error
-PRAGMA drop_ngram_index('guarded', 's');
-----
-is empty
-
-statement error
-PRAGMA ngram_refresh('guarded');
-----
-is empty
-
-statement ok
-INSERT INTO ngram_main_guarded.meta_s SELECT * FROM guarded_meta;
-
-statement ok
-PRAGMA drop_ngram_index('guarded', 's');
 
 # index build on an empty table works and yields empty postings
 statement ok
@@ -255,10 +230,15 @@ CREATE TABLE empty_docs(s VARCHAR);
 statement ok
 PRAGMA create_ngram_index('empty_docs', 's');
 
+statement ok
+SET VARIABLE empty_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name = 'empty_docs');
+
 query IIII
-SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_empty_docs.segments_s),
-       (SELECT count(*) FROM ngram_main_empty_docs.stats_s), gram_size
-FROM ngram_main_empty_docs.meta_s;
+SELECT hwm_rowid,
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('empty_schema') || '.segments')),
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('empty_schema') || '.stats')), gram_size
+FROM query('SELECT * FROM ' || getvariable('empty_schema') || '.meta');
 ----
 -1	0	0	3
 
@@ -327,13 +307,12 @@ statement ok
 PRAGMA drop_ngram_index('"my.table"', 'sträße');
 
 query I
-SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_my.table';
+SELECT count(*) FROM __ngram.registry WHERE table_name = 'my.table';
 ----
 0
 
-# shadow schema name collision: (schema a, table b_c) and (schema a_b, table c)
-# both map to ngram_a_b_c; the second create must fail loudly, and neither drop
-# nor stats may operate through the colliding schema
+# Opaque UUID storage removes the old non-injective collision between
+# (schema a, table b_c) and (schema a_b, table c).
 statement ok
 CREATE SCHEMA a;
 
@@ -355,46 +334,28 @@ INSERT INTO a_b.c VALUES ('goodbye');
 statement ok
 PRAGMA create_ngram_index('a.b_c', 's');
 
-statement error
+statement ok
 PRAGMA create_ngram_index('a_b.c', 's');
-----
-shadow schema collision
 
-statement error
-PRAGMA drop_ngram_index('a_b.c', 's');
-----
-shadow schema collision
-
-# stats through the colliding name raises the collision error rather than
-# reporting nothing (the foreign index is not this table's to report on)
-statement error
-PRAGMA ngram_index_stats('a_b.c');
-----
-shadow schema collision
-
-# the failed create and refused drop left the owner's index untouched
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('a.b_c');
 ----
 s	3	true	0	0	0	9	9	0	1	9	27	NULL
 
-# once the owner drops its index, the schema name is free for the other table
+query I
+SELECT count(DISTINCT index_id) FROM __ngram.registry
+WHERE (schema_name = 'a' AND table_name = 'b_c') OR (schema_name = 'a_b' AND table_name = 'c');
+----
+2
+
 statement ok
 PRAGMA drop_ngram_index('a.b_c', 's');
-
-statement ok
-PRAGMA create_ngram_index('a_b.c', 's');
-
-query II
-SELECT schema_name, table_name FROM ngram_a_b_c.meta_s;
-----
-a_b	c
 
 statement ok
 PRAGMA drop_ngram_index('a_b.c', 's');
 
 # DuckDB folds only ASCII bytes for identifiers. SQL lower() is Unicode-aware,
-# so ownership guards must not use it: Ä and ä remain distinct identifiers.
+# so opaque owner keys must keep Ä and ä distinct identifiers.
 statement ok
 SET default_collation = 'nocase';
 
@@ -408,28 +369,24 @@ statement ok
 PRAGMA create_ngram_index('"Ä"', 's');
 
 statement ok
-UPDATE "ngram_main_Ä".meta_s SET table_name = 'ä';
+CREATE TABLE "ä"(s VARCHAR);
 
-statement error
-SELECT * FROM ngram_search('"Ä"', 'tent');
-----
-shadow schema collision
+statement ok
+INSERT INTO "ä" VALUES ('another tent');
 
-statement error
-PRAGMA drop_ngram_index('"Ä"', 's');
-----
-shadow schema collision
+statement ok
+PRAGMA create_ngram_index('"ä"', 's');
 
 query I
-SELECT count(*) FROM "ngram_main_Ä".segments_s;
+SELECT count(DISTINCT owner_key) FROM __ngram.registry WHERE table_name IN ('Ä', 'ä');
 ----
-4
-
-statement ok
-UPDATE "ngram_main_Ä".meta_s SET table_name = 'Ä';
+2
 
 statement ok
 PRAGMA drop_ngram_index('"Ä"', 's');
+
+statement ok
+PRAGMA drop_ngram_index('"ä"', 's');
 
 statement ok
 SET default_collation = 'binary';
@@ -448,7 +405,7 @@ statement ok
 PRAGMA drop_ngram_index('CASE_DROP', 's');
 
 query I
-SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'ngram_main_case_drop';
+SELECT count(*) FROM __ngram.registry WHERE table_name = 'case_drop';
 ----
 0
 

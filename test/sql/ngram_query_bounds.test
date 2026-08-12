@@ -124,6 +124,9 @@ RESET ngram_max_grams_per_query;
 # An unbounded user K still walks the sorted per-segment descriptor range once,
 # in gram order. This one-row posting shape exercises 34 distinct grams.
 statement ok
+SET threads = 1;
+
+statement ok
 CREATE TABLE high_k(id INTEGER, s VARCHAR);
 
 statement ok
@@ -152,9 +155,6 @@ RESET ngram_max_grams_per_query;
 #===----------------------------------------------------------------------===#
 # Admission before decode: hard-work and memory policies
 #===----------------------------------------------------------------------===#
-
-statement ok
-SET threads = 1;
 
 statement ok
 CREATE TABLE dense AS
@@ -258,31 +258,8 @@ SET memory_limit = '1GB';
 # Expected availability fallback versus fatal malformed-index errors
 #===----------------------------------------------------------------------===#
 
-statement ok
-CREATE TABLE unavailable(id INTEGER, s VARCHAR);
-
-statement ok
-INSERT INTO unavailable VALUES (1, 'a tent'), (2, 'nothing');
-
-statement ok
-PRAGMA create_ngram_index('unavailable', 's');
-
-statement ok
-PREPARE unavailable_query AS SELECT id FROM ngram_search('unavailable', 'tent');
-
-statement ok
-DROP TABLE ngram_main_unavailable.segments_s;
-
-# Missing shadow storage is an expected execution-time availability decline.
-query I
-EXECUTE unavailable_query;
-----
-1
-
-query I
-SELECT id FROM unavailable WHERE contains(s, 'tent');
-----
-1
+# SQLLogic query() cannot issue DDL/DML against a runtime UUID schema. The C++
+# lifecycle harness retains the prepared missing-segments availability fallback.
 
 # An index built on an empty table has HWM=-1. A later matching row is an
 # exhaustive storage scan, not a candidate fetch under the vacuum fence.
@@ -305,106 +282,9 @@ EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM empty_tail WHERE contains(s,
 ----
 analyzed_plan	<REGEX>:.*"Ngram Mode": "index \(<= 0 candidates, 0 decoded rowids\)".*
 
-# A present HWM is either the empty sentinel -1 or a committed DuckDB rowid.
-statement ok
-CREATE TABLE bad_hwm(id INTEGER, s VARCHAR);
-
-statement ok
-INSERT INTO bad_hwm VALUES (1, 'aaaa'), (2, 'nothing');
-
-statement ok
-PRAGMA create_ngram_index('bad_hwm', 's');
-
-statement ok
-UPDATE ngram_main_bad_hwm.meta_s SET hwm_rowid = -2;
-
-statement error
-SELECT count(*) FROM ngram_search('bad_hwm', 'aaaa');
-----
-hwm_rowid -2
-
-statement error
-SELECT count(*) FROM bad_hwm WHERE contains(s, 'aaaa');
-----
-hwm_rowid -2
-
-statement ok
-UPDATE ngram_main_bad_hwm.meta_s SET hwm_rowid = 36028797018960000;
-
-statement error
-SELECT count(*) FROM ngram_candidates('bad_hwm', 's', 'aaaa');
-----
-hwm_rowid 36028797018960000
-
-# Impossible stats fragmentation is corruption, not a resource fallback.
-statement ok
-CREATE TABLE bad_stats(id INTEGER, s VARCHAR);
-
-statement ok
-INSERT INTO bad_stats VALUES (1, 'aaaa'), (2, 'aaaa');
-
-statement ok
-PRAGMA create_ngram_index('bad_stats', 's');
-
-statement ok
-UPDATE ngram_main_bad_stats.stats_s
-SET row_count = 1000000, segment_count = 1000000
-WHERE gram = 'aaa';
-
-statement error
-SELECT count(*) FROM ngram_search('bad_stats', 'aaaa');
-----
-stats describe more segment rows than exist
-
-statement error
-SELECT count(*) FROM bad_stats WHERE contains(s, 'aaaa');
-----
-stats describe more segment rows than exist
-
-# Stats pruning is advisory: the C++ map remains the exact selected-gram
-# filter. Corruption in an unrelated gram is not on this query's read path,
-# while the same row is still fatal as soon as its gram is requested.
-statement ok
-UPDATE ngram_main_bad_stats.stats_s
-SET row_count = NULL
-WHERE gram = 'aaa';
-
-query I
-SELECT count(*) FROM ngram_search('bad_stats', 'bad');
-----
-0
-
-statement error
-SELECT count(*) FROM ngram_search('bad_stats', 'aaaa');
-----
-requested stats row contains NULLs
-
-# A forged generation aggregate above the actual partial-segment capacity is
-# also classified before any work/memory decline or blob decode.
-statement ok
-CREATE TABLE bad_capacity(id INTEGER, s VARCHAR);
-
-statement ok
-INSERT INTO bad_capacity VALUES (1, 'aaaa'), (2, 'aaaa');
-
-statement ok
-PRAGMA create_ngram_index('bad_capacity', 's');
-
-statement ok
-UPDATE ngram_main_bad_capacity.stats_s SET row_count = 3 WHERE gram = 'aaa';
-
-statement ok
-UPDATE ngram_main_bad_capacity.segments_s SET rowid_count = 3 WHERE gram = 'aaa';
-
-statement error
-SELECT count(*) FROM ngram_search('bad_capacity', 'aaaa');
-----
-gram posting count exceeds its segment rowid range
-
-statement error
-SELECT count(*) FROM bad_capacity WHERE contains(s, 'aaaa');
-----
-gram posting count exceeds its segment rowid range
+# The C++ lifecycle harness mutates opaque meta/stats/segments to retain the
+# HWM, stats-fragmentation, NULL-row, and segment-capacity corruption matrix on
+# explicit and transparent paths.
 
 # A resource decline in an earlier segment must not hide structural corruption
 # in a later one. NULL rows make this cross-boundary fixture cheap to build.
@@ -457,72 +337,8 @@ SET threads = 1;
 statement ok
 SET memory_limit = '1GB';
 
-statement ok
-UPDATE ngram_main_late_bad.stats_s SET row_count = 5 WHERE gram = 'aaa';
-
-statement ok
-UPDATE ngram_main_late_bad.segments_s SET rowid_count = 3 WHERE gram = 'aaa' AND segment_no = 1;
-
-statement ok
-SET ngram_max_probe_rowids = 1;
-
-statement error
-SELECT count(*) FROM ngram_search('late_bad', 'aaaa');
-----
-gram posting count exceeds its segment rowid range
-
-statement error
-SELECT count(*) FROM late_bad WHERE contains(s, 'aaaa');
-----
-gram posting count exceeds its segment rowid range
-
-statement ok
-RESET ngram_max_probe_rowids;
-
-# Blob/manifest corruption propagates from the shared decoder on both paths.
-statement ok
-CREATE TABLE bad_blob(id INTEGER, s VARCHAR);
-
-statement ok
-INSERT INTO bad_blob VALUES (1, 'aaaa'), (2, 'aaaa');
-
-statement ok
-PRAGMA create_ngram_index('bad_blob', 's');
-
-statement ok
-UPDATE ngram_main_bad_blob.segments_s SET postings = 'bad'::BLOB WHERE gram = 'aaa';
-
-statement error
-SELECT count(*) FROM ngram_search('bad_blob', 'aaaa');
-----
-unknown postings blob format
-
-statement error
-SELECT count(*) FROM bad_blob WHERE contains(s, 'aaaa');
-----
-unknown postings blob format
-
-# At optimizer time, a present object of the wrong type is malformed; only a
-# truly absent meta table is an ordinary rewrite decline.
-statement ok
-CREATE TABLE wrong_meta(id INTEGER, s VARCHAR);
-
-statement ok
-INSERT INTO wrong_meta VALUES (1, 'aaaa');
-
-statement ok
-PRAGMA create_ngram_index('wrong_meta', 's');
-
-statement ok
-DROP TABLE ngram_main_wrong_meta.meta_s;
-
-statement ok
-CREATE VIEW ngram_main_wrong_meta.meta_s AS SELECT 1 AS not_meta;
-
-statement error
-SELECT count(*) FROM wrong_meta WHERE contains(s, 'aaaa');
-----
-wrong catalog type
+# The C++ lifecycle harness also retains the cross-segment late-corruption,
+# malformed postings blob, and wrong-kind owned-meta optimizer gates.
 
 statement ok
 RESET ngram_auto_accelerate;

@@ -103,6 +103,10 @@ INSERT INTO race SELECT i, 'seed ' || i || ' tent' FROM range(500) t(i);
 statement ok
 PRAGMA create_ngram_index('race', 's');
 
+statement ok
+SET VARIABLE race_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                            FROM __ngram.registry WHERE table_name='race' AND column_name='s');
+
 concurrentloop c 0 4
 
 loop i 0 6
@@ -126,7 +130,8 @@ endloop
 # 24 calls of at most 137 rowids each cannot cover the 4,800 rows the threads
 # appended, so the mark is behind the table and ahead of where it started
 query I
-SELECT hwm_rowid > 499 AND hwm_rowid < (SELECT max(rowid) FROM race) FROM ngram_main_race.meta_s;
+SELECT hwm_rowid > 499 AND hwm_rowid < (SELECT max(rowid) FROM race)
+FROM query('SELECT * FROM ' || getvariable('race_schema') || '.meta');
 ----
 true
 
@@ -135,7 +140,8 @@ true
 query I
 SELECT count(*) FROM (
 	SELECT rowid FROM race
-	WHERE rowid <= (SELECT hwm_rowid FROM ngram_main_race.meta_s) AND contains(lower(s), 'tent')
+	WHERE rowid <= (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('race_schema') || '.meta'))
+	  AND contains(lower(s), 'tent')
 	EXCEPT
 	SELECT rowid FROM ngram_candidates('race', 's', 'tent')
 );
@@ -160,7 +166,8 @@ query II
 SELECT
 	(SELECT count(*) FROM (
 		SELECT rowid FROM race
-		WHERE rowid <= (SELECT hwm_rowid FROM ngram_main_race.meta_s) AND contains(lower(s), 'tent')
+		WHERE rowid <= (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('race_schema') || '.meta'))
+		  AND contains(lower(s), 'tent')
 		EXCEPT
 		SELECT rowid FROM ngram_candidates('race', 's', 'tent'))),
 	(SELECT count(*) FROM (
@@ -171,6 +178,7 @@ SELECT
 0	0
 
 query I
-SELECT hwm_rowid = (SELECT max(rowid) FROM race) FROM ngram_main_race.meta_s;
+SELECT hwm_rowid = (SELECT max(rowid) FROM race)
+FROM query('SELECT * FROM ' || getvariable('race_schema') || '.meta');
 ----
 true

@@ -33,6 +33,7 @@ import argparse
 import csv
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,22 @@ class Db:
         if proc.returncode != 0 and not allow_error:
             raise RuntimeError("duckdb failed:\n%s\n--- script ---\n%s" % (proc.stderr[-4000:], script[:2000]))
         return proc.returncode, proc.stdout, proc.stderr
+
+    def storage_schema(self):
+        _, catalog_out, _ = self.run("SELECT current_database();")
+        catalog = next(csv.reader(catalog_out.splitlines()))[0]
+        _, out, _ = self.run("PRAGMA ngram_indexes;")
+        rows = [row for row in csv.reader(out.splitlines())
+                if len(row) == 10 and row[0] == catalog and row[1] == "registered"
+                and row[3:6] == ["main", "corpus", "s"] and row[7] == "3" and row[8] == "READY"]
+        if len(rows) != 1:
+            raise RuntimeError("expected one canonical registered corpus.s allocation")
+        index_ref, schema = rows[0][2], rows[0][6]
+        if (not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", index_ref)
+                or not re.fullmatch(r"__ngram_idx_[0-9a-f]{8}_[0-9a-f]{4}_4[0-9a-f]{3}_[89ab][0-9a-f]{3}_[0-9a-f]{12}", schema)
+                or schema != "__ngram_idx_" + index_ref.replace("-", "_")):
+            raise RuntimeError("public corpus.s allocation identity is not canonical")
+        return schema
 
 
 def rows_sql(rng, start, count):
@@ -172,8 +189,8 @@ class Churn:
         elif op == "tail_update":
             modulus = self.rng.randint(7, 23)
             self.db.run("UPDATE corpus SET s = s || ' %s' "
-                        "WHERE rowid > (SELECT hwm_rowid FROM ngram_main_corpus.meta_s) AND id %% %d = %d;"
-                        % (MARKER, modulus, self.rng.randrange(modulus)))
+                        "WHERE rowid > (SELECT hwm_rowid FROM %s.meta) AND id %% %d = %d;"
+                        % (MARKER, self.db.storage_schema(), modulus, self.rng.randrange(modulus)))
         elif op == "checkpoint":
             self.db.run("CHECKPOINT;")
         elif op == "refresh":

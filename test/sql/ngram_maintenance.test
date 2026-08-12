@@ -13,6 +13,10 @@ INSERT INTO docs VALUES (1, 'a tent pitched'), (2, 'no match'), (3, 'ten cents')
 statement ok
 PRAGMA create_ngram_index('docs', 's');
 
+statement ok
+SET VARIABLE docs_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                            FROM __ngram.registry WHERE table_name='docs' AND column_name='s');
+
 #===----------------------------------------------------------------------===#
 # refresh indexes the tail
 #===----------------------------------------------------------------------===#
@@ -45,7 +49,8 @@ SELECT count(*) FROM ngram_candidates('docs', 's', 'tent') WHERE rowid > 2;
 2
 
 query I
-SELECT hwm_rowid = (SELECT max(rowid) FROM docs) FROM ngram_main_docs.meta_s;
+SELECT hwm_rowid = (SELECT max(rowid) FROM docs)
+FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.meta');
 ----
 true
 
@@ -58,7 +63,8 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 
 # the refresh appended a generation rather than rewriting the index
 query I
-SELECT count(DISTINCT generation) FROM ngram_main_docs.segments_s;
+SELECT count(DISTINCT generation)
+FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.segments');
 ----
 2
 
@@ -67,7 +73,8 @@ statement ok
 PRAGMA ngram_refresh('docs');
 
 query II
-SELECT (SELECT hwm_rowid FROM ngram_main_docs.meta_s), (SELECT count(*) FROM ngram_main_docs.segments_s);
+SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.meta')),
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.segments'));
 ----
 6	45
 
@@ -101,7 +108,8 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 #===----------------------------------------------------------------------===#
 
 query I
-SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM ngram_main_docs.segments_s
+SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM
+	query('SELECT * FROM ' || getvariable('docs_schema') || '.segments')
 	GROUP BY gram, segment_no HAVING count(*) > 1);
 ----
 true
@@ -111,24 +119,28 @@ PRAGMA ngram_compact('docs');
 
 # every (gram, segment_no) is one row again
 query I
-SELECT count(*) FROM (SELECT gram, segment_no FROM ngram_main_docs.segments_s
+SELECT count(*) FROM (SELECT gram, segment_no FROM
+	query('SELECT * FROM ' || getvariable('docs_schema') || '.segments')
 	GROUP BY gram, segment_no HAVING count(*) > 1);
 ----
 0
 
 # stats hold one row per gram, matching the merged segments
 query I
-SELECT count(*) FROM (SELECT gram FROM ngram_main_docs.stats_s GROUP BY gram HAVING count(*) > 1);
+SELECT count(*) FROM (SELECT gram FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.stats')
+	GROUP BY gram HAVING count(*) > 1);
 ----
 0
 
 query I
 SELECT count(*) FROM (
-	(SELECT gram, row_count FROM ngram_main_docs.stats_s
-	 EXCEPT SELECT gram, sum(rowid_count)::BIGINT FROM ngram_main_docs.segments_s GROUP BY gram)
+	(SELECT gram, row_count FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.stats')
+	 EXCEPT SELECT gram, sum(rowid_count)::BIGINT
+	 FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.segments') GROUP BY gram)
 	UNION ALL
-	(SELECT gram, sum(rowid_count)::BIGINT FROM ngram_main_docs.segments_s GROUP BY gram
-	 EXCEPT SELECT gram, row_count FROM ngram_main_docs.stats_s)
+	(SELECT gram, sum(rowid_count)::BIGINT
+	 FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.segments') GROUP BY gram
+	 EXCEPT SELECT gram, row_count FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.stats'))
 );
 ----
 0
@@ -155,7 +167,8 @@ statement ok
 PRAGMA ngram_compact('docs');
 
 query I
-SELECT count(*) FROM (SELECT gram, segment_no FROM ngram_main_docs.segments_s
+SELECT count(*) FROM (SELECT gram, segment_no FROM
+	query('SELECT * FROM ' || getvariable('docs_schema') || '.segments')
 	GROUP BY gram, segment_no HAVING count(*) > 1);
 ----
 0
@@ -272,126 +285,9 @@ SELECT count(*) FROM (
 ----
 0
 
-# Compaction validates every selected shadow row before purging can hide it.
-# This tiny fragmented key pins NULL/malformed keys, descriptors, and the
-# concrete cross-segment posting that previously became silent deletion.
-statement ok
-CREATE TABLE compact_bad(s VARCHAR);
-
-statement ok
-INSERT INTO compact_bad VALUES ('aaa');
-
-statement ok
-PRAGMA create_ngram_index('compact_bad', 's');
-
-statement ok
-INSERT INTO compact_bad VALUES ('aaa');
-
-statement ok
-PRAGMA ngram_refresh('compact_bad');
-
-statement ok
-UPDATE ngram_main_compact_bad.segments_s SET segment_no = NULL WHERE gram = 'aaa';
-
-statement error
-PRAGMA ngram_compact('compact_bad');
-----
-malformed segments-table key
-
-statement ok
-UPDATE ngram_main_compact_bad.segments_s SET segment_no = 0, gram = NULL;
-
-statement error
-PRAGMA ngram_compact('compact_bad', purge = true);
-----
-malformed segments-table key
-
-statement ok
-UPDATE ngram_main_compact_bad.segments_s SET gram = 'aa';
-
-statement error
-PRAGMA ngram_compact('compact_bad');
-----
-malformed segments-table key
-
-statement ok
-UPDATE ngram_main_compact_bad.segments_s SET gram = 'aaa';
-
-statement ok
-UPDATE ngram_main_compact_bad.segments_s
-SET postings = ngram_encode_postings([1048576]::BIGINT[]), rowid_count = 1,
-    min_rowid = 1048576, max_rowid = 1048576
-WHERE generation = 0;
-
-statement error
-PRAGMA ngram_compact('compact_bad');
-----
-outside its declared segment or indexed range
-
-# Purge must validate the selected blob before an empty live-row temp can
-# filter every decoded posting away.
-statement ok
-UPDATE compact_bad SET s = NULL;
-
-statement error
-PRAGMA ngram_compact('compact_bad', purge = true);
-----
-outside its declared segment or indexed range
-
-statement ok
-UPDATE ngram_main_compact_bad.segments_s
-SET postings = ngram_encode_postings([0]::BIGINT[]), rowid_count = 2,
-    min_rowid = 0, max_rowid = 0
-WHERE generation = 0;
-
-statement error
-PRAGMA ngram_compact('compact_bad');
-----
-descriptor disagrees
-
-# All failed scripts are atomic: neither generation was deleted or repaired.
-query II
-SELECT count(*), count(DISTINCT generation) FROM ngram_main_compact_bad.segments_s;
-----
-2	2
-
-# Refresh rewrites the complete stats layout, so it must reject each malformed
-# historical row rather than letting negative and positive generations sum to
-# a plausible aggregate. The generated script remains atomic on that error.
-statement ok
-CREATE TABLE refresh_bad_stats(s VARCHAR);
-
-statement ok
-INSERT INTO refresh_bad_stats VALUES ('aaa');
-
-statement ok
-PRAGMA create_ngram_index('refresh_bad_stats', 's');
-
-statement ok
-UPDATE ngram_main_refresh_bad_stats.stats_s
-SET row_count = -1, segment_count = -1 WHERE encode(gram) = encode('aaa');
-
-statement ok
-INSERT INTO ngram_main_refresh_bad_stats.stats_s VALUES ('aaa', 2, 2);
-
-statement ok
-INSERT INTO refresh_bad_stats VALUES ('aaa');
-
-statement error
-PRAGMA ngram_refresh('refresh_bad_stats');
-----
-invalid stats row
-
-query IIIIIII
-SELECT (SELECT hwm_rowid FROM ngram_main_refresh_bad_stats.meta_s),
-       (SELECT count(*) FROM ngram_main_refresh_bad_stats.segments_s),
-       (SELECT max(generation) FROM ngram_main_refresh_bad_stats.segments_s),
-       (SELECT count(*) FROM ngram_main_refresh_bad_stats.stats_s),
-       (SELECT min(row_count) FROM ngram_main_refresh_bad_stats.stats_s),
-       (SELECT max(row_count) FROM ngram_main_refresh_bad_stats.stats_s),
-       (SELECT sum(row_count) FROM ngram_main_refresh_bad_stats.stats_s);
-----
-0	1	0	2	-1	2	1
+# SQLLogic query() cannot issue DDL/DML against a runtime UUID schema. The C++
+# lifecycle harness retains the complete NULL/key/blob/descriptor corruption
+# matrix and the atomic refresh/compaction state assertions above.
 
 query I
 SELECT count(*) FROM duckdb_tables()
@@ -420,17 +316,22 @@ INSERT INTO compact_collation VALUES (1, 'Aaa'), (2, 'aaa'), (3, 'é日🙂x');
 statement ok
 PRAGMA create_ngram_index('compact_collation', 's', case_insensitive = false);
 
+statement ok
+SET VARIABLE collation_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                                 FROM __ngram.registry
+                                 WHERE table_name='compact_collation' AND column_name='s');
+
 query II
 SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
        count(*) FILTER (WHERE encode(gram) = encode('aaa'))
-FROM ngram_main_compact_collation.stats_s;
+FROM query('SELECT * FROM ' || getvariable('collation_schema') || '.stats');
 ----
 1	1
 
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM ngram_main_compact_collation.stats_s)
+	FROM query('SELECT gram,rowid FROM ' || getvariable('collation_schema') || '.stats'))
 WHERE out_of_order;
 ----
 0
@@ -446,14 +347,14 @@ PRAGMA ngram_refresh('compact_collation');
 query II
 SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
        count(*) FILTER (WHERE encode(gram) = encode('aaa'))
-FROM ngram_main_compact_collation.stats_s;
+FROM query('SELECT * FROM ' || getvariable('collation_schema') || '.stats');
 ----
 1	1
 
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM ngram_main_compact_collation.stats_s)
+	FROM query('SELECT gram,rowid FROM ' || getvariable('collation_schema') || '.stats'))
 WHERE out_of_order;
 ----
 0
@@ -461,7 +362,7 @@ WHERE out_of_order;
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (PARTITION BY generation ORDER BY rowid) AS out_of_order
-	FROM ngram_main_compact_collation.segments_s)
+	FROM query('SELECT gram,generation,rowid FROM ' || getvariable('collation_schema') || '.segments'))
 WHERE out_of_order;
 ----
 0
@@ -480,7 +381,7 @@ SELECT (SELECT count(*) FROM ngram_search('compact_collation', 'Aaa')),
 2	2	2
 
 query II
-SELECT row_count, segment_count FROM ngram_main_compact_collation.stats_s
+SELECT row_count, segment_count FROM query('SELECT * FROM ' || getvariable('collation_schema') || '.stats')
 WHERE encode(gram) = encode('Aaa');
 ----
 2	1
@@ -488,14 +389,14 @@ WHERE encode(gram) = encode('Aaa');
 query II
 SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
        count(*) FILTER (WHERE encode(gram) = encode('aaa'))
-FROM ngram_main_compact_collation.segments_s;
+FROM query('SELECT * FROM ' || getvariable('collation_schema') || '.segments');
 ----
 1	1
 
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM ngram_main_compact_collation.stats_s)
+	FROM query('SELECT gram,rowid FROM ' || getvariable('collation_schema') || '.stats'))
 WHERE out_of_order;
 ----
 0
@@ -503,7 +404,7 @@ WHERE out_of_order;
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM ngram_main_compact_collation.segments_s)
+	FROM query('SELECT gram,rowid FROM ' || getvariable('collation_schema') || '.segments'))
 WHERE out_of_order;
 ----
 0
@@ -548,13 +449,22 @@ statement ok
 PRAGMA create_ngram_index('two', 'b');
 
 statement ok
+SET VARIABLE two_a_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name='two' AND column_name='a');
+
+statement ok
+SET VARIABLE two_b_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name='two' AND column_name='b');
+
+statement ok
 INSERT INTO two VALUES (2, 'second tent a', 'second tent b');
 
 statement ok
 PRAGMA ngram_refresh('two', col = 'a');
 
 query II
-SELECT (SELECT hwm_rowid FROM ngram_main_two.meta_a), (SELECT hwm_rowid FROM ngram_main_two.meta_b);
+SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('two_a_schema') || '.meta')),
+       (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('two_b_schema') || '.meta'));
 ----
 1	0
 
@@ -573,7 +483,8 @@ statement ok
 PRAGMA ngram_refresh('two');
 
 query II
-SELECT (SELECT hwm_rowid FROM ngram_main_two.meta_a), (SELECT hwm_rowid FROM ngram_main_two.meta_b);
+SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('two_a_schema') || '.meta')),
+       (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('two_b_schema') || '.meta'));
 ----
 1	1
 
@@ -612,10 +523,14 @@ INSERT INTO local_rows VALUES (2, 'uncommitted tent');
 statement ok con1
 PRAGMA create_ngram_index('local_rows', 's');
 
+statement ok con1
+SET VARIABLE local_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name='local_rows' AND column_name='s');
+
 # the index stops at the last committed rowid; the uncommitted row is found by
 # the tail scan
 query I con1
-SELECT hwm_rowid FROM ngram_main_local_rows.meta_s;
+SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('local_schema') || '.meta');
 ----
 0
 
@@ -629,12 +544,16 @@ statement ok con1
 PRAGMA ngram_refresh('local_rows');
 
 query I con1
-SELECT hwm_rowid FROM ngram_main_local_rows.meta_s;
+SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('local_schema') || '.meta');
 ----
 0
 
 statement ok con1
 COMMIT;
+
+statement ok
+SET VARIABLE local_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name='local_rows' AND column_name='s');
 
 # after the commit the row has a real rowid past the mark, and a refresh picks
 # it up (before the transaction-local filter this scenario recorded a posting
@@ -649,7 +568,8 @@ statement ok
 PRAGMA ngram_refresh('local_rows');
 
 query II
-SELECT (SELECT hwm_rowid FROM ngram_main_local_rows.meta_s), (SELECT count(*) FROM ngram_candidates('local_rows', 's', 'tent'));
+SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('local_schema') || '.meta')),
+       (SELECT count(*) FROM ngram_candidates('local_rows', 's', 'tent'));
 ----
 1	2
 
@@ -672,6 +592,10 @@ statement ok
 PRAGMA create_ngram_index('atomic', 's');
 
 statement ok
+SET VARIABLE atomic_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                              FROM __ngram.registry WHERE table_name='atomic' AND column_name='s');
+
+statement ok
 INSERT INTO atomic VALUES (2, 'another tent');
 
 statement ok
@@ -681,7 +605,9 @@ statement ok
 PRAGMA ngram_refresh('atomic');
 
 query II
-SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_atomic.segments_s) FROM ngram_main_atomic.meta_s;
+SELECT hwm_rowid,
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments'))
+FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta');
 ----
 1	14
 
@@ -694,7 +620,9 @@ statement ok
 FORCE CHECKPOINT;
 
 query II
-SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_atomic.segments_s) FROM ngram_main_atomic.meta_s;
+SELECT hwm_rowid,
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments'))
+FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta');
 ----
 0	4
 
@@ -708,7 +636,9 @@ statement ok
 COMMIT;
 
 query II
-SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_atomic.segments_s) FROM ngram_main_atomic.meta_s;
+SELECT hwm_rowid,
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments'))
+FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta');
 ----
 1	14
 
@@ -721,15 +651,15 @@ SELECT count(*) FROM ngram_candidates('atomic', 's', 'tent');
 # unit, including its stats rewrite and scratch tables.
 statement ok
 CREATE TEMP TABLE phase13_segments_before AS
-SELECT * FROM ngram_main_atomic.segments_s;
+SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments');
 
 statement ok
 CREATE TEMP TABLE phase13_stats_before AS
-SELECT * FROM ngram_main_atomic.stats_s;
+SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.stats');
 
 statement ok
 CREATE TEMP TABLE phase13_meta_before AS
-SELECT * FROM ngram_main_atomic.meta_s;
+SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta');
 
 statement ok
 BEGIN;
@@ -738,7 +668,8 @@ statement ok
 PRAGMA ngram_compact('atomic');
 
 query I
-SELECT count(*) FROM (SELECT gram, segment_no FROM ngram_main_atomic.segments_s
+SELECT count(*) FROM (SELECT gram, segment_no FROM
+	query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments')
 	GROUP BY gram, segment_no HAVING count(*) > 1);
 ----
 0
@@ -748,17 +679,23 @@ ROLLBACK;
 
 query III
 SELECT (SELECT count(*) FROM (
-	(SELECT * FROM phase13_segments_before EXCEPT SELECT * FROM ngram_main_atomic.segments_s)
+	(SELECT * FROM phase13_segments_before EXCEPT
+	 SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments'))
 	UNION ALL
-	(SELECT * FROM ngram_main_atomic.segments_s EXCEPT SELECT * FROM phase13_segments_before))),
+	(SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments')
+	 EXCEPT SELECT * FROM phase13_segments_before))),
        (SELECT count(*) FROM (
-	(SELECT * FROM phase13_stats_before EXCEPT SELECT * FROM ngram_main_atomic.stats_s)
+	(SELECT * FROM phase13_stats_before EXCEPT
+	 SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.stats'))
 	UNION ALL
-	(SELECT * FROM ngram_main_atomic.stats_s EXCEPT SELECT * FROM phase13_stats_before))),
+	(SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.stats')
+	 EXCEPT SELECT * FROM phase13_stats_before))),
        (SELECT count(*) FROM (
-	(SELECT * FROM phase13_meta_before EXCEPT SELECT * FROM ngram_main_atomic.meta_s)
+	(SELECT * FROM phase13_meta_before EXCEPT
+	 SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta'))
 	UNION ALL
-	(SELECT * FROM ngram_main_atomic.meta_s EXCEPT SELECT * FROM phase13_meta_before)));
+	(SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta')
+	 EXCEPT SELECT * FROM phase13_meta_before)));
 ----
 0	0	0
 
@@ -788,15 +725,21 @@ statement ok
 PRAGMA create_ngram_index('compact_empty', 's');
 
 statement ok
+SET VARIABLE compact_empty_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                                     FROM __ngram.registry
+                                     WHERE table_name='compact_empty' AND column_name='s');
+
+statement ok
 PRAGMA ngram_compact('compact_empty');
 
 statement ok
 PRAGMA ngram_compact('compact_empty', purge = true);
 
 query III
-SELECT hwm_rowid, (SELECT count(*) FROM ngram_main_compact_empty.segments_s),
-       (SELECT count(*) FROM ngram_main_compact_empty.stats_s)
-FROM ngram_main_compact_empty.meta_s;
+SELECT hwm_rowid,
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('compact_empty_schema') || '.segments')),
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('compact_empty_schema') || '.stats'))
+FROM query('SELECT * FROM ' || getvariable('compact_empty_schema') || '.meta');
 ----
 -1	0	0
 
@@ -833,62 +776,8 @@ PRAGMA ngram_refresh('does_not_exist');
 ----
 does not exist
 
-# an index whose meta was written by a different format version is never
-# guessed at
-statement ok
-CREATE TABLE versioned(s VARCHAR);
-
-statement ok
-INSERT INTO versioned VALUES ('a tent');
-
-statement ok
-PRAGMA create_ngram_index('versioned', 's');
-
-statement ok
-UPDATE ngram_main_versioned.meta_s SET format_version = 1;
-
-statement error
-SELECT * FROM ngram_search('versioned', 'tent');
-----
-format_version
-
-statement error
-PRAGMA ngram_refresh('versioned');
-----
-format_version
-
-statement error
-PRAGMA ngram_compact('versioned');
-----
-format_version
-
-statement error
-PRAGMA ngram_index_stats('versioned');
-----
-format_version
-
-# Present incompatible meta is malformed index state on every query path.
-statement ok
-SET ngram_auto_accelerate = true;
-
-statement error
-SELECT count(*) FROM versioned WHERE s LIKE '%tent%';
-----
-format_version
-
-statement error
-EXPLAIN SELECT count(*) FROM versioned WHERE s LIKE '%tent%';
-----
-format_version
-
-statement ok
-SET ngram_auto_accelerate = false;
-
-statement ok
-UPDATE ngram_main_versioned.meta_s SET format_version = 3;
-
-statement ok
-PRAGMA ngram_refresh('versioned');
+# The C++ lifecycle harness mutates runtime UUID storage to retain the complete
+# incompatible-version explicit/maintenance/stats/transparent refusal matrix.
 
 #===----------------------------------------------------------------------===#
 # shape changes while the table's identity is proven
@@ -979,15 +868,27 @@ INSERT INTO a_b.c VALUES ('another tent');
 statement ok
 PRAGMA create_ngram_index('a.b_c', 's');
 
+# The old name-derived collision is gone: the foreign owner remains simply
+# unindexed until it receives its own UUID allocation.
 statement error
 PRAGMA ngram_refresh('a_b.c');
 ----
-shadow schema collision
+no ngram index exists
 
-statement error
+statement ok
+PRAGMA create_ngram_index('a_b.c', 's');
+
+statement ok
+PRAGMA ngram_refresh('a.b_c');
+
+statement ok
 PRAGMA ngram_compact('a_b.c');
+
+query II
+SELECT (SELECT count(*) FROM ngram_search('a.b_c', 'tent')),
+       (SELECT count(*) FROM ngram_search('a_b.c', 'tent'));
 ----
-shadow schema collision
+1	1
 
 #===----------------------------------------------------------------------===#
 # evil identifiers survive generated SQL

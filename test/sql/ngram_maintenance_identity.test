@@ -93,29 +93,10 @@ ALTER TABLE t RENAME TO T;
 ----
 entries that depend on it
 
-# Shadow-table discovery follows the same semantics; catalog-equivalent casing
-# cannot hide an existing index from create/refresh/compact.
-statement ok
-ALTER TABLE ngram_main_t.meta_s RENAME TO META_s;
-
-query IIIIIIIIIIIII
-PRAGMA ngram_index_stats('t');
-----
-s	3	true	1	1	0	9	9	0	1	9	27	NULL
-
-statement error
-PRAGMA create_ngram_index('t', 's');
-----
-An ngram index already exists
-
-statement ok
-PRAGMA ngram_refresh('t');
-
-statement ok
-PRAGMA ngram_compact('t');
-
-statement ok
-ALTER TABLE ngram_main_t.META_s RENAME TO meta_s;
+# Exact opaque object spelling is part of the corruption contract. Dynamic DDL
+# cannot be expressed through SQLLogic's query() table function, so the C++
+# lifecycle harness pins case-mutated schema/table observation and hot-path
+# refusal without weakening this test's host-rename assertions.
 
 #===----------------------------------------------------------------------===#
 # DETACH + re-ATTACH is not a re-creation

@@ -68,6 +68,10 @@ docs:
 
     * `PRAGMA create_ngram_index(table, column[, gram, case_insensitive])`,
       `PRAGMA drop_ngram_index(table, column)`
+    * `PRAGMA ngram_indexes`,
+      `PRAGMA ngram_index_status(database_name, index_ref)`, and
+      `PRAGMA drop_ngram_index_by_id(database_name, index_ref)` — discover and
+      remove UUID-backed or legacy allocations even after the base is absent
     * `ngram_search(table, needle[, col])` — rows, exact and complete
     * `ngram_candidates(table, column, needle)` — the raw superset, for
       building your own pipelines
@@ -85,6 +89,12 @@ docs:
     maintenance refuses until rebuild. Transparent acceleration remains opt-in
     until candidate materialization is resource-bounded and its two execution
     engines are consolidated; exactness is unconditional today.
+
+    DuckDB v1.5.5 refuses table/column rename while the physical guard exists;
+    schema moves/renames are host-not-implemented. Save the catalog-qualified
+    stable ID, drop by ID, rename, then rebuild. Identifiable catalog corruption
+    is listed with a reason, but cleanup fails closed rather than force-dropping
+    objects whose ownership or guard identity cannot be proved.
 
     Expect the index to be roughly the size of the text it indexes, which is
     the usual range for an exhaustive trigram index. Not a fuzzy-matching or

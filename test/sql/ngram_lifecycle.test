@@ -1,0 +1,103 @@
+# name: test/sql/ngram_lifecycle.test
+# description: opaque registry lifecycle and catalog-qualified ID APIs
+# group: [sql]
+
+require ngram
+
+statement ok
+CREATE TABLE lifecycle_docs(s VARCHAR, t VARCHAR);
+
+statement ok
+INSERT INTO lifecycle_docs VALUES ('hello world', 'second column'), ('shell game', 'other');
+
+statement ok
+PRAGMA create_ngram_index('lifecycle_docs', 's');
+
+query III
+SELECT count(*), count(DISTINCT owner_key), count(DISTINCT index_id) FROM __ngram.registry;
+----
+1	1	1
+
+query IIIIII
+SELECT registry_version, typeof(index_id), typeof(owner_key), schema_name, table_name, column_name
+FROM __ngram.registry;
+----
+1	UUID	BLOB	main	lifecycle_docs	s
+
+query TTTTTTITTT
+PRAGMA ngram_indexes;
+----
+memory	registered	<REGEX>:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}	main	lifecycle_docs	s	<REGEX>:__ngram_idx_[0-9a-f_]{36}	3	READY	NULL
+
+query I
+SELECT count(*) FROM ngram_search('lifecycle_docs', 'hell');
+----
+2
+
+statement ok
+PRAGMA ngram_refresh('lifecycle_docs');
+
+statement ok
+PRAGMA ngram_compact('lifecycle_docs');
+
+# The physical guard makes every table/column spelling of rename fail. Schema
+# moves/renames are separately host-not-implemented on pinned DuckDB v1.5.5.
+statement error
+ALTER TABLE lifecycle_docs RENAME TO LIFECYCLE_DOCS;
+----
+Dependency Error
+
+statement error
+ALTER TABLE lifecycle_docs RENAME COLUMN s TO renamed;
+----
+Dependency Error
+
+statement error
+ALTER TABLE lifecycle_docs SET SCHEMA information_schema;
+----
+Not implemented
+
+statement error
+ALTER SCHEMA main RENAME TO renamed_main;
+----
+not yet supported
+
+# A second registered column preserves the protector rules while using a
+# separate opaque allocation.
+statement ok
+PRAGMA create_ngram_index('LIFECYCLE_DOCS', 'T');
+
+query II
+SELECT count(*), count(DISTINCT regexp_replace(schema_name, '^__ngram_idx_', ''))
+FROM duckdb_schemas() WHERE schema_name LIKE '__ngram_idx_%';
+----
+2	2
+
+# Registered table/column drop remains routed through stable ID internally.
+statement ok
+PRAGMA drop_ngram_index('LIFECYCLE_DOCS', 'T');
+
+query I
+SELECT count(*) FROM __ngram.registry;
+----
+1
+
+# Ordinary base drop produces an observable/removable orphan.
+statement ok
+DROP TABLE lifecycle_docs;
+
+query TTTTTTITTT
+PRAGMA ngram_indexes;
+----
+memory	registered	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	<REGEX>:__ngram_idx_[0-9a-f_]{36}	3	ORPHAN	<REGEX>:.*base table is missing.*
+
+# Strict textual refs reject noncanonical and injection-shaped inputs.
+statement error
+PRAGMA ngram_index_status('memory', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA');
+----
+canonical lowercase UUID
+
+statement error
+PRAGMA drop_ngram_index_by_id('memory', '''; DROP TABLE __ngram.registry; --');
+----
+canonical lowercase UUID

@@ -159,6 +159,7 @@ string CertainStaleReason(const MetaInfo &meta, const TableFingerprint &now) {
 //! the shadow tables, with its meta row already read and validated.
 struct MaintenanceColumn {
 	string column_name;
+	IndexLocation location;
 	MetaInfo meta;
 };
 
@@ -181,19 +182,24 @@ static string ScratchName(const char *purpose) {
 //! pragma for useful early errors and again after the generated script owns its
 //! transaction-lifetime vacuum fence, where it becomes the correctness check.
 static MaintenanceColumn ResolveMaintenanceColumn(ClientContext &context, const char *fn, ResolvedTarget &target,
-                                                   const string &column_name,
+                                                   const IndexLocation &location,
                                                    const TableFingerprint &fingerprint) {
+	auto &column_name = location.column_name;
 	if (!target.entry->ColumnExists(column_name)) {
 		throw CatalogException("%s: the ngram index on %s references column %s, which no longer exists; drop the "
 		                       "index with PRAGMA drop_ngram_index",
 		                       fn, target.table_name, column_name);
 	}
 	auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
-	auto &meta_entry = ResolveExistingTable(context, target.catalog_name, target.shadow_schema,
-	                                      MetaTableName(column_name), "ngram index meta table");
-	ShadowTarget shadow {target.schema_name, target.table_name, column_name, target.shadow_schema};
+	if (!IndexLocationAvailable(context, target, location)) {
+		throw InvalidInputException("%s: index storage is unavailable", fn);
+	}
+	auto &meta_entry = ResolveExistingTable(context, target.catalog_name, location.shadow_schema,
+	                                      location.MetaTable(), "ngram index meta table");
+	ShadowTarget shadow {target.schema_name, target.table_name, column_name, location.shadow_schema};
 	MaintenanceColumn column;
 	column.column_name = column_name;
+	column.location = location;
 	column.meta = ReadMeta(context, transaction, meta_entry, shadow);
 	auto reason = CertainStaleReason(column.meta, fingerprint);
 	if (reason.empty()) {
@@ -216,30 +222,30 @@ static MaintenanceColumn ResolveMaintenanceColumn(ClientContext &context, const 
 static vector<MaintenanceColumn> ResolveMaintenanceColumns(ClientContext &context, const char *fn,
                                                            ResolvedTarget &target, const string &only_column,
                                                            const TableFingerprint &fingerprint) {
-	vector<string> names;
-	for (auto &meta_name : ExistingMetaTables(context, target)) {
-		names.push_back(meta_name.substr(strlen("meta_")));
-	}
-	if (names.empty()) {
+	auto indexes = ExistingIndexes(context, target);
+	RequireUniqueIndexColumns(indexes);
+	if (indexes.empty()) {
 		throw CatalogException("%s: no ngram index exists on %s", fn, target.table_name);
 	}
 	if (!only_column.empty()) {
-		vector<string> filtered;
-		for (auto &name : names) {
-			if (StringUtil::CIEquals(name, only_column)) {
-				filtered.push_back(name);
+		vector<IndexLocation> filtered;
+		for (auto &location : indexes) {
+			if (StringUtil::CIEquals(location.column_name, only_column)) {
+				filtered.push_back(location);
 			}
 		}
 		if (filtered.empty()) {
 			throw CatalogException("%s: no ngram index exists on %s.%s", fn, target.table_name, only_column);
 		}
-		names = std::move(filtered);
+		indexes = std::move(filtered);
 	}
-	std::sort(names.begin(), names.end());
+	std::sort(indexes.begin(), indexes.end(), [](const IndexLocation &left, const IndexLocation &right) {
+		return left.column_name < right.column_name;
+	});
 
 	vector<MaintenanceColumn> result;
-	for (auto &column_name : names) {
-		result.push_back(ResolveMaintenanceColumn(context, fn, target, column_name, fingerprint));
+	for (auto &location : indexes) {
+		result.push_back(ResolveMaintenanceColumn(context, fn, target, location, fingerprint));
 	}
 	return result;
 }
@@ -250,7 +256,11 @@ static string MaintenanceGuardCall(const char *fn, const ResolvedTarget &target,
 	       Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(column.column_name) + ", false, " +
 	       to_string(column.meta.hwm_rowid) + ", " + to_string(fingerprint.table_oid) + ", " +
 	       Lit(fingerprint.schema_fingerprint) + ", " + to_string(column.meta.options.gram_size) + ", " +
-	       (column.meta.options.case_insensitive ? "true" : "false") + ", '', '', '', '', 0, '')";
+	       (column.meta.options.case_insensitive ? "true" : "false") + ", '', '', '', '', 0, '', 0, false, " +
+	       Lit(column.location.index_ref) + ", " + Lit(column.location.shadow_schema) + ", " +
+	       Lit(column.location.MetaTable()) + ", " + to_string(column.location.registry_oid) + ", " +
+	       to_string(column.location.schema_oid) + ", " + to_string(column.location.meta_oid) + ", " +
+	       to_string(column.location.segments_oid) + ", " + to_string(column.location.stats_oid) + ")";
 }
 
 static string FingerprintAssignments(const TableFingerprint &fingerprint, const string &column_name) {
@@ -446,9 +456,38 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 		auto protector_identity = args.GetValue(14, row).ToString();
 		auto protector_timestamp = args.GetValue(15, row).GetValue<int64_t>();
 		auto new_guard_name = args.GetValue(16, row).ToString();
+		auto expected_registry_oid = NumericCast<idx_t>(args.GetValue(17, row).GetValue<int64_t>());
+		auto expected_registry_bootstrap = args.GetValue(18, row).GetValue<bool>();
+		auto location_ref = args.GetValue(19, row).ToString();
+		auto location_schema = args.GetValue(20, row).ToString();
+		auto location_meta = args.GetValue(21, row).ToString();
+		IndexLocation location;
+		if (!creating) {
+			location.index_ref = location_ref;
+			location.shadow_schema = location_schema;
+			location.column_name = column_name;
+			location.registry_oid = NumericCast<idx_t>(args.GetValue(22, row).GetValue<int64_t>());
+			location.schema_oid = NumericCast<idx_t>(args.GetValue(23, row).GetValue<int64_t>());
+			location.meta_oid = NumericCast<idx_t>(args.GetValue(24, row).GetValue<int64_t>());
+			location.segments_oid = NumericCast<idx_t>(args.GetValue(25, row).GetValue<int64_t>());
+			location.stats_oid = NumericCast<idx_t>(args.GetValue(26, row).GetValue<int64_t>());
+			if (!StringUtil::CIEquals(location.MetaTable(), location_meta)) {
+				throw InvalidInputException("%s: index location changed after preparation", fn);
+			}
+		}
 
 		auto &catalog = Catalog::GetCatalog(context, catalog_name);
 		AcquireMaintenanceFence(context, catalog);
+		if (fn == "drop_ngram_index_by_id") {
+			ResolvedTarget drop_target {catalog_name, schema_name, table_name, column_name,
+			                            ShadowSchemaName(schema_name, table_name), nullptr};
+			if (!IndexLocationAvailable(context, drop_target, location)) {
+				throw InvalidInputException("%s: index storage was removed after preparation", fn);
+			}
+			RequireExclusiveOwnerAllocation(context, drop_target, location_ref);
+			output[row] = true;
+			continue;
+		}
 		unique_ptr<StorageLockKey> creation_lock;
 		if (creating) {
 			creation_lock = AcquireCreationBarrier(DuckTransaction::Get(context, catalog));
@@ -463,33 +502,43 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 			                            table_name);
 		}
 		if (creating) {
-			// CREATE can add tables to a pre-existing, non-injective shadow
-			// schema. Enumerate it now, not during pragma expansion: another
-			// owner may have populated the colliding schema before this fenced
-			// transaction began.
+			ValidateRegistryForCreate(context, catalog_name, expected_registry_oid, expected_registry_bootstrap);
+			// Enumerate again behind the creation barrier: another connection may
+			// have registered the owner after pragma preprocessing.
 			auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
-			auto meta_tables = ExistingMetaTables(context, target);
-			if (protector_kind.empty() && !meta_tables.empty()) {
+			auto table_target = target;
+			table_target.column_name.clear();
+			auto indexes = ExistingIndexes(context, table_target);
+			if (protector_kind.empty() && !indexes.empty()) {
 				throw InvalidInputException(
 				    "%s: another ngram index appeared while the statement was being prepared; run it again", fn);
 			}
-			for (auto &meta_name : meta_tables) {
-				auto indexed_column = meta_name.substr(strlen("meta_"));
-				auto &meta_entry = ResolveExistingTable(context, target.catalog_name, target.shadow_schema, meta_name,
+			for (auto &location : indexes) {
+				auto &indexed_column = location.column_name;
+				auto &meta_entry = ResolveExistingTable(context, target.catalog_name, location.shadow_schema,
+				                                        location.MetaTable(),
 				                                        "ngram index meta table");
-				ShadowTarget shadow {target.schema_name, target.table_name, indexed_column, target.shadow_schema};
+				ShadowTarget shadow {target.schema_name, target.table_name, indexed_column, location.shadow_schema};
 				ReadMeta(context, transaction, meta_entry, shadow);
-				if (StringUtil::CIEquals(meta_name, MetaTableName(column_name))) {
+				if (StringUtil::CIEquals(indexed_column, column_name)) {
 					throw InvalidInputException(
 					    "An ngram index already exists on %s.%s (%s); use drop_ngram_index first", target.table_name,
-					    column_name, target.shadow_schema);
+					    column_name, location.index_ref);
 				}
 			}
 			if (protector_kind == "ngram_v3") {
-				auto &meta_entry = ResolveExistingTable(context, target.catalog_name, target.shadow_schema,
-				                                        MetaTableName(protector_detail), "ngram index meta table");
+				auto protector_owner = target;
+				protector_owner.column_name = protector_detail;
+				auto protectors = ExistingIndexes(context, protector_owner);
+				if (protectors.size() != 1) {
+					throw InvalidInputException("%s: protecting ngram index disappeared while preparing", fn);
+				}
+				auto &protector_location = protectors[0];
+				auto &meta_entry = ResolveExistingTable(context, target.catalog_name,
+				                                        protector_location.shadow_schema, protector_location.MetaTable(),
+				                                        "ngram index meta table");
 				ShadowTarget protector_target {target.schema_name, target.table_name, protector_detail,
-				                               target.shadow_schema};
+				                               protector_location.shadow_schema};
 				auto protector = ReadMeta(context, DuckTransaction::Get(context, target.entry->ParentCatalog()),
 				                          meta_entry, protector_target);
 				if (protector.guard_name != protector_name || protector.guard_token != protector_identity) {
@@ -532,7 +581,7 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 			                                 protector_kind.empty(), target.schema_name, target.table_name, column_name,
 			                                 new_guard_name);
 		} else {
-			auto column = ResolveMaintenanceColumn(context, fn.c_str(), target, column_name, fingerprint);
+			auto column = ResolveMaintenanceColumn(context, fn.c_str(), target, location, fingerprint);
 			if (column.meta.hwm_rowid != expected_hwm ||
 			    column.meta.options.gram_size != NumericCast<idx_t>(expected_gram_size) ||
 			    column.meta.options.case_insensitive != expected_case_insensitive) {
@@ -665,7 +714,6 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 	auto columns = ResolveMaintenanceColumns(context, "ngram_refresh", target, only_column, fingerprint);
 
 	auto base = Ident(target.catalog_name) + "." + Ident(target.schema_name) + "." + Ident(target.table_name);
-	auto shadow = Ident(target.catalog_name) + "." + Ident(target.shadow_schema);
 	auto local_start = to_string(LOCAL_ROWID_START);
 
 	string script;
@@ -673,9 +721,10 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 	bool first_guard = true;
 	vector<string> summary_rows;
 	for (auto &column : columns) {
-		auto meta = shadow + "." + Ident(MetaTableName(column.column_name));
-		auto segments = shadow + "." + Ident(SegmentsTableName(column.column_name));
-		auto stats = shadow + "." + Ident(StatsTableName(column.column_name));
+		auto shadow = Ident(target.catalog_name) + "." + Ident(column.location.shadow_schema);
+		auto meta = shadow + "." + Ident(column.location.MetaTable());
+		auto segments = shadow + "." + Ident(column.location.SegmentsTable());
+		auto stats = shadow + "." + Ident(column.location.StatsTable());
 		auto quoted_column = Ident(column.column_name);
 		auto hwm = to_string(column.meta.hwm_rowid);
 		auto gram_str = to_string(column.meta.options.gram_size);
@@ -874,15 +923,15 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 	auto columns = ResolveMaintenanceColumns(context, "ngram_compact", target, only_column, fingerprint);
 
 	auto base = Ident(target.catalog_name) + "." + Ident(target.schema_name) + "." + Ident(target.table_name);
-	auto shadow = Ident(target.catalog_name) + "." + Ident(target.shadow_schema);
 
 	string script;
 	auto guard = ScratchName("guard");
 	bool first_guard = true;
 	for (auto &column : columns) {
-		auto meta = shadow + "." + Ident(MetaTableName(column.column_name));
-		auto segments = shadow + "." + Ident(SegmentsTableName(column.column_name));
-		auto stats = shadow + "." + Ident(StatsTableName(column.column_name));
+		auto shadow = Ident(target.catalog_name) + "." + Ident(column.location.shadow_schema);
+		auto meta = shadow + "." + Ident(column.location.MetaTable());
+		auto segments = shadow + "." + Ident(column.location.SegmentsTable());
+		auto stats = shadow + "." + Ident(column.location.StatsTable());
 		auto keys = ScratchName("compact_keys");
 		auto key_guard = ScratchName("compact_key_guard");
 		auto selected = ScratchName("compact_source");
@@ -992,7 +1041,10 @@ void RegisterMaintenance(ExtensionLoader &loader) {
 	                             LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR,
 	                             LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::BIGINT, LogicalType::VARCHAR},
+	                             LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                             LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
+	                             LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
 	                            LogicalType::BOOLEAN, MaintenanceGuardFunction);
 	guard.stability = FunctionStability::VOLATILE;
 	guard.SetFallible();

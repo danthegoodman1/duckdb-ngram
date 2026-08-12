@@ -15,8 +15,13 @@ CREATE TABLE big AS SELECT i AS id, i::VARCHAR AS s FROM range(1150000) t(i);
 statement ok
 PRAGMA create_ngram_index('big', 's');
 
+statement ok
+SET VARIABLE big_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                           FROM __ngram.registry WHERE table_name='big' AND column_name='s');
+
 query I
-SELECT count(DISTINCT segment_no) FROM ngram_main_big.segments_s;
+SELECT count(DISTINCT segment_no)
+FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments');
 ----
 2
 

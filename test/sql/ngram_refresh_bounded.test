@@ -20,6 +20,10 @@ statement ok
 PRAGMA create_ngram_index('docs', 's');
 
 statement ok
+SET VARIABLE docs_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                            FROM __ngram.registry WHERE table_name='docs' AND column_name='s');
+
+statement ok
 INSERT INTO docs SELECT i, 'row ' || i || ' tent tail' FROM range(10, 30) t(i);
 
 #===----------------------------------------------------------------------===#
@@ -41,7 +45,8 @@ s	4	17	12
 
 # the reported mark is the recorded mark, and the reported tail is real
 query II
-SELECT (SELECT hwm_rowid FROM ngram_main_docs.meta_s), (SELECT count(*) FROM docs WHERE rowid > 17);
+SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.meta')),
+       (SELECT count(*) FROM docs WHERE rowid > 17);
 ----
 17	12
 
@@ -148,6 +153,10 @@ statement ok
 PRAGMA create_ngram_index('owned', 's');
 
 statement ok
+SET VARIABLE owned_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                             FROM __ngram.registry WHERE table_name='owned' AND column_name='s');
+
+statement ok
 INSERT INTO owned SELECT i, 'row ' || i || ' tail' FROM range(4, 12) t(i);
 
 statement ok
@@ -159,7 +168,8 @@ PRAGMA ngram_refresh('owned', 3);
 s	3	6	5
 
 query II
-SELECT hwm_rowid, (SELECT count(*) > 0 FROM ngram_candidates('owned', 's', 'tail')) FROM ngram_main_owned.meta_s;
+SELECT hwm_rowid, (SELECT count(*) > 0 FROM ngram_candidates('owned', 's', 'tail'))
+FROM query('SELECT * FROM ' || getvariable('owned_schema') || '.meta');
 ----
 6	true
 
@@ -167,7 +177,8 @@ statement ok
 ROLLBACK;
 
 query II
-SELECT hwm_rowid, (SELECT count(*) FROM ngram_candidates('owned', 's', 'tail')) FROM ngram_main_owned.meta_s;
+SELECT hwm_rowid, (SELECT count(*) FROM ngram_candidates('owned', 's', 'tail'))
+FROM query('SELECT * FROM ' || getvariable('owned_schema') || '.meta');
 ----
 3	0
 
@@ -183,7 +194,8 @@ statement ok
 COMMIT;
 
 query II
-SELECT hwm_rowid, (SELECT count(*) FROM ngram_candidates('owned', 's', 'tail')) FROM ngram_main_owned.meta_s;
+SELECT hwm_rowid, (SELECT count(*) FROM ngram_candidates('owned', 's', 'tail'))
+FROM query('SELECT * FROM ' || getvariable('owned_schema') || '.meta');
 ----
 6	3
 
@@ -292,6 +304,14 @@ statement ok
 PRAGMA create_ngram_index('twin_b', 's');
 
 statement ok
+SET VARIABLE twin_a_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                              FROM __ngram.registry WHERE table_name='twin_a' AND column_name='s');
+
+statement ok
+SET VARIABLE twin_b_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                              FROM __ngram.registry WHERE table_name='twin_b' AND column_name='s');
+
+statement ok
 INSERT INTO twin_a SELECT i, 'tail ' || i || ' content connection needle' FROM range(50, 1050) t(i);
 
 statement ok
@@ -314,19 +334,24 @@ PRAGMA ngram_refresh('twin_b', 100);
 endloop
 
 query II
-SELECT (SELECT hwm_rowid FROM ngram_main_twin_a.meta_s), (SELECT hwm_rowid FROM ngram_main_twin_b.meta_s);
+SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.meta')),
+       (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.meta'));
 ----
 1049	1049
 
 query I
 SELECT count(*) FROM (
-	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM ngram_main_twin_a.segments_s))
+	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
+	 query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments')))
 	 EXCEPT
-	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM ngram_main_twin_b.segments_s)))
+	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
+	 query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments'))))
 	UNION ALL
-	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM ngram_main_twin_b.segments_s))
+	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
+	 query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments')))
 	 EXCEPT
-	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM ngram_main_twin_a.segments_s)))
+	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
+	 query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments'))))
 );
 ----
 0
@@ -335,9 +360,11 @@ SELECT count(*) FROM (
 query II
 SELECT
 	(SELECT count(*) FROM (SELECT gram, r FROM ngram_unpack_postings(
-		(SELECT gram, segment_no, postings FROM ngram_main_twin_a.segments_s)) GROUP BY ALL HAVING count(*) > 1)),
+		(SELECT gram, segment_no, postings FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments')))
+		GROUP BY ALL HAVING count(*) > 1)),
 	(SELECT count(*) FROM (SELECT gram, r FROM ngram_unpack_postings(
-		(SELECT gram, segment_no, postings FROM ngram_main_twin_b.segments_s)) GROUP BY ALL HAVING count(*) > 1));
+		(SELECT gram, segment_no, postings FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments')))
+		GROUP BY ALL HAVING count(*) > 1));
 ----
 0	0
 
@@ -345,7 +372,8 @@ SELECT
 # twice (a bound smaller than a segment ends mid-segment); a compaction folds
 # the two indexes back into the same rows, byte for byte
 query I
-SELECT (SELECT count(*) FROM ngram_main_twin_b.segments_s) > (SELECT count(*) FROM ngram_main_twin_a.segments_s);
+SELECT (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments')) >
+       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments'));
 ----
 true
 
@@ -357,18 +385,22 @@ PRAGMA ngram_compact('twin_b', purge = true);
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_main_twin_a.segments_s EXCEPT ALL SELECT * FROM ngram_main_twin_b.segments_s)
+	(SELECT * FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments') EXCEPT ALL
+	 SELECT * FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments'))
 	UNION ALL
-	(SELECT * FROM ngram_main_twin_b.segments_s EXCEPT ALL SELECT * FROM ngram_main_twin_a.segments_s)
+	(SELECT * FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments') EXCEPT ALL
+	 SELECT * FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments'))
 );
 ----
 0
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_main_twin_a.stats_s EXCEPT ALL SELECT * FROM ngram_main_twin_b.stats_s)
+	(SELECT * FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.stats') EXCEPT ALL
+	 SELECT * FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.stats'))
 	UNION ALL
-	(SELECT * FROM ngram_main_twin_b.stats_s EXCEPT ALL SELECT * FROM ngram_main_twin_a.stats_s)
+	(SELECT * FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.stats') EXCEPT ALL
+	 SELECT * FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.stats'))
 );
 ----
 0
@@ -394,6 +426,10 @@ statement ok
 PRAGMA create_ngram_index('crossing', 's');
 
 statement ok
+SET VARIABLE crossing_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                                FROM __ngram.registry WHERE table_name='crossing' AND column_name='s');
+
+statement ok
 INSERT INTO crossing SELECT i, 'row ' || i || ' tail' FROM range(100, 1200000) t(i);
 
 # asked for 1,100,000 rows from a mark of 99: the span would have ended at
@@ -410,9 +446,11 @@ s	151424	1199999	0
 
 query II
 SELECT
-	(SELECT count(*) FROM (SELECT gram, segment_no FROM ngram_main_crossing.segments_s
+	(SELECT count(*) FROM (SELECT gram, segment_no FROM
+	 query('SELECT * FROM ' || getvariable('crossing_schema') || '.segments')
 		WHERE segment_no > 0 GROUP BY ALL HAVING count(*) > 1)),
-	(SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM ngram_main_crossing.segments_s
+	(SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM
+	 query('SELECT * FROM ' || getvariable('crossing_schema') || '.segments')
 		WHERE segment_no = 0 GROUP BY ALL HAVING count(*) > 1));
 ----
 0	true
@@ -641,6 +679,10 @@ statement ok
 PRAGMA create_ngram_index('vac.main.t', 's');
 
 statement ok
+SET VARIABLE vac_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                           FROM vac.__ngram.registry WHERE table_name='t' AND column_name='s');
+
+statement ok
 INSERT INTO vac.t SELECT i, 'row ' || i || ' tail tent' FROM range(20000, 60000) r(i);
 
 query IIII
@@ -657,7 +699,7 @@ CHECKPOINT vac;
 # live rowids did not move across the checkpoint
 query II
 SELECT (SELECT max(rowid) FROM vac.t),
-	(SELECT hwm_rowid FROM vac.ngram_main_t.meta_s);
+	(SELECT hwm_rowid FROM query('SELECT * FROM vac.' || getvariable('vac_schema') || '.meta'));
 ----
 59999	24999
 

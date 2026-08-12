@@ -38,6 +38,7 @@ import argparse
 import csv
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -138,7 +139,7 @@ def differential_sql(needle, case_insensitive):
     )
 
 
-def candidates_sql(needle, case_insensitive):
+def candidates_sql(needle, case_insensitive, storage):
     q = sql_quote(needle)
     if case_insensitive:
         pred = "contains(lower(s), lower(%s))" % q
@@ -146,9 +147,9 @@ def candidates_sql(needle, case_insensitive):
         pred = "contains(s, %s)" % q
     return (
         "SELECT 'cand', %s, count(*) FROM ("
-        "SELECT rowid FROM corpus WHERE %s AND rowid <= (SELECT hwm_rowid FROM ngram_main_corpus.meta_s)"
+        "SELECT rowid FROM corpus WHERE %s AND rowid <= (SELECT hwm_rowid FROM %s.meta)"
         " EXCEPT SELECT rowid FROM ngram_candidates('corpus', 's', %s));"
-        % (q, pred, q)
+        % (q, pred, storage, q)
     )
 
 
@@ -210,6 +211,21 @@ def run_duckdb(db_path, script):
     return proc.stdout
 
 
+def storage_schema(db_path):
+    catalog = next(csv.reader(run_duckdb(db_path, "SELECT current_database();").splitlines()))[0]
+    rows = [row for row in csv.reader(run_duckdb(db_path, "PRAGMA ngram_indexes;").splitlines())
+            if len(row) == 10 and row[0] == catalog and row[1] == "registered"
+            and row[3:6] == ["main", "corpus", "s"] and row[7] == "3" and row[8] == "READY"]
+    if len(rows) != 1:
+        raise RuntimeError("expected one canonical registered corpus.s allocation")
+    index_ref, schema = rows[0][2], rows[0][6]
+    if (not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", index_ref)
+            or not re.fullmatch(r"__ngram_idx_[0-9a-f]{8}_[0-9a-f]{4}_4[0-9a-f]{3}_[89ab][0-9a-f]{3}_[0-9a-f]{12}", schema)
+            or schema != "__ngram_idx_" + index_ref.replace("-", "_")):
+        raise RuntimeError("public corpus.s allocation identity is not canonical")
+    return schema
+
+
 def check_output(out, label, failures):
     ok = 0
     for line in csv.reader(out.splitlines()):
@@ -258,6 +274,7 @@ def one_trial(trial, rng, rows, transparent):
         run_duckdb(db_path, "\n".join(setup))
         run_duckdb(db_path, "PRAGMA create_ngram_index('corpus', 's', gram = %d, case_insensitive = %s);"
                    % (gram_size, "true" if case_insensitive else "false"))
+        storage = storage_schema(db_path)
 
         if transparent:
             session_settings = ["SET ngram_auto_accelerate=true;"]
@@ -280,7 +297,7 @@ def one_trial(trial, rng, rows, transparent):
                     failures.append("explain: rewrite did not fire for needle %r" % probe)
         else:
             phase_checks = [differential_sql(n, case_insensitive) for n in needles]
-            phase_checks += [candidates_sql(n, case_insensitive) for n in needles if len(n) >= gram_size]
+            phase_checks += [candidates_sql(n, case_insensitive, storage) for n in needles if len(n) >= gram_size]
             txn_checks = [differential_sql(n, case_insensitive) for n in needles[:40]]
 
         # phase 1: committed, fully indexed corpus
@@ -292,7 +309,7 @@ def one_trial(trial, rng, rows, transparent):
             update_checks = session_settings + transparent_checks([("plain", UPDATE_MARKER)])
         else:
             update_checks = [differential_sql(UPDATE_MARKER, case_insensitive),
-                             candidates_sql(UPDATE_MARKER, case_insensitive)]
+                             candidates_sql(UPDATE_MARKER, case_insensitive, storage)]
         run_duckdb(db_path, "UPDATE corpus SET s = coalesce(s, '') || %s WHERE id = 0;"
                    % sql_quote(" " + UPDATE_MARKER))
         checks += check_output(run_duckdb(db_path, "\n".join(update_checks)),

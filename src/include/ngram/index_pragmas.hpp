@@ -41,6 +41,23 @@ struct ResolvedTarget {
 	optional_ptr<TableCatalogEntry> entry;
 };
 
+//! A registered UUID or strict legacy locator plus its bound storage identity.
+struct IndexLocation {
+	string index_ref;
+	string shadow_schema;
+	string column_name;
+	idx_t registry_oid = 0;
+	idx_t schema_oid = 0;
+	idx_t meta_oid = 0;
+	idx_t segments_oid = 0;
+	idx_t stats_oid = 0;
+
+	bool Registered() const { return index_ref.rfind("legacy:", 0) != 0; }
+	string MetaTable() const { return Registered() ? "meta" : MetaTableName(column_name); }
+	string SegmentsTable() const { return Registered() ? "segments" : SegmentsTableName(column_name); }
+	string StatsTable() const { return Registered() ? "stats" : StatsTableName(column_name); }
+};
+
 //! Resolve a user-supplied table name (optionally schema/catalog-qualified) to a
 //! base table. Throws binder errors for views and temporary tables. With
 //! require_column set, additionally validates the column for index builds
@@ -50,11 +67,18 @@ struct ResolvedTarget {
 ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, const string &column_name,
                              bool require_column);
 
-//! Whether a table named `name` exists in the target's shadow schema.
-bool ShadowTableExists(ClientContext &context, const ResolvedTarget &target, const string &name);
+//! Resolve registered or pre-registry legacy allocations owned by `target`.
+vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarget &target,
+                                      bool ignore_registry_corruption = false);
+void RequireUniqueIndexColumns(const vector<IndexLocation> &indexes);
+void RequireExclusiveOwnerAllocation(ClientContext &context, const ResolvedTarget &target,
+                                     const string &index_ref);
 
-//! Names of meta_* tables currently present in the target's shadow schema.
-vector<string> ExistingMetaTables(ClientContext &context, const ResolvedTarget &target);
+void ValidateRegistryForCreate(ClientContext &context, const string &catalog_name, idx_t expected_registry_oid,
+                               bool expected_bootstrap);
+
+//! False means removed; partial storage, replacement, or corruption raises.
+bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target, const IndexLocation &location);
 
 //! Quote an identifier / a string literal, or qualify a built-in function so
 //! generated SQL cannot resolve a same-named macro from the current schema.

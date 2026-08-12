@@ -140,10 +140,18 @@ struct ProbePlan {
 	unique_ptr<ProbeMemoryReservation> memory_reservation;
 };
 
+struct MetaHeader {
+	int64_t format_version = -1;
+	string schema_name, table_name, column_name;
+};
+
 //! Read and validate the single meta row of an index (format version,
 //! ownership, gram options, high-water mark); throws when the shadow tables do
 //! not look like this extension built them for `target`.
 MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry, const ShadowTarget &target);
+
+MetaHeader ReadMetaHeader(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
+                          const ShadowTarget &target);
 
 //! Read only the common ownership/version prefix. Used by DROP to recognize
 //! the known guard-less v2 layout without weakening normal readers.

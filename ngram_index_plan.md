@@ -1069,29 +1069,31 @@ Scope:
   storage before and after index creation. Run both engines with 24 threads and a 48 GiB
   memory limit on the same local machine.
 - Measure rare, moderate, and dense substring needles. For each engine, run its normal
-  search path and an index-disabled scan control in one persistent warm session, with one
-  warm-up and ten measured samples. Require sorted matching-row SHA-256 values—not only
+  search path and an index-disabled scan control. Collect three file-data-cold samples
+  after stopped-engine sync and `POSIX_FADV_DONTNEED`, plus one persistent warm session
+  with one warm-up and ten samples. Require sorted matching-row SHA-256 values—not only
   counts—to match across both search paths and both scan controls.
 - Retain raw samples, binary/tool hashes, versions, ClickHouse plans, and a generated concise
   comparison. Call differences below 10% roughly tied; otherwise report the lower value.
 
 Out of scope:
-- Cold-cache campaigns, large scale sweeps, broad ClickHouse tuning, distributed systems,
-  concurrency saturation, or a universal engine ranking.
+- Global kernel-cache drops/reboots, large scale sweeps, broad ClickHouse tuning,
+  distributed systems, concurrency saturation, or a universal engine ranking.
 - Claiming identical architecture: ClickHouse uses its native text inverted index and
   adaptive LIKE hint, while DuckDB uses this extension's postings candidates and exact
   base-table recheck, including an adaptive scan fallback for dense terms.
 
 Completion gate:
-The compact harness completes three fresh paired load/build states, ten positive warm
-samples for every query/mode cell, exact cross-engine row-set identity, paired storage,
-and ClickHouse plan capture for both case modes. The checked JSON reproduces the concise
-Markdown comparisons and clearly labels them as same-machine points of reference.
+The compact harness completes three fresh paired load/build states, three positive
+file-data-cold and ten positive warm samples for every query/mode cell, exact cross-engine
+row-set identity, paired storage, and ClickHouse plan capture for both case modes. The
+checked JSON reproduces the concise Markdown comparisons and labels the cold-cache limits.
 
 Testing plan:
 - Verify the normalized input size/SHA-256 and pinned ClickHouse binary before collection.
-- Require three records per engine, ten positive samples per query cell, one identical count
-  across both search paths and both scan controls, and `text_ngram` in the rare-query plan.
+- Require three records per engine, three positive cold and ten positive warm samples per
+  query cell, one identical count across both paths/temperatures, and `text_ngram` in the
+  rare-query plan.
 - Re-render the Markdown from the raw artifact, compile the harness, run the Phase 14
   evidence check, and keep `git diff --check` clean.
 
@@ -1099,8 +1101,8 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Scope | One bounded same-machine point of reference | Uses the checked enwik9 normalization, 24 threads, 48 GiB, three fresh paired states, and one warm-up plus ten samples for rare/moderate/dense needles. |
+| Complete | Scope | One bounded same-machine point of reference | Uses the checked enwik9 normalization, 24 threads, 48 GiB, three fresh paired states, three file-data-cold samples, and one warm-up plus ten warm samples per cell. |
 | Complete | Work | Compare against the modern ClickHouse n-gram text index | `benchmarks/clickhouse_compare.py` uses ClickHouse 26.7.3.19 `TYPE text(tokenizer = ngrams(3))`, not the deprecated Bloom-filter index, with normal LIKE search and a fully index-disabled scan control. |
-| Complete | Work | Publish raw evidence and concise generated results | The case-sensitive and case-insensitive JSON artifacts retain stage/query samples, plans, exact row-set digests, settings, versions, and hashes; `CLICKHOUSE.md` and `CLICKHOUSE_CASE_INSENSITIVE.md` render the tables. |
-| Complete | Gate | Results, repetitions, samples, storage, and provenance are coherent | Each artifact has six stage records, twelve query cells, ten positive timings per cell, four-way sorted row-ID SHA-256 identity per needle, paired storage, and a rare-query plan naming `text_ngram`. |
+| Complete | Work | Publish raw evidence and concise generated results | The case-sensitive and case-insensitive JSON artifacts retain cold/warm samples, eviction bytes, plans, exact row-set digests, settings, versions, and hashes; both Markdown reports render cold and warm matrices. |
+| Complete | Gate | Results, repetitions, samples, storage, and provenance are coherent | Each artifact has six stage records, 36 positive cold samples, twelve ten-sample warm cells, four-way sorted row-ID SHA-256 identity per needle, paired storage, and a rare-query plan naming `text_ngram`. |
 | Complete | Test | Harness and repository evidence checks pass | `py_compile`, both artifact/tool/row-set assertions, deterministic rendering, Phase 14 `release_evidence.py check`, and `git diff --check` pass. |

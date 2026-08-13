@@ -12,6 +12,9 @@ Both campaigns used:
 - DuckDB 1.5.5 and ClickHouse 26.7.3.19 on the same 24-core machine.
 - 24 threads and a 48 GiB engine memory limit.
 - Three fresh load/index-build repetitions, alternating engine order.
+- Three file-data-cold queries per engine, needle, and mode. Before each query,
+  the engine was stopped, files were synced and evicted with
+  `POSIX_FADV_DONTNEED`, and a fresh process executed once without warm-up.
 - One warm-up and ten measured warm queries per engine, needle, and mode.
 - A normal indexed search and an index-disabled scan control in each engine.
 - A SHA-256 over sorted matching row IDs. The indexed and scan results from
@@ -22,6 +25,11 @@ warm-source ingest times. Storage compares DuckDB's database file with
 ClickHouse's active-table on-disk bytes; ClickHouse logs and temporarily
 retained inactive parts are excluded.
 
+“File-data-cold” is narrower than a reboot or globally empty kernel cache: all
+database and index file pages were explicitly evicted, but filesystem metadata
+may remain cached. This models a working set larger than available memory much
+more closely than the warm measurements do.
+
 ## Case-sensitive trigrams
 
 DuckDB used `gram=3, case_insensitive=false`. ClickHouse used
@@ -31,20 +39,30 @@ DuckDB used `gram=3, case_insensitive=false`. ClickHouse used
 
 | Engine | Load median (range) | Index build median (range) | Base | Indexed | Index delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| DuckDB | 1.869 s (1.554–2.395) | 7.602 s (7.575–7.696) | 0.692 GiB | 1.687 GiB | 0.995 GiB |
-| ClickHouse | 1.383 s (1.320–1.412) | 18.115 s (17.152–18.484) | 0.538 GiB | 1.853 GiB | 1.315 GiB |
+| DuckDB | 2.102 s (1.471–2.114) | 7.541 s (7.537–7.606) | 0.690 GiB | 1.685 GiB | 0.995 GiB |
+| ClickHouse | 1.348 s (1.301–1.386) | 18.836 s (16.814–20.048) | 0.538 GiB | 1.853 GiB | 1.316 GiB |
 
-- ClickHouse loaded 1.35x faster.
-- DuckDB built the index 2.38x faster.
+- ClickHouse loaded 1.56x faster.
+- DuckDB built the index 2.50x faster.
 - DuckDB used 1.32x less incremental index storage.
+
+### File-data-cold substring queries
+
+Values are medians with the three-sample range in parentheses.
+
+| Needle | Matches | DuckDB search | DuckDB scan | ClickHouse search | ClickHouse scan | Faster search |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Rare | 1 | 17.0 ms (15.0–17.0) | 171.0 ms (167.0–171.0) | 37.0 ms (35.7–43.6) | 129.4 ms (116.4–131.2) | DuckDB by 2.18x |
+| Moderate | 26,068 | 142.0 ms (136.0–160.0) | 163.0 ms (163.0–164.0) | 138.5 ms (138.2–139.1) | 120.6 ms (119.9–121.0) | Roughly tied |
+| Common | 1,963,067 | 175.0 ms (164.0–177.0) | 165.0 ms (162.0–167.0) | 162.8 ms (158.6–164.5) | 125.0 ms (116.1–127.2) | Roughly tied |
 
 ### Warm substring queries
 
 | Needle | Matches | DuckDB search | DuckDB scan | ClickHouse search | ClickHouse scan | Faster search |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Rare | 1 | 6.0 ms | 41.0 ms | 12.1 ms | 41.4 ms | DuckDB by 2.02x |
-| Moderate | 26,068 | 15.0 ms | 27.5 ms | 66.1 ms | 43.6 ms | DuckDB by 4.41x |
-| Common | 1,963,067 | 43.0 ms | 37.0 ms | 94.3 ms | 43.0 ms | DuckDB by 2.19x |
+| Rare | 1 | 7.0 ms | 40.0 ms | 11.9 ms | 43.7 ms | DuckDB by 1.69x |
+| Moderate | 26,068 | 15.0 ms | 27.0 ms | 68.7 ms | 43.4 ms | DuckDB by 4.58x |
+| Common | 1,963,067 | 41.5 ms | 36.0 ms | 98.3 ms | 44.9 ms | DuckDB by 2.37x |
 
 See the [detailed case-sensitive report](CLICKHOUSE.md) and
 [raw case-sensitive artifact](artifacts/enwik9-clickhouse-text-vs-ngram-v1.json).
@@ -60,20 +78,30 @@ exact `ILIKE` recheck.
 
 | Engine | Load median (range) | Index build median (range) | Base | Indexed | Index delta |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| DuckDB | 1.890 s (1.776–2.010) | 7.089 s (7.012–7.126) | 0.683 GiB | 1.613 GiB | 0.930 GiB |
-| ClickHouse | 1.328 s (1.325–1.348) | 17.471 s (16.242–19.425) | 0.538 GiB | 1.808 GiB | 1.270 GiB |
+| DuckDB | 1.820 s (1.620–2.190) | 7.014 s (6.969–7.028) | 0.683 GiB | 1.614 GiB | 0.931 GiB |
+| ClickHouse | 1.309 s (1.286–1.332) | 17.729 s (16.598–17.879) | 0.538 GiB | 1.808 GiB | 1.270 GiB |
 
-- ClickHouse loaded 1.42x faster.
-- DuckDB built the index 2.46x faster.
-- DuckDB used 1.37x less incremental index storage.
+- ClickHouse loaded 1.39x faster.
+- DuckDB built the index 2.53x faster.
+- DuckDB used 1.36x less incremental index storage.
+
+### File-data-cold substring queries
+
+Values are medians with the three-sample range in parentheses.
+
+| Needle | Matches | DuckDB search | DuckDB scan | ClickHouse search | ClickHouse scan | Faster search |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Rare | 12 | 18.0 ms (17.0–19.0) | 286.0 ms (284.0–289.0) | 49.2 ms (48.1–54.5) | 137.8 ms (127.1–138.1) | DuckDB by 2.73x |
+| Moderate | 26,540 | 143.0 ms (140.0–152.0) | 266.0 ms (263.0–295.0) | 162.1 ms (154.7–166.3) | 125.9 ms (120.3–131.0) | DuckDB by 1.13x |
+| Common | 2,203,902 | 221.0 ms (219.0–229.0) | 204.0 ms (198.0–219.0) | 203.4 ms (196.3–203.9) | 127.4 ms (122.7–134.4) | Roughly tied |
 
 ### Warm substring queries
 
 | Needle | Matches | DuckDB search | DuckDB scan | ClickHouse search | ClickHouse scan | Faster search |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Rare | 12 | 8.0 ms | 211.0 ms | 12.9 ms | 62.4 ms | DuckDB by 1.61x |
-| Moderate | 26,540 | 16.5 ms | 190.0 ms | 84.4 ms | 54.2 ms | DuckDB by 5.12x |
-| Common | 2,203,902 | 119.5 ms | 135.0 ms | 149.3 ms | 56.1 ms | DuckDB by 1.25x |
+| Rare | 12 | 6.0 ms | 209.0 ms | 13.3 ms | 59.5 ms | DuckDB by 2.21x |
+| Moderate | 26,540 | 16.0 ms | 190.5 ms | 86.2 ms | 49.5 ms | DuckDB by 5.39x |
+| Common | 2,203,902 | 117.0 ms | 132.0 ms | 147.3 ms | 53.6 ms | DuckDB by 1.26x |
 
 See the [detailed case-insensitive report](CLICKHOUSE_CASE_INSENSITIVE.md) and
 [raw case-insensitive artifact](artifacts/enwik9-clickhouse-text-ci-vs-ngram-v1.json).

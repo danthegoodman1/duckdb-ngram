@@ -93,6 +93,23 @@ def file_size(path):
     return {"apparent_bytes": stat.st_size, "allocated_bytes": stat.st_blocks * 512}
 
 
+def evict_files(root):
+    root = Path(root)
+    files = [root] if root.is_file() else sorted(
+        path for path in root.rglob("*") if path.is_file() and not path.is_symlink())
+    os.sync()
+    total = 0
+    for path in files:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            size = path.stat().st_size
+            os.posix_fadvise(descriptor, 0, size, os.POSIX_FADV_DONTNEED)
+            total += size
+        finally:
+            os.close(descriptor)
+    return total
+
+
 def open_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -333,6 +350,29 @@ def ch_query_samples(server, samples, case_insensitive=False):
     return records
 
 
+def ch_cold_queries(binary, root, repetition, case_insensitive=False):
+    records = []
+    for query_id, needle_hex in NEEDLES.items():
+        for mode in ("indexed", "scan"):
+            evicted = evict_files(Path(root) / "data")
+            with ClickHouse(binary, root) as server:
+                connection = http.client.HTTPConnection("127.0.0.1", server.http, timeout=3600)
+                connection.connect()
+                sql = ch_query(needle_hex, mode == "indexed", case_insensitive)
+                start = time.monotonic_ns()
+                connection.request("POST", "/", body=(sql + " FORMAT TabSeparatedRaw").encode())
+                response = connection.getresponse()
+                body = response.read()
+                elapsed = time.monotonic_ns() - start
+                connection.close()
+                if response.status != 200:
+                    fail("ClickHouse cold query failed: %s" % body[-500:])
+            records.append({"engine": "clickhouse", "repetition": repetition,
+                            "query": query_id, "mode": mode, "count": int(body),
+                            "wall_ns": elapsed, "evicted_bytes": evicted})
+    return records
+
+
 def duck_query_samples(binary, database, samples, case_insensitive=False):
     script = ".headers off\n.mode list\n.timer off\n" + DUCK_SETTINGS
     order = []
@@ -365,6 +405,31 @@ def duck_query_samples(binary, database, samples, case_insensitive=False):
         grouped[key]["wall_ns"].append((int(timer[0]) * 1000 + int(timer[1])) * 1_000_000)
     return [{"engine": "duckdb", "query": query_id, "mode": mode, **record}
             for (query_id, mode), record in grouped.items()]
+
+
+def duck_cold_queries(binary, database, repetition, case_insensitive=False):
+    records = []
+    for query_id, needle_hex in NEEDLES.items():
+        for mode in ("indexed", "scan"):
+            if mode == "indexed":
+                source = "ngram_search('docs',decode(unhex('%s')),col := 'text')" % needle_hex
+            elif case_insensitive:
+                source = "docs WHERE text ILIKE ('%%' || decode(unhex('%s')) || '%%')" % needle_hex
+            else:
+                source = "docs WHERE contains(text,decode(unhex('%s')))" % needle_hex
+            evicted = evict_files(database)
+            script = ".headers off\n.mode list\n.timer off\n" + DUCK_SETTINGS
+            script += ".timer on\nSELECT count(*) FROM %s;\n.timer off\n" % source
+            process = run([binary, "-readonly", database], input_text=script)
+            values = [int(value) for value in re.findall(r"^\d+$", process.stdout, re.MULTILINE)]
+            timers = TIMER.findall(process.stdout)
+            if len(values) != 1 or len(timers) != 1:
+                fail("DuckDB cold timing output differs")
+            elapsed = (int(timers[0][0]) * 1000 + int(timers[0][1])) * 1_000_000
+            records.append({"engine": "duckdb", "repetition": repetition,
+                            "query": query_id, "mode": mode, "count": values[0],
+                            "wall_ns": elapsed, "evicted_bytes": evicted})
+    return records
 
 
 def duck_result_sets(binary, database, case_insensitive=False):
@@ -403,7 +468,7 @@ def collect(args):
     if sha256(clickhouse) != CLICKHOUSE_SHA256:
         fail("ClickHouse binary differs")
     work.mkdir(parents=True)
-    stages, queries, result_sets = [], [], []
+    stages, queries, cold_queries, result_sets = [], [], [], []
     for repetition in range(1, args.repetitions + 1):
         duck_db = work / ("duck-%d.db" % repetition)
         ch_root = work / ("clickhouse-%d" % repetition)
@@ -420,6 +485,8 @@ def collect(args):
                                "index_bytes": indexed["apparent_bytes"] - base["apparent_bytes"],
                                "base_allocated_bytes": base["allocated_bytes"],
                                "indexed_allocated_bytes": indexed["allocated_bytes"]})
+                cold_queries.extend(duck_cold_queries(
+                    duckdb, duck_db, repetition, args.case_insensitive))
                 if repetition == args.repetitions:
                     queries.extend(duck_query_samples(
                         duckdb, duck_db, args.samples, args.case_insensitive))
@@ -444,7 +511,10 @@ def collect(args):
                                    "base_filesystem": base, "indexed_filesystem": indexed,
                                    "base_logical": base_logical,
                                    "indexed_logical": indexed_logical})
-                    if repetition == args.repetitions:
+                cold_queries.extend(ch_cold_queries(
+                    clickhouse, ch_root, repetition, args.case_insensitive))
+                if repetition == args.repetitions:
+                    with ClickHouse(clickhouse, ch_root) as server:
                         queries.extend(ch_query_samples(server, args.samples, args.case_insensitive))
                         result_sets.extend(ch_result_sets(server, args.case_insensitive))
                         plans = {query_id: server.query(
@@ -459,8 +529,18 @@ def collect(args):
     for query_id in NEEDLES:
         counts = {by_cell[(engine, query_id, mode)]["count"]
                   for engine in ("duckdb", "clickhouse") for mode in ("indexed", "scan")}
+        counts.update(record["count"] for record in cold_queries if record["query"] == query_id)
         if len(counts) != 1:
             fail("cross-engine count mismatch for %s: %s" % (query_id, counts))
+        for engine in ("duckdb", "clickhouse"):
+            for mode in ("indexed", "scan"):
+                cells = [record for record in cold_queries if record["engine"] == engine and
+                         record["query"] == query_id and record["mode"] == mode]
+                if ({record["repetition"] for record in cells} !=
+                        set(range(1, args.repetitions + 1)) or
+                        any(record["wall_ns"] <= 0 or record["evicted_bytes"] <= 0
+                            for record in cells)):
+                    fail("cold query samples differ for %s/%s/%s" % (engine, query_id, mode))
         sets = [record for record in result_sets if record["query"] == query_id]
         if len(sets) != 4 or len({(record["rows"], record["row_id_sha256"])
                                   for record in sets}) != 1:
@@ -488,9 +568,12 @@ def collect(args):
                      "clickhouse_index": ch_index_type(args.case_insensitive),
                      "duckdb_index": "gram=3, case_insensitive=%s" %
                                      str(args.case_insensitive).lower(),
-                     "query_samples": args.samples, "repetitions": args.repetitions},
+                     "query_samples": args.samples, "cold_samples": args.repetitions,
+                     "cold_preparation": "sync + POSIX_FADV_DONTNEED; metadata may remain cached",
+                     "repetitions": args.repetitions},
         "stages": stages,
         "queries": queries,
+        "cold_queries": cold_queries,
         "result_sets": result_sets,
         "clickhouse_plans": plans,
     }
@@ -562,7 +645,24 @@ def render(args):
               "- Index build: %s." % verdict([stage_medians[engine]["build"] for engine in ("duckdb", "clickhouse")]),
               "- Incremental index storage: %s." % verdict(
                   [stage_medians[engine]["index"] for engine in ("duckdb", "clickhouse")]),
-              "", "## Warm query latency", "",
+              "", "## File-data-cold query latency", "",
+              "Each observation used a stopped engine, `sync`, and `POSIX_FADV_DONTNEED` on every",
+              "database/index file before a fresh process and one query with no warm-up. These three",
+              "samples model file-data-cold access; filesystem metadata may remain cached.", "",
+              "| Needle | Matches | DuckDB search | DuckDB scan | ClickHouse search | ClickHouse scan | Faster search |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | --- |"]
+    cold = artifact["cold_queries"]
+    for query_id in NEEDLES:
+        groups = [[row["wall_ns"] for row in cold if row["engine"] == engine and
+                   row["query"] == query_id and row["mode"] == mode]
+                  for engine in ("duckdb", "clickhouse") for mode in ("indexed", "scan")]
+        medians = [statistics.median(values) for values in groups]
+        count = next(row["count"] for row in cold if row["query"] == query_id)
+        display = ["%s ms (%s–%s)" % (ms(statistics.median(values)), ms(min(values)),
+                                      ms(max(values))) for values in groups]
+        lines.append("| %s | %d | %s | %s | %s | %s | %s |" % (
+            query_id, count, *display, verdict([medians[0], medians[2]])))
+    lines += ["", "## Warm query latency", "",
               "One warm-up preceded %d measured samples per cell. Sorted matching-row digests matched" %
               artifact["settings"]["query_samples"],
               "across both engines and their scan controls.", "",

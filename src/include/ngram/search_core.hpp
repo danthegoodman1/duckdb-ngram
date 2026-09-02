@@ -227,8 +227,8 @@ void InitializeSearchCoreLocal(ExecutionContext &context, SearchCoreGlobal &glob
 //! Shared candidate fetch, scan, projection and scheduling loop. `recheck`
 //! selects exact matches from either fetched candidates or scan chunks.
 void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchCoreGlobal &global,
-                       SearchCoreLocal &local,
-                       const std::function<idx_t(DataChunk &, SelectionVector &)> &recheck, DataChunk &output);
+                       SearchCoreLocal &local, const std::function<idx_t(DataChunk &, SelectionVector &)> &recheck,
+                       DataChunk &output);
 
 } // namespace ngram
 } // namespace duckdb

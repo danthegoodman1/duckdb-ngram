@@ -355,14 +355,18 @@ static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet
 //! full scan — the index is an optimization, never a correctness dependency.
 static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind, NgramScanGlobalState &state) {
 	auto &base = ResolveExistingTable(context, bind.catalog_name, bind.schema_name, bind.table_name, "table");
-	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name,
-	                       ShadowSchemaName(bind.schema_name, bind.table_name), &base};
+	ResolvedTarget target {bind.catalog_name,
+	                       bind.schema_name,
+	                       bind.table_name,
+	                       bind.column_name,
+	                       ShadowSchemaName(bind.schema_name, bind.table_name),
+	                       &base};
 	if (!IndexLocationAvailable(context, target, bind.location, true)) {
 		state.fallback_reason = "index unavailable";
 		return false;
 	}
 	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-	                                bind.location.MetaTable(), "ngram index meta table");
+	                                  bind.location.MetaTable(), "ngram index meta table");
 	auto info = ReadMeta(context, *state.core.tx, meta, bind.Target());
 	if (!CertainStaleReason(info, ComputeTableFingerprint(context, base)).empty()) {
 		// a plain LIKE must return every matching row: a proven-stale index
@@ -398,15 +402,14 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 	auto segments = TryResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
 	                                        bind.location.SegmentsTable(), "ngram index segments table");
 	auto stats = TryResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-	                                     bind.location.StatsTable(),
-	                                     "ngram index stats table");
+	                                     bind.location.StatsTable(), "ngram index stats table");
 	if (!segments || !stats) {
 		state.fallback_reason = "index unavailable";
 		return false;
 	}
-	auto probe = PlanIndexProbe(context, *state.core.tx, *segments, *stats, grams, MaxGramsPerQuery(context),
-	                            info.hwm_rowid, state.core.storage->GetTotalRows(), MaxCandidateFraction(context),
-	                            DConstants::INVALID_INDEX);
+	auto probe =
+	    PlanIndexProbe(context, *state.core.tx, *segments, *stats, grams, MaxGramsPerQuery(context), info.hwm_rowid,
+	                   state.core.storage->GetTotalRows(), MaxCandidateFraction(context), DConstants::INVALID_INDEX);
 	state.candidate_count = probe->candidate_upper_bound;
 	if (!probe->admitted) {
 		state.fallback_reason = probe->decline_reason;
@@ -512,8 +515,9 @@ static idx_t RecheckChunk(NgramScanLocalState &lstate, DataChunk &chunk, Selecti
 static void NgramScanFunc(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<NgramScanGlobalState>();
 	auto &lstate = data.local_state->Cast<NgramScanLocalState>();
-	ExecuteSearchCore(context, data, state.core, lstate.core,
-	                  [&](DataChunk &chunk, SelectionVector &sel) { return RecheckChunk(lstate, chunk, sel); }, output);
+	ExecuteSearchCore(
+	    context, data, state.core, lstate.core,
+	    [&](DataChunk &chunk, SelectionVector &sel) { return RecheckChunk(lstate, chunk, sel); }, output);
 }
 
 //! Ordered sinks reassemble a parallel scan's output by batch index. Fetch
@@ -613,8 +617,8 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 	auto &columns = table->GetColumns();
 	auto catalog_name = table->ParentCatalog().GetName();
 	auto schema_name = table->ParentSchema().name;
-	ResolvedTarget resolved {catalog_name, schema_name, table->name, string(), ShadowSchemaName(schema_name, table->name),
-	                         table};
+	ResolvedTarget resolved {
+	    catalog_name, schema_name, table->name, string(), ShadowSchemaName(schema_name, table->name), table};
 	auto locations = ExistingIndexes(context, resolved, true);
 
 	auto &transaction = DuckTransaction::Get(context, table->ParentCatalog());

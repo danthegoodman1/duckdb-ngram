@@ -52,10 +52,18 @@ struct IndexLocation {
 	idx_t segments_oid = 0;
 	idx_t stats_oid = 0;
 
-	bool Registered() const { return index_ref.rfind("legacy:", 0) != 0; }
-	string MetaTable() const { return Registered() ? "meta" : MetaTableName(column_name); }
-	string SegmentsTable() const { return Registered() ? "segments" : SegmentsTableName(column_name); }
-	string StatsTable() const { return Registered() ? "stats" : StatsTableName(column_name); }
+	bool Registered() const {
+		return index_ref.rfind("legacy:", 0) != 0;
+	}
+	string MetaTable() const {
+		return Registered() ? "meta" : MetaTableName(column_name);
+	}
+	string SegmentsTable() const {
+		return Registered() ? "segments" : SegmentsTableName(column_name);
+	}
+	string StatsTable() const {
+		return Registered() ? "stats" : StatsTableName(column_name);
+	}
 };
 
 //! Resolve a user-supplied table name (optionally schema/catalog-qualified) to a
@@ -71,8 +79,7 @@ ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, 
 vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarget &target,
                                       bool ignore_registry_corruption = false);
 void RequireUniqueIndexColumns(const vector<IndexLocation> &indexes);
-void RequireExclusiveOwnerAllocation(ClientContext &context, const ResolvedTarget &target,
-                                     const string &index_ref);
+void RequireExclusiveOwnerAllocation(ClientContext &context, const ResolvedTarget &target, const string &index_ref);
 
 void ValidateRegistryForCreate(ClientContext &context, const string &catalog_name, idx_t expected_registry_oid,
                                bool expected_bootstrap);

@@ -182,8 +182,7 @@ static string ScratchName(const char *purpose) {
 //! pragma for useful early errors and again after the generated script owns its
 //! transaction-lifetime vacuum fence, where it becomes the correctness check.
 static MaintenanceColumn ResolveMaintenanceColumn(ClientContext &context, const char *fn, ResolvedTarget &target,
-                                                   const IndexLocation &location,
-                                                   const TableFingerprint &fingerprint) {
+                                                  const IndexLocation &location, const TableFingerprint &fingerprint) {
 	auto &column_name = location.column_name;
 	if (!target.entry->ColumnExists(column_name)) {
 		throw CatalogException("%s: the ngram index on %s references column %s, which no longer exists; drop the "
@@ -194,8 +193,8 @@ static MaintenanceColumn ResolveMaintenanceColumn(ClientContext &context, const 
 	if (!IndexLocationAvailable(context, target, location)) {
 		throw InvalidInputException("%s: index storage is unavailable", fn);
 	}
-	auto &meta_entry = ResolveExistingTable(context, target.catalog_name, location.shadow_schema,
-	                                      location.MetaTable(), "ngram index meta table");
+	auto &meta_entry = ResolveExistingTable(context, target.catalog_name, location.shadow_schema, location.MetaTable(),
+	                                        "ngram index meta table");
 	ShadowTarget shadow {target.schema_name, target.table_name, column_name, location.shadow_schema};
 	MaintenanceColumn column;
 	column.column_name = column_name;
@@ -305,8 +304,8 @@ public:
 	}
 
 	void HoldCreationBarrier(DuckTransaction &transaction, DataTable &original_table,
-	                         unique_ptr<StorageLockKey> creation_lock, bool requires_replacement,
-	                         string schema_name, string table_name, string column_name, string guard_name) {
+	                         unique_ptr<StorageLockKey> creation_lock, bool requires_replacement, string schema_name,
+	                         string table_name, string column_name, string guard_name) {
 		lock_guard<mutex> guard(fences_lock);
 		for (auto &held : fences) {
 			if (held.manager != &transaction.GetTransactionManager()) {
@@ -340,14 +339,14 @@ public:
 			}
 			if (!StringUtil::CIEquals(held.creation_schema_name, schema_name) ||
 			    !StringUtil::CIEquals(held.creation_table_name, table_name) ||
-			    !StringUtil::CIEquals(held.creation_column_name, column_name) || held.creation_guard_name != guard_name) {
+			    !StringUtil::CIEquals(held.creation_column_name, column_name) ||
+			    held.creation_guard_name != guard_name) {
 				throw TransactionException("ngram creation barrier does not match the fresh rowid guard");
 			}
 			if (held.creation_requires_replacement) {
 				if (held.creation_table->IsMainTable() || !current_table.IsMainTable() ||
 				    held.creation_table == &current_table) {
-					throw TransactionException(
-					    "ngram creation cannot finish because the base table was not replaced");
+					throw TransactionException("ngram creation cannot finish because the base table was not replaced");
 				}
 			} else if (held.creation_table != &current_table || !current_table.IsMainTable()) {
 				throw TransactionException("ngram creation cannot finish because its protected table changed");
@@ -479,8 +478,8 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 		auto &catalog = Catalog::GetCatalog(context, catalog_name);
 		AcquireMaintenanceFence(context, catalog);
 		if (fn == "drop_ngram_index_by_id") {
-			ResolvedTarget drop_target {catalog_name, schema_name, table_name, column_name,
-			                            ShadowSchemaName(schema_name, table_name), nullptr};
+			ResolvedTarget drop_target {
+			    catalog_name, schema_name, table_name, column_name, ShadowSchemaName(schema_name, table_name), nullptr};
 			if (!IndexLocationAvailable(context, drop_target, location)) {
 				throw InvalidInputException("%s: index storage was removed after preparation", fn);
 			}
@@ -516,8 +515,7 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 			for (auto &location : indexes) {
 				auto &indexed_column = location.column_name;
 				auto &meta_entry = ResolveExistingTable(context, target.catalog_name, location.shadow_schema,
-				                                        location.MetaTable(),
-				                                        "ngram index meta table");
+				                                        location.MetaTable(), "ngram index meta table");
 				ShadowTarget shadow {target.schema_name, target.table_name, indexed_column, location.shadow_schema};
 				ReadMeta(context, transaction, meta_entry, shadow);
 				if (StringUtil::CIEquals(indexed_column, column_name)) {
@@ -534,20 +532,20 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 					throw InvalidInputException("%s: protecting ngram index disappeared while preparing", fn);
 				}
 				auto &protector_location = protectors[0];
-				auto &meta_entry = ResolveExistingTable(context, target.catalog_name,
-				                                        protector_location.shadow_schema, protector_location.MetaTable(),
-				                                        "ngram index meta table");
+				auto &meta_entry = ResolveExistingTable(context, target.catalog_name, protector_location.shadow_schema,
+				                                        protector_location.MetaTable(), "ngram index meta table");
 				ShadowTarget protector_target {target.schema_name, target.table_name, protector_detail,
 				                               protector_location.shadow_schema};
 				auto protector = ReadMeta(context, DuckTransaction::Get(context, target.entry->ParentCatalog()),
 				                          meta_entry, protector_target);
 				if (protector.guard_name != protector_name || protector.guard_token != protector_identity) {
 					throw InvalidInputException(
-					    "%s: the protecting rowid guard changed while the statement was being prepared; run it again", fn);
+					    "%s: the protecting rowid guard changed while the statement was being prepared; run it again",
+					    fn);
 				}
 				vector<string> ignored;
-				auto reason = RowIdGuardProtectionReason(target.entry->Cast<DuckTableEntry>(), protector,
-				                                         column_name, ignored);
+				auto reason =
+				    RowIdGuardProtectionReason(target.entry->Cast<DuckTableEntry>(), protector, column_name, ignored);
 				if (!reason.empty()) {
 					throw InvalidInputException("%s: the protecting rowid guard is unavailable: %s; run it again", fn,
 					                            reason);
@@ -560,9 +558,9 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 					throw InvalidInputException("%s: malformed native update protector identity", fn);
 				}
 				NativeUpdateProtector protector {protector_name, protector_oid,
-				                                   NumericCast<transaction_t>(protector_timestamp)};
-				auto reason = NativeUpdateProtectorReason(context, target.entry->Cast<DuckTableEntry>(), column_name,
-				                                           protector);
+				                                 NumericCast<transaction_t>(protector_timestamp)};
+				auto reason =
+				    NativeUpdateProtectorReason(context, target.entry->Cast<DuckTableEntry>(), column_name, protector);
 				if (!reason.empty()) {
 					throw InvalidInputException("%s: the native update protector is unavailable: %s; run it again", fn,
 					                            reason);
@@ -575,8 +573,7 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 			} else if (!protector_kind.empty()) {
 				throw InvalidInputException("%s: unknown creation protector kind %s", fn, protector_kind);
 			}
-			auto fence_state =
-			    context.registered_state->GetOrCreate<MaintenanceFenceState>("ngram_maintenance_fence");
+			auto fence_state = context.registered_state->GetOrCreate<MaintenanceFenceState>("ngram_maintenance_fence");
 			fence_state->HoldCreationBarrier(transaction, target.entry->GetStorage(), std::move(creation_lock),
 			                                 protector_kind.empty(), target.schema_name, target.table_name, column_name,
 			                                 new_guard_name);
@@ -610,8 +607,7 @@ static void CreationFinishFunction(DataChunk &args, ExpressionState &state, Vect
 		auto &catalog = Catalog::GetCatalog(context, catalog_name);
 		auto &table = ResolveExistingTable(context, catalog_name, schema_name, table_name, "ngram index base table");
 		auto token = InstalledRowIdGuardToken(table, column_name, guard_name);
-		auto context_state =
-		    context.registered_state->GetOrCreate<MaintenanceFenceState>("ngram_maintenance_fence");
+		auto context_state = context.registered_state->GetOrCreate<MaintenanceFenceState>("ngram_maintenance_fence");
 		context_state->FinishCreation(DuckTransaction::Get(context, catalog), table.GetStorage(), schema_name,
 		                              table_name, column_name, guard_name);
 		output[row] = StringVector::AddString(result, token);
@@ -763,9 +759,8 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 			script += PackPartitionStatement(
 			    packed, i == 0,
 			    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, " +
-			        SystemFunction("unnest") + "(" +
-			        SystemFunction("trigrams") + "(" + quoted_column + ", " + gram_str + ", " + ci_str +
-			        ")) AS gram FROM " + base +
+			        SystemFunction("unnest") + "(" + SystemFunction("trigrams") + "(" + quoted_column + ", " +
+			        gram_str + ", " + ci_str + ")) AS gram FROM " + base +
 			        " WHERE rowid >= " + to_string(ranges[i].first) + " AND rowid <= " + to_string(ranges[i].second) +
 			        " AND " + quoted_column + " IS NOT NULL");
 		}
@@ -773,11 +768,9 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		// readers union every row of a (gram, segment_no), compaction merges.
 		// Written in gram order like every other generation, so the probe's
 		// `gram = ?` filter keeps pruning row groups by zone map.
-		script += "INSERT INTO " + segments +
-		          " SELECT gram, segment_no, (SELECT coalesce(" + SystemFunction("max") +
-		          "(generation), 0) + 1 FROM " + segments +
-		          "), postings, rowid_count, min_rowid, max_rowid FROM " + packed + " ORDER BY " +
-		          SystemFunction("encode") + "(gram), segment_no;\n";
+		script += "INSERT INTO " + segments + " SELECT gram, segment_no, (SELECT coalesce(" + SystemFunction("max") +
+		          "(generation), 0) + 1 FROM " + segments + "), postings, rowid_count, min_rowid, max_rowid FROM " +
+		          packed + " ORDER BY " + SystemFunction("encode") + "(gram), segment_no;\n";
 		// Fold the existing stats and this delta into one byte-ordered row per
 		// gram in a single statement, then replace the table. Refresh generations
 		// are individually ordered but DuckDB can place several small appends in
@@ -800,16 +793,16 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		script += "CREATE TEMP TABLE " + folded_stats + " AS SELECT " + SystemFunction("decode") +
 		          "(gram_key) AS gram, " + SystemFunction("sum") + "(checked_row_count)::BIGINT AS row_count, " +
 		          SystemFunction("sum") + "(checked_segment_count)::BIGINT AS segment_count FROM (SELECT " +
-		          SystemFunction("encode") + "(gram) AS gram_key, CASE WHEN " + invalid_stats + " THEN " +
-		          stats_error + " ELSE row_count END AS checked_row_count, CASE WHEN " + invalid_stats + " THEN " +
-		          stats_error + " ELSE segment_count END AS checked_segment_count FROM " + stats +
-		          " UNION ALL SELECT " + SystemFunction("encode") +
+		          SystemFunction("encode") + "(gram) AS gram_key, CASE WHEN " + invalid_stats + " THEN " + stats_error +
+		          " ELSE row_count END AS checked_row_count, CASE WHEN " + invalid_stats + " THEN " + stats_error +
+		          " ELSE segment_count END AS checked_segment_count FROM " + stats + " UNION ALL SELECT " +
+		          SystemFunction("encode") +
 		          "(gram) AS gram_key, rowid_count::BIGINT AS checked_row_count, "
 		          "1::BIGINT AS checked_segment_count FROM " +
 		          packed + ") GROUP BY gram_key ORDER BY gram_key;\n";
 		script += "DELETE FROM " + stats + ";\n";
-		script += "INSERT INTO " + stats + " SELECT * FROM " + folded_stats + " ORDER BY " +
-		          SystemFunction("encode") + "(gram);\n";
+		script += "INSERT INTO " + stats + " SELECT * FROM " + folded_stats + " ORDER BY " + SystemFunction("encode") +
+		          "(gram);\n";
 		script += "DROP TABLE " + folded_stats + ";\n";
 		// Unbounded, the new mark is the highest committed rowid the partitions
 		// just covered. Bounded, it is bound_end itself — but only once some
@@ -851,15 +844,14 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 			auto bound_str = to_string(bound_end);
 			new_hwm = "CASE WHEN EXISTS (SELECT 1 FROM " + base + " WHERE rowid > " + bound_str + " AND rowid < " +
 			          local_start + ") THEN " + bound_str + " ELSE coalesce((SELECT " + SystemFunction("max") +
-			          "(rowid) FROM " + base +
-			          " WHERE " + tail_predicate + " AND rowid <= " + bound_str + "), hwm_rowid) END";
+			          "(rowid) FROM " + base + " WHERE " + tail_predicate + " AND rowid <= " + bound_str +
+			          "), hwm_rowid) END";
 		} else {
 			new_hwm = "coalesce((SELECT " + SystemFunction("max") + "(rowid) FROM " + base + " WHERE " +
 			          tail_predicate + "), hwm_rowid)";
 		}
 		script += "UPDATE " + meta + " SET hwm_rowid = " + new_hwm + ", " +
-		          FingerprintAssignments(fingerprint, column.column_name) +
-		          ";\n";
+		          FingerprintAssignments(fingerprint, column.column_name) + ";\n";
 		script += "DROP TABLE " + packed + ";\n";
 
 		if (bounded) {
@@ -873,13 +865,11 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 			// literal: the execution-time maintenance guard above has already
 			// refused the whole script if the meta row no longer held it.
 			auto recorded = "(SELECT hwm_rowid FROM " + meta + ")";
-			summary_rows.push_back("SELECT " + Lit(column.column_name) + " AS column_name, (SELECT " +
-			                       SystemFunction("count") + "(*) FROM " +
-			                       base + " WHERE rowid > " + hwm + " AND rowid <= " + recorded +
-			                       ") AS rows_indexed, " + recorded + " AS hwm_rowid, (SELECT " +
-			                       SystemFunction("count") + "(*) FROM " + base +
-			                       " WHERE rowid > " + recorded + " AND rowid < " + local_start +
-			                       ") AS remaining_tail");
+			summary_rows.push_back(
+			    "SELECT " + Lit(column.column_name) + " AS column_name, (SELECT " + SystemFunction("count") +
+			    "(*) FROM " + base + " WHERE rowid > " + hwm + " AND rowid <= " + recorded + ") AS rows_indexed, " +
+			    recorded + " AS hwm_rowid, (SELECT " + SystemFunction("count") + "(*) FROM " + base +
+			    " WHERE rowid > " + recorded + " AND rowid < " + local_start + ") AS remaining_tail");
 		}
 	}
 	script += "DROP TABLE " + guard + ";\n";
@@ -961,27 +951,26 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		script += "CREATE TEMP TABLE " + key_guard + " AS SELECT CASE WHEN " + SystemFunction("count") +
 		          "(*) = 0 THEN true ELSE " + SystemFunction("error") +
 		          "('ngram: malformed segments-table key') END AS valid FROM " + keys +
-		          " WHERE gram IS NULL OR segment_no IS NULL OR " + SystemFunction("length") + "(gram) != " +
-		          to_string(column.meta.options.gram_size) +
-		          " OR segment_no < 0 OR segment_no > " +
+		          " WHERE gram IS NULL OR segment_no IS NULL OR " + SystemFunction("length") +
+		          "(gram) != " + to_string(column.meta.options.gram_size) + " OR segment_no < 0 OR segment_no > " +
 		          to_string(column.meta.hwm_rowid < 0 ? -1 : column.meta.hwm_rowid >> SEGMENT_SHIFT) + ";\n";
 		// The persistent table is gram-ordered for query pruning, so scanning it
 		// once per rowid partition multiplies reads. Copy only selected encoded
 		// rows into a spillable segment-ordered source once, before decoding.
 		script += "CREATE TEMP TABLE " + selected +
 		          " AS SELECT s.gram, s.segment_no, s.postings, s.rowid_count, s.min_rowid, s.max_rowid, "
-		          "s.generation::BIGINT AS generation FROM " + segments +
-		          " s WHERE EXISTS (SELECT 1 FROM " + keys +
-		          " k WHERE " + SystemFunction("encode") + "(k.gram) = " + SystemFunction("encode") +
-		          "(s.gram) AND k.segment_no = s.segment_no) ORDER BY s.segment_no, " +
-		          SystemFunction("encode") + "(s.gram);\n";
+		          "s.generation::BIGINT AS generation FROM " +
+		          segments + " s WHERE EXISTS (SELECT 1 FROM " + keys + " k WHERE " + SystemFunction("encode") +
+		          "(k.gram) = " + SystemFunction("encode") +
+		          "(s.gram) AND k.segment_no = s.segment_no) ORDER BY s.segment_no, " + SystemFunction("encode") +
+		          "(s.gram);\n";
 		if (purge_everywhere) {
 			// DuckDB v1.5.5 cannot physically prune a base scan on the rowid
 			// pseudo-column. Materialize the relevant live rowids in one pass;
 			// the ordered one-BIGINT temp then prunes each packing range.
 			script += "CREATE TEMP TABLE " + live + " AS SELECT rowid AS r FROM " + base +
-			          " WHERE rowid >= 0 AND rowid <= " + to_string(column.meta.hwm_rowid) +
-			          " AND " + Ident(column.column_name) + " IS NOT NULL" +
+			          " WHERE rowid >= 0 AND rowid <= " + to_string(column.meta.hwm_rowid) + " AND " +
+			          Ident(column.column_name) + " IS NOT NULL" +
 			          " AND EXISTS (SELECT 1 FROM (SELECT DISTINCT segment_no FROM " + keys +
 			          ") k WHERE k.segment_no = rowid >> " + to_string(SEGMENT_SHIFT) + ") ORDER BY r;\n";
 		}
@@ -1002,14 +991,12 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 			auto source = "SELECT gram, segment_no, r FROM " + SystemFunction("ngram_unpack_postings") +
 			              "((SELECT gram, segment_no, postings, rowid_count, min_rowid, max_rowid, generation, " +
 			              to_string(column.meta.hwm_rowid) + "::BIGINT AS hwm FROM " + selected +
-			              " WHERE segment_no >= " +
-			              segment_lo + " AND segment_no <= " + segment_hi + "))";
+			              " WHERE segment_no >= " + segment_lo + " AND segment_no <= " + segment_hi + "))";
 			if (purge_everywhere) {
 				source += " WHERE r IN (SELECT r FROM " + live + " WHERE r >= " + to_string(ranges[i].first) +
 				          " AND r <= " + to_string(ranges[i].second) + ")";
 			}
-			script += PackPartitionStatement(
-			    packed, i == 0, source);
+			script += PackPartitionStatement(packed, i == 0, source);
 		}
 		script += "DELETE FROM " + segments + " WHERE EXISTS (SELECT 1 FROM " + keys + " k WHERE " +
 		          SystemFunction("encode") + "(k.gram) = " + SystemFunction("encode") + "(" + segments +
@@ -1032,8 +1019,8 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		script += "DELETE FROM " + stats + ";\n";
 		script += "INSERT INTO " + stats + " SELECT " + SystemFunction("decode") + "(gram_key), " +
 		          SystemFunction("sum") + "(rowid_count)::BIGINT, " + SystemFunction("count") +
-		          "(*)::BIGINT FROM (SELECT " + SystemFunction("encode") +
-		          "(gram) AS gram_key, rowid_count FROM " + segments + ") GROUP BY gram_key ORDER BY gram_key;\n";
+		          "(*)::BIGINT FROM (SELECT " + SystemFunction("encode") + "(gram) AS gram_key, rowid_count FROM " +
+		          segments + ") GROUP BY gram_key ORDER BY gram_key;\n";
 		script += "UPDATE " + meta + " SET " + FingerprintAssignments(fingerprint, column.column_name) + ";\n";
 		script += "DROP TABLE " + keys + ";\n";
 		script += "DROP TABLE " + key_guard + ";\n";
@@ -1049,24 +1036,22 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 
 void RegisterMaintenance(ExtensionLoader &loader) {
 	auto guard = ScalarFunction(NGRAM_MAINTENANCE_GUARD,
-	                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
-	                             LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR,
-	                             LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT,
-	                             LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
-	                             LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
+	                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BIGINT,  LogicalType::BIGINT,
+	                             LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                             LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BOOLEAN, LogicalType::VARCHAR,
+	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
+	                             LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT},
 	                            LogicalType::BOOLEAN, MaintenanceGuardFunction);
 	guard.stability = FunctionStability::VOLATILE;
 	guard.SetFallible();
 	loader.RegisterFunction(guard);
 
-	auto finish = ScalarFunction(NGRAM_CREATION_FINISH,
-	                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                              LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                             LogicalType::VARCHAR, CreationFinishFunction);
+	auto finish = ScalarFunction(
+	    NGRAM_CREATION_FINISH,
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    LogicalType::VARCHAR, CreationFinishFunction);
 	finish.stability = FunctionStability::VOLATILE;
 	finish.SetFallible();
 	loader.RegisterFunction(finish);

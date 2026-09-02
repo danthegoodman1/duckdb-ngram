@@ -534,10 +534,11 @@ static void ThrowIfCandidatesCertainlyStale(ClientContext &context, DuckTableEnt
 	if (reason.empty()) {
 		return;
 	}
-	throw InvalidInputException("ngram_candidates: the ngram index on %s.%s is stale and cannot be used: %s. Rebuild it: PRAGMA "
-	                            "drop_ngram_index('%s', '%s') then PRAGMA create_ngram_index('%s', '%s')",
-	                            bind.table_name, bind.column_name, reason, bind.table_name, bind.column_name,
-	                            bind.table_name, bind.column_name);
+	throw InvalidInputException(
+	    "ngram_candidates: the ngram index on %s.%s is stale and cannot be used: %s. Rebuild it: PRAGMA "
+	    "drop_ngram_index('%s', '%s') then PRAGMA create_ngram_index('%s', '%s')",
+	    bind.table_name, bind.column_name, reason, bind.table_name, bind.column_name, bind.table_name,
+	    bind.column_name);
 }
 
 //===----------------------------------------------------------------------===//
@@ -659,8 +660,8 @@ static void CheckedAtomicAdd(atomic<idx_t> &target, idx_t value) {
 }
 
 static vector<GramStats> ReadGramStats(ClientContext &context, DuckTransaction &tx, DuckTableEntry &stats_entry,
-                                      const vector<string> &grams, idx_t workers, idx_t &rows_scanned,
-                                      idx_t &chunks_scanned) {
+                                       const vector<string> &grams, idx_t workers, idx_t &rows_scanned,
+                                       idx_t &chunks_scanned) {
 	// string_t keys reference the immutable query grams for this scan. Looking
 	// up a stats value therefore allocates no per-row scratch, even when a
 	// malformed/unrelated stats gram is very large.
@@ -684,44 +685,44 @@ static vector<GramStats> ReadGramStats(ClientContext &context, DuckTransaction &
 	// Raw storage scans cannot execute an InFilter directly. OptionalFilter
 	// uses it only for row-group pruning; the map below remains the exact row
 	// filter and accumulator across every visible refresh generation.
-	filters.PushFilter(ColumnIndex(0),
-	                   make_uniq<OptionalFilter>(make_uniq<InFilter>(std::move(gram_values))));
+	filters.PushFilter(ColumnIndex(0), make_uniq<OptionalFilter>(make_uniq<InFilter>(std::move(gram_values))));
 	atomic<idx_t> scanned_rows {0};
 	atomic<idx_t> scanned_chunks {0};
-	ParallelScanShadowTable(context, tx, stats_entry.GetStorage(), column_ids, types, &filters, workers,
-	                        [&](DataChunk &chunk, idx_t worker) {
-		scanned_rows.fetch_add(chunk.size());
-		scanned_chunks.fetch_add(1);
-		UnifiedVectorFormat gram_format, row_format, segment_format;
-		chunk.data[0].ToUnifiedFormat(chunk.size(), gram_format);
-		chunk.data[1].ToUnifiedFormat(chunk.size(), row_format);
-		chunk.data[2].ToUnifiedFormat(chunk.size(), segment_format);
-		auto gram_data = UnifiedVectorFormat::GetData<string_t>(gram_format);
-		auto row_data = UnifiedVectorFormat::GetData<int64_t>(row_format);
-		auto segment_data = UnifiedVectorFormat::GetData<int64_t>(segment_format);
-		for (idx_t r = 0; r < chunk.size(); r++) {
-			auto gram_idx = gram_format.sel->get_index(r);
-			auto row_idx = row_format.sel->get_index(r);
-			auto segment_idx = segment_format.sel->get_index(r);
-			if (!gram_format.validity.RowIsValid(gram_idx)) {
-				continue;
-			}
-			auto entry = gram_index.find(gram_data[gram_idx]);
-			if (entry == gram_index.end()) {
-				continue;
-			}
-			if (!row_format.validity.RowIsValid(row_idx) || !segment_format.validity.RowIsValid(segment_idx)) {
-				throw InvalidInputException("ngram: requested stats row contains NULLs; the index is malformed");
-			}
-			if (row_data[row_idx] <= 0 || segment_data[segment_idx] <= 0) {
-				throw InvalidInputException("ngram: invalid gram row in stats table; the index is malformed");
-			}
-			auto rows = NumericCast<idx_t>(row_data[row_idx]);
-			auto segments = NumericCast<idx_t>(segment_data[segment_idx]);
-			CheckedAtomicAdd(totals[entry->second].row_count, rows);
-			CheckedAtomicAdd(totals[entry->second].segment_count, segments);
-		}
-		                        });
+	ParallelScanShadowTable(
+	    context, tx, stats_entry.GetStorage(), column_ids, types, &filters, workers,
+	    [&](DataChunk &chunk, idx_t worker) {
+		    scanned_rows.fetch_add(chunk.size());
+		    scanned_chunks.fetch_add(1);
+		    UnifiedVectorFormat gram_format, row_format, segment_format;
+		    chunk.data[0].ToUnifiedFormat(chunk.size(), gram_format);
+		    chunk.data[1].ToUnifiedFormat(chunk.size(), row_format);
+		    chunk.data[2].ToUnifiedFormat(chunk.size(), segment_format);
+		    auto gram_data = UnifiedVectorFormat::GetData<string_t>(gram_format);
+		    auto row_data = UnifiedVectorFormat::GetData<int64_t>(row_format);
+		    auto segment_data = UnifiedVectorFormat::GetData<int64_t>(segment_format);
+		    for (idx_t r = 0; r < chunk.size(); r++) {
+			    auto gram_idx = gram_format.sel->get_index(r);
+			    auto row_idx = row_format.sel->get_index(r);
+			    auto segment_idx = segment_format.sel->get_index(r);
+			    if (!gram_format.validity.RowIsValid(gram_idx)) {
+				    continue;
+			    }
+			    auto entry = gram_index.find(gram_data[gram_idx]);
+			    if (entry == gram_index.end()) {
+				    continue;
+			    }
+			    if (!row_format.validity.RowIsValid(row_idx) || !segment_format.validity.RowIsValid(segment_idx)) {
+				    throw InvalidInputException("ngram: requested stats row contains NULLs; the index is malformed");
+			    }
+			    if (row_data[row_idx] <= 0 || segment_data[segment_idx] <= 0) {
+				    throw InvalidInputException("ngram: invalid gram row in stats table; the index is malformed");
+			    }
+			    auto rows = NumericCast<idx_t>(row_data[row_idx]);
+			    auto segments = NumericCast<idx_t>(segment_data[segment_idx]);
+			    CheckedAtomicAdd(totals[entry->second].row_count, rows);
+			    CheckedAtomicAdd(totals[entry->second].segment_count, segments);
+		    }
+	    });
 	rows_scanned = scanned_rows.load();
 	chunks_scanned = scanned_chunks.load();
 	vector<GramStats> result(grams.size());
@@ -788,17 +789,16 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 		plan->decline_reason = "query grams exceed query memory budget";
 		return plan;
 	}
-	plan->memory_reservation = make_uniq<ProbeMemoryReservation>(BufferManager::GetBufferManager(context),
-	                                                           preflight_bytes);
+	plan->memory_reservation =
+	    make_uniq<ProbeMemoryReservation>(BufferManager::GetBufferManager(context), preflight_bytes);
 	auto all_stats = ReadGramStats(context, tx, stats_entry, grams, stats_workers, plan->stats_rows_scanned,
 	                               plan->stats_chunks_scanned);
 	vector<idx_t> order(grams.size());
 	for (idx_t i = 0; i < order.size(); i++) {
 		order[i] = i;
 	}
-	std::stable_sort(order.begin(), order.end(), [&](idx_t a, idx_t b) {
-		return all_stats[a].row_count < all_stats[b].row_count;
-	});
+	std::stable_sort(order.begin(), order.end(),
+	                 [&](idx_t a, idx_t b) { return all_stats[a].row_count < all_stats[b].row_count; });
 	order.resize(MinValue(order.size(), max_grams));
 	vector<GramStats> selected_stats;
 	selected_stats.reserve(order.size());
@@ -826,8 +826,7 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 	idx_t gram_scratch_bytes;
 	if (!CheckedMultiply(order.size(), sizeof(idx_t), gram_scratch_bytes) ||
 	    !CheckedMultiply(descriptor_count, sizeof(ProbeDescriptor) + sizeof(ProbeSegment), manifest_bytes) ||
-	    !CheckedAdd(manifest_bytes, gram_scratch_bytes) ||
-	    !CheckedAdd(manifest_bytes, idx_t(4096))) {
+	    !CheckedAdd(manifest_bytes, gram_scratch_bytes) || !CheckedAdd(manifest_bytes, idx_t(4096))) {
 		plan->decline_reason = "segment manifest size overflow";
 		return plan;
 	}
@@ -874,24 +873,26 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 					throw InvalidInputException("ngram: segments table contains NULLs; the index is malformed");
 				}
 				auto &gram = gram_data[gram_idx];
-				if (gram != string_t(plan->grams[gram_index]) || segment_data[segment_idx] < 0 ||
-				    hwm < 0 || segment_data[segment_idx] > (hwm >> SEGMENT_SHIFT) || count_data[count_idx] <= 0) {
+				if (gram != string_t(plan->grams[gram_index]) || segment_data[segment_idx] < 0 || hwm < 0 ||
+				    segment_data[segment_idx] > (hwm >> SEGMENT_SHIFT) || count_data[count_idx] <= 0) {
 					throw InvalidInputException("ngram: invalid segments-table descriptor; the index is malformed");
 				}
 				if (plan->descriptors.size() >= descriptor_count ||
 				    found_descriptors[gram_index] >= selected_stats[gram_index].segment_count) {
-					throw InvalidInputException("ngram: segments and stats descriptor counts disagree; the index is malformed");
+					throw InvalidInputException(
+					    "ngram: segments and stats descriptor counts disagree; the index is malformed");
 				}
 				auto count = NumericCast<idx_t>(count_data[count_idx]);
 				if (count > (idx_t(1) << SEGMENT_SHIFT)) {
-					throw InvalidInputException("ngram: segment row_count exceeds its rowid range; the index is malformed");
+					throw InvalidInputException(
+					    "ngram: segment row_count exceeds its rowid range; the index is malformed");
 				}
 				if (!CheckedAdd(found_rows[gram_index], count)) {
 					throw InvalidInputException("ngram: segments row counts overflow; the index is malformed");
 				}
 				found_descriptors[gram_index]++;
-				plan->descriptors.push_back(ProbeDescriptor {segment_data[segment_idx], gram_index,
-				                                                   rowid_data[rowid_idx], count});
+				plan->descriptors.push_back(
+				    ProbeDescriptor {segment_data[segment_idx], gram_index, rowid_data[rowid_idx], count});
 			}
 		});
 		if (found_descriptors[gram_index] != selected_stats[gram_index].segment_count ||
@@ -902,15 +903,16 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 	if (plan->descriptors.size() != descriptor_count) {
 		throw InvalidInputException("ngram: segments and stats descriptor counts disagree; the index is malformed");
 	}
-	std::sort(plan->descriptors.begin(), plan->descriptors.end(), [](const ProbeDescriptor &a, const ProbeDescriptor &b) {
-		if (a.segment_no != b.segment_no) {
-			return a.segment_no < b.segment_no;
-		}
-		if (a.gram_index != b.gram_index) {
-			return a.gram_index < b.gram_index;
-		}
-		return a.posting_rowid < b.posting_rowid;
-	});
+	std::sort(plan->descriptors.begin(), plan->descriptors.end(),
+	          [](const ProbeDescriptor &a, const ProbeDescriptor &b) {
+		          if (a.segment_no != b.segment_no) {
+			          return a.segment_no < b.segment_no;
+		          }
+		          if (a.gram_index != b.gram_index) {
+			          return a.gram_index < b.gram_index;
+		          }
+		          return a.posting_rowid < b.posting_rowid;
+	          });
 
 	auto hard_work_limit = MaxProbeRowids(context);
 	vector<idx_t> counts;
@@ -936,8 +938,8 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 			}
 		}
 		auto segment_start = NumericCast<idx_t>(plan->descriptors[begin].segment_no) << SEGMENT_SHIFT;
-		auto segment_capacity = MinValue<idx_t>((idx_t(1) << SEGMENT_SHIFT),
-		                                        NumericCast<idx_t>(hwm) - segment_start + 1);
+		auto segment_capacity =
+		    MinValue<idx_t>((idx_t(1) << SEGMENT_SHIFT), NumericCast<idx_t>(hwm) - segment_start + 1);
 		for (auto count : counts) {
 			if (count > segment_capacity) {
 				throw InvalidInputException(
@@ -998,8 +1000,7 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 			continue;
 		}
 		idx_t peak_bytes;
-		if (!CheckedMultiply(peak_rows, sizeof(row_t), peak_bytes) ||
-		    !CheckedAdd(peak_bytes, idx_t(256 * 1024))) {
+		if (!CheckedMultiply(peak_rows, sizeof(row_t), peak_bytes) || !CheckedAdd(peak_bytes, idx_t(256 * 1024))) {
 			resource_decline = "segment memory estimate overflow";
 			begin = end;
 			continue;
@@ -1029,8 +1030,8 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 		return plan;
 	}
 	auto possible_workers = (memory_budget - reserved_bytes) / peak_worker_bytes;
-	plan->max_threads = MinValue<idx_t>(plan->segments.size(),
-	                                  MinValue<idx_t>(worker_cap, MinValue<idx_t>(ProbeThreads(context), possible_workers)));
+	plan->max_threads = MinValue<idx_t>(
+	    plan->segments.size(), MinValue<idx_t>(worker_cap, MinValue<idx_t>(ProbeThreads(context), possible_workers)));
 	D_ASSERT(plan->max_threads > 0);
 	idx_t workspace_bytes;
 	if (!CheckedMultiply(peak_worker_bytes, plan->max_threads, workspace_bytes)) {
@@ -1112,9 +1113,8 @@ static void DecodeDescriptorRange(ClientContext &context, DuckTransaction &tx, P
 			auto &blob = blob_data[blob_idx];
 			auto encoded_count = PostingsCount(blob.GetData(), blob.GetSize());
 			auto &descriptor = descriptors[offset + r];
-			if (gram != string_t(plan.grams[gram_index]) ||
-			    segment_data[segment_idx] != segment.segment_no || count_data[count_idx] <= 0 ||
-			    NumericCast<idx_t>(count_data[count_idx]) != descriptor.posting_count ||
+			if (gram != string_t(plan.grams[gram_index]) || segment_data[segment_idx] != segment.segment_no ||
+			    count_data[count_idx] <= 0 || NumericCast<idx_t>(count_data[count_idx]) != descriptor.posting_count ||
 			    encoded_count != descriptor.posting_count || encoded_count > expected - postings.size()) {
 				throw InvalidInputException("ngram: posting row disagrees with its manifest; the index is malformed");
 			}
@@ -1205,7 +1205,8 @@ void FinalizeSearchCore(ClientContext &context, SearchCoreGlobal &state) {
 	state.storage->InitializeParallelScan(context, state.parallel_scan, NO_COLUMN_INDEXES);
 	constexpr idx_t FETCH_BATCHES_PER_SEGMENT = (idx_t(1) << SEGMENT_SHIFT) / STANDARD_VECTOR_SIZE;
 	state.fetch_batch_base = state.probe ? state.probe->segments.size() * FETCH_BATCHES_PER_SEGMENT : 0;
-	state.max_threads = (state.probe ? state.probe->max_threads : 0) + SearchCoreScanUnits(context, *state.storage, state);
+	state.max_threads =
+	    (state.probe ? state.probe->max_threads : 0) + SearchCoreScanUnits(context, *state.storage, state);
 	state.max_threads = MaxValue<idx_t>(state.max_threads, 1);
 }
 
@@ -1243,8 +1244,8 @@ static void SearchCoreEmit(SearchCoreGlobal &global, SearchCoreLocal &local, Dat
 }
 
 void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchCoreGlobal &global,
-                       SearchCoreLocal &local,
-                       const std::function<idx_t(DataChunk &, SelectionVector &)> &recheck, DataChunk &output) {
+                       SearchCoreLocal &local, const std::function<idx_t(DataChunk &, SelectionVector &)> &recheck,
+                       DataChunk &output) {
 	while (true) {
 		switch (local.phase) {
 		case SearchCorePhase::FETCH: {
@@ -1436,8 +1437,12 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	state->vacuum_lock = DuckTransactionManager::Get(storage.GetAttached()).SharedVacuumLock();
 
 	state->options = bind.bound_options;
-	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name,
-	                       ShadowSchemaName(bind.schema_name, bind.table_name), &base};
+	ResolvedTarget target {bind.catalog_name,
+	                       bind.schema_name,
+	                       bind.table_name,
+	                       bind.column_name,
+	                       ShadowSchemaName(bind.schema_name, bind.table_name),
+	                       &base};
 	if (!IndexLocationAvailable(context, target, bind.location, true)) {
 		state->fallback_reason = "index unavailable";
 	} else {
@@ -1479,7 +1484,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 		requested_to_fetch.push_back(state->core.fetch_types.size());
 		state->core.fetch_column_ids.push_back(base.GetStorageIndex(col_idx));
 		state->core.fetch_types.push_back(col_idx.HasType() ? col_idx.GetScanType()
-		                                                     : columns.GetColumn(col_idx.ToLogical()).Type());
+		                                                    : columns.GetColumn(col_idx.ToLogical()).Type());
 		state->fetched_columns.push_back(columns.GetColumn(col_idx.ToLogical()).Name() +
 		                                 (col_idx.IsPushdownExtract() ? " (extract)" : ""));
 		if (col_idx.GetPrimaryIndex() == bind.search_column_idx && !col_idx.HasChildren()) {
@@ -1558,11 +1563,12 @@ static unique_ptr<LocalTableFunctionState> SearchInitLocal(ExecutionContext &con
 static void SearchFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<SearchGlobalState>();
 	auto &lstate = data.local_state->Cast<SearchLocalState>();
-	ExecuteSearchCore(context, data, state.core, lstate.core,
-	                  [&](DataChunk &chunk, SelectionVector &sel) {
-		                  return lstate.recheck.Recheck(chunk, state.search_column_idx, sel);
-	                  },
-	                  output);
+	ExecuteSearchCore(
+	    context, data, state.core, lstate.core,
+	    [&](DataChunk &chunk, SelectionVector &sel) {
+		    return lstate.recheck.Recheck(chunk, state.search_column_idx, sel);
+	    },
+	    output);
 }
 
 //! Ordered sinks reassemble a parallel scan's output by batch index. Fetch
@@ -1591,9 +1597,9 @@ static InsertionOrderPreservingMap<string> SearchDynamicToString(TableFunctionDy
 	auto &state = input.global_state->Cast<SearchGlobalState>();
 	result["Ngram Storage Columns"] = StringUtil::Join(state.fetched_columns, ", ");
 	if (state.core.probe) {
-		result["Ngram Mode"] = StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
-		                                          state.core.probe->candidate_upper_bound,
-		                                          state.core.probe->decoded_rowids.load());
+		result["Ngram Mode"] =
+		    StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
+		                       state.core.probe->candidate_upper_bound, state.core.probe->decoded_rowids.load());
 		result["Ngram Stats Rows Scanned"] = to_string(state.core.probe->stats_rows_scanned);
 		result["Ngram Stats Chunks Scanned"] = to_string(state.core.probe->stats_chunks_scanned);
 	} else {
@@ -1646,13 +1652,17 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 	state->tx = &DuckTransaction::Get(context, base.ParentCatalog());
 	state->vacuum_lock = DuckTransactionManager::Get(storage.GetAttached()).SharedVacuumLock();
 
-	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name,
-	                       ShadowSchemaName(bind.schema_name, bind.table_name), &base};
+	ResolvedTarget target {bind.catalog_name,
+	                       bind.schema_name,
+	                       bind.table_name,
+	                       bind.column_name,
+	                       ShadowSchemaName(bind.schema_name, bind.table_name),
+	                       &base};
 	if (!IndexLocationAvailable(context, target, bind.location)) {
 		throw InvalidInputException("ngram_candidates: index storage was removed after binding");
 	}
-	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema, bind.location.MetaTable(),
-	                                "ngram index meta table");
+	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
+	                                  bind.location.MetaTable(), "ngram index meta table");
 	auto info = ReadMeta(context, *state->tx, meta, bind.Target());
 	ThrowIfCandidatesCertainlyStale(context, base, info, bind);
 	state->hwm = info.hwm_rowid;

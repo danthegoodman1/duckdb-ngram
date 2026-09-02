@@ -154,8 +154,8 @@ static string RegisteredStorageSchema(const string &index_ref) {
 static void ValidateRegistryShape(DuckTableEntry &table) {
 	static const array<const char *, 6> NAMES = {"registry_version", "index_id",   "owner_key",
 	                                             "schema_name",      "table_name", "column_name"};
-	static const array<LogicalType, 6> TYPES = {LogicalType::INTEGER, LogicalType::UUID, LogicalType::BLOB,
-	                                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	static const array<LogicalType, 6> TYPES = {LogicalType::INTEGER, LogicalType::UUID,    LogicalType::BLOB,
+	                                            LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	auto columns = table.GetColumns().Logical();
 	if (columns.Size() != NAMES.size()) {
 		throw InvalidInputException("ngram: registry must have exactly six columns");
@@ -247,8 +247,8 @@ static RegistrySnapshot ReadRegistry(ClientContext &context, const string &catal
 			if (version != REGISTRY_VERSION) {
 				error = StringUtil::Format("ngram: unsupported registry row version %d", version);
 			} else if (!IsCanonicalUUID(registry_row.index_ref) ||
-			           registry_row.owner_key != OwnerKey(registry_row.schema_name, registry_row.table_name,
-			                                              registry_row.column_name)) {
+			           registry_row.owner_key !=
+			               OwnerKey(registry_row.schema_name, registry_row.table_name, registry_row.column_name)) {
 				error = "ngram: registry row has a noncanonical ID or owner key";
 			}
 			if (!error.empty()) {
@@ -273,18 +273,16 @@ struct RegistryCreateState {
 	idx_t registry_oid = 0;
 };
 
-static idx_t ExistingTableOid(ClientContext &context, const string &catalog, const string &schema,
-                              const string &table);
+static idx_t ExistingTableOid(ClientContext &context, const string &catalog, const string &schema, const string &table);
 static idx_t ExistingSchemaOid(ClientContext &context, const string &catalog, const string &schema);
 
 static idx_t ForeignSchemaEntries(ClientContext &context, SchemaCatalogEntry &schema,
                                   const vector<string> &allowed_tables) {
-	static const CatalogType TYPES[] = {
-	    CatalogType::TABLE_ENTRY,           CatalogType::INDEX_ENTRY,
-	    CatalogType::SEQUENCE_ENTRY,        CatalogType::MACRO_ENTRY,
-	    CatalogType::TABLE_MACRO_ENTRY,     CatalogType::TYPE_ENTRY,
-	    CatalogType::COLLATION_ENTRY,       CatalogType::COPY_FUNCTION_ENTRY,
-	    CatalogType::PRAGMA_FUNCTION_ENTRY, CatalogType::COORDINATE_SYSTEM_ENTRY};
+	static const CatalogType TYPES[] = {CatalogType::TABLE_ENTRY,           CatalogType::INDEX_ENTRY,
+	                                    CatalogType::SEQUENCE_ENTRY,        CatalogType::MACRO_ENTRY,
+	                                    CatalogType::TABLE_MACRO_ENTRY,     CatalogType::TYPE_ENTRY,
+	                                    CatalogType::COLLATION_ENTRY,       CatalogType::COPY_FUNCTION_ENTRY,
+	                                    CatalogType::PRAGMA_FUNCTION_ENTRY, CatalogType::COORDINATE_SYSTEM_ENTRY};
 	idx_t foreign = 0;
 	for (auto type : TYPES) {
 		schema.Scan(context, type, [&](CatalogEntry &entry) {
@@ -319,8 +317,7 @@ static bool ParseOpaqueSchema(const string &schema, string &index_ref) {
 static RegistryCreateState InspectRegistryForCreate(ClientContext &context, const string &catalog_name) {
 	RegistryCreateState result;
 	auto registry = ReadRegistry(context, catalog_name);
-	auto registry_schema =
-	    Catalog::GetSchema(context, catalog_name, REGISTRY_SCHEMA, OnEntryNotFound::RETURN_NULL);
+	auto registry_schema = Catalog::GetSchema(context, catalog_name, REGISTRY_SCHEMA, OnEntryNotFound::RETURN_NULL);
 	unordered_set<string> opaque;
 	for (auto &schema : Catalog::GetSchemas(context, catalog_name)) {
 		if (StringUtil::CIStartsWith(schema.get().name, REGISTERED_PREFIX)) {
@@ -352,8 +349,7 @@ static RegistryCreateState InspectRegistryForCreate(ClientContext &context, cons
 		    ForeignSchemaEntries(context, *entry, {REGISTERED_META, REGISTERED_SEGMENTS, REGISTERED_STATS})) {
 			throw InvalidInputException("create_ngram_index: registered storage schema %s is malformed", schema);
 		}
-		auto &meta = ResolveExistingTable(context, catalog_name, schema, REGISTERED_META,
-		                                  "ngram index meta table");
+		auto &meta = ResolveExistingTable(context, catalog_name, schema, REGISTERED_META, "ngram index meta table");
 		ShadowTarget owner {row.schema_name, row.table_name, row.column_name, schema};
 		auto header = ReadMetaHeader(context, DuckTransaction::Get(context, meta.ParentCatalog()), meta, owner);
 		if (header.format_version != NGRAM_FORMAT_VERSION) {
@@ -389,8 +385,8 @@ void ValidateRegistryForCreate(ClientContext &context, const string &catalog_nam
 
 static void ClassifyRegisteredBase(ClientContext &context, ObservedIndex &observed, const MetaInfo &info) {
 	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, observed.table_name);
-	auto base = Catalog::GetEntry(context, observed.catalog_name, observed.schema_name, lookup,
-	                              OnEntryNotFound::RETURN_NULL);
+	auto base =
+	    Catalog::GetEntry(context, observed.catalog_name, observed.schema_name, lookup, OnEntryNotFound::RETURN_NULL);
 	if (!base || base->type != CatalogType::TABLE_ENTRY || !base->Cast<TableCatalogEntry>().IsDuckTable()) {
 		observed.status = "ORPHAN";
 		observed.reason = "base table is missing or no longer an ordinary DuckDB table";
@@ -448,7 +444,7 @@ static vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string
 			registry_error = registry.error;
 		} catch (std::exception &ex) {
 			RethrowFatalObservation(ex);
-		registry_error = ErrorData(ex).Message();
+			registry_error = ErrorData(ex).Message();
 		}
 	}
 	unordered_map<string, RegistryRow> rows;
@@ -496,12 +492,11 @@ static vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string
 			if (!observed.location.meta_oid || !observed.location.segments_oid || !observed.location.stats_oid) {
 				throw InvalidInputException("one or more exact storage tables are missing");
 			}
-			if (ForeignSchemaEntries(context, schema,
-			                         {REGISTERED_META, REGISTERED_SEGMENTS, REGISTERED_STATS}) != 0) {
+			if (ForeignSchemaEntries(context, schema, {REGISTERED_META, REGISTERED_SEGMENTS, REGISTERED_STATS}) != 0) {
 				throw InvalidInputException("opaque storage schema contains foreign objects; ID drop is blocked");
 			}
-			auto &meta = ResolveExistingTable(context, catalog_name, schema.name, REGISTERED_META,
-			                                  "ngram index meta table");
+			auto &meta =
+			    ResolveExistingTable(context, catalog_name, schema.name, REGISTERED_META, "ngram index meta table");
 			auto &tx = DuckTransaction::Get(context, meta.ParentCatalog());
 			ShadowTarget target {observed.schema_name, observed.table_name, observed.location.column_name, schema.name};
 			auto header = ReadMetaHeader(context, tx, meta, target);
@@ -596,8 +591,8 @@ static vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string
 			observed.location.shadow_schema = schema.name;
 			observed.location.schema_oid = schema.oid;
 			try {
-				auto &meta = ResolveExistingTable(context, catalog_name, schema.name, meta_name,
-				                                  "ngram index meta table");
+				auto &meta =
+				    ResolveExistingTable(context, catalog_name, schema.name, meta_name, "ngram index meta table");
 				auto &tx = DuckTransaction::Get(context, meta.ParentCatalog());
 				ShadowTarget target {string(), string(), string(), schema.name};
 				auto header = ReadMetaHeader(context, tx, meta, target);
@@ -611,10 +606,10 @@ static vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string
 				observed.table_name = header.table_name;
 				observed.location.column_name = header.column_name;
 				observed.location.meta_oid = meta.oid;
-				observed.location.segments_oid = ExistingTableOid(context, catalog_name, schema.name,
-				                                             SegmentsTableName(header.column_name));
-				observed.location.stats_oid = ExistingTableOid(context, catalog_name, schema.name,
-				                                                  StatsTableName(header.column_name));
+				observed.location.segments_oid =
+				    ExistingTableOid(context, catalog_name, schema.name, SegmentsTableName(header.column_name));
+				observed.location.stats_oid =
+				    ExistingTableOid(context, catalog_name, schema.name, StatsTableName(header.column_name));
 				if (!observed.location.segments_oid || !observed.location.stats_oid) {
 					throw InvalidInputException("one or more legacy storage tables are missing");
 				}
@@ -654,16 +649,15 @@ static ObservedIndex FindObserved(ClientContext &context, const string &catalog_
 	throw CatalogException("ngram: index %s does not exist in catalog %s", index_ref, catalog_name);
 }
 
-void RequireExclusiveOwnerAllocation(ClientContext &context, const ResolvedTarget &target,
-                                     const string &index_ref) {
+void RequireExclusiveOwnerAllocation(ClientContext &context, const ResolvedTarget &target, const string &index_ref) {
 	// Preserve the hot resolver's strict legacy spelling/ownership checks, then
 	// supplement it with lifecycle observation for registry-row-lost storage.
 	RequireUniqueIndexColumns(ExistingIndexes(context, target));
 	auto expected_owner = OwnerKey(target.schema_name, target.table_name, target.column_name);
 	bool found = false;
 	for (auto &observed : ObserveCatalog(context, target.catalog_name)) {
-		auto same_owner = OwnerKey(observed.schema_name, observed.table_name, observed.location.column_name) ==
-		                  expected_owner;
+		auto same_owner =
+		    OwnerKey(observed.schema_name, observed.table_name, observed.location.column_name) == expected_owner;
 		if (observed.location.index_ref != index_ref) {
 			if (same_owner) {
 				throw InvalidInputException("ngram: multiple allocations claim column %s", target.column_name);
@@ -780,11 +774,10 @@ static string MaintenanceGuardCall(const ResolvedTarget &target, const string &c
                                    const CreationProtector &protector, const string &new_guard_name,
                                    const RegistryCreateState &registry) {
 	return SystemFunction(NGRAM_MAINTENANCE_GUARD) + "(" + Lit(fn) + ", " + Lit(target.catalog_name) + ", " +
-	       Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(column_name) + ", true, " +
-	       "-1, " + to_string(fingerprint.table_oid) + ", " +
-	       Lit(fingerprint.schema_fingerprint) + ", 0, false, " + Lit(protector.kind) + ", " +
-	       Lit(protector.detail) + ", " + Lit(protector.name) + ", " + Lit(protector.identity) + ", " +
-	       to_string(protector.timestamp) + ", " + Lit(new_guard_name) + ", " +
+	       Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(column_name) + ", true, " + "-1, " +
+	       to_string(fingerprint.table_oid) + ", " + Lit(fingerprint.schema_fingerprint) + ", 0, false, " +
+	       Lit(protector.kind) + ", " + Lit(protector.detail) + ", " + Lit(protector.name) + ", " +
+	       Lit(protector.identity) + ", " + to_string(protector.timestamp) + ", " + Lit(new_guard_name) + ", " +
 	       to_string(registry.registry_oid) + ", " + (registry.bootstrap ? "true" : "false") +
 	       ", '', '', '', 0, 0, 0, 0, 0)";
 }
@@ -843,14 +836,13 @@ vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_
 
 string PackPartitionStatement(const string &packed, bool first, const string &pair_source) {
 	string statement = first ? "CREATE TEMP TABLE " + packed + " AS " : "INSERT INTO " + packed + " ";
-	return statement +
-	       "SELECT " + SystemFunction("decode") + "(gram_key) AS gram, segment_no, " +
-	       SystemFunction("struct_extract") + "(segment, 'postings') AS postings, " +
-	       SystemFunction("struct_extract") + "(segment, 'rowid_count') AS rowid_count, " +
-	       SystemFunction("struct_extract") + "(segment, 'min_rowid') AS min_rowid, " +
-	       SystemFunction("struct_extract") + "(segment, 'max_rowid') AS max_rowid FROM (" +
-	       "SELECT " + SystemFunction("encode") + "(gram) AS gram_key, segment_no, " +
-	       SystemFunction("ngram_pack_segment") + "(r) AS segment FROM (" + pair_source + ") GROUP BY gram_key, segment_no);\n";
+	return statement + "SELECT " + SystemFunction("decode") + "(gram_key) AS gram, segment_no, " +
+	       SystemFunction("struct_extract") + "(segment, 'postings') AS postings, " + SystemFunction("struct_extract") +
+	       "(segment, 'rowid_count') AS rowid_count, " + SystemFunction("struct_extract") +
+	       "(segment, 'min_rowid') AS min_rowid, " + SystemFunction("struct_extract") +
+	       "(segment, 'max_rowid') AS max_rowid FROM (" + "SELECT " + SystemFunction("encode") +
+	       "(gram) AS gram_key, segment_no, " + SystemFunction("ngram_pack_segment") + "(r) AS segment FROM (" +
+	       pair_source + ") GROUP BY gram_key, segment_no);\n";
 }
 
 idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs) {
@@ -960,10 +952,12 @@ vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarg
 	try {
 		registry = ReadRegistry(context, target.catalog_name);
 	} catch (CatalogException &) {
-		if (ignore_registry_corruption) return result;
+		if (ignore_registry_corruption)
+			return result;
 		throw;
 	} catch (InvalidInputException &) {
-		if (ignore_registry_corruption) return result;
+		if (ignore_registry_corruption)
+			return result;
 		throw;
 	}
 	for (auto &row : registry.rows) {
@@ -1016,7 +1010,8 @@ vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarg
 		location.schema_oid = ExistingSchemaOid(context, target.catalog_name, location.shadow_schema);
 		location.segments_oid =
 		    ExistingTableOid(context, target.catalog_name, location.shadow_schema, location.SegmentsTable());
-		location.stats_oid = ExistingTableOid(context, target.catalog_name, location.shadow_schema, location.StatsTable());
+		location.stats_oid =
+		    ExistingTableOid(context, target.catalog_name, location.shadow_schema, location.StatsTable());
 		result.push_back(std::move(location));
 	}
 	return result;
@@ -1047,7 +1042,9 @@ bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target
 	auto current_segments =
 	    ExistingTableOid(context, target.catalog_name, location.shadow_schema, location.SegmentsTable());
 	auto current_stats = ExistingTableOid(context, target.catalog_name, location.shadow_schema, location.StatsTable());
-	auto changed = [](idx_t expected, idx_t current) { return current && current != expected; };
+	auto changed = [](idx_t expected, idx_t current) {
+		return current && current != expected;
+	};
 	if (changed(location.schema_oid, current_schema) || changed(location.meta_oid, current_meta) ||
 	    changed(location.segments_oid, current_segments) || changed(location.stats_oid, current_stats)) {
 		return replaced("ngram: storage schema or tables changed after the index operation was prepared");
@@ -1093,16 +1090,16 @@ bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target
 		matches++;
 		if (row.owner_key != OwnerKey(target.schema_name, target.table_name, location.column_name) ||
 		    location.shadow_schema != RegisteredStorageSchema(row.index_ref)) {
-			return replaced(StringUtil::Format(
-			    "ngram: registry row %s changed after the index operation was prepared", location.index_ref));
+			return replaced(StringUtil::Format("ngram: registry row %s changed after the index operation was prepared",
+			                                   location.index_ref));
 		}
 	}
 	if (matches != 1) {
 		if (!current_schema && !current_meta && !current_segments && !current_stats && matches == 0) {
 			return false;
 		}
-		return replaced(StringUtil::Format(
-		    "ngram: registry row %s was removed after the index operation was prepared", location.index_ref));
+		return replaced(StringUtil::Format("ngram: registry row %s was removed after the index operation was prepared",
+		                                   location.index_ref));
 	}
 	return !absent;
 }
@@ -1185,8 +1182,7 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 		for (auto &location : existing_indexes) {
 			auto indexed_column = location.column_name;
 			auto &meta_entry = ResolveExistingTable(context, target.catalog_name, location.shadow_schema,
-				                                        location.MetaTable(),
-			                                        "ngram index meta table");
+			                                        location.MetaTable(), "ngram index meta table");
 			ShadowTarget existing {target.schema_name, target.table_name, indexed_column, location.shadow_schema};
 			auto info = ReadMeta(context, transaction, meta_entry, existing);
 			if (StringUtil::CIEquals(indexed_column, column_name)) {
@@ -1194,8 +1190,8 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 				                            target.table_name, column_name, location.index_ref);
 			}
 			vector<string> covered_columns;
-			auto reason = RowIdGuardProtectionReason(target.entry->Cast<DuckTableEntry>(), info, column_name,
-			                                         covered_columns);
+			auto reason =
+			    RowIdGuardProtectionReason(target.entry->Cast<DuckTableEntry>(), info, column_name, covered_columns);
 			if (reason.empty() && protector.kind.empty()) {
 				// A v3 guard was created behind this phase's ADD/DROP barrier,
 				// so its broad column dependency proves every older snapshot was
@@ -1277,11 +1273,11 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 		          "(registry_version INTEGER NOT NULL, index_id UUID PRIMARY KEY, owner_key BLOB UNIQUE NOT NULL, "
 		          "schema_name VARCHAR NOT NULL, table_name VARCHAR NOT NULL, column_name VARCHAR NOT NULL);\n";
 	}
-	script += "INSERT INTO " + Ident(target.catalog_name) + "." + Ident(REGISTRY_SCHEMA) + "." +
-	          Ident(REGISTRY_TABLE) + " VALUES (" + to_string(REGISTRY_VERSION) + ", " + Lit(index_ref) +
-	          "::UUID, " + SystemFunction("from_hex") + "(" + Lit(Hex(OwnerKey(target.schema_name, target.table_name,
-	                                                                           column_name))) +
-	          "), " + Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(column_name) + ");\n";
+	script += "INSERT INTO " + Ident(target.catalog_name) + "." + Ident(REGISTRY_SCHEMA) + "." + Ident(REGISTRY_TABLE) +
+	          " VALUES (" + to_string(REGISTRY_VERSION) + ", " + Lit(index_ref) + "::UUID, " +
+	          SystemFunction("from_hex") + "(" +
+	          Lit(Hex(OwnerKey(target.schema_name, target.table_name, column_name))) + "), " + Lit(target.schema_name) +
+	          ", " + Lit(target.table_name) + ", " + Lit(column_name) + ");\n";
 	// This custom index has no postings and its build plan never scans the base
 	// table. Its physical column dependency rewrites future indexed-column
 	// updates to delete+insert, while its non-ART type disables rowid-moving
@@ -1293,18 +1289,17 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	// Uncommitted rows are found by the tail scan instead, and land past the
 	// high-water mark when they commit.
 	auto committed_only = "rowid < " + to_string(LOCAL_ROWID_START);
-	auto committed_hwm = "(SELECT coalesce(" + SystemFunction("max") + "(rowid), -1) FROM " + base + " WHERE " +
-	                     committed_only + ")";
+	auto committed_hwm =
+	    "(SELECT coalesce(" + SystemFunction("max") + "(rowid), -1) FROM " + base + " WHERE " + committed_only + ")";
 	script += "CREATE SCHEMA " + shadow + ";\n";
 	script += "CREATE TABLE " + meta + " AS SELECT " + to_string(NGRAM_FORMAT_VERSION) + " AS format_version, " +
 	          Lit(target.schema_name) + " AS schema_name, " + Lit(target.table_name) + " AS table_name, " +
 	          Lit(column_name) + " AS column_name, " + gram_str + " AS gram_size, " + ci_str +
-	          " AS case_insensitive, " +
-	          committed_hwm + " AS hwm_rowid, " + Lit(fingerprint.schema_fingerprint) +
+	          " AS case_insensitive, " + committed_hwm + " AS hwm_rowid, " + Lit(fingerprint.schema_fingerprint) +
 	          " AS schema_fingerprint, " + Lit(fingerprint.ColumnType(column_name)) + " AS column_type, " +
 	          to_string(fingerprint.table_oid) + "::BIGINT AS table_oid, " + to_string(fingerprint.catalog_oid) +
-	          "::BIGINT AS catalog_oid, " + Lit(fingerprint.instance_id) + " AS instance_id, " +
-	          Lit(guard_name) + " AS guard_name, (SELECT guard_token FROM " + guard + ") AS guard_token;\n";
+	          "::BIGINT AS catalog_oid, " + Lit(fingerprint.instance_id) + " AS instance_id, " + Lit(guard_name) +
+	          " AS guard_name, (SELECT guard_token FROM " + guard + ") AS guard_token;\n";
 	auto partitions =
 	    BuildPartitionCount(context, EstimateGramCount(context, *target.entry, column_name, 0,
 	                                                   fingerprint.total_rows - 1, NumericCast<idx_t>(gram_size)));
@@ -1312,12 +1307,10 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	for (idx_t i = 0; i < ranges.size(); i++) {
 		script += PackPartitionStatement(
 		    packed, i == 0,
-		    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, " +
-		        SystemFunction("unnest") + "(" +
-		        SystemFunction("trigrams") + "(" + column +
-		        ", " + gram_str + ", " + ci_str + ")) AS gram FROM " + base +
-		        " WHERE rowid >= " + to_string(ranges[i].first) + " AND rowid <= " + to_string(ranges[i].second) +
-		        " AND " + column + " IS NOT NULL");
+		    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, " + SystemFunction("unnest") +
+		        "(" + SystemFunction("trigrams") + "(" + column + ", " + gram_str + ", " + ci_str + ")) AS gram FROM " +
+		        base + " WHERE rowid >= " + to_string(ranges[i].first) +
+		        " AND rowid <= " + to_string(ranges[i].second) + " AND " + column + " IS NOT NULL");
 	}
 	// gram order is what makes the probe's `gram = ?` filter prune row groups by
 	// zone map, so the segments table is written sorted even though the
@@ -1328,9 +1321,9 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	          packed + " ORDER BY " + SystemFunction("encode") + "(gram), segment_no;\n";
 	script += "CREATE TABLE " + stats +
 	          " AS "
-	          "SELECT " + SystemFunction("decode") + "(gram_key) AS gram, " + SystemFunction("sum") +
-	          "(rowid_count)::BIGINT AS row_count, " +
-	          SystemFunction("count") + "(*)::BIGINT AS segment_count FROM " +
+	          "SELECT " +
+	          SystemFunction("decode") + "(gram_key) AS gram, " + SystemFunction("sum") +
+	          "(rowid_count)::BIGINT AS row_count, " + SystemFunction("count") + "(*)::BIGINT AS segment_count FROM " +
 	          "(SELECT " + SystemFunction("encode") + "(gram) AS gram_key, rowid_count FROM " + segments +
 	          ") GROUP BY gram_key ORDER BY gram_key;\n";
 	script += "DROP TABLE " + packed + ";\n";
@@ -1416,29 +1409,30 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 		query += "SELECT m.column_name, m.gram_size, m.case_insensitive, m.hwm_rowid, " +
 		         to_string(fingerprint.total_rows - 1) +
 		         "::BIGINT AS table_max_rowid, "
-		         "(SELECT " + SystemFunction("count") + "(*) FROM " +
-		         base + " WHERE rowid > m.hwm_rowid AND rowid < " + to_string(LOCAL_ROWID_START) +
+		         "(SELECT " +
+		         SystemFunction("count") + "(*) FROM " + base + " WHERE rowid > m.hwm_rowid AND rowid < " +
+		         to_string(LOCAL_ROWID_START) +
 		         ") AS remaining_tail, "
-		         "(SELECT " + SystemFunction("count") + "(DISTINCT " + SystemFunction("encode") + "(gram)) FROM " +
-		         stats +
+		         "(SELECT " +
+		         SystemFunction("count") + "(DISTINCT " + SystemFunction("encode") + "(gram)) FROM " + stats +
 		         ") AS distinct_grams, "
-		         "(SELECT " + SystemFunction("count") + "(*) FROM " +
-		         segments +
+		         "(SELECT " +
+		         SystemFunction("count") + "(*) FROM " + segments +
 		         ") AS segments, "
-		         "(SELECT " + SystemFunction("count") + "(*) FROM (SELECT " + SystemFunction("encode") +
-		         "(gram) AS gram_key, segment_no FROM " +
-		         segments +
-		         " GROUP BY " + SystemFunction("encode") + "(gram), segment_no HAVING " +
-		         SystemFunction("count") + "(*) > 1)) AS fragmented_keys, "
-		         "(SELECT " + SystemFunction("count") + "(DISTINCT generation) FROM " +
-		         segments +
+		         "(SELECT " +
+		         SystemFunction("count") + "(*) FROM (SELECT " + SystemFunction("encode") +
+		         "(gram) AS gram_key, segment_no FROM " + segments + " GROUP BY " + SystemFunction("encode") +
+		         "(gram), segment_no HAVING " + SystemFunction("count") +
+		         "(*) > 1)) AS fragmented_keys, "
+		         "(SELECT " +
+		         SystemFunction("count") + "(DISTINCT generation) FROM " + segments +
 		         ") AS generations, "
-		         "(SELECT coalesce(" + SystemFunction("sum") + "(rowid_count), 0) FROM " +
-		         segments +
+		         "(SELECT coalesce(" +
+		         SystemFunction("sum") + "(rowid_count), 0) FROM " + segments +
 		         ") AS posting_entries, "
-		         "(SELECT coalesce(" + SystemFunction("sum") + "(" + SystemFunction("octet_length") +
-		         "(postings)), 0) FROM " +
-		         segments + ") AS postings_bytes, " + (staleness.empty() ? string("NULL::VARCHAR") : Lit(staleness)) +
+		         "(SELECT coalesce(" +
+		         SystemFunction("sum") + "(" + SystemFunction("octet_length") + "(postings)), 0) FROM " + segments +
+		         ") AS postings_bytes, " + (staleness.empty() ? string("NULL::VARCHAR") : Lit(staleness)) +
 		         " AS stale_reason FROM " + meta + " m ";
 	}
 	query += "ORDER BY column_name;";
@@ -1446,12 +1440,14 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 }
 
 static string ValuesRow(const ObservedIndex &index) {
-	auto value = [](const string &text) { return text.empty() ? string("NULL::VARCHAR") : Lit(text); };
-	return "(" + Lit(index.catalog_name) + ", " + Lit(index.location.Registered() ? "registered" : "legacy") +
-	       ", " + Lit(index.location.index_ref) + ", " + value(index.schema_name) + ", " + value(index.table_name) +
-	       ", " + value(index.location.column_name) + ", " + Lit(index.location.shadow_schema) + ", " +
-	       (index.format_version < 0 ? "NULL::BIGINT" : to_string(index.format_version) + "::BIGINT") + ", " + Lit(index.status) +
-	       ", " + value(index.reason) + ")";
+	auto value = [](const string &text) {
+		return text.empty() ? string("NULL::VARCHAR") : Lit(text);
+	};
+	return "(" + Lit(index.catalog_name) + ", " + Lit(index.location.Registered() ? "registered" : "legacy") + ", " +
+	       Lit(index.location.index_ref) + ", " + value(index.schema_name) + ", " + value(index.table_name) + ", " +
+	       value(index.location.column_name) + ", " + Lit(index.location.shadow_schema) + ", " +
+	       (index.format_version < 0 ? "NULL::BIGINT" : to_string(index.format_version) + "::BIGINT") + ", " +
+	       Lit(index.status) + ", " + value(index.reason) + ")";
 }
 
 static string NgramIndexesQuery(ClientContext &context, const FunctionParameters &) {
@@ -1461,7 +1457,8 @@ static string NgramIndexesQuery(ClientContext &context, const FunctionParameters
 			continue;
 		}
 		auto observed = ObserveCatalog(context, database->GetName());
-		indexes.insert(indexes.end(), std::make_move_iterator(observed.begin()), std::make_move_iterator(observed.end()));
+		indexes.insert(indexes.end(), std::make_move_iterator(observed.begin()),
+		               std::make_move_iterator(observed.end()));
 	}
 	string query = "SELECT * FROM (VALUES ";
 	if (indexes.empty()) {
@@ -1475,7 +1472,9 @@ static string NgramIndexesQuery(ClientContext &context, const FunctionParameters
 			query += ValuesRow(indexes[i]);
 		}
 	}
-	query += ") v(database_name,kind,index_ref,schema_name,table_name,column_name,storage_schema,format_version,status,reason)";
+	query += ") "
+	         "v(database_name,kind,index_ref,schema_name,table_name,column_name,storage_schema,format_version,status,"
+	         "reason)";
 	if (indexes.empty()) {
 		query += " WHERE false";
 	}
@@ -1486,7 +1485,9 @@ static string NgramIndexesQuery(ClientContext &context, const FunctionParameters
 static string NgramIndexStatusQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto index = FindObserved(context, parameters.values[0].ToString(), parameters.values[1].ToString());
 	return "SELECT * FROM (VALUES " + ValuesRow(index) +
-	       ") v(database_name,kind,index_ref,schema_name,table_name,column_name,storage_schema,format_version,status,reason)";
+	       ") "
+	       "v(database_name,kind,index_ref,schema_name,table_name,column_name,storage_schema,format_version,status,"
+	       "reason)";
 }
 
 static string DropNgramIndexByIdQuery(ClientContext &context, const FunctionParameters &parameters) {
@@ -1501,8 +1502,12 @@ static string DropNgramIndexByIdQuery(ClientContext &context, const FunctionPara
 		throw InvalidInputException("drop_ngram_index_by_id: index %s is %s: %s; repair the catalog manually",
 		                            index_ref, index.status, index.reason);
 	}
-	ResolvedTarget owner {index.catalog_name, index.schema_name, index.table_name, index.location.column_name,
-	                      ShadowSchemaName(index.schema_name, index.table_name), nullptr};
+	ResolvedTarget owner {index.catalog_name,
+	                      index.schema_name,
+	                      index.table_name,
+	                      index.location.column_name,
+	                      ShadowSchemaName(index.schema_name, index.table_name),
+	                      nullptr};
 	RequireExclusiveOwnerAllocation(context, owner, index_ref);
 	string meta_table = REGISTERED_META;
 	string segments_table = REGISTERED_SEGMENTS;
@@ -1522,16 +1527,15 @@ static string DropNgramIndexByIdQuery(ClientContext &context, const FunctionPara
 	script += "CREATE TEMP TABLE " + guard + " AS SELECT " + SystemFunction(NGRAM_MAINTENANCE_GUARD) +
 	          "('drop_ngram_index_by_id', " + Lit(index.catalog_name) + ", " + Lit(index.schema_name) + ", " +
 	          Lit(index.table_name) + ", " + Lit(index.location.column_name) +
-	          ", false, -1, 0, '', 0, false, '', '', '', '', 0, '', 0, false, " + Lit(index.location.index_ref) +
-	          ", " + Lit(index.location.shadow_schema) + ", " + Lit(meta_table) + ", " +
+	          ", false, -1, 0, '', 0, false, '', '', '', '', 0, '', 0, false, " + Lit(index.location.index_ref) + ", " +
+	          Lit(index.location.shadow_schema) + ", " + Lit(meta_table) + ", " +
 	          to_string(index.location.registry_oid) + ", " + to_string(index.location.schema_oid) + ", " +
 	          to_string(index.location.meta_oid) + ", " + to_string(index.location.segments_oid) + ", " +
-	          to_string(index.location.stats_oid) +
-	          ") AS ignored;\n";
+	          to_string(index.location.stats_oid) + ") AS ignored;\n";
 	if (index.format_version == 2 || index.format_version == NGRAM_FORMAT_VERSION) {
 		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, index.table_name);
-		auto base = Catalog::GetEntry(context, index.catalog_name, index.schema_name, lookup,
-		                              OnEntryNotFound::RETURN_NULL);
+		auto base =
+		    Catalog::GetEntry(context, index.catalog_name, index.schema_name, lookup, OnEntryNotFound::RETURN_NULL);
 		if (base && base->type == CatalogType::TABLE_ENTRY && base->Cast<TableCatalogEntry>().IsDuckTable()) {
 			auto &table = base->Cast<DuckTableEntry>();
 			auto &meta = ResolveExistingTable(context, index.catalog_name, index.location.shadow_schema, meta_table,
@@ -1545,13 +1549,12 @@ static string DropNgramIndexByIdQuery(ClientContext &context, const FunctionPara
 				guard_name = info.guard_name;
 				guard_token = info.guard_token;
 			}
-			script += SilentGuard(guard, SystemFunction(NGRAM_ROWID_GUARD_VALIDATE) + "(" +
-			                                Lit(index.catalog_name) + ", " + Lit(index.schema_name) + ", " +
-			                                Lit(index.table_name) + ", " + Lit(index.location.column_name) + ", " +
-			                                Lit(index.location.shadow_schema) + ", " +
-			                                to_string(index.format_version) + ", " +
-			                                to_string(index.location.meta_oid) + ", " + Lit(guard_name) + ", " +
-			                                Lit(guard_token) + ", " + Lit(meta_table) + ")");
+			script += SilentGuard(
+			    guard, SystemFunction(NGRAM_ROWID_GUARD_VALIDATE) + "(" + Lit(index.catalog_name) + ", " +
+			               Lit(index.schema_name) + ", " + Lit(index.table_name) + ", " +
+			               Lit(index.location.column_name) + ", " + Lit(index.location.shadow_schema) + ", " +
+			               to_string(index.format_version) + ", " + to_string(index.location.meta_oid) + ", " +
+			               Lit(guard_name) + ", " + Lit(guard_token) + ", " + Lit(meta_table) + ")");
 			if (index.format_version == NGRAM_FORMAT_VERSION) {
 				script += "DROP INDEX IF EXISTS " + Ident(index.catalog_name) + "." + Ident(index.schema_name) + "." +
 				          Ident(guard_name) + ";\n";
@@ -1576,8 +1579,7 @@ static string DropNgramIndexByIdQuery(ClientContext &context, const FunctionPara
 	}
 	if (index.location.Registered() && !index.location.registry_oid) {
 		auto registry = ReadRegistry(context, index.catalog_name);
-		auto reserved = Catalog::GetSchema(context, index.catalog_name, REGISTRY_SCHEMA,
-		                                   OnEntryNotFound::RETURN_NULL);
+		auto reserved = Catalog::GetSchema(context, index.catalog_name, REGISTRY_SCHEMA, OnEntryNotFound::RETURN_NULL);
 		if (!registry.oid && reserved && ForeignSchemaEntries(context, *reserved, {}) == 0) {
 			// A whole-registry deletion leaves this empty reserved schema behind.
 			// Plain DROP (never CASCADE) makes concurrent object creation roll back.
@@ -1611,7 +1613,6 @@ void RegisterIndexPragmas(ExtensionLoader &loader) {
 	                                                   {LogicalType::VARCHAR, LogicalType::VARCHAR}));
 	loader.RegisterFunction(PragmaFunction::PragmaCall("drop_ngram_index_by_id", DropNgramIndexByIdQuery,
 	                                                   {LogicalType::VARCHAR, LogicalType::VARCHAR}));
-
 }
 
 } // namespace ngram

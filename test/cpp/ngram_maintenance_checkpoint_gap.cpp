@@ -56,9 +56,9 @@ static string OpaqueSchema(Connection &con, const string &table_name, const stri
 static string IndexRef(Connection &con, const string &table_name, const string &column_name,
                        const string &catalog_name = string()) {
 	auto registry = catalog_name.empty() ? string("__ngram.registry") : catalog_name + ".__ngram.registry";
-	return ScalarString(con, "SELECT index_id::VARCHAR FROM " + registry + " WHERE table_name=" +
-	                             KeywordHelper::WriteQuoted(table_name) + " AND column_name=" +
-	                             KeywordHelper::WriteQuoted(column_name));
+	return ScalarString(con, "SELECT index_id::VARCHAR FROM " + registry +
+	                             " WHERE table_name=" + KeywordHelper::WriteQuoted(table_name) +
+	                             " AND column_name=" + KeywordHelper::WriteQuoted(column_name));
 }
 
 static string IndexStatus(Connection &con, const string &table_name, const string &column_name) {
@@ -68,7 +68,8 @@ static string IndexStatus(Connection &con, const string &table_name, const strin
 	return result->GetValue(8, 0).ToString();
 }
 
-static unique_ptr<MaterializedQueryResult> StatusByRef(Connection &con, const string &catalog, const string &index_ref) {
+static unique_ptr<MaterializedQueryResult> StatusByRef(Connection &con, const string &catalog,
+                                                       const string &index_ref) {
 	return Query(con, "PRAGMA ngram_index_status(" + KeywordHelper::WriteQuoted(catalog) + "," +
 	                      KeywordHelper::WriteQuoted(index_ref) + ")");
 }
@@ -90,15 +91,14 @@ static void DropByRef(Connection &con, const string &catalog, const string &inde
 static void ExpectStatus(Connection &con, const string &catalog, const string &index_ref, const string &expected) {
 	auto actual = StatusName(con, catalog, index_ref);
 	if (actual != expected) {
-		throw std::runtime_error("expected index " + index_ref + " status " + expected + ", got " + actual +
-		                         ": " + StatusReason(con, catalog, index_ref));
+		throw std::runtime_error("expected index " + index_ref + " status " + expected + ", got " + actual + ": " +
+		                         StatusReason(con, catalog, index_ref));
 	}
 }
 
 static string TestUUID(uint64_t value) {
 	char buffer[37];
-	snprintf(buffer, sizeof(buffer), "00000000-0000-4000-8000-%012llx",
-	         static_cast<unsigned long long>(value));
+	snprintf(buffer, sizeof(buffer), "00000000-0000-4000-8000-%012llx", static_cast<unsigned long long>(value));
 	return buffer;
 }
 
@@ -131,15 +131,12 @@ static string LegacyRef(Connection &con, const string &schema_name, const string
                         const string &column_name) {
 	auto result = Query(con, "PRAGMA ngram_indexes");
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		if (result->GetValue(1, row).ToString() == "legacy" &&
-		    result->GetValue(3, row).ToString() == schema_name &&
-		    result->GetValue(4, row).ToString() == table_name &&
-		    result->GetValue(5, row).ToString() == column_name) {
+		if (result->GetValue(1, row).ToString() == "legacy" && result->GetValue(3, row).ToString() == schema_name &&
+		    result->GetValue(4, row).ToString() == table_name && result->GetValue(5, row).ToString() == column_name) {
 			return result->GetValue(2, row).ToString();
 		}
 	}
-	throw std::runtime_error("legacy allocation not listed for " + schema_name + "." + table_name + "." +
-	                         column_name);
+	throw std::runtime_error("legacy allocation not listed for " + schema_name + "." + table_name + "." + column_name);
 }
 
 static string RefForStorage(Connection &con, const string &storage_schema) {
@@ -153,7 +150,7 @@ static string RefForStorage(Connection &con, const string &storage_schema) {
 }
 
 static string CopyRegisteredToLegacy(Connection &con, const string &schema_name, const string &table_name,
-	                                 const string &column_name, bool remove_registered, bool make_v2 = false) {
+                                     const string &column_name, bool remove_registered, bool make_v2 = false) {
 	auto opaque = OpaqueSchema(con, table_name, column_name);
 	auto legacy = "ngram_" + schema_name + "_" + table_name;
 	Check(con, "CREATE SCHEMA IF NOT EXISTS " + KeywordHelper::WriteOptionallyQuoted(legacy));
@@ -174,8 +171,8 @@ static string CopyRegisteredToLegacy(Connection &con, const string &schema_name,
 	}
 	if (remove_registered) {
 		Check(con, "DELETE FROM __ngram.registry WHERE schema_name=" + KeywordHelper::WriteQuoted(schema_name) +
-		               " AND table_name=" + KeywordHelper::WriteQuoted(table_name) + " AND column_name=" +
-		               KeywordHelper::WriteQuoted(column_name));
+		               " AND table_name=" + KeywordHelper::WriteQuoted(table_name) +
+		               " AND column_name=" + KeywordHelper::WriteQuoted(column_name));
 		Check(con, "DROP TABLE " + opaque + ".meta");
 		Check(con, "DROP TABLE " + opaque + ".segments");
 		Check(con, "DROP TABLE " + opaque + ".stats");
@@ -206,8 +203,8 @@ static void CopyFile(const string &source, const string &target) {
 static bool HasRowIdGuard(Connection &con, const string &table_name) {
 	bool found = false;
 	con.context->RunFunctionInTransaction([&]() {
-		auto &table = Catalog::GetEntry<TableCatalogEntry>(*con.context, DatabaseManager::GetDefaultDatabase(*con.context),
-		                                                "main", table_name)
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(
+		                  *con.context, DatabaseManager::GetDefaultDatabase(*con.context), "main", table_name)
 		                  .Cast<DuckTableEntry>();
 		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
 			if (entry.index->GetIndexType() == ngram::NGRAM_ROWID_GUARD_TYPE) {
@@ -223,8 +220,8 @@ static bool RowIdGuardIsBound(Connection &con, const string &table_name) {
 	bool found = false;
 	bool bound = false;
 	con.context->RunFunctionInTransaction([&]() {
-		auto &table = Catalog::GetEntry<TableCatalogEntry>(*con.context, DatabaseManager::GetDefaultDatabase(*con.context),
-		                                                "main", table_name)
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(
+		                  *con.context, DatabaseManager::GetDefaultDatabase(*con.context), "main", table_name)
 		                  .Cast<DuckTableEntry>();
 		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
 			if (entry.index->GetIndexType() != ngram::NGRAM_ROWID_GUARD_TYPE) {
@@ -311,8 +308,8 @@ static int64_t PreparedScalar(PreparedStatement &prepared) {
 static void ExpectPreparedError(PreparedStatement &prepared, const string &needle) {
 	auto result = prepared.Execute();
 	if (!result->HasError() || result->GetError().find(needle) == string::npos) {
-		throw std::runtime_error("expected prepared error containing '" + needle + "', got: " +
-		                         (result->HasError() ? result->GetError() : result->ToString()));
+		throw std::runtime_error("expected prepared error containing '" + needle +
+		                         "', got: " + (result->HasError() ? result->GetError() : result->ToString()));
 	}
 }
 
@@ -445,13 +442,13 @@ static void StockWriteFails(const string &executable, const string &path, const 
 	throw std::runtime_error("stock DuckDB did not fail closed for " + kind);
 }
 
-static void MutateGuardOption(Connection &con, const string &table_name, const string &guard_name,
-                              const string &option, Value value) {
+static void MutateGuardOption(Connection &con, const string &table_name, const string &guard_name, const string &option,
+                              Value value) {
 	auto catalog_name = DatabaseManager::GetDefaultDatabase(*con.context);
 	bool found = false;
 	con.context->RunFunctionInTransaction([&]() {
-		auto &table = Catalog::GetEntry<TableCatalogEntry>(*con.context, catalog_name, "main", table_name)
-		                  .Cast<DuckTableEntry>();
+		auto &table =
+		    Catalog::GetEntry<TableCatalogEntry>(*con.context, catalog_name, "main", table_name).Cast<DuckTableEntry>();
 		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
 			auto &index = *entry.index;
 			if (index.GetIndexName() != guard_name || index.IsBound()) {
@@ -612,8 +609,8 @@ static void TestCreationSchedules(const string &path) {
 			break;
 		}
 	}
-	if (creator_statement.find("COMMIT") == string::npos || creator_error.find("underlying table state was reverted") ==
-	                                                            string::npos) {
+	if (creator_statement.find("COMMIT") == string::npos ||
+	    creator_error.find("underlying table state was reverted") == string::npos) {
 		throw std::runtime_error("creator did not fail its COMMIT after RevertAppend: " + creator_error);
 	}
 	Rollback(staged_creator);
@@ -730,8 +727,7 @@ static void TestProtectorsAndDrop(const string &path) {
 		auto drop_hybrid_meta = OpaqueTable(con, "drop_hybrid", "s", "meta");
 		Check(con, "UPDATE " + drop_hybrid_meta + " SET format_version=2");
 		ExpectError(con, "PRAGMA drop_ngram_index('drop_hybrid', 's')", "unsupported meta format");
-		if (!HasRowIdGuard(con, "drop_hybrid") ||
-		    ScalarInt64(con, "SELECT count(*) FROM " + drop_hybrid_meta) != 1) {
+		if (!HasRowIdGuard(con, "drop_hybrid") || ScalarInt64(con, "SELECT count(*) FROM " + drop_hybrid_meta) != 1) {
 			throw std::runtime_error("malformed v2/v3 hybrid drop changed guard or metadata");
 		}
 		Check(con, "UPDATE " + drop_hybrid_meta + " SET format_version=3");
@@ -775,16 +771,14 @@ static void TestProtectorsAndDrop(const string &path) {
 		Check(con, "SET ngram_auto_accelerate=true");
 		if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('drop_cross_owner', 'needle')") != 1 ||
 		    ScalarInt64(con, "SELECT count(*) FROM drop_cross_owner WHERE s LIKE '%needle%'") != 1 ||
-		    Query(con, "EXPLAIN SELECT * FROM drop_cross_owner WHERE s LIKE '%needle%'")
-		            ->ToString()
-		            .find("SEQ_SCAN") == string::npos) {
+		    Query(con, "EXPLAIN SELECT * FROM drop_cross_owner WHERE s LIKE '%needle%'")->ToString().find("SEQ_SCAN") ==
+		        string::npos) {
 			throw std::runtime_error("missing rowid guard did not choose exact explicit/transparent fallback");
 		}
 		Check(con, "CREATE TABLE drop_cross_other(s VARCHAR)");
 		Check(con, "CREATE INDEX " + guard + " ON drop_cross_other USING NGRAM_ROWID_GUARD(s)");
 		ExpectError(con, "PRAGMA drop_ngram_index('drop_cross_owner', 's')", "different table");
-		if (!HasRowIdGuard(con, "drop_cross_other") ||
-		    ScalarInt64(con, "SELECT count(*) FROM " + cross_meta) != 1) {
+		if (!HasRowIdGuard(con, "drop_cross_other") || ScalarInt64(con, "SELECT count(*) FROM " + cross_meta) != 1) {
 			throw std::runtime_error("cross-table guard collision was not preserved by public drop");
 		}
 		Check(con, "DROP INDEX " + guard);
@@ -1117,10 +1111,8 @@ static void TestIncompatibleGuardQuarantine(const string &path) {
 		    ScalarInt64(con, "SELECT count(*) FROM max_guard WHERE s LIKE '%needle%'") != 1 ||
 		    Query(con, "EXPLAIN SELECT * FROM max_guard WHERE s LIKE '%needle%'")->ToString().find("SEQ_SCAN") ==
 		        string::npos ||
-		    Query(con, "PRAGMA ngram_index_stats('max_guard')")
-		            ->GetValue(12, 0)
-		            .ToString()
-		            .find("not observed") == string::npos) {
+		    Query(con, "PRAGMA ngram_index_stats('max_guard')")->GetValue(12, 0).ToString().find("not observed") ==
+		        string::npos) {
 			throw std::runtime_error("max-behind guard did not choose and report exact fallback");
 		}
 		ExpectError(con, "PRAGMA ngram_refresh('max_guard')", "not observed");
@@ -1140,7 +1132,7 @@ static void TestIncompatibleGuardQuarantine(const string &path) {
 		for (idx_t i = 0; i < 2; i++) {
 			if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('bad_guard', 'updated')") != 1 ||
 			    Query(con, "PRAGMA ngram_index_stats('bad_guard')")->GetValue(12, 0).ToString().find("incompatible") ==
-		        string::npos) {
+			        string::npos) {
 				throw std::runtime_error("quarantine state did not survive reopen without a bind spin");
 			}
 		}
@@ -1366,12 +1358,12 @@ static void TestMigratedOpaqueCorruption() {
 	Check(con, "INSERT INTO " + refresh_stats + " VALUES ('aaa', 2, 2)");
 	Check(con, "INSERT INTO refresh_bad_stats VALUES ('aaa')");
 	ExpectError(con, "PRAGMA ngram_refresh('refresh_bad_stats')", "invalid stats row");
-	auto refresh_digest = ScalarString(
-	    con, "SELECT concat((SELECT hwm_rowid FROM " + refresh_meta + "),':',(SELECT count(*) FROM " +
-	             refresh_segments + "),':',(SELECT max(generation) FROM " + refresh_segments +
-	             "),':',(SELECT count(*) FROM " + refresh_stats + "),':',(SELECT min(row_count) FROM " +
-	             refresh_stats + "),':',(SELECT max(row_count) FROM " + refresh_stats +
-	             "),':',(SELECT sum(row_count) FROM " + refresh_stats + "))");
+	auto refresh_digest =
+	    ScalarString(con, "SELECT concat((SELECT hwm_rowid FROM " + refresh_meta + "),':',(SELECT count(*) FROM " +
+	                          refresh_segments + "),':',(SELECT max(generation) FROM " + refresh_segments +
+	                          "),':',(SELECT count(*) FROM " + refresh_stats + "),':',(SELECT min(row_count) FROM " +
+	                          refresh_stats + "),':',(SELECT max(row_count) FROM " + refresh_stats +
+	                          "),':',(SELECT sum(row_count) FROM " + refresh_stats + "))");
 	if (refresh_digest != "0:1:0:2:-1:2:1") {
 		throw std::runtime_error("failed refresh changed malformed stats state: " + refresh_digest);
 	}
@@ -1408,8 +1400,7 @@ static void TestMigratedOpaqueCorruption() {
 	ExpectError(con, "SELECT count(*) FROM ngram_search('bad_hwm', 'aaaa')", "hwm_rowid -2");
 	ExpectError(con, "SELECT count(*) FROM bad_hwm WHERE contains(s, 'aaaa')", "hwm_rowid -2");
 	Check(con, "UPDATE " + bad_hwm_meta + " SET hwm_rowid=36028797018960000");
-	ExpectError(con, "SELECT count(*) FROM ngram_candidates('bad_hwm', 's', 'aaaa')",
-	            "hwm_rowid 36028797018960000");
+	ExpectError(con, "SELECT count(*) FROM ngram_candidates('bad_hwm', 's', 'aaaa')", "hwm_rowid 36028797018960000");
 
 	// Impossible stats/capacity and NULL requested rows remain structural errors.
 	Check(con, "CREATE TABLE bad_stats(id INTEGER, s VARCHAR)");
@@ -1430,10 +1421,8 @@ static void TestMigratedOpaqueCorruption() {
 	Check(con, "CREATE TABLE bad_capacity(id INTEGER, s VARCHAR)");
 	Check(con, "INSERT INTO bad_capacity VALUES (1, 'aaaa'), (2, 'aaaa')");
 	Check(con, "PRAGMA create_ngram_index('bad_capacity', 's')");
-	Check(con, "UPDATE " + OpaqueTable(con, "bad_capacity", "s", "stats") +
-	               " SET row_count=3 WHERE gram='aaa'");
-	Check(con, "UPDATE " + OpaqueTable(con, "bad_capacity", "s", "segments") +
-	               " SET rowid_count=3 WHERE gram='aaa'");
+	Check(con, "UPDATE " + OpaqueTable(con, "bad_capacity", "s", "stats") + " SET row_count=3 WHERE gram='aaa'");
+	Check(con, "UPDATE " + OpaqueTable(con, "bad_capacity", "s", "segments") + " SET rowid_count=3 WHERE gram='aaa'");
 	ExpectError(con, "SELECT count(*) FROM ngram_search('bad_capacity', 'aaaa')",
 	            "gram posting count exceeds its segment rowid range");
 	ExpectError(con, "SELECT count(*) FROM bad_capacity WHERE contains(s, 'aaaa')",
@@ -1444,8 +1433,7 @@ static void TestMigratedOpaqueCorruption() {
 	Check(con, "INSERT INTO bad_blob SELECT i, 'aaaa' FROM range(1000) t(i)");
 	Check(con, "PRAGMA create_ngram_index('bad_blob', 's')");
 	Check(con, "SET ngram_max_candidate_fraction=1.0");
-	Check(con, "UPDATE " + OpaqueTable(con, "bad_blob", "s", "segments") +
-	               " SET postings=from_hex('626164')");
+	Check(con, "UPDATE " + OpaqueTable(con, "bad_blob", "s", "segments") + " SET postings=from_hex('626164')");
 	ExpectError(con, "SELECT count(*) FROM ngram_search('bad_blob', 'aaaa')", "unknown postings blob format");
 	ExpectError(con, "SELECT count(*) FROM bad_blob WHERE contains(s, 'aaaa')", "unknown postings blob format");
 	Check(con, "RESET ngram_max_candidate_fraction");
@@ -1468,8 +1456,7 @@ static void TestMigratedOpaqueCorruption() {
 	Check(con, "CREATE TABLE late_bad AS SELECT i::INTEGER id, CASE WHEN i IN (0,1,1048576) "
 	           "THEN 'aaaa'::VARCHAR ELSE NULL::VARCHAR END s FROM range(1048578) t(i)");
 	Check(con, "PRAGMA create_ngram_index('late_bad', 's')");
-	Check(con, "UPDATE " + OpaqueTable(con, "late_bad", "s", "stats") +
-	               " SET row_count=5 WHERE gram='aaa'");
+	Check(con, "UPDATE " + OpaqueTable(con, "late_bad", "s", "stats") + " SET row_count=5 WHERE gram='aaa'");
 	Check(con, "UPDATE " + OpaqueTable(con, "late_bad", "s", "segments") +
 	               " SET rowid_count=3 WHERE gram='aaa' AND segment_no=1");
 	Check(con, "SET ngram_max_probe_rowids=1");
@@ -1712,8 +1699,8 @@ static void TestRegistryBootstrapAndConflicts() {
 		Check(con, "DELETE FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
 		Check(con, "INSERT INTO __ngram.registry SELECT 1," + KeywordHelper::WriteQuoted(TestUUID(1)) +
 		               "::UUID,owner_key,schema_name,table_name,column_name FROM " + schema +
-		               ".meta CROSS JOIN (SELECT from_hex(" + KeywordHelper::WriteQuoted(OwnerKeyHex("main", "owner_unique", "s")) +
-		               ") owner_key)");
+		               ".meta CROSS JOIN (SELECT from_hex(" +
+		               KeywordHelper::WriteQuoted(OwnerKeyHex("main", "owner_unique", "s")) + ") owner_key)");
 		if (StatusName(con, "memory", TestUUID(1)) != "MISSING_STORAGE") {
 			throw std::runtime_error("registry UUID/schema mismatch was not observable");
 		}
@@ -1893,10 +1880,10 @@ static void TestLegacyTransition() {
 	Check(con, "PRAGMA create_ngram_index('ambiguous','s')");
 	auto ambiguous_registered = IndexRef(con, "ambiguous", "s");
 	auto ambiguous_legacy = CopyRegisteredToLegacy(con, "main", "ambiguous", "s", false);
-	for (auto &sql : vector<string> {"SELECT * FROM ngram_search('ambiguous','needle',col='s')",
-	                                "PRAGMA ngram_refresh('ambiguous')", "PRAGMA ngram_compact('ambiguous')",
-	                                "PRAGMA ngram_index_stats('ambiguous')",
-	                                "PRAGMA drop_ngram_index('ambiguous','s')"}) {
+	for (auto &sql :
+	     vector<string> {"SELECT * FROM ngram_search('ambiguous','needle',col='s')",
+	                     "PRAGMA ngram_refresh('ambiguous')", "PRAGMA ngram_compact('ambiguous')",
+	                     "PRAGMA ngram_index_stats('ambiguous')", "PRAGMA drop_ngram_index('ambiguous','s')"}) {
 		ExpectError(con, sql, "multiple allocations");
 	}
 	ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ambiguous_legacy) + ")",
@@ -1923,8 +1910,8 @@ static void TestLegacyTransition() {
 	auto unregistered_ref = IndexRef(con, "unregistered_shared", "s");
 	auto unregistered_storage = OpaqueSchema(con, "unregistered_shared", "s");
 	auto shared_legacy = CopyRegisteredToLegacy(con, "main", "unregistered_shared", "s", false);
-	Check(con, "DELETE FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(unregistered_ref) +
-	               "::UUID");
+	Check(con,
+	      "DELETE FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(unregistered_ref) + "::UUID");
 	ExpectStatus(con, catalog, unregistered_ref, "UNREGISTERED");
 	ExpectStatus(con, catalog, shared_legacy, "READY");
 	ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(shared_legacy) + ")",
@@ -1951,8 +1938,8 @@ static void TestLegacyTransition() {
 	auto mutated_storage = OpaqueSchema(con, "mutated_shared", "s");
 	auto mutated_legacy = CopyRegisteredToLegacy(con, "main", "mutated_shared", "s", false);
 	Check(con, "UPDATE __ngram.registry SET table_name='false_owner', owner_key=from_hex(" +
-	               KeywordHelper::WriteQuoted(OwnerKeyHex("main", "false_owner", "s")) + ") WHERE index_id=" +
-	               KeywordHelper::WriteQuoted(mutated_registered) + "::UUID");
+	               KeywordHelper::WriteQuoted(OwnerKeyHex("main", "false_owner", "s")) +
+	               ") WHERE index_id=" + KeywordHelper::WriteQuoted(mutated_registered) + "::UUID");
 	ExpectStatus(con, catalog, mutated_registered, "MALFORMED");
 	ExpectStatus(con, catalog, mutated_legacy, "READY");
 	ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(mutated_legacy) + ")",
@@ -1966,8 +1953,8 @@ static void TestLegacyTransition() {
 	Check(con, "DROP TABLE ngram_main_mutated_shared.stats_s");
 	Check(con, "DROP SCHEMA ngram_main_mutated_shared");
 	Check(con, "UPDATE __ngram.registry SET table_name='mutated_shared', owner_key=from_hex(" +
-	               KeywordHelper::WriteQuoted(OwnerKeyHex("main", "mutated_shared", "s")) + ") WHERE index_id=" +
-	               KeywordHelper::WriteQuoted(mutated_registered) + "::UUID");
+	               KeywordHelper::WriteQuoted(OwnerKeyHex("main", "mutated_shared", "s")) +
+	               ") WHERE index_id=" + KeywordHelper::WriteQuoted(mutated_registered) + "::UUID");
 	if (StatusName(con, catalog, mutated_registered) != "READY" ||
 	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('mutated_shared','needle')") != 1) {
 		throw std::runtime_error("registered survivor was not exact after owner-row repair");
@@ -2044,7 +2031,8 @@ static void TestLegacyTransition() {
 	if (!HasRowIdGuard(con, "copied_owner")) {
 		throw std::runtime_error("copied opaque ID drop touched the original guard");
 	}
-	ExpectError(con, "PRAGMA ngram_index_status('memory','legacy:abc:00')", "canonical lowercase UUID or legacy locator");
+	ExpectError(con, "PRAGMA ngram_index_status('memory','legacy:abc:00')",
+	            "canonical lowercase UUID or legacy locator");
 }
 
 static void TestRegistryCorruption() {
@@ -2093,8 +2081,8 @@ static void TestRegistryCorruption() {
 		ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")",
 		            "MISSING_STORAGE");
 		if (!HasRowIdGuard(con, "dangling") ||
-		    ScalarInt64(con, "SELECT count(*) FROM __ngram.registry WHERE index_id=" +
-		                         KeywordHelper::WriteQuoted(ref) + "::UUID") != 1) {
+		    ScalarInt64(con, "SELECT count(*) FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) +
+		                         "::UUID") != 1) {
 			throw std::runtime_error("dangling fail-closed path hid its stable ID or guard");
 		}
 	}
@@ -2123,7 +2111,8 @@ static void TestRegistryCorruption() {
 		if (ScalarInt64(con, "SELECT count(*) FROM unrelated WHERE contains(s,'needle')") != 1) {
 			throw std::runtime_error("malformed global registry poisoned unrelated LIKE");
 		}
-		ExpectError(con, "PRAGMA create_ngram_index('unrelated','s')", as_view ? "ordinary DuckDB table" : "constraints");
+		ExpectError(con, "PRAGMA create_ngram_index('unrelated','s')",
+		            as_view ? "ordinary DuckDB table" : "constraints");
 		ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")",
 		            "MALFORMED");
 	}
@@ -2141,8 +2130,8 @@ static void TestRegistryCorruption() {
 		               KeywordHelper::WriteQuoted(ref) + "::UUID");
 		ExpectStatus(con, catalog, ref, "MALFORMED");
 	}
-	for (auto &field : vector<pair<string, string>> {{"schema_name", "other"}, {"table_name", "other"},
-	                                                   {"column_name", "other"}}) {
+	for (auto &field :
+	     vector<pair<string, string>> {{"schema_name", "other"}, {"table_name", "other"}, {"column_name", "other"}}) {
 		DuckDB db(nullptr);
 		LoadNgram(db);
 		Connection con(db);
@@ -2150,10 +2139,10 @@ static void TestRegistryCorruption() {
 		Check(con, "PRAGMA create_ngram_index('owner_bad','s')");
 		auto ref = IndexRef(con, "owner_bad", "s");
 		Check(con, "UPDATE __ngram.registry SET " + field.first + "=" + KeywordHelper::WriteQuoted(field.second) +
-		               ", owner_key=from_hex(" + KeywordHelper::WriteQuoted(
-		                   OwnerKeyHex(field.first == "schema_name" ? field.second : "main",
-		                               field.first == "table_name" ? field.second : "owner_bad",
-		                               field.first == "column_name" ? field.second : "s")) +
+		               ", owner_key=from_hex(" +
+		               KeywordHelper::WriteQuoted(OwnerKeyHex(field.first == "schema_name" ? field.second : "main",
+		                                                      field.first == "table_name" ? field.second : "owner_bad",
+		                                                      field.first == "column_name" ? field.second : "s")) +
 		               ") WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
 		ExpectStatus(con, catalog, ref, "MALFORMED");
 		Check(con, "CREATE TABLE create_blocked(s VARCHAR)");
@@ -2280,8 +2269,8 @@ static void TestRegistryCorruption() {
 		if (ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE schema_name=" +
 		                         KeywordHelper::WriteQuoted(storage)) != 4 ||
 		    !HasRowIdGuard(con, "foreign_schema") ||
-		    ScalarInt64(con, "SELECT count(*) FROM __ngram.registry WHERE index_id=" +
-		                         KeywordHelper::WriteQuoted(ref) + "::UUID") != 1) {
+		    ScalarInt64(con, "SELECT count(*) FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) +
+		                         "::UUID") != 1) {
 			throw std::runtime_error("foreign-object refusal was not atomic");
 		}
 	}
@@ -2344,7 +2333,8 @@ static void TestExecutionIdentityRaces() {
 		auto candidate = setup.Prepare("SELECT count(*) FROM ngram_candidates('swapped_part','s','needle')");
 		Check(ddl, "DROP TABLE " + table);
 		Check(ddl, "CREATE TABLE " + table + " AS SELECT * FROM backup_" + part);
-		// F4 coverage for IndexLocationAvailable(..., changed_is_absent): the stale exact plan scans instead of raising.
+		// F4 coverage for IndexLocationAvailable(..., changed_is_absent): the stale exact plan scans instead of
+		// raising.
 		if (PreparedScalar(*exact) != 1 || PreparedScalar(*transparent) != 1) {
 			throw std::runtime_error("prepared exhaustive query did not fall back after " + part + " replacement");
 		}
@@ -2402,8 +2392,7 @@ static void TestExecutionIdentityRaces() {
 
 	// Maintenance scripts pin registry/storage identities at execution, not only
 	// when the pragma is preprocessed.
-	for (auto &pragma : vector<string> {"PRAGMA ngram_refresh('maint_race')",
-	                                   "PRAGMA ngram_compact('maint_race')"}) {
+	for (auto &pragma : vector<string> {"PRAGMA ngram_refresh('maint_race')", "PRAGMA ngram_compact('maint_race')"}) {
 		DuckDB db(nullptr);
 		LoadNgram(db);
 		Connection planned(db), ddl(db);
@@ -2440,8 +2429,8 @@ static void TestExecutionIdentityRaces() {
 		if (orphan_first) {
 			Check(ddl, "DROP TABLE base_race");
 		}
-		auto script = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," +
-		                                      KeywordHelper::WriteQuoted(ref) + ")");
+		auto script =
+		    Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
 		if (orphan_first) {
 			Check(ddl, "CREATE TABLE base_race(s VARCHAR)");
 		} else {
@@ -2470,27 +2459,27 @@ static void TestExecutionIdentityRaces() {
 		auto ref = IndexRef(planned, "row_race", "s");
 		Check(ddl, "CREATE TABLE row_backup AS SELECT * FROM __ngram.registry WHERE index_id=" +
 		               KeywordHelper::WriteQuoted(ref) + "::UUID");
-		auto removed = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," +
-		                                       KeywordHelper::WriteQuoted(ref) + ")");
+		auto removed =
+		    Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
 		Check(ddl, "DELETE FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
 		auto error = ExecuteRemainingForError(planned, removed);
 		if (error.find("removed after") == string::npos) {
 			throw std::runtime_error("registry-row deletion race did not fail closed: " + error);
 		}
 		Rollback(planned);
-		auto unregistered = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," +
-		                                            KeywordHelper::WriteQuoted(ref) + ")");
+		auto unregistered =
+		    Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
 		Check(ddl, "INSERT INTO __ngram.registry SELECT * FROM row_backup");
 		error = ExecuteRemainingForError(planned, unregistered);
 		if (error.find("appeared after") == string::npos) {
 			throw std::runtime_error("registry-row restoration race did not fail closed: " + error);
 		}
 		Rollback(planned);
-		auto changed = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," +
-		                                       KeywordHelper::WriteQuoted(ref) + ")");
+		auto changed =
+		    Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
 		Check(ddl, "UPDATE __ngram.registry SET table_name='changed', owner_key=from_hex(" +
-		               KeywordHelper::WriteQuoted(OwnerKeyHex("main", "changed", "s")) + ") WHERE index_id=" +
-		               KeywordHelper::WriteQuoted(ref) + "::UUID");
+		               KeywordHelper::WriteQuoted(OwnerKeyHex("main", "changed", "s")) +
+		               ") WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
 		error = ExecuteRemainingForError(planned, changed);
 		if (error.find("changed after") == string::npos) {
 			throw std::runtime_error("registry-row mutation race did not fail closed: " + error);
@@ -2511,8 +2500,8 @@ static void TestExecutionIdentityRaces() {
 		auto legacy_ref = CopyRegisteredToLegacy(planned, "main", "legacy_drop_race", "s", true);
 		Check(planned, "PRAGMA create_ngram_index('registered_drop_race','s')");
 		auto registered_meta = OpaqueTable(planned, "registered_drop_race", "s", "meta");
-		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," +
-		                                    KeywordHelper::WriteQuoted(legacy_ref) + ")");
+		auto drop =
+		    Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(legacy_ref) + ")");
 		Check(ddl, "UPDATE " + registered_meta +
 		               " SET schema_name='main', table_name='legacy_drop_race', column_name='s', "
 		               "guard_name=(SELECT guard_name FROM ngram_main_legacy_drop_race.meta_s), "
@@ -2540,8 +2529,7 @@ static void TestExecutionIdentityRaces() {
 		auto exact = planned.Prepare("SELECT count(*) FROM ngram_search('registry_swap','needle')");
 		auto transparent = planned.Prepare("SELECT count(*) FROM registry_swap WHERE contains(s,'needle')");
 		auto candidate = planned.Prepare("SELECT count(*) FROM ngram_candidates('registry_swap','s','needle')");
-		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," +
-		                                    KeywordHelper::WriteQuoted(ref) + ")");
+		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
 		Check(ddl, "CREATE TABLE registry_backup AS SELECT * FROM __ngram.registry");
 		Check(ddl, "DROP TABLE __ngram.registry");
 		Check(ddl, "CREATE TABLE __ngram.registry(registry_version INTEGER NOT NULL, index_id UUID PRIMARY KEY, "
@@ -2571,8 +2559,7 @@ static void TestExecutionIdentityRaces() {
 		auto ref = IndexRef(planned, "drop_swap", "s");
 		auto table = OpaqueTable(planned, "drop_swap", "s", part);
 		Check(ddl, "CREATE TABLE saved_part AS SELECT * FROM " + table);
-		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," +
-		                                    KeywordHelper::WriteQuoted(ref) + ")");
+		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
 		Check(ddl, "DROP TABLE " + table);
 		Check(ddl, "CREATE TABLE " + table + " AS SELECT * FROM saved_part");
 		auto error = ExecuteRemainingForError(planned, drop);
@@ -2580,8 +2567,8 @@ static void TestExecutionIdentityRaces() {
 			throw std::runtime_error("ID drop did not pin " + part + " OID: " + error);
 		}
 		Rollback(planned);
-		if (ScalarInt64(ddl, "SELECT count(*) FROM __ngram.registry WHERE index_id=" +
-		                         KeywordHelper::WriteQuoted(ref) + "::UUID") != 1) {
+		if (ScalarInt64(ddl, "SELECT count(*) FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) +
+		                         "::UUID") != 1) {
 			throw std::runtime_error("failed component-swap ID drop removed registry row");
 		}
 	}
@@ -2596,8 +2583,7 @@ static void TestExecutionIdentityRaces() {
 		for (auto &part : vector<string> {"meta", "segments", "stats"}) {
 			Check(ddl, "CREATE TABLE saved_" + part + " AS SELECT * FROM " + storage + "." + part);
 		}
-		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," +
-		                                    KeywordHelper::WriteQuoted(ref) + ")");
+		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
 		DropOpaqueStorage(ddl, storage);
 		Check(ddl, "CREATE SCHEMA " + storage);
 		for (auto &part : vector<string> {"meta", "segments", "stats"}) {
@@ -2620,8 +2606,7 @@ static void TestExecutionIdentityRaces() {
 		auto ref = IndexRef(planned, "guard_race", "s");
 		auto guard = ScalarString(planned, "SELECT guard_name FROM " + OpaqueTable(planned, "guard_race", "s", "meta"));
 		Check(ddl, "DROP INDEX " + guard);
-		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," +
-		                                    KeywordHelper::WriteQuoted(ref) + ")");
+		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
 		Check(ddl, "CREATE TABLE other_guard(s VARCHAR)");
 		Check(ddl, "CREATE INDEX " + guard + " ON other_guard USING NGRAM_ROWID_GUARD(s)");
 		auto error = ExecuteRemainingForError(planned, drop);
@@ -2630,8 +2615,8 @@ static void TestExecutionIdentityRaces() {
 		}
 		Rollback(planned);
 		if (!HasRowIdGuard(ddl, "other_guard") ||
-		    ScalarInt64(ddl, "SELECT count(*) FROM __ngram.registry WHERE index_id=" +
-		                         KeywordHelper::WriteQuoted(ref) + "::UUID") != 1) {
+		    ScalarInt64(ddl, "SELECT count(*) FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) +
+		                         "::UUID") != 1) {
 			throw std::runtime_error("failed guard-collision ID drop changed either allocation");
 		}
 	}
@@ -2647,7 +2632,8 @@ static void TestRegistryScale() {
 	auto live_ref = IndexRef(con, "scale_live", "s");
 	string insert = "INSERT INTO __ngram.registry VALUES ";
 	for (idx_t i = 1; i < 10000; i++) {
-		if (i > 1) insert += ",";
+		if (i > 1)
+			insert += ",";
 		auto table = "scale_" + to_string(i);
 		insert += "(1," + KeywordHelper::WriteQuoted(TestUUID(i)) + "::UUID,from_hex(" +
 		          KeywordHelper::WriteQuoted(OwnerKeyHex("main", table, "s")) + "),'main'," +
@@ -2656,10 +2642,12 @@ static void TestRegistryScale() {
 	Check(con, insert);
 	auto start = std::chrono::steady_clock::now();
 	ExpectStatus(con, "memory", live_ref, "READY");
-	auto status_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto status_ms =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	start = std::chrono::steady_clock::now();
 	auto listed = Query(con, "PRAGMA ngram_indexes");
-	auto list_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto list_ms =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	idx_t ready = 0, missing = 0;
 	for (idx_t row = 0; row < listed->RowCount(); row++) {
 		auto status = listed->GetValue(8, row).ToString();
@@ -2673,18 +2661,19 @@ static void TestRegistryScale() {
 #endif
 	if (listed->RowCount() != 10000 || ready != 1 || missing != 9999 || status_ms > STATUS_LIMIT_MS ||
 	    list_ms > LIST_LIMIT_MS) {
-		throw std::runtime_error("10k registry lookup/list exceeded bounded gate: rows=" +
-		                         to_string(listed->RowCount()) + ", status_ms=" + to_string(status_ms) +
-		                         ", list_ms=" + to_string(list_ms));
+		throw std::runtime_error(
+		    "10k registry lookup/list exceeded bounded gate: rows=" + to_string(listed->RowCount()) +
+		    ", status_ms=" + to_string(status_ms) + ", list_ms=" + to_string(list_ms));
 	}
 	start = std::chrono::steady_clock::now();
 	DropByRef(con, "memory", live_ref);
-	auto drop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	auto drop_ms =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	if (drop_ms > STATUS_LIMIT_MS || HasRowIdGuard(con, "scale_live")) {
 		throw std::runtime_error("10k registry ID drop exceeded bounded gate: " + to_string(drop_ms) + " ms");
 	}
-	std::cerr << "registry-scale rows=10000 status_ms=" << status_ms << " list_ms=" << list_ms
-	          << " drop_ms=" << drop_ms << "\n";
+	std::cerr << "registry-scale rows=10000 status_ms=" << status_ms << " list_ms=" << list_ms << " drop_ms=" << drop_ms
+	          << "\n";
 }
 
 static void TestQueryCancellation() {
@@ -2727,28 +2716,37 @@ static void TestQueryCancellation() {
 	           "struct_extract(segment, 'max_rowid') AS max_rowid FROM ("
 	           "SELECT gram, segment_no, r % 32 AS generation, ngram_pack_segment(r) AS segment "
 	           "FROM ngram_unpack_postings((SELECT gram, segment_no, postings "
-	           "FROM " + cancel_segments + ")) GROUP BY gram, segment_no, generation)");
+	           "FROM " +
+	               cancel_segments + ")) GROUP BY gram, segment_no, generation)");
 	Check(con, "DELETE FROM " + cancel_segments);
-	Check(con, "INSERT INTO " + cancel_segments + " SELECT * FROM cancel_split "
-	           "ORDER BY encode(gram), segment_no, generation");
+	Check(con, "INSERT INTO " + cancel_segments +
+	               " SELECT * FROM cancel_split "
+	               "ORDER BY encode(gram), segment_no, generation");
 	Check(con, "DELETE FROM " + cancel_stats);
-	Check(con, "INSERT INTO " + cancel_stats + " SELECT decode(gram_key), sum(rowid_count)::BIGINT, "
-	           "count(*)::BIGINT FROM (SELECT encode(gram) AS gram_key, rowid_count "
-	           "FROM " + cancel_segments + ") GROUP BY gram_key ORDER BY gram_key");
+	Check(con, "INSERT INTO " + cancel_stats +
+	               " SELECT decode(gram_key), sum(rowid_count)::BIGINT, "
+	               "count(*)::BIGINT FROM (SELECT encode(gram) AS gram_key, rowid_count "
+	               "FROM " +
+	               cancel_segments + ") GROUP BY gram_key ORDER BY gram_key");
 	Check(con, "DROP TABLE cancel_split");
 	auto maintenance_digest = [&]() {
 		return ScalarString(
 		    con,
 		    "SELECT concat("
 		    "(SELECT count(*) || ':' || sum(hash(gram,segment_no,generation,postings,rowid_count,min_rowid,max_rowid)) "
-		    "FROM " + cancel_segments + "), '|', "
-		    "(SELECT count(*) || ':' || sum(hash(gram,row_count,segment_count)) "
-		    "FROM " + cancel_stats + "), "
-		    "'|', (SELECT hwm_rowid FROM " + cancel_meta + "))");
+		    "FROM " +
+		        cancel_segments +
+		        "), '|', "
+		        "(SELECT count(*) || ':' || sum(hash(gram,row_count,segment_count)) "
+		        "FROM " +
+		        cancel_stats +
+		        "), "
+		        "'|', (SELECT hwm_rowid FROM " +
+		        cancel_meta + "))");
 	};
 	auto before = maintenance_digest();
-	for (auto &pragma : vector<string> {"PRAGMA ngram_compact('cancel_rows')",
-	                                    "PRAGMA ngram_compact('cancel_rows', purge=true)"}) {
+	for (auto &pragma :
+	     vector<string> {"PRAGMA ngram_compact('cancel_rows')", "PRAGMA ngram_compact('cancel_rows', purge=true)"}) {
 		result.reset();
 		std::thread maintenance([&]() { result = con.Query(pragma); });
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -2785,8 +2783,8 @@ int main(int argc, char **argv) {
 			std::cerr << "usage: ngram_maintenance_checkpoint_gap DATABASE\n";
 			return 2;
 		}
-		auto unique = string(argv[1]) + "." +
-		              to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+		auto unique =
+		    string(argv[1]) + "." + to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
 		TestCreationSchedules(unique + ".creation");
 		TestProtectorsAndDrop(unique + ".protectors");
 		TestVacuumAndConflict(unique + ".vacuum");

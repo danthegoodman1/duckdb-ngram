@@ -31,10 +31,9 @@ static unique_ptr<FunctionData> UnpackPostingsBind(ClientContext &context, Table
 	auto &types = input.input_table_types;
 	if ((types.size() != 3 && types.size() != 8) || types[0].id() != LogicalTypeId::VARCHAR ||
 	    types[1].id() != LogicalTypeId::BIGINT || types[2].id() != LogicalTypeId::BLOB ||
-	    (types.size() == 8 &&
-	     (types[3].id() != LogicalTypeId::BIGINT || types[4].id() != LogicalTypeId::BIGINT ||
-	      types[5].id() != LogicalTypeId::BIGINT || types[6].id() != LogicalTypeId::BIGINT ||
-	      types[7].id() != LogicalTypeId::BIGINT))) {
+	    (types.size() == 8 && (types[3].id() != LogicalTypeId::BIGINT || types[4].id() != LogicalTypeId::BIGINT ||
+	                           types[5].id() != LogicalTypeId::BIGINT || types[6].id() != LogicalTypeId::BIGINT ||
+	                           types[7].id() != LogicalTypeId::BIGINT))) {
 		throw BinderException(
 		    "ngram_unpack_postings expects a table of (gram VARCHAR, segment_no BIGINT, postings BLOB) or its "
 		    "checked eight-column form");
@@ -59,8 +58,8 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
                                                  DataChunk &input, DataChunk &output) {
 	auto &state = data_p.local_state->Cast<UnpackPostingsLocalState>();
 
-	UnifiedVectorFormat gram_format, segment_format, blob_format, count_format, min_format, max_format, generation_format,
-	    hwm_format;
+	UnifiedVectorFormat gram_format, segment_format, blob_format, count_format, min_format, max_format,
+	    generation_format, hwm_format;
 	input.data[0].ToUnifiedFormat(input.size(), gram_format);
 	input.data[1].ToUnifiedFormat(input.size(), segment_format);
 	input.data[2].ToUnifiedFormat(input.size(), blob_format);
@@ -98,10 +97,10 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 		auto hwm_idx = checked ? hwm_format.sel->get_index(row) : 0;
 		if (!gram_format.validity.RowIsValid(gram_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
 		    !blob_format.validity.RowIsValid(blob_idx) ||
-		    (checked && (!count_format.validity.RowIsValid(count_idx) || !min_format.validity.RowIsValid(min_idx) ||
-		                 !max_format.validity.RowIsValid(max_idx) ||
-		                 !generation_format.validity.RowIsValid(generation_idx) ||
-		                 !hwm_format.validity.RowIsValid(hwm_idx)))) {
+		    (checked &&
+		     (!count_format.validity.RowIsValid(count_idx) || !min_format.validity.RowIsValid(min_idx) ||
+		      !max_format.validity.RowIsValid(max_idx) || !generation_format.validity.RowIsValid(generation_idx) ||
+		      !hwm_format.validity.RowIsValid(hwm_idx)))) {
 			throw InvalidInputException("ngram_unpack_postings: input must not contain NULLs");
 		}
 		if (!state.row_decoded) {
@@ -110,8 +109,8 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 			DecodePostings(blobs[blob_idx].GetData(), blobs[blob_idx].GetSize(), state.rowids);
 			if (checked) {
 				for (auto rowid : state.rowids) {
-					if (rowid < 0 || segments[segment_idx] < 0 ||
-					    (rowid >> SEGMENT_SHIFT) != segments[segment_idx] || rowid > hwms[hwm_idx]) {
+					if (rowid < 0 || segments[segment_idx] < 0 || (rowid >> SEGMENT_SHIFT) != segments[segment_idx] ||
+					    rowid > hwms[hwm_idx]) {
 						throw InvalidInputException(
 						    "ngram_unpack_postings: posting rowid lies outside its declared segment or indexed range");
 					}

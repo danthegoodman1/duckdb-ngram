@@ -63,13 +63,11 @@ void InitializeRowIdGuardHostRuntime(ExtensionLoader &loader) {
 		// This cataloged table function executes inside the host binary. Calling
 		// DuckDB::SourceID() from a static-linked DSO only identifies the DSO.
 		Connection connection(loader.GetDatabaseInstance());
-		auto result = connection.Query(
-		    "SELECT library_version, source_id FROM system.main.pragma_version()");
+		auto result = connection.Query("SELECT library_version, source_id FROM system.main.pragma_version()");
 		if (!result->HasError()) {
 			auto version = result->GetValue(0, 0).ToString();
 			auto source = result->GetValue(1, 0).ToString();
-			compatible = version == DUCKDB_VERSION &&
-			             (source == DUCKDB_SOURCE_ID || source == "d8cdaa33fd");
+			compatible = version == DUCKDB_VERSION && (source == DUCKDB_SOURCE_ID || source == "d8cdaa33fd");
 		}
 	} catch (std::exception &) {
 	}
@@ -244,8 +242,8 @@ public:
 		}
 		// WriteHeader advances the iteration exactly once after index metadata is
 		// serialized. A future unbound checkpoint can only copy this old seal.
-		return Serialize(max_seen, compatible ? unsafe_reuse : true,
-		                 compatible ? current_iteration + 1 : 0, compatible);
+		return Serialize(max_seen, compatible ? unsafe_reuse : true, compatible ? current_iteration + 1 : 0,
+		                 compatible);
 	}
 
 	IndexStorageInfo SerializeToWAL(const case_insensitive_map_t<Value> &) override {
@@ -259,8 +257,7 @@ public:
 		// until that transaction commits. Persist the live commit-time state:
 		// creator-local rows are already included and are not replayed through
 		// this index; later WAL transactions buffer against the unbound index.
-		auto result = Serialize(max_seen, compatible ? unsafe_reuse : true,
-		                        current_iteration, compatible);
+		auto result = Serialize(max_seen, compatible ? unsafe_reuse : true, current_iteration, compatible);
 		result.buffers.emplace_back();
 		return result;
 	}
@@ -354,13 +351,12 @@ public:
 	unique_ptr<BoundIndex> index;
 };
 
-class GuardBuildLocalState final : public IndexBuildLocalState {
-};
+class GuardBuildLocalState final : public IndexBuildLocalState {};
 
 static void RequirePinnedRuntime() {
 	if (!RowIdGuardRuntimeCompatible()) {
-		throw InvalidInputException("ngram rowid guard requires host DuckDB %s source %s or d8cdaa33fd",
-		                            DUCKDB_VERSION, DUCKDB_SOURCE_ID);
+		throw InvalidInputException("ngram rowid guard requires host DuckDB %s source %s or d8cdaa33fd", DUCKDB_VERSION,
+		                            DUCKDB_SOURCE_ID);
 	}
 }
 
@@ -382,10 +378,10 @@ static unique_ptr<IndexBuildGlobalState> GuardBuildGlobalInit(IndexBuildInitGlob
 	storage.AppendLock(DuckTransaction::Get(input.context, input.table.ParentCatalog()), state->append_state);
 	auto total_rows = storage.GetTotalRows();
 	auto max_seen = total_rows == 0 ? int64_t(-1) : NumericCast<int64_t>(total_rows - 1);
-	state->index = make_uniq<RowIdGuard>(input.info.index_name, input.storage_ids, TableIOManager::Get(storage),
-	                                      input.expressions, storage.db, UUID::ToString(UUID::GenerateRandomUUID()),
-	                                      max_seen, false, true, optional_idx(),
-	                                      ObservableCheckpointIteration(storage.db));
+	state->index =
+	    make_uniq<RowIdGuard>(input.info.index_name, input.storage_ids, TableIOManager::Get(storage), input.expressions,
+	                          storage.db, UUID::ToString(UUID::GenerateRandomUUID()), max_seen, false, true,
+	                          optional_idx(), ObservableCheckpointIteration(storage.db));
 	return std::move(state);
 }
 
@@ -409,8 +405,8 @@ static unique_ptr<BoundIndex> GuardCreateInstance(CreateIndexInput &input) {
 	}
 	auto stored = ReadStoredGuardState(input.storage_info);
 	return make_uniq<RowIdGuard>(input.name, input.column_ids, input.table_io_manager, input.unbound_expressions,
-	                              input.db, std::move(stored.token), stored.max_seen, stored.unsafe_reuse,
-	                              stored.protection_compatible, stored.checkpoint_iteration, optional_idx());
+	                             input.db, std::move(stored.token), stored.max_seen, stored.unsafe_reuse,
+	                             stored.protection_compatible, stored.checkpoint_iteration, optional_idx());
 }
 
 static IndexType GuardIndexType();
@@ -542,8 +538,8 @@ static string RowIdGuardDropReason(ClientContext &context, DuckTableEntry &table
 	if (catalog_entry) {
 		auto &index_entry = catalog_entry->Cast<DuckIndexEntry>();
 		if (!has_column || index_entry.index_type != NGRAM_ROWID_GUARD_TYPE ||
-		    std::find(index_entry.column_ids.begin(), index_entry.column_ids.end(), expected_column.GetPrimaryIndex()) ==
-		        index_entry.column_ids.end() ||
+		    std::find(index_entry.column_ids.begin(), index_entry.column_ids.end(),
+		              expected_column.GetPrimaryIndex()) == index_entry.column_ids.end() ||
 		    &index_entry.GetDataTableInfo() != storage.GetDataTableInfo().get()) {
 			return "an index with the recorded guard name belongs to a different table, type, or column";
 		}
@@ -756,14 +752,13 @@ static void RowIdGuardValidateFunction(DataChunk &args, ExpressionState &state, 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto output = FlatVector::GetData<bool>(result);
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto &table = ResolveExistingTable(context, args.GetValue(0, row).ToString(),
-		                                   args.GetValue(1, row).ToString(), args.GetValue(2, row).ToString(),
-		                                   "ngram index base table");
+		auto &table = ResolveExistingTable(context, args.GetValue(0, row).ToString(), args.GetValue(1, row).ToString(),
+		                                   args.GetValue(2, row).ToString(), "ngram index base table");
 		auto column_name = args.GetValue(3, row).ToString();
 		auto shadow_schema = args.GetValue(4, row).ToString();
 		auto meta_name = args.GetValue(9, row).ToString();
-		auto &meta_table = ResolveExistingTable(context, args.GetValue(0, row).ToString(), shadow_schema,
-		                                          meta_name, "ngram index meta table");
+		auto &meta_table = ResolveExistingTable(context, args.GetValue(0, row).ToString(), shadow_schema, meta_name,
+		                                        "ngram index meta table");
 		auto expected_format = args.GetValue(5, row).GetValue<int64_t>();
 		if (NumericCast<int64_t>(meta_table.oid) != args.GetValue(6, row).GetValue<int64_t>()) {
 			throw InvalidInputException("ngram meta table changed while drop_ngram_index was prepared");
@@ -808,12 +803,11 @@ void RegisterRowIdGuard(ExtensionLoader &loader) {
 	types.RegisterIndexType(GuardIndexType());
 	ExtensionCallback::Register(config, make_shared_ptr<RowIdGuardBindCallback>());
 
-	auto validate = ScalarFunction(NGRAM_ROWID_GUARD_VALIDATE,
-	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
-	                                LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                                LogicalType::VARCHAR},
-	                               LogicalType::BOOLEAN, RowIdGuardValidateFunction);
+	auto validate = ScalarFunction(
+	    NGRAM_ROWID_GUARD_VALIDATE,
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	     LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    LogicalType::BOOLEAN, RowIdGuardValidateFunction);
 	validate.stability = FunctionStability::VOLATILE;
 	validate.SetFallible();
 	loader.RegisterFunction(validate);
@@ -919,7 +913,8 @@ bool FindNativeUpdateProtector(ClientContext &context, DuckTableEntry &table, co
 		auto entries = storage.GetDataTableInfo()->GetIndexes().IndexEntries();
 		for (auto &item : entries) {
 			auto &index = *item.index;
-			if (index.IsBound() && index.GetIndexType() == ART::TYPE_NAME && CoversColumn(index.GetColumnIds(), expected)) {
+			if (index.IsBound() && index.GetIndexType() == ART::TYPE_NAME &&
+			    CoversColumn(index.GetColumnIds(), expected)) {
 				candidates.push_back(index.GetIndexName());
 			}
 		}
@@ -960,7 +955,7 @@ string NativeUpdateProtectorReason(ClientContext &context, DuckTableEntry &table
 	auto &storage = table.GetStorage();
 	EntryLookupInfo lookup(CatalogType::INDEX_ENTRY, expected_protector.name);
 	auto catalog_entry = Catalog::GetEntry(context, table.ParentCatalog().GetName(), table.ParentSchema().name, lookup,
-	                                     OnEntryNotFound::RETURN_NULL);
+	                                       OnEntryNotFound::RETURN_NULL);
 	if (!catalog_entry) {
 		return "the native update protector is missing from the index catalog";
 	}

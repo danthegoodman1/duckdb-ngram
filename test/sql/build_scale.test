@@ -13,44 +13,44 @@ statement ok
 PRAGMA create_ngram_index('big', 's');
 
 statement ok
-SET VARIABLE big_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE big_id = (SELECT replace(index_id::VARCHAR, '-', '')
                            FROM __ngram.registry WHERE table_name = 'big');
 
 # the index is exactly the brute-force extraction (both directions)
 query I
 SELECT count(*) FROM (
 	(SELECT gram, unnest(ngram_decode_postings(postings)) rid
-	 FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments')
+	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id'))
 	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM big WHERE s IS NOT NULL)
 	UNION ALL
 	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM big WHERE s IS NOT NULL
 	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid
-	 FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments'))
+	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id')))
 );
 ----
 0
 
 # rowids 0..1149999 span exactly two rowid >> 20 buckets
 query I
-SELECT count(DISTINCT segment_no) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments');
+SELECT count(DISTINCT segment_no) FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id'));
 ----
 2
 
 # stats totals agree with the segments table
 query I
-SELECT (SELECT sum(row_count) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.stats')) =
-       (SELECT sum(rowid_count) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments'))
-   AND (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.stats')) =
-       (SELECT count(DISTINCT gram) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments'))
-   AND (SELECT sum(segment_count) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.stats')) =
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments'));
+SELECT (SELECT sum(row_count) FROM query('SELECT * FROM __ngram.stats_' || getvariable('big_id'))) =
+       (SELECT sum(rowid_count) FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id')))
+   AND (SELECT count(*) FROM query('SELECT * FROM __ngram.stats_' || getvariable('big_id'))) =
+       (SELECT count(DISTINCT gram) FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id')))
+   AND (SELECT sum(segment_count) FROM query('SELECT * FROM __ngram.stats_' || getvariable('big_id'))) =
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id')));
 ----
 true
 
 # hwm covers all rows
 query I
 SELECT hwm_rowid = (SELECT max(rowid) FROM big)
-FROM query('SELECT * FROM ' || getvariable('big_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('big_id'));
 ----
 true
 
@@ -79,11 +79,11 @@ statement ok
 PRAGMA create_ngram_index('parts', 's');
 
 statement ok
-SET VARIABLE parts_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE parts_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name = 'parts');
 
 statement ok
-CREATE TABLE snapshot_one AS FROM query('SELECT * FROM ' || getvariable('parts_schema') || '.segments');
+CREATE TABLE snapshot_one AS FROM query('SELECT * FROM __ngram.segments_' || getvariable('parts_id'));
 
 query I
 SELECT count(DISTINCT segment_no) FROM snapshot_one;
@@ -100,11 +100,11 @@ statement ok
 PRAGMA create_ngram_index('parts', 's');
 
 statement ok
-SET VARIABLE parts_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE parts_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name = 'parts');
 
 statement ok
-CREATE TABLE snapshot_three AS FROM query('SELECT * FROM ' || getvariable('parts_schema') || '.segments');
+CREATE TABLE snapshot_three AS FROM query('SELECT * FROM __ngram.segments_' || getvariable('parts_id'));
 
 # every column of every segment row, both directions: three partitions produce
 # the same bytes as one
@@ -127,7 +127,7 @@ true
 query I
 SELECT count(*) FROM (
 	SELECT gram < lag(gram) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram, rowid FROM ' || getvariable('parts_schema') || '.segments'))
+	FROM query('SELECT gram, rowid FROM __ngram.segments_' || getvariable('parts_id')))
 WHERE out_of_order;
 ----
 0
@@ -142,15 +142,15 @@ statement ok
 PRAGMA create_ngram_index('parts', 's');
 
 statement ok
-SET VARIABLE parts_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE parts_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name = 'parts');
 
 query I
 SELECT count(*) FROM (
 	(SELECT * FROM snapshot_one EXCEPT
-	 SELECT * FROM query('SELECT * FROM ' || getvariable('parts_schema') || '.segments'))
+	 SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('parts_id')))
 	UNION ALL
-	(SELECT * FROM query('SELECT * FROM ' || getvariable('parts_schema') || '.segments')
+	(SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('parts_id'))
 	 EXCEPT SELECT * FROM snapshot_one));
 ----
 0
@@ -207,17 +207,17 @@ statement ok
 PRAGMA create_ngram_index('mem_corpus', 's');
 
 statement ok
-SET VARIABLE mem_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE mem_id = (SELECT replace(index_id::VARCHAR, '-', '')
                            FROM __ngram.registry WHERE table_name = 'mem_corpus');
 
 query I
-SELECT count(*) > 0 FROM query('SELECT * FROM ' || getvariable('mem_schema') || '.stats');
+SELECT count(*) > 0 FROM query('SELECT * FROM __ngram.stats_' || getvariable('mem_id'));
 ----
 true
 
 query I
 SELECT hwm_rowid = (SELECT max(rowid) FROM mem_corpus)
-FROM query('SELECT * FROM ' || getvariable('mem_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('mem_id'));
 ----
 true
 

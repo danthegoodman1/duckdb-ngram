@@ -22,8 +22,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (bench_path, free_disk_gb, gb, log, ngram_storage_schema,  # noqa: E402
-                    require_duckdb, run_sql, write_json)
+from common import (bench_path, free_disk_gb, gb, log, ngram_index_ref, ngram_registry_row,  # noqa: E402
+                    ngram_storage_table, require_duckdb, run_sql, write_json)
 from gen_corpus import DEFAULT_SEED, SOURCE_DB, replica_select  # noqa: E402
 
 #! postings, encoded bytes, segment rows, stats rows. The last is one row per
@@ -34,9 +34,14 @@ INDEX_SIZE_SQL = """
 SELECT coalesce(sum(rowid_count), 0)::BIGINT,
        coalesce(sum(octet_length(postings)), 0)::BIGINT,
        count(*)::BIGINT,
-       (SELECT count(*) FROM {storage}.stats)::BIGINT
-FROM {storage}.segments;
+       (SELECT count(*) FROM {stats})::BIGINT
+FROM {segments};
 """
+
+
+def index_size_sql(index_ref):
+    return INDEX_SIZE_SQL.format(segments=ngram_storage_table(index_ref, "segments"),
+                                 stats=ngram_storage_table(index_ref, "stats"))
 
 CORPUS_SIZE_SQL = "SELECT count(*)::BIGINT, coalesce(sum(strlen(s)), 0)::BIGINT FROM docs;"
 
@@ -143,8 +148,7 @@ def main():
             corpus = run_sql(db, CORPUS_SIZE_SQL, settings=settings, timeout=86400).rows[0]
             report["steps"][-1]["corpus_rows"] = int(corpus[0])
             report["steps"][-1]["corpus_bytes"] = int(corpus[1])
-            storage = ngram_storage_schema(db, "docs", "s", settings)
-            index = run_sql(db, INDEX_SIZE_SQL.format(storage=storage), settings=settings,
+            index = run_sql(db, index_size_sql(ngram_index_ref(db, "docs", "s", settings)), settings=settings,
                             timeout=86400).rows[0]
             report["steps"][-1]["postings"] = int(index[0])
             report["steps"][-1]["postings_bytes"] = int(index[1])
@@ -175,8 +179,7 @@ def main():
         report["steps"].append(step(db, "PRAGMA ngram_compact('docs', col = 's');", settings, "compact",
                                     timeout=259200))
         report["steps"].append(step(db, "CHECKPOINT;", settings, "checkpoint post-compact", timeout=86400))
-        storage = ngram_storage_schema(db, "docs", "s", settings)
-        index = run_sql(db, INDEX_SIZE_SQL.format(storage=storage), settings=settings).rows[0]
+        index = run_sql(db, index_size_sql(ngram_index_ref(db, "docs", "s", settings)), settings=settings).rows[0]
         report["post_compact"] = {
             "postings": int(index[0]), "postings_bytes": int(index[1]),
             "segment_rows": int(index[2]), "distinct_grams": int(index[3]),
@@ -198,15 +201,17 @@ def verify(db, settings, count, gram_size, case_insensitive):
     compare the distinct rowids their segments decode to against the rows a
     plain `contains` scan finds at or below the high-water mark.
     """
-    storage = ngram_storage_schema(db, "docs", "s", settings)
+    ref = ngram_index_ref(db, "docs", "s", settings)
+    segments, stats, registry = (ngram_storage_table(ref, "segments"), ngram_storage_table(ref, "stats"),
+                                 ngram_registry_row(ref))
     fold = "lower(s)" if case_insensitive else "s"
     picks = run_sql(db, """
 SELECT gram FROM (
   SELECT gram, row_count, row_number() OVER (ORDER BY row_count) AS lo,
          count(*) OVER () AS n
-  FROM {storage}.stats
+  FROM {stats}
 ) WHERE lo IN (1, (n/2)::BIGINT, n) LIMIT {count};
-""".format(storage=storage, count=count), settings=settings).rows
+""".format(stats=stats, count=count), settings=settings).rows
     grams = [row[0] for row in picks]
     results = []
     for gram in grams:
@@ -217,11 +222,11 @@ SELECT gram FROM (
         sql = """
 SELECT (SELECT count(DISTINCT r) FROM (
           SELECT unnest(ngram_decode_postings(postings)) AS r
-          FROM {storage}.segments WHERE gram = {g}))::BIGINT AS decoded,
+          FROM {segments} WHERE gram = {g}))::BIGINT AS decoded,
        (SELECT count(*) FROM docs
-         WHERE rowid <= (SELECT hwm_rowid FROM {storage}.meta)
+         WHERE rowid <= (SELECT hwm_rowid FROM {registry})
            AND contains({fold}, {g}))::BIGINT AS brute;
-""".format(storage=storage, g=literal, fold=fold)
+""".format(segments=segments, registry=registry, g=literal, fold=fold)
         row = run_sql(db, sql, settings=settings, timeout=86400).rows[0]
         decoded, brute = int(row[0]), int(row[1])
         log("verify gram %r: decoded %d, brute %d, %s" % (gram, decoded, brute,

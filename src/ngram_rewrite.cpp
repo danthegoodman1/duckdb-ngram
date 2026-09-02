@@ -71,11 +71,11 @@ namespace ngram {
 // case-insensitive indexes; probing a CS index with an ILIKE needle would
 // miss case-variant matches and is never done.
 //
-// Staleness: the same identity checks and rowid-guard validation as the
-// explicit path make this path decline instead. At plan time it leaves the
-// sequential scan intact; at execution time the replacement performs one full
-// scan. Updates, vacuum, reopen, and uncertain guard state therefore cannot
-// make a rewritten predicate omit rows.
+// Staleness: the same rowid-guard verdict as the explicit path makes this
+// path decline instead. At plan time it leaves the sequential scan intact; at
+// execution time the replacement performs one full scan. Updates, vacuum,
+// reopen, and uncertain guard state therefore cannot make a rewritten
+// predicate omit rows.
 //===----------------------------------------------------------------------===//
 
 //! The density gate runs after metadata planning but before postings decode;
@@ -130,10 +130,6 @@ struct NgramScanBindData : public TableFunctionData {
 	vector<LogicalType> base_types;
 	//! For the dependency callback only; execution goes through the names.
 	optional_ptr<TableCatalogEntry> table;
-
-	ShadowTarget Target() const {
-		return ShadowTarget {schema_name, table_name, column_name, location.shadow_schema};
-	}
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<NgramScanBindData>(*this);
@@ -355,25 +351,12 @@ static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet
 //! full scan — the index is an optimization, never a correctness dependency.
 static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind, NgramScanGlobalState &state) {
 	auto &base = ResolveExistingTable(context, bind.catalog_name, bind.schema_name, bind.table_name, "table");
-	ResolvedTarget target {bind.catalog_name,
-	                       bind.schema_name,
-	                       bind.table_name,
-	                       bind.column_name,
-	                       ShadowSchemaName(bind.schema_name, bind.table_name),
-	                       &base};
+	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name, &base};
 	if (!IndexLocationAvailable(context, target, bind.location, true)) {
 		state.fallback_reason = "index unavailable";
 		return false;
 	}
-	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-	                                  bind.location.MetaTable(), "ngram index meta table");
-	auto info = ReadMeta(context, *state.core.tx, meta, bind.Target());
-	if (!CertainStaleReason(info, ComputeTableFingerprint(context, base)).empty()) {
-		// a plain LIKE must return every matching row: a proven-stale index
-		// cannot, so the scan degrades instead of erroring the user's query
-		state.fallback_reason = "index stale";
-		return false;
-	}
+	auto info = ReadMeta(context, bind.catalog_name, bind.location);
 	auto guard_reason = RowIdGuardReason(context, base, info);
 	if (!guard_reason.empty()) {
 		state.fallback_reason = "rowid guard: " + guard_reason;
@@ -399,10 +382,10 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 			}
 		}
 	}
-	auto segments = TryResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-	                                        bind.location.SegmentsTable(), "ngram index segments table");
-	auto stats = TryResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-	                                     bind.location.StatsTable(), "ngram index stats table");
+	auto segments = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
+	                                        "ngram index segments table");
+	auto stats = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.StatsTable(),
+	                                     "ngram index stats table");
 	if (!segments || !stats) {
 		state.fallback_reason = "index unavailable";
 		return false;
@@ -617,11 +600,9 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 	auto &columns = table->GetColumns();
 	auto catalog_name = table->ParentCatalog().GetName();
 	auto schema_name = table->ParentSchema().name;
-	ResolvedTarget resolved {
-	    catalog_name, schema_name, table->name, string(), ShadowSchemaName(schema_name, table->name), table};
+	ResolvedTarget resolved {catalog_name, schema_name, table->name, string(), table};
 	auto locations = ExistingIndexes(context, resolved, true);
 
-	auto &transaction = DuckTransaction::Get(context, table->ParentCatalog());
 	for (auto &entry : get.table_filters.filters) {
 		if (entry.first >= columns.LogicalColumnCount()) {
 			continue;
@@ -652,15 +633,7 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		if (!IndexLocationAvailable(context, resolved, location)) {
 			continue;
 		}
-		auto &meta = ResolveExistingTable(context, catalog_name, location.shadow_schema, location.MetaTable(),
-		                                  "ngram index meta table");
-		ShadowTarget target {schema_name, table->name, column.Name(), location.shadow_schema};
-		auto info = ReadMeta(context, transaction, meta, target);
-		if (!CertainStaleReason(info, ComputeTableFingerprint(context, *table)).empty()) {
-			// the index provably no longer describes this table; a LIKE must
-			// still return every matching row, so leave the seq scan in place
-			continue;
-		}
+		auto info = ReadMeta(context, catalog_name, location);
 		if (!RowIdGuardReason(context, table->Cast<DuckTableEntry>(), info).empty()) {
 			continue;
 		}

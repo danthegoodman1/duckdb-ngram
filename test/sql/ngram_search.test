@@ -27,7 +27,7 @@ statement ok
 PRAGMA create_ngram_index('docs', 's');
 
 statement ok
-SET VARIABLE docs_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE docs_id = (SELECT replace(index_id::VARCHAR, '-', '')
                             FROM __ngram.registry WHERE table_name='docs' AND column_name='s');
 
 # rows inserted after the build sit past the high-water mark and must still be found
@@ -58,7 +58,7 @@ SELECT rowid FROM ngram_candidates('docs', 's', 'tent') ORDER BY rowid;
 query I
 SELECT count(*) FROM (
 	SELECT rowid FROM docs WHERE contains(lower(s), 'tent') AND rowid <=
-	      (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.meta'))
+	      (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('docs_id')))
 	EXCEPT SELECT rowid FROM ngram_candidates('docs', 's', 'tent'));
 ----
 0
@@ -355,17 +355,17 @@ statement ok
 PRAGMA create_ngram_index('cased', 'S');
 
 statement ok
-SET VARIABLE cased_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE cased_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name='cased' AND column_name='s');
 
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE schema_name = getvariable('cased_schema') AND table_name IN ('meta', 'segments', 'stats');
+WHERE schema_name = '__ngram' AND table_name IN ('segments_' || getvariable('cased_id'), 'stats_' || getvariable('cased_id'));
 ----
-3
+2
 
 query I
-SELECT column_name FROM query('SELECT * FROM ' || getvariable('cased_schema') || '.meta');
+SELECT column_name FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('cased_id'));
 ----
 s
 
@@ -408,12 +408,11 @@ statement ok
 PRAGMA create_ngram_index('cased2', 's');
 
 statement ok
-SET VARIABLE cased2_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE cased2_id = (SELECT replace(index_id::VARCHAR, '-', '')
                               FROM __ngram.registry WHERE table_name='cased2' AND column_name='S');
 
 query I
-SELECT count(*) FROM duckdb_tables()
-WHERE schema_name = getvariable('cased2_schema') AND table_name = 'meta';
+SELECT count(*) FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('cased2_id');
 ----
 1
 

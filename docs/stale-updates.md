@@ -1,19 +1,18 @@
 # Rowid safety, updates, and fail-closed recovery
 
-**Status: implemented in metadata format 3 (2026-08-11).** Updates, deletes,
-checkpoint vacuum, WAL replay, and reopened databases cannot silently make an
-ngram query omit a matching row. When the extension cannot prove that indexed
-rowids are still safe, it scans or refuses before returning.
+Updates, deletes, checkpoint vacuum, WAL replay, and reopened databases cannot
+silently make an ngram query omit a matching row. When the extension cannot
+prove that indexed rowids are still safe, it scans or refuses before returning.
 
 This note describes the v1.5.5-specific mechanism, its proof, and its costs.
-The implementation is deliberately smaller than a dirty-rowgroup overlay: one
-zero-posting native guard plus one permanent uncertainty bit per ngram index.
+The implementation is one zero-posting native guard per table plus one
+permanent uncertainty bit.
 
 ## The invariant
 
-Postings cover rowids through the metadata high-water mark. Rows after that
-mark, including transaction-local inserts, are read by a live tail scan. Every
-posting candidate is fetched under the caller's transaction and rechecked
+Postings cover rowids through the registry row's high-water mark. Rows after
+that mark, including transaction-local inserts, are read by a live tail scan.
+Every posting candidate is fetched under the caller's transaction and rechecked
 against the real predicate.
 
 That is exhaustive if both conditions hold:
@@ -23,24 +22,35 @@ That is exhaustive if both conditions hold:
 2. an append never reuses a rowid at or below a range the guard has already
    observed.
 
-Each ngram index therefore owns a DuckDB `NGRAM_ROWID_GUARD` index. It stores no
-keys or postings. Its physical column dependencies make DuckDB rewrite updates
-of covered columns as delete plus insert, and its non-ART type permanently
-disables v1.5.5's ART-only moving-vacuum path. The guard persists four facts:
+Each table with ngram indexes therefore carries one DuckDB `NGRAM_ROWID_GUARD`
+index. It stores no keys or postings. Its physical column dependencies make
+DuckDB rewrite updates of covered columns as delete plus insert, and its non-ART
+type keeps v1.5.5's moving vacuum disabled even under `vacuum_rebuild_indexes`.
+The guard persists four facts:
 
 - the greatest append rowid it has observed;
 - a permanent `unsafe_reuse` latch;
-- a random incarnation token, also recorded by ngram metadata; and
+- a random incarnation token, also recorded by every index's registry row; and
 - a checkpoint-iteration seal and compatibility bit.
 
 The live predicate recheck remains authoritative. The guard only proves that
 postings are a candidate superset; it never makes postings a source of truth.
 
+## Identity
+
+The guard is the only proof that an index still describes its table. Each
+registry row records the guard's name and token. While the guard exists DuckDB
+refuses every `ALTER` except `ADD COLUMN`, `SET DEFAULT`, foreign-key
+bookkeeping, and comments (`dependency_manager.cpp`), refuses to drop or retype
+a covered column (`data_table.cpp`), and drops the guard with its table. A
+table that was dropped and re-created under the same name therefore has no
+guard, or a guard with another token, and every read path scans it.
+
 ## Atomic creation
 
 The hard case is a transaction whose write plan predates guard creation. A
 native index created later cannot retroactively change that plan. The first
-ngram index on an unprotected column uses this barrier:
+ngram index on a table uses this barrier:
 
 1. Mark the creating DuckDB transaction as `CREATE_INDEX`, acquire the external
    checkpoint lock exclusively, and reject active or recently committed
@@ -57,28 +67,28 @@ ngram index on an unprotected column uses this barrier:
    baseline and physical installation. The guard mints its own token.
 4. `__ngram_creation_finish` validates the exact fresh guard and replacement
    storage, copies the token, and releases the exclusive lock. The potentially
-   long postings build then runs with only the ordinary Phase 10 vacuum fence.
+   long postings build then runs with only the ordinary shared vacuum fence.
 
 Reads continue during the build. Writers whose snapshots overlap the barrier
 may fail with DuckDB's altered-table transaction conflict and must retry after
 the create commits. A staged writer whose rollback restores the old storage
-makes the creator's commit fail; guard and shadows are not published, and a
+makes the creator's commit fail; guard and storage are not published, and a
 fresh retry is safe.
 
-The ADD/DROP barrier invalidates DuckDB's reservoir sample. It also cannot run
-through every pre-existing index dependency. Two narrowly proven protectors
-avoid it:
-
-- an exact format-3 ngram guard may protect another column only if that guard's
-  persisted physical dependency set contains the new target; the new guard
-  copies no broader coverage than that proven set;
-- an explicit, non-internal native ART on the target may protect it only when
-  its committed catalog timestamp is strictly older than every active
-  transaction. That fallback creates a target-only guard.
-
-The normal barrier-created guard depends on every physical `VARCHAR` column
-that exists at creation time. This lets later ngram indexes on those columns
-reuse the protection proof without another ADD/DROP barrier.
+The guard depends on every physical `VARCHAR` column that exists at creation
+time. A later ngram index on one of those columns finds the guard through the
+table's registry rows, proves it (name, type, token, coverage of the target
+column), records the same name and token, and runs no barrier: every write
+plan that predates the guard was already invalidated when the guard was
+created. A `VARCHAR` added after the guard is outside its coverage; indexing it
+requires dropping the table's ngram indexes and rebuilding them. Dropping an
+index drops the guard only when no other registry row references it. That
+count reads the dropping transaction's snapshot, so concurrent drops of the
+last two indexes each see the other's row and both leave the guard, which the
+next first-index create drops (every `__ngram_guard_*` index on the table that
+no registry row names) before its barrier; a drop concurrent with a create on
+the same table can yield an index that is `SCAN_ONLY` from birth, whose remedy
+is to drop and re-create it.
 
 ## Updates, deletes, and vacuum
 
@@ -86,13 +96,13 @@ reuse the protection proof without another ADD/DROP barrier.
   becomes delete plus insert. The old posting is a harmless false positive that
   recheck discards; the new rowid is in the live tail until refresh.
 - Updating an uncovered column may remain in place. That is safe because it
-  cannot change the indexed value. A normal broad guard covers all `VARCHAR`
-  columns that existed when it was created; a native-ART fallback may cover
-  only the indexed target.
+  cannot change an indexed value: every indexed column is covered.
 - Delete alone is safe. Visibility and recheck remove deleted candidates.
-- The non-ART guard makes `CanRebuildExistingIndexesAfterVacuum` false even
-  when `vacuum_rebuild_indexes` is enabled, so vacuum cannot move a surviving
-  live rowid.
+- Any index on a table makes DuckDB skip moving vacuum by default. With
+  `vacuum_rebuild_indexes` enabled, v1.5.5 moves rows only when every index on
+  the table is an ART it can rebuild; the guard's non-ART type makes
+  `CanRebuildExistingIndexesAfterVacuum` false, so vacuum cannot move a
+  surviving live rowid.
 - DuckDB may still discard fully deleted *trailing* row groups. That moves no
   live row. If a later committed append reuses any rowid at or below the
   guard's maximum, `unsafe_reuse` latches before the append becomes visible.
@@ -128,10 +138,10 @@ the unsafe latch.
 
 There is no list of dirty groups or repeated overlay work. One boolean selects
 one scan, so 1, 10, 100, or 1,000 uncertain events have the same query-plan
-shape and bounded state. Proven table/meta identity staleness also makes both
-full-result paths scan; the candidate-only and maintenance APIs raise because
-they have no equivalent exhaustive fallback. A present malformed shadow object
-is corruption and always propagates rather than being treated as unavailable.
+shape and bounded state. A registry row this version cannot read declines the
+transparent path and raises on the explicit, candidate, and maintenance paths.
+A present malformed storage table is corruption and always propagates rather
+than being treated as unavailable.
 
 Recovery is explicit:
 
@@ -140,11 +150,11 @@ PRAGMA drop_ngram_index('logs', 'message');
 PRAGMA create_ngram_index('logs', 'message');
 ```
 
-Public drop validates metadata layout and catalog OID at execution time. For a
-format-3 index it drops the recorded guard only when name, type, table, column,
-and token prove the incarnation; a genuinely missing guard is recoverable.
-Format-2 metadata is drop-only and is accepted only when it truly has no guard
-columns and no guard covering the target column on the base table.
+Public drop validates the registry row at execution time and drops the guard
+only when no other index records it and its name, type, table, and token prove
+the incarnation; a genuinely missing guard is recoverable. An index written by
+an earlier storage format is listed `MALFORMED` and is removed by
+`drop_ngram_index_by_id` under the same token check.
 
 ## WAL, checkpoints, and reopen
 
@@ -173,8 +183,8 @@ conservatively require rebuild on the next attach.
 Malformed non-identity persisted guard options (source, version, seal, or
 state) create a bound quarantine guard with
 `protection_compatible=false` and `unsafe_reuse=true` instead of leaving
-DuckDB's v1.5.5 bind state stuck at `BINDING`. Queries scan, future protection
-proofs reject it, ordinary extension-loaded writes remain usable, and public
+DuckDB's v1.5.5 bind state stuck at `BINDING`. Queries scan, a later index on
+the table is refused, ordinary extension-loaded writes remain usable, and public
 drop can recover it while the recorded token remains readable and matches.
 A missing or wrong-typed identity token must make exact drop refuse. Every use
 of checkpoint internals is gated by the exact v1.5.5 version/source pin.
@@ -186,17 +196,16 @@ of checkpoint internals is gated by the exact v1.5.5 version/source pin.
   `ngram`. In the pinned host, INSERT and UPDATE fail on the unknown custom
   type, DELETE can busy-spin in index binding and must be terminated, and
   guarded-column DROP/rename is refused. An unrelated ADD COLUMN works.
-- A normal broad guard makes updates to every then-existing `VARCHAR` column
-  full delete-plus-insert rewrites. Bulk INSERT callback work is O(1) per
-  vector: the guard stores no key data and handles the sequence rowid vector
-  without flattening or per-row iteration.
+- The guard makes updates to every then-existing `VARCHAR` column full
+  delete-plus-insert rewrites. Bulk INSERT callback work is O(1) per vector:
+  the guard stores no key data and handles the sequence rowid vector without
+  flattening or per-row iteration.
 - DELETE and rollback cleanup on a wide guarded table may fetch every
   guard-covered `VARCHAR`: v1.5.5 unions index dependencies before calling the
-  value-independent `TryDelete`. Multiple broad guards deduplicate that union.
+  value-independent `TryDelete`.
 - ADD COLUMN is safe for existing ngram indexes, but a newly added `VARCHAR` is
-  outside their dependency sets. Indexing that new column requires an old
-  guard that already covers it, an old-enough explicit ART on the target, or
-  dropping/rebuilding the table's ngram indexes.
+  outside the guard's dependency set. Indexing that new column requires
+  dropping and rebuilding the table's ngram indexes.
 - DuckDB index dependencies refuse table/column rename and many DROP/ALTER
   operations while a guard exists. Drop the ngram indexes first.
 - Creation invalidates the reservoir sample and can make overlapping writers
@@ -243,9 +252,3 @@ build/release/duckdb /tmp/ng-wide.db -c "SET threads=1; CREATE TABLE w AS SELECT
 /usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kb=%M' build/release/duckdb /tmp/ng-wide-guard.db -c "LOAD ngram; SET threads=1; ALTER TABLE w ADD COLUMN __ngram_barrier_bench BOOLEAN; ALTER TABLE w DROP COLUMN __ngram_barrier_bench; CREATE INDEX gw ON w USING NGRAM_ROWID_GUARD(c00,c01,c02,c03,c04,c05,c06,c07,c08,c09,c10,c11,c12,c13,c14,c15); CHECKPOINT"
 stat -c '%s bytes, %b blocks' /tmp/ng-wide.db /tmp/ng-wide-guard.db
 ```
-
-These costs replace the former probabilistic row witnesses and blanket
-user-managed ART requirement. Format 3 stores no witnesses and maintenance
-performs no random row fetches: the guard/barrier proof is deterministic, and
-any uncertainty has an exhaustive fallback. An explicit ART remains an
-optional creation protector for the added-column/dependency cases above.

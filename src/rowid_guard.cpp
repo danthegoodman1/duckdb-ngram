@@ -3,10 +3,8 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_set.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/uuid.hpp"
-#include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/index/bound_index.hpp"
 #include "duckdb/execution/index/index_type.hpp"
 #include "duckdb/execution/index/unbound_index.hpp"
@@ -535,70 +533,61 @@ string InstalledRowIdGuardToken(DuckTableEntry &table, const string &column_name
 
 static bool CanBindRowIdGuards(DuckTableEntry &table, bool require_compatible);
 
-static string RowIdGuardDropReason(ClientContext &context, DuckTableEntry &table, const MetaInfo &meta,
-                                   bool bind_unbound = true) {
-	if (meta.guard_name.empty() || meta.guard_token.empty()) {
+//! Empty when the guard named by a registry row is absent or is exactly the
+//! recorded incarnation (name, type, table, token); otherwise why the drop
+//! must not touch the index carrying that name.
+static string RowIdGuardDropReason(ClientContext &context, DuckTableEntry &table, const string &guard_name,
+                                   const string &guard_token, bool bind_unbound = true) {
+	if (guard_name.empty() || guard_token.empty()) {
 		return "the index does not record a valid rowid guard name and token";
 	}
 
 	auto &storage = table.GetStorage();
-	auto has_column = table.ColumnExists(meta.column_name);
-	StorageIndex expected_column;
-	if (has_column) {
-		expected_column = table.GetStorageIndex(ColumnIndex(table.GetColumn(meta.column_name).Logical().index));
-	}
-
-	EntryLookupInfo lookup(CatalogType::INDEX_ENTRY, meta.guard_name);
+	EntryLookupInfo lookup(CatalogType::INDEX_ENTRY, guard_name);
 	auto catalog_entry = Catalog::GetEntry(context, table.ParentCatalog().GetName(), table.ParentSchema().name, lookup,
 	                                       OnEntryNotFound::RETURN_NULL);
 	if (catalog_entry) {
 		auto &index_entry = catalog_entry->Cast<DuckIndexEntry>();
-		if (!has_column || index_entry.index_type != NGRAM_ROWID_GUARD_TYPE ||
-		    std::find(index_entry.column_ids.begin(), index_entry.column_ids.end(),
-		              expected_column.GetPrimaryIndex()) == index_entry.column_ids.end() ||
+		if (index_entry.index_type != NGRAM_ROWID_GUARD_TYPE ||
 		    &index_entry.GetDataTableInfo() != storage.GetDataTableInfo().get()) {
-			return "an index with the recorded guard name belongs to a different table, type, or column";
+			return "an index with the recorded guard name belongs to a different table or type";
 		}
 	}
 
 	bool needs_bind = false;
-	{
-		for (auto &entry : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
-			auto &index = *entry.index;
-			if (index.GetIndexName() != meta.guard_name) {
-				continue;
-			}
-			if (!catalog_entry) {
-				return "the recorded rowid guard exists in table storage but not in the index catalog";
-			}
-			if (entry.bind_state.load() == IndexBindState::BINDING) {
-				return "the recorded rowid guard is being bound; retry the drop";
-			}
-			if (!has_column || index.GetIndexType() != NGRAM_ROWID_GUARD_TYPE ||
-			    std::find(index.GetColumnIds().begin(), index.GetColumnIds().end(),
-			              expected_column.GetPrimaryIndex()) == index.GetColumnIds().end()) {
-				return "the recorded rowid guard has the wrong type or column dependency";
-			}
-			string token;
-			if (index.IsBound()) {
-				token = index.Cast<RowIdGuard>().GetState().token;
-			} else {
-				auto &options = index.Cast<UnboundIndex>().GetStorageInfo().options;
-				auto token_entry = options.find(OPTION_TOKEN);
-				if (token_entry == options.end() || token_entry->second.IsNull()) {
-					return "the unbound rowid guard does not persist an incarnation token";
-				}
-				token = StringValue::Get(token_entry->second);
-				needs_bind = true;
-			}
-			if (token != meta.guard_token) {
-				return "the recorded rowid guard was dropped and re-created";
-			}
-			if (!needs_bind) {
-				return string();
-			}
-			break;
+	for (auto &entry : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
+		auto &index = *entry.index;
+		if (index.GetIndexName() != guard_name) {
+			continue;
 		}
+		if (!catalog_entry) {
+			return "the recorded rowid guard exists in table storage but not in the index catalog";
+		}
+		if (entry.bind_state.load() == IndexBindState::BINDING) {
+			return "the recorded rowid guard is being bound; retry the drop";
+		}
+		if (index.GetIndexType() != NGRAM_ROWID_GUARD_TYPE) {
+			return "the recorded rowid guard has the wrong type";
+		}
+		string token;
+		if (index.IsBound()) {
+			token = index.Cast<RowIdGuard>().GetState().token;
+		} else {
+			auto &options = index.Cast<UnboundIndex>().GetStorageInfo().options;
+			auto token_entry = options.find(OPTION_TOKEN);
+			if (token_entry == options.end() || token_entry->second.IsNull()) {
+				return "the unbound rowid guard does not persist an incarnation token";
+			}
+			token = StringValue::Get(token_entry->second);
+			needs_bind = true;
+		}
+		if (token != guard_token) {
+			return "the recorded rowid guard was dropped and re-created";
+		}
+		if (!needs_bind) {
+			return string();
+		}
+		break;
 	}
 	if (needs_bind) {
 		if (!bind_unbound) {
@@ -619,29 +608,10 @@ static string RowIdGuardDropReason(ClientContext &context, DuckTableEntry &table
 		}
 		// Success is safe only after re-reading the catalog and physical entry as
 		// BOUND. A bound index cannot later enter the raw-pointer BINDING path.
-		return RowIdGuardDropReason(context, table, meta, false);
+		return RowIdGuardDropReason(context, table, guard_name, guard_token, false);
 	}
 	if (catalog_entry) {
 		return "the recorded rowid guard is cataloged but missing from table storage";
-	}
-	return string();
-}
-
-static string LegacyRowIdGuardReason(DuckTableEntry &table, const string &column_name) {
-	auto has_column = table.ColumnExists(column_name);
-	StorageIndex expected_column;
-	if (has_column) {
-		expected_column = table.GetStorageIndex(ColumnIndex(table.GetColumn(column_name).Logical().index));
-	}
-	for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-		auto &index = *entry.index;
-		if (index.GetIndexType() != NGRAM_ROWID_GUARD_TYPE) {
-			continue;
-		}
-		if (!has_column || std::find(index.GetColumnIds().begin(), index.GetColumnIds().end(),
-		                             expected_column.GetPrimaryIndex()) != index.GetColumnIds().end()) {
-			return "a rowid guard exists on the base table, so this is not a guard-less v2 index";
-		}
 	}
 	return string();
 }
@@ -763,6 +733,8 @@ public:
 	}
 };
 
+//! The execution-time check before a generated drop script drops a guard:
+//! (catalog, schema, table, guard_name, guard_token).
 static void RowIdGuardValidateFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
@@ -770,42 +742,8 @@ static void RowIdGuardValidateFunction(DataChunk &args, ExpressionState &state, 
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto &table = ResolveExistingTable(context, args.GetValue(0, row).ToString(), args.GetValue(1, row).ToString(),
 		                                   args.GetValue(2, row).ToString(), "ngram index base table");
-		auto column_name = args.GetValue(3, row).ToString();
-		auto shadow_schema = args.GetValue(4, row).ToString();
-		auto meta_name = args.GetValue(9, row).ToString();
-		auto &meta_table = ResolveExistingTable(context, args.GetValue(0, row).ToString(), shadow_schema, meta_name,
-		                                        "ngram index meta table");
-		auto expected_format = args.GetValue(5, row).GetValue<int64_t>();
-		if (NumericCast<int64_t>(meta_table.oid) != args.GetValue(6, row).GetValue<int64_t>()) {
-			throw InvalidInputException("ngram meta table changed while drop_ngram_index was prepared");
-		}
-		ShadowTarget target {args.GetValue(1, row).ToString(), args.GetValue(2, row).ToString(), column_name,
-		                     shadow_schema};
-		auto &transaction = DuckTransaction::Get(context, table.ParentCatalog());
-		auto actual_format = ReadMetaFormatVersion(context, transaction, meta_table, target);
-		if (actual_format != expected_format) {
-			throw InvalidInputException("ngram meta format changed while drop_ngram_index was prepared");
-		}
-		if (expected_format == 2) {
-			if (meta_table.ColumnExists("guard_name") || meta_table.ColumnExists("guard_token")) {
-				throw InvalidInputException("format_version 2 meta table unexpectedly contains rowid guard columns");
-			}
-			auto reason = LegacyRowIdGuardReason(table, column_name);
-			if (!reason.empty()) {
-				throw InvalidInputException("ngram v2 drop validation failed: %s", reason);
-			}
-			output[row] = true;
-			continue;
-		}
-		if (expected_format != NGRAM_FORMAT_VERSION) {
-			throw InvalidInputException("unsupported ngram meta format_version %lld", expected_format);
-		}
-		auto meta = ReadMeta(context, transaction, meta_table, target);
-		if (meta.guard_name != args.GetValue(7, row).ToString() ||
-		    meta.guard_token != args.GetValue(8, row).ToString()) {
-			throw InvalidInputException("ngram rowid guard changed while drop_ngram_index was prepared");
-		}
-		auto reason = RowIdGuardDropReason(context, table, meta);
+		auto reason =
+		    RowIdGuardDropReason(context, table, args.GetValue(3, row).ToString(), args.GetValue(4, row).ToString());
 		if (!reason.empty()) {
 			throw InvalidInputException("ngram rowid guard validation failed: %s", reason);
 		}
@@ -821,8 +759,7 @@ void RegisterRowIdGuard(ExtensionLoader &loader) {
 
 	auto validate = ScalarFunction(
 	    NGRAM_ROWID_GUARD_VALIDATE,
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	     LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	    LogicalType::BOOLEAN, RowIdGuardValidateFunction);
 	validate.stability = FunctionStability::VOLATILE;
 	validate.SetFallible();
@@ -878,122 +815,6 @@ string RowIdGuardReason(ClientContext &context, DuckTableEntry &table, const Met
 		return "the rowid guard cannot exclude reuse of rowids already covered by the ngram index";
 	}
 	return string();
-}
-
-string RowIdGuardProtectionReason(DuckTableEntry &table, const MetaInfo &meta, const string &column_name,
-                                  vector<string> &protected_columns) {
-	protected_columns.clear();
-	string reason;
-	auto state = ReadExactGuard(table, meta, reason);
-	if (!state) {
-		return reason;
-	}
-	if (!table.ColumnExists(column_name)) {
-		return "the new indexed column no longer exists";
-	}
-	auto expected = table.GetStorageIndex(ColumnIndex(table.GetColumn(column_name).Logical().index)).GetPrimaryIndex();
-	if (std::find(state->column_ids.begin(), state->column_ids.end(), expected) == state->column_ids.end()) {
-		return "existing rowid guards do not cover the new indexed column";
-	}
-	for (auto &definition : table.GetColumns().Physical()) {
-		auto physical = table.GetStorageIndex(ColumnIndex(definition.Logical().index)).GetPrimaryIndex();
-		if (std::find(state->column_ids.begin(), state->column_ids.end(), physical) != state->column_ids.end()) {
-			protected_columns.push_back(definition.Name());
-		}
-	}
-	if (protected_columns.size() != state->column_ids.size()) {
-		return "the rowid guard's physical column dependency no longer matches the table";
-	}
-	return string();
-}
-
-static bool CoversColumn(const vector<column_t> &column_ids, column_t expected) {
-	return std::find(column_ids.begin(), column_ids.end(), expected) != column_ids.end();
-}
-
-bool FindNativeUpdateProtector(ClientContext &context, DuckTableEntry &table, const string &column_name,
-                               NativeUpdateProtector &result) {
-	if (!table.ColumnExists(column_name)) {
-		return false;
-	}
-	auto expected = table.GetStorageIndex(ColumnIndex(table.GetColumn(column_name).Logical().index)).GetPrimaryIndex();
-	auto &storage = table.GetStorage();
-	try {
-		storage.GetDataTableInfo()->BindIndexes(context, ART::TYPE_NAME);
-	} catch (std::exception &ex) {
-		throw InvalidInputException("create_ngram_index cannot bind an existing ART update protector: %s",
-		                            ErrorData(ex).RawMessage());
-	}
-	vector<string> candidates;
-	{
-		auto entries = storage.GetDataTableInfo()->GetIndexes().IndexEntries();
-		for (auto &item : entries) {
-			auto &index = *item.index;
-			if (index.IsBound() && index.GetIndexType() == ART::TYPE_NAME &&
-			    CoversColumn(index.GetColumnIds(), expected)) {
-				candidates.push_back(index.GetIndexName());
-			}
-		}
-	}
-	for (auto &candidate : candidates) {
-		EntryLookupInfo lookup(CatalogType::INDEX_ENTRY, candidate);
-		auto catalog_entry = Catalog::GetEntry(context, table.ParentCatalog().GetName(), table.ParentSchema().name,
-		                                       lookup, OnEntryNotFound::RETURN_NULL);
-		if (!catalog_entry) {
-			continue;
-		}
-		auto &entry = catalog_entry->Cast<DuckIndexEntry>();
-		if (entry.internal || entry.index_type != ART::TYPE_NAME ||
-		    &entry.GetDataTableInfo() != storage.GetDataTableInfo().get() ||
-		    !CoversColumn(entry.column_ids, expected)) {
-			continue;
-		}
-		auto timestamp = entry.timestamp.load();
-		if (!CatalogSet::IsCommitted(timestamp)) {
-			continue;
-		}
-		result = NativeUpdateProtector(entry.name, entry.oid, timestamp);
-		return true;
-	}
-	return false;
-}
-
-string NativeUpdateProtectorReason(ClientContext &context, DuckTableEntry &table, const string &column_name,
-                                   const NativeUpdateProtector &expected_protector) {
-	if (expected_protector.name.empty() || !CatalogSet::IsCommitted(expected_protector.timestamp)) {
-		return "the recorded native update protector is malformed or uncommitted";
-	}
-	if (!table.ColumnExists(column_name)) {
-		return "the protected column no longer exists";
-	}
-	auto expected_column =
-	    table.GetStorageIndex(ColumnIndex(table.GetColumn(column_name).Logical().index)).GetPrimaryIndex();
-	auto &storage = table.GetStorage();
-	EntryLookupInfo lookup(CatalogType::INDEX_ENTRY, expected_protector.name);
-	auto catalog_entry = Catalog::GetEntry(context, table.ParentCatalog().GetName(), table.ParentSchema().name, lookup,
-	                                       OnEntryNotFound::RETURN_NULL);
-	if (!catalog_entry) {
-		return "the native update protector is missing from the index catalog";
-	}
-	auto &entry = catalog_entry->Cast<DuckIndexEntry>();
-	if (entry.internal || entry.oid != expected_protector.oid || entry.index_type != ART::TYPE_NAME ||
-	    entry.timestamp.load() != expected_protector.timestamp ||
-	    &entry.GetDataTableInfo() != storage.GetDataTableInfo().get() ||
-	    !CoversColumn(entry.column_ids, expected_column)) {
-		return "the native update protector's catalog identity, table, type, column dependency, or timestamp changed";
-	}
-	for (auto &item : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
-		auto &index = *item.index;
-		if (index.GetIndexName() != expected_protector.name) {
-			continue;
-		}
-		if (!index.IsBound() || index.GetIndexType() != ART::TYPE_NAME ||
-		    !CoversColumn(index.GetColumnIds(), expected_column)) {
-			return "the native update protector is no longer bound to the indexed column";
-		}
-		return string();
-	}
-	return "the native update protector is missing from table storage";
 }
 
 } // namespace ngram

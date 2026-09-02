@@ -13,7 +13,6 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
-#include "duckdb/storage/object_cache.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/index_pragmas.hpp"
@@ -29,134 +28,11 @@ namespace duckdb {
 namespace ngram {
 
 //===----------------------------------------------------------------------===//
-// Staleness detection
-//
-// These metadata checks reject a shadow index attached to the wrong table or
-// schema shape. Rowid stability and trailing-range reuse are handled by the
-// native rowid guard: uncertain guard state makes queries scan and maintenance
-// refuse, so no probabilistic row witnesses are needed.
-//
-// What a query path reads is metadata only: the table's allocated rowid count
-// and catalog oid are O(1) and its column list is O(columns).
-//===----------------------------------------------------------------------===//
-
-//! Length-prefixed so a string prefix is exactly a column-list prefix: a
-//! column name can otherwise contain any separator we might pick. Names are
-//! folded because identifiers match case-insensitively — two columns cannot
-//! differ by case alone, and a case-only rename changes no data.
-static void AppendColumnFingerprint(string &result, const string &name, const string &type) {
-	auto folded = StringUtil::Lower(name);
-	result += to_string(folded.size()) + ":" + folded + to_string(type.size()) + ":" + type;
-}
-
-//! A value unique to one open database instance. It lives in the instance's
-//! object cache rather than in a setting: a setting's default is fixed when
-//! the extension registers it and would survive a close/reopen inside the same
-//! process, which is exactly the case (a restart renumbers catalog oids) where
-//! comparing oids must stop.
-struct InstanceIdEntry : public ObjectCacheEntry {
-	InstanceIdEntry() : id(UUID::ToString(UUID::GenerateRandomUUID())) {
-	}
-
-	string id;
-
-	static string ObjectType() {
-		return "ngram_instance_id";
-	}
-	string GetObjectType() override {
-		return ObjectType();
-	}
-	//! no memory estimate: the entry must never be evicted, or an index
-	//! written earlier in this session would stop being comparable
-	optional_idx GetEstimatedCacheMemory() const override {
-		return optional_idx();
-	}
-};
-
-string InstanceId(ClientContext &context) {
-	auto entry = ObjectCache::GetObjectCache(context).GetOrCreate<InstanceIdEntry>("ngram_instance_id");
-	return entry ? entry->id : string();
-}
-
-TableFingerprint ComputeTableFingerprint(ClientContext &context, TableCatalogEntry &table) {
-	TableFingerprint result;
-	result.table_oid = NumericCast<int64_t>(table.oid);
-	result.catalog_oid = NumericCast<int64_t>(table.ParentCatalog().GetOid());
-	result.instance_id = InstanceId(context);
-	for (auto &col : table.GetColumns().Logical()) {
-		auto type = col.Type().ToString();
-		AppendColumnFingerprint(result.schema_fingerprint, col.Name(), type);
-		result.columns.emplace_back(col.Name(), type);
-	}
-	result.total_rows = NumericCast<int64_t>(table.Cast<DuckTableEntry>().GetStorage().GetTotalRows());
-	return result;
-}
-
-bool TableFingerprint::ProvesSameTable(const MetaInfo &meta) const {
-	// oids are handed out from one process-wide counter, so a recorded pair is
-	// comparable only inside the instance that recorded it, and only while the
-	// database it named is still the same attach incarnation
-	return !meta.instance_id.empty() && meta.instance_id == instance_id && meta.catalog_oid == catalog_oid &&
-	       meta.table_oid == table_oid;
-}
-
-string TableFingerprint::ColumnType(const string &column) const {
-	for (auto &entry : columns) {
-		// identifiers match case-insensitively, and a case-only rename leaves
-		// every value and rowid alone: it must not read as a vanished column
-		if (StringUtil::CIEquals(entry.first, column)) {
-			return entry.second;
-		}
-	}
-	return string();
-}
-
-string CertainStaleReason(const MetaInfo &meta, const TableFingerprint &now) {
-	auto same_instance = !meta.instance_id.empty() && meta.instance_id == now.instance_id;
-	auto same_catalog = same_instance && meta.catalog_oid == now.catalog_oid;
-	if (same_catalog && meta.table_oid != now.table_oid) {
-		// Same running instance, same attach incarnation, different catalog
-		// entry: the table this index was built for is gone. Table oids
-		// survive every ALTER (verified on v1.5.5) and are only handed out
-		// again on CREATE, so within one incarnation this is proof. The
-		// catalog oid has to match too — ATTACH mints fresh oids for
-		// everything it loads, so after a DETACH + re-ATTACH the table's oid
-		// differs for a perfectly healthy index.
-		return "the table was dropped and re-created (or replaced) after the index was built, so the index describes "
-		       "rows that no longer exist";
-	}
-	if (now.ProvesSameTable(meta)) {
-		// This is provably the same table object the index was built from, so
-		// it cannot have been re-created and the rest of the column list says
-		// nothing about the index's health: an ALTER that renames, drops or
-		// retypes some *other* column leaves every indexed rowid and value
-		// where it was. Only the indexed column's own shape matters.
-		auto current_type = now.ColumnType(meta.column_name);
-		if (current_type.empty()) {
-			return "the indexed column " + meta.column_name + " no longer exists on the table";
-		}
-		if (!meta.column_type.empty() && current_type != meta.column_type) {
-			return "the indexed column " + meta.column_name + " is now " + current_type + ", not " + meta.column_type;
-		}
-	} else if (!meta.schema_fingerprint.empty() && now.schema_fingerprint.rfind(meta.schema_fingerprint, 0) != 0) {
-		// Identity cannot be proven here (another session, another attach
-		// incarnation), and the column list is then the only signal that
-		// separates "the same table, altered" from "a different table under
-		// the same name". Columns appended at the end keep every recorded
-		// column in place and preserve rowids, so they are tolerated; anything
-		// else is treated as a re-creation.
-		return "the table's column list changed after the index was built, or a table with a different column list "
-		       "now carries its name (columns were removed, renamed, retyped or reordered)";
-	}
-	return string();
-}
-
-//===----------------------------------------------------------------------===//
 // Shared pragma scaffolding
 //===----------------------------------------------------------------------===//
 
-//! An indexed column of a base table, resolved against both the catalog and
-//! the shadow tables, with its meta row already read and validated.
+//! An indexed column of a base table, resolved against the registry, with its
+//! metadata already read and its guard verdict already passed.
 struct MaintenanceColumn {
 	string column_name;
 	IndexLocation location;
@@ -182,28 +58,21 @@ static string ScratchName(const char *purpose) {
 //! pragma for useful early errors and again after the generated script owns its
 //! transaction-lifetime vacuum fence, where it becomes the correctness check.
 static MaintenanceColumn ResolveMaintenanceColumn(ClientContext &context, const char *fn, ResolvedTarget &target,
-                                                  const IndexLocation &location, const TableFingerprint &fingerprint) {
+                                                  const IndexLocation &location) {
 	auto &column_name = location.column_name;
 	if (!target.entry->ColumnExists(column_name)) {
 		throw CatalogException("%s: the ngram index on %s references column %s, which no longer exists; drop the "
 		                       "index with PRAGMA drop_ngram_index",
 		                       fn, target.table_name, column_name);
 	}
-	auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
 	if (!IndexLocationAvailable(context, target, location)) {
 		throw InvalidInputException("%s: index storage is unavailable", fn);
 	}
-	auto &meta_entry = ResolveExistingTable(context, target.catalog_name, location.shadow_schema, location.MetaTable(),
-	                                        "ngram index meta table");
-	ShadowTarget shadow {target.schema_name, target.table_name, column_name, location.shadow_schema};
 	MaintenanceColumn column;
 	column.column_name = column_name;
 	column.location = location;
-	column.meta = ReadMeta(context, transaction, meta_entry, shadow);
-	auto reason = CertainStaleReason(column.meta, fingerprint);
-	if (reason.empty()) {
-		reason = RowIdGuardReason(context, target.entry->Cast<DuckTableEntry>(), column.meta);
-	}
+	column.meta = ReadMeta(context, target.catalog_name, location);
+	auto reason = RowIdGuardReason(context, target.entry->Cast<DuckTableEntry>(), column.meta);
 	if (!reason.empty()) {
 		throw InvalidInputException("%s: the ngram index on %s.%s cannot be maintained incrementally because %s. "
 		                            "Rebuild it: PRAGMA drop_ngram_index('%s', '%s') then PRAGMA "
@@ -216,11 +85,10 @@ static MaintenanceColumn ResolveMaintenanceColumn(ClientContext &context, const 
 
 //! Resolve every index that the pragma should operate on: all indexed columns
 //! of the table, or the single column named by `only_column`. Reads and
-//! validates each meta row (format version, ownership) and refuses outright
-//! when a detector proves the index cannot be maintained incrementally.
+//! validates each registry row and refuses outright when the guard cannot
+//! prove the index maintainable.
 static vector<MaintenanceColumn> ResolveMaintenanceColumns(ClientContext &context, const char *fn,
-                                                           ResolvedTarget &target, const string &only_column,
-                                                           const TableFingerprint &fingerprint) {
+                                                           ResolvedTarget &target, const string &only_column) {
 	auto indexes = ExistingIndexes(context, target);
 	RequireUniqueIndexColumns(indexes);
 	if (indexes.empty()) {
@@ -244,29 +112,26 @@ static vector<MaintenanceColumn> ResolveMaintenanceColumns(ClientContext &contex
 
 	vector<MaintenanceColumn> result;
 	for (auto &location : indexes) {
-		result.push_back(ResolveMaintenanceColumn(context, fn, target, location, fingerprint));
+		result.push_back(ResolveMaintenanceColumn(context, fn, target, location));
 	}
 	return result;
 }
 
-static string MaintenanceGuardCall(const char *fn, const ResolvedTarget &target, const MaintenanceColumn &column,
-                                   const TableFingerprint &fingerprint) {
+static string MaintenanceGuardCall(const char *fn, const ResolvedTarget &target, const MaintenanceColumn &column) {
 	return SystemFunction(NGRAM_MAINTENANCE_GUARD) + "(" + Lit(fn) + ", " + Lit(target.catalog_name) + ", " +
 	       Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(column.column_name) + ", false, " +
-	       to_string(column.meta.hwm_rowid) + ", " + to_string(fingerprint.table_oid) + ", " +
-	       Lit(fingerprint.schema_fingerprint) + ", " + to_string(column.meta.options.gram_size) + ", " +
-	       (column.meta.options.case_insensitive ? "true" : "false") + ", '', '', '', '', 0, '', 0, false, " +
-	       Lit(column.location.index_ref) + ", " + Lit(column.location.shadow_schema) + ", " +
-	       Lit(column.location.MetaTable()) + ", " + to_string(column.location.registry_oid) + ", " +
-	       to_string(column.location.schema_oid) + ", " + to_string(column.location.meta_oid) + ", " +
-	       to_string(column.location.segments_oid) + ", " + to_string(column.location.stats_oid) + ")";
+	       to_string(column.meta.hwm_rowid) + ", " + to_string(column.meta.options.gram_size) + ", " +
+	       (column.meta.options.case_insensitive ? "true" : "false") + ", '', '', " + Lit(column.location.index_ref) +
+	       ", " + to_string(column.location.registry_oid) + ", false)";
 }
 
-static string FingerprintAssignments(const TableFingerprint &fingerprint, const string &column_name) {
-	return "table_oid = " + to_string(fingerprint.table_oid) + ", catalog_oid = " + to_string(fingerprint.catalog_oid) +
-	       ", instance_id = " + Lit(fingerprint.instance_id) +
-	       ", schema_fingerprint = " + Lit(fingerprint.schema_fingerprint) +
-	       ", column_type = " + Lit(fingerprint.ColumnType(column_name));
+static string StorageTable(const ResolvedTarget &target, const string &table) {
+	return Ident(target.catalog_name) + "." + Ident(NGRAM_SCHEMA) + "." + Ident(table);
+}
+
+//! The registry row of one index, as a FROM/UPDATE target.
+static string RegistryRow(const ResolvedTarget &target, const MaintenanceColumn &column) {
+	return StorageTable(target, "registry") + " WHERE index_id = " + Lit(column.location.index_ref) + "::UUID";
 }
 
 //! DuckTransaction drops its own vacuum lock just before running an automatic
@@ -283,7 +148,6 @@ private:
 		unique_ptr<StorageLockKey> vacuum_lock;
 		unique_ptr<StorageLockKey> creation_lock;
 		DataTable *creation_table = nullptr;
-		bool creation_requires_replacement = false;
 		string creation_schema_name;
 		string creation_table_name;
 		string creation_column_name;
@@ -304,8 +168,8 @@ public:
 	}
 
 	void HoldCreationBarrier(DuckTransaction &transaction, DataTable &original_table,
-	                         unique_ptr<StorageLockKey> creation_lock, bool requires_replacement, string schema_name,
-	                         string table_name, string column_name, string guard_name) {
+	                         unique_ptr<StorageLockKey> creation_lock, string schema_name, string table_name,
+	                         string column_name, string guard_name) {
 		lock_guard<mutex> guard(fences_lock);
 		for (auto &held : fences) {
 			if (held.manager != &transaction.GetTransactionManager()) {
@@ -316,7 +180,6 @@ public:
 			}
 			held.creation_lock = std::move(creation_lock);
 			held.creation_table = &original_table;
-			held.creation_requires_replacement = requires_replacement;
 			held.creation_schema_name = std::move(schema_name);
 			held.creation_table_name = std::move(table_name);
 			held.creation_column_name = std::move(column_name);
@@ -343,13 +206,9 @@ public:
 			    held.creation_guard_name != guard_name) {
 				throw TransactionException("ngram creation barrier does not match the fresh rowid guard");
 			}
-			if (held.creation_requires_replacement) {
-				if (held.creation_table->IsMainTable() || !current_table.IsMainTable() ||
-				    held.creation_table == &current_table) {
-					throw TransactionException("ngram creation cannot finish because the base table was not replaced");
-				}
-			} else if (held.creation_table != &current_table || !current_table.IsMainTable()) {
-				throw TransactionException("ngram creation cannot finish because its protected table changed");
+			if (held.creation_table->IsMainTable() || !current_table.IsMainTable() ||
+			    held.creation_table == &current_table) {
+				throw TransactionException("ngram creation cannot finish because the base table was not replaced");
 			}
 			held.creation_lock.reset();
 			held.creation_table = nullptr;
@@ -445,140 +304,82 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 		auto column_name = args.GetValue(4, row).ToString();
 		auto creating = args.GetValue(5, row).GetValue<bool>();
 		auto expected_hwm = args.GetValue(6, row).GetValue<int64_t>();
-		auto expected_table_oid = args.GetValue(7, row).GetValue<int64_t>();
-		auto expected_schema_fingerprint = args.GetValue(8, row).ToString();
-		auto expected_gram_size = args.GetValue(9, row).GetValue<int32_t>();
-		auto expected_case_insensitive = args.GetValue(10, row).GetValue<bool>();
-		auto protector_kind = args.GetValue(11, row).ToString();
-		auto protector_detail = args.GetValue(12, row).ToString();
-		auto protector_name = args.GetValue(13, row).ToString();
-		auto protector_identity = args.GetValue(14, row).ToString();
-		auto protector_timestamp = args.GetValue(15, row).GetValue<int64_t>();
-		auto new_guard_name = args.GetValue(16, row).ToString();
-		auto expected_registry_oid = NumericCast<idx_t>(args.GetValue(17, row).GetValue<int64_t>());
-		auto expected_registry_bootstrap = args.GetValue(18, row).GetValue<bool>();
-		auto location_ref = args.GetValue(19, row).ToString();
-		auto location_schema = args.GetValue(20, row).ToString();
-		auto location_meta = args.GetValue(21, row).ToString();
+		auto expected_gram_size = args.GetValue(7, row).GetValue<int64_t>();
+		auto expected_case_insensitive = args.GetValue(8, row).GetValue<bool>();
+		auto guard_name = args.GetValue(9, row).ToString();
+		auto guard_token = args.GetValue(10, row).ToString();
 		IndexLocation location;
-		if (!creating) {
-			location.index_ref = location_ref;
-			location.shadow_schema = location_schema;
-			location.column_name = column_name;
-			location.registry_oid = NumericCast<idx_t>(args.GetValue(22, row).GetValue<int64_t>());
-			location.schema_oid = NumericCast<idx_t>(args.GetValue(23, row).GetValue<int64_t>());
-			location.meta_oid = NumericCast<idx_t>(args.GetValue(24, row).GetValue<int64_t>());
-			location.segments_oid = NumericCast<idx_t>(args.GetValue(25, row).GetValue<int64_t>());
-			location.stats_oid = NumericCast<idx_t>(args.GetValue(26, row).GetValue<int64_t>());
-			if (!StringUtil::CIEquals(location.MetaTable(), location_meta)) {
-				throw InvalidInputException("%s: index location changed after preparation", fn);
-			}
-		}
+		location.index_ref = args.GetValue(11, row).ToString();
+		location.column_name = column_name;
+		location.registry_oid = NumericCast<idx_t>(args.GetValue(12, row).GetValue<int64_t>());
+		auto expected_registry_bootstrap = args.GetValue(13, row).GetValue<bool>();
 
 		auto &catalog = Catalog::GetCatalog(context, catalog_name);
 		AcquireMaintenanceFence(context, catalog);
 		if (fn == "drop_ngram_index_by_id") {
-			ResolvedTarget drop_target {
-			    catalog_name, schema_name, table_name, column_name, ShadowSchemaName(schema_name, table_name), nullptr};
+			ResolvedTarget drop_target {catalog_name, schema_name, table_name, column_name, nullptr};
 			if (!IndexLocationAvailable(context, drop_target, location)) {
 				throw InvalidInputException("%s: index storage was removed after preparation", fn);
 			}
-			RequireExclusiveOwnerAllocation(context, drop_target, location_ref);
+			if (!guard_name.empty() &&
+			    OtherGuardReferences(context, drop_target, guard_name, location.index_ref) != 0) {
+				throw InvalidInputException("%s: another ngram index now shares the rowid guard; run it again", fn);
+			}
 			output[row] = true;
 			continue;
 		}
 		unique_ptr<StorageLockKey> creation_lock;
-		if (creating) {
+		if (creating && guard_token.empty()) {
 			creation_lock = AcquireCreationBarrier(DuckTransaction::Get(context, catalog));
 		}
 
 		auto qualified = Ident(catalog_name) + "." + Ident(schema_name) + "." + Ident(table_name);
 		auto target = ResolveTarget(context, qualified, column_name, true);
-		auto fingerprint = ComputeTableFingerprint(context, *target.entry);
-		if (fingerprint.table_oid != expected_table_oid ||
-		    fingerprint.schema_fingerprint != expected_schema_fingerprint) {
-			throw InvalidInputException("%s: %s changed while the statement was being prepared; run it again", fn,
-			                            table_name);
-		}
+		auto &table = target.entry->Cast<DuckTableEntry>();
 		if (creating) {
-			ValidateRegistryForCreate(context, catalog_name, expected_registry_oid, expected_registry_bootstrap);
-			// Enumerate again behind the creation barrier: another connection may
-			// have registered the owner after pragma preprocessing.
-			auto &transaction = DuckTransaction::Get(context, target.entry->ParentCatalog());
+			ValidateRegistryForCreate(context, catalog_name, location.registry_oid, expected_registry_bootstrap);
+			// Enumerate again behind the fence: another connection may have
+			// registered an index on this table after pragma preprocessing.
 			auto table_target = target;
 			table_target.column_name.clear();
-			auto indexes = ExistingIndexes(context, table_target);
-			if (protector_kind.empty() && !indexes.empty()) {
-				throw InvalidInputException(
-				    "%s: another ngram index appeared while the statement was being prepared; run it again", fn);
-			}
-			for (auto &location : indexes) {
-				auto &indexed_column = location.column_name;
-				auto &meta_entry = ResolveExistingTable(context, target.catalog_name, location.shadow_schema,
-				                                        location.MetaTable(), "ngram index meta table");
-				ShadowTarget shadow {target.schema_name, target.table_name, indexed_column, location.shadow_schema};
-				ReadMeta(context, transaction, meta_entry, shadow);
-				if (StringUtil::CIEquals(indexed_column, column_name)) {
+			auto siblings = ExistingIndexes(context, table_target);
+			for (auto &sibling : siblings) {
+				if (StringUtil::CIEquals(sibling.column_name, column_name)) {
 					throw InvalidInputException(
 					    "An ngram index already exists on %s.%s (%s); use drop_ngram_index first", target.table_name,
-					    column_name, location.index_ref);
+					    column_name, sibling.index_ref);
 				}
-			}
-			if (protector_kind == "ngram_v3") {
-				auto protector_owner = target;
-				protector_owner.column_name = protector_detail;
-				auto protectors = ExistingIndexes(context, protector_owner);
-				if (protectors.size() != 1) {
-					throw InvalidInputException("%s: protecting ngram index disappeared while preparing", fn);
-				}
-				auto &protector_location = protectors[0];
-				auto &meta_entry = ResolveExistingTable(context, target.catalog_name, protector_location.shadow_schema,
-				                                        protector_location.MetaTable(), "ngram index meta table");
-				ShadowTarget protector_target {target.schema_name, target.table_name, protector_detail,
-				                               protector_location.shadow_schema};
-				auto protector = ReadMeta(context, DuckTransaction::Get(context, target.entry->ParentCatalog()),
-				                          meta_entry, protector_target);
-				if (protector.guard_name != protector_name || protector.guard_token != protector_identity) {
+				if (guard_token.empty() || sibling.guard_name != guard_name || sibling.guard_token != guard_token) {
 					throw InvalidInputException(
-					    "%s: the protecting rowid guard changed while the statement was being prepared; run it again",
-					    fn);
+					    "%s: the ngram indexes on %s changed while the statement was being prepared; run it again", fn,
+					    table_name);
 				}
-				vector<string> ignored;
-				auto reason =
-				    RowIdGuardProtectionReason(target.entry->Cast<DuckTableEntry>(), protector, column_name, ignored);
-				if (!reason.empty()) {
-					throw InvalidInputException("%s: the protecting rowid guard is unavailable: %s; run it again", fn,
-					                            reason);
-				}
-			} else if (protector_kind == "native_art") {
-				idx_t protector_oid;
-				try {
-					protector_oid = NumericCast<idx_t>(std::stoull(protector_identity));
-				} catch (std::exception &) {
-					throw InvalidInputException("%s: malformed native update protector identity", fn);
-				}
-				NativeUpdateProtector protector {protector_name, protector_oid,
-				                                 NumericCast<transaction_t>(protector_timestamp)};
-				auto reason =
-				    NativeUpdateProtectorReason(context, target.entry->Cast<DuckTableEntry>(), column_name, protector);
-				if (!reason.empty()) {
-					throw InvalidInputException("%s: the native update protector is unavailable: %s; run it again", fn,
-					                            reason);
-				}
-				auto &manager = transaction.GetTransactionManager();
-				if (protector.timestamp >= manager.LowestActiveStart()) {
-					throw TransactionException(
-					    "%s: an active transaction predates the native update protector; roll it back and retry", fn);
-				}
-			} else if (!protector_kind.empty()) {
-				throw InvalidInputException("%s: unknown creation protector kind %s", fn, protector_kind);
 			}
-			auto fence_state = context.registered_state->GetOrCreate<MaintenanceFenceState>("ngram_maintenance_fence");
-			fence_state->HoldCreationBarrier(transaction, target.entry->GetStorage(), std::move(creation_lock),
-			                                 protector_kind.empty(), target.schema_name, target.table_name, column_name,
-			                                 new_guard_name);
+			if (creation_lock) {
+				auto fence_state =
+				    context.registered_state->GetOrCreate<MaintenanceFenceState>("ngram_maintenance_fence");
+				fence_state->HoldCreationBarrier(DuckTransaction::Get(context, catalog), table.GetStorage(),
+				                                 std::move(creation_lock), target.schema_name, target.table_name,
+				                                 column_name, guard_name);
+			} else {
+				if (siblings.empty()) {
+					throw InvalidInputException(
+					    "%s: the ngram indexes on %s changed while the statement was being prepared; run it again", fn,
+					    table_name);
+				}
+				MetaInfo shared;
+				shared.column_name = column_name;
+				shared.guard_name = guard_name;
+				shared.guard_token = guard_token;
+				auto reason = RowIdGuardReason(context, table, shared);
+				if (!reason.empty()) {
+					throw InvalidInputException("%s: the rowid guard shared by the ngram indexes on %s cannot cover %s "
+					                            "(%s); drop the table's ngram indexes and rebuild them",
+					                            fn, table_name, column_name, reason);
+				}
+			}
 		} else {
-			auto column = ResolveMaintenanceColumn(context, fn.c_str(), target, location, fingerprint);
+			auto column = ResolveMaintenanceColumn(context, fn.c_str(), target, location);
 			if (column.meta.hwm_rowid != expected_hwm ||
 			    column.meta.options.gram_size != NumericCast<idx_t>(expected_gram_size) ||
 			    column.meta.options.case_insensitive != expected_case_insensitive) {
@@ -592,8 +393,7 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 }
 
 //! Prove the scan-free physical guard was installed before releasing the
-//! creation EXCLUSIVE. In the ordinary path ADD/DROP must also have replaced
-//! the original DataTable; protector-backed paths retain the same table.
+//! creation EXCLUSIVE, and that ADD/DROP replaced the original DataTable.
 static void CreationFinishFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
@@ -706,8 +506,8 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 	if (!target.entry->IsDuckTable()) {
 		throw BinderException("ngram_refresh: %s is not a DuckDB base table", table_input);
 	}
-	auto fingerprint = ComputeTableFingerprint(context, *target.entry);
-	auto columns = ResolveMaintenanceColumns(context, "ngram_refresh", target, only_column, fingerprint);
+	auto total_rows = TableTotalRows(*target.entry);
+	auto columns = ResolveMaintenanceColumns(context, "ngram_refresh", target, only_column);
 
 	auto base = Ident(target.catalog_name) + "." + Ident(target.schema_name) + "." + Ident(target.table_name);
 	auto local_start = to_string(LOCAL_ROWID_START);
@@ -717,10 +517,8 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 	bool first_guard = true;
 	vector<string> summary_rows;
 	for (auto &column : columns) {
-		auto shadow = Ident(target.catalog_name) + "." + Ident(column.location.shadow_schema);
-		auto meta = shadow + "." + Ident(column.location.MetaTable());
-		auto segments = shadow + "." + Ident(column.location.SegmentsTable());
-		auto stats = shadow + "." + Ident(column.location.StatsTable());
+		auto segments = StorageTable(target, column.location.SegmentsTable());
+		auto stats = StorageTable(target, column.location.StatsTable());
 		auto quoted_column = Ident(column.column_name);
 		auto hwm = to_string(column.meta.hwm_rowid);
 		auto gram_str = to_string(column.meta.options.gram_size);
@@ -736,10 +534,10 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		// unbounded script, so "loop until remaining_tail is 0" costs exactly
 		// one call when the tail already fits.
 		auto bound_end = bounded ? BoundedRefreshEnd(column.meta.hwm_rowid, max_rows) : LOCAL_ROWID_START - 1;
-		auto stops_short = bound_end < fingerprint.total_rows - 1;
-		auto range_end = stops_short ? bound_end : fingerprint.total_rows - 1;
+		auto stops_short = bound_end < total_rows - 1;
+		auto range_end = stops_short ? bound_end : total_rows - 1;
 
-		auto guard_call = MaintenanceGuardCall("ngram_refresh", target, column, fingerprint);
+		auto guard_call = MaintenanceGuardCall("ngram_refresh", target, column);
 		if (first_guard) {
 			script += "CREATE TEMP TABLE " + guard + " AS SELECT " + guard_call + " AS ignored;\n";
 			first_guard = false;
@@ -850,8 +648,8 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 			new_hwm = "coalesce((SELECT " + SystemFunction("max") + "(rowid) FROM " + base + " WHERE " +
 			          tail_predicate + "), hwm_rowid)";
 		}
-		script += "UPDATE " + meta + " SET hwm_rowid = " + new_hwm + ", " +
-		          FingerprintAssignments(fingerprint, column.column_name) + ";\n";
+		script += "UPDATE " + StorageTable(target, "registry") + " SET hwm_rowid = " + new_hwm +
+		          " WHERE index_id = " + Lit(column.location.index_ref) + "::UUID;\n";
 		script += "DROP TABLE " + packed + ";\n";
 
 		if (bounded) {
@@ -863,8 +661,8 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 			// transaction, and so in the same snapshot, as the packing pass, so
 			// they reconcile with what was indexed exactly. The old mark is a
 			// literal: the execution-time maintenance guard above has already
-			// refused the whole script if the meta row no longer held it.
-			auto recorded = "(SELECT hwm_rowid FROM " + meta + ")";
+			// refused the whole script if the registry row no longer held it.
+			auto recorded = "(SELECT hwm_rowid FROM " + RegistryRow(target, column) + ")";
 			summary_rows.push_back(
 			    "SELECT " + Lit(column.column_name) + " AS column_name, (SELECT " + SystemFunction("count") +
 			    "(*) FROM " + base + " WHERE rowid > " + hwm + " AND rowid <= " + recorded + ") AS rows_indexed, " +
@@ -888,10 +686,9 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 // PRAGMA ngram_compact
 //
 // Merges the segment rows that share a (gram, segment_no) — every refresh
-// appends a new generation, and an index written by an older version of this
-// extension could also hold per-thread partial segments — back into one row
-// per key. It is shadow-only and retains dead postings; results stay exact
-// because readers already union duplicate rows and recheck filters dead rows.
+// appends a new generation — back into one row per key. It is index-only and
+// retains dead postings; results stay exact because readers already union
+// duplicate rows and recheck filters dead rows.
 //
 // purge := true rewrites every key and consults the base snapshot, removing
 // every posting whose rowid is no longer live.
@@ -918,8 +715,7 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 	if (!target.entry->IsDuckTable()) {
 		throw BinderException("ngram_compact: %s is not a DuckDB base table", table_input);
 	}
-	auto fingerprint = ComputeTableFingerprint(context, *target.entry);
-	auto columns = ResolveMaintenanceColumns(context, "ngram_compact", target, only_column, fingerprint);
+	auto columns = ResolveMaintenanceColumns(context, "ngram_compact", target, only_column);
 
 	auto base = Ident(target.catalog_name) + "." + Ident(target.schema_name) + "." + Ident(target.table_name);
 
@@ -927,17 +723,15 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 	auto guard = ScratchName("guard");
 	bool first_guard = true;
 	for (auto &column : columns) {
-		auto shadow = Ident(target.catalog_name) + "." + Ident(column.location.shadow_schema);
-		auto meta = shadow + "." + Ident(column.location.MetaTable());
-		auto segments = shadow + "." + Ident(column.location.SegmentsTable());
-		auto stats = shadow + "." + Ident(column.location.StatsTable());
+		auto segments = StorageTable(target, column.location.SegmentsTable());
+		auto stats = StorageTable(target, column.location.StatsTable());
 		auto keys = ScratchName("compact_keys");
 		auto key_guard = ScratchName("compact_key_guard");
 		auto selected = ScratchName("compact_source");
 		auto live = ScratchName("compact_live");
 		auto packed = ScratchName("compact_packed");
 
-		auto guard_call = MaintenanceGuardCall("ngram_compact", target, column, fingerprint);
+		auto guard_call = MaintenanceGuardCall("ngram_compact", target, column);
 		if (first_guard) {
 			script += "CREATE TEMP TABLE " + guard + " AS SELECT " + guard_call + " AS ignored;\n";
 			first_guard = false;
@@ -1006,22 +800,19 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		script += "INSERT INTO " + segments +
 		          " SELECT gram, segment_no, 0, postings, rowid_count, min_rowid, max_rowid FROM " + packed +
 		          " ORDER BY " + SystemFunction("encode") + "(gram), segment_no;\n";
-		// stats are cheap to rebuild exactly (two small columns) and the merge
-		// changed both the per-gram row counts and the segment counts
-		// Rebuild even when there are no selected segment keys: compact is the
-		// manual upgrade path that collapses and byte-orders an old v3 stats
-		// history without requiring another append. No persisted layout marker
-		// justifies making repeated no-key calls cheaper at the cost of a schema.
-		// Nothing inserts into stats before this DELETE, and nothing deletes
-		// from segments after the possibly empty insert above, so neither table
-		// takes the v1.5.5 empty-insert, delete, reinsert shape that empties a
-		// table in-process (docs/upstream/duckdb-empty-batch-insert.md).
+		// Stats are rebuilt from the merged segment metadata: the merge changed
+		// both the per-gram row counts and the segment counts, and the two
+		// small columns are cheap to recompute exactly. The rebuild runs even
+		// when no key was selected. Nothing inserts into stats before this
+		// DELETE, and nothing deletes from segments after the possibly empty
+		// insert above, so neither table takes the v1.5.5 empty-insert, delete,
+		// reinsert shape that empties a table in-process
+		// (docs/upstream/duckdb-empty-batch-insert.md).
 		script += "DELETE FROM " + stats + ";\n";
 		script += "INSERT INTO " + stats + " SELECT " + SystemFunction("decode") + "(gram_key), " +
 		          SystemFunction("sum") + "(rowid_count)::BIGINT, " + SystemFunction("count") +
 		          "(*)::BIGINT FROM (SELECT " + SystemFunction("encode") + "(gram) AS gram_key, rowid_count FROM " +
 		          segments + ") GROUP BY gram_key ORDER BY gram_key;\n";
-		script += "UPDATE " + meta + " SET " + FingerprintAssignments(fingerprint, column.column_name) + ";\n";
 		script += "DROP TABLE " + keys + ";\n";
 		script += "DROP TABLE " + key_guard + ";\n";
 		script += "DROP TABLE " + selected + ";\n";
@@ -1037,12 +828,9 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 void RegisterMaintenance(ExtensionLoader &loader) {
 	auto guard = ScalarFunction(NGRAM_MAINTENANCE_GUARD,
 	                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BIGINT,  LogicalType::BIGINT,
-	                             LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
-	                             LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BOOLEAN, LogicalType::VARCHAR,
-	                             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
-	                             LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT},
+	                             LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::BIGINT,
+	                             LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                             LogicalType::BIGINT, LogicalType::BOOLEAN},
 	                            LogicalType::BOOLEAN, MaintenanceGuardFunction);
 	guard.stability = FunctionStability::VOLATILE;
 	guard.SetFallible();

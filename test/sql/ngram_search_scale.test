@@ -16,12 +16,12 @@ statement ok
 PRAGMA create_ngram_index('big', 's');
 
 statement ok
-SET VARIABLE big_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE big_id = (SELECT replace(index_id::VARCHAR, '-', '')
                            FROM __ngram.registry WHERE table_name='big' AND column_name='s');
 
 query I
 SELECT count(DISTINCT segment_no)
-FROM query('SELECT * FROM ' || getvariable('big_schema') || '.segments');
+FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id'));
 ----
 2
 

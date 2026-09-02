@@ -23,19 +23,19 @@ s	3	true	3	3	0	35	35	0	1	39	109	NULL
 restart
 
 statement ok
-SET VARIABLE idx_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE idx_id = (SELECT replace(index_id::VARCHAR, '-', '')
                            FROM __ngram.registry WHERE table_name = 'docs' AND column_name = 's');
 
 # the reopened index is identical to a brute-force re-extraction
 query I
 SELECT count(*) FROM (
 	(SELECT gram, unnest(ngram_decode_postings(postings)) rid
-	 FROM query('SELECT * FROM ' || getvariable('idx_schema') || '.segments')
+	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('idx_id'))
 	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL)
 	UNION ALL
 	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL
 	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid
-	 FROM query('SELECT * FROM ' || getvariable('idx_schema') || '.segments'))
+	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('idx_id')))
 );
 ----
 0
@@ -60,6 +60,6 @@ PRAGMA drop_ngram_index('docs', 's');
 restart
 
 query I
-SELECT count(*) FROM duckdb_schemas() WHERE schema_name LIKE '__ngram_idx_%';
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry';
 ----
 0

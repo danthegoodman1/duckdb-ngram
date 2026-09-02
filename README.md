@@ -144,49 +144,60 @@ decomposition share.
 
 ## Staleness and fail-closed recovery
 
-Format-3 indexes make exhaustiveness unconditional. Covered-column updates,
-including changes below the high-water mark, become delete-plus-insert; their
-new rowids are found in the tail. Deletes leave harmless false-positive
-postings. The non-ART guard prevents moving vacuum even when DuckDB's
-`vacuum_rebuild_indexes` setting is enabled. Vacuum may discard fully deleted
-trailing row groups, but the first committed append into their reused rowids
-permanently marks the guard uncertain.
+Exhaustiveness is unconditional. Covered-column updates, including changes
+below the high-water mark, become delete-plus-insert; their new rowids are found
+in the tail. Deletes leave harmless false-positive postings. Any index on a
+table blocks DuckDB's moving vacuum by default, and the guard's non-ART type
+keeps it blocked when `vacuum_rebuild_indexes` is enabled. Vacuum may discard
+fully deleted trailing row groups, but the first committed append into their
+reused rowids permanently marks the guard uncertain.
 
-Every query validates the exact guard name, type, column dependency, random
-incarnation token, source/version, durable checkpoint seal, high-water mark,
-and reuse latch. Behavior is fail closed:
+The guard is the only proof of identity. Each index's registry row records the
+guard's name and random token. While the guard exists, DuckDB refuses every
+`ALTER` except `ADD COLUMN`, `SET DEFAULT`, foreign-key bookkeeping, and
+comments, and drops the guard with its table, so a guard that still matches
+proves the table is the one the index was built from. Every read path validates
+the guard (name, type, column dependency, token, source/version, durable
+checkpoint seal, high-water mark, and reuse latch) before it reads a posting.
+Behavior is fail closed:
 
 | State | Explicit search | Transparent predicate | `ngram_candidates` | Maintenance |
 | --- | --- | --- | --- | --- |
 | Guard proves the indexed prefix safe | postings + live recheck + disjoint tail | `NGRAM_INDEX_SCAN` | posting candidates in the prefix | refresh/compact allowed |
 | Guard is missing, replaced, incompatible, unbound with replay, or cannot exclude rowid reuse | one full live-table scan | one sequential-scan fallback | every visible rowid through the recorded mark | refuse; rebuild required |
-| Valid meta proves the base-table identity/fingerprint stale | one full live-table scan | sequential-scan fallback | raise | refuse; rebuild required |
 
-A malformed, wrong-kind, or colliding meta/shadow object is corruption rather
-than staleness and raises on every path.
+A registry row this version cannot read (another storage format, corrupt
+values) declines the transparent path and raises with the remedy on the explicit
+and maintenance paths. A malformed or wrong-kind storage table is corruption and
+raises on every path.
 
-`ngram_index_stats.stale_reason` explains the latter two states. The guard
-records the checkpoint iteration each time its maximum advances and latches
-unsafe only when an append at or below the maximum finds a different iteration,
-which is the only way a vacuumed rowid can come back. A commit that a later
-UNIQUE index rejects leaves no row and leaves the guard usable when the next
-append finds the same iteration; a checkpoint between the two appends, an
-in-memory database, a checkpoint in progress, or a freshly reopened file makes
-that check conservative. The unsafe state costs performance, never correctness.
+`ngram_index_stats.stale_reason` explains the second state. The guard records
+the checkpoint iteration each time its maximum advances and latches unsafe only
+when an append at or below the maximum finds a different iteration, which is
+the only way a vacuumed rowid can come back. A commit that a later UNIQUE index
+rejects leaves no row and leaves the guard usable when the next append finds
+the same iteration; a checkpoint between the two appends, an in-memory
+database, a checkpoint in progress, or a freshly reopened file makes that check
+conservative. The unsafe state costs performance, never correctness.
 
-Creation itself closes stale-snapshot races. The first build briefly takes an
-exclusive checkpoint lock, adds and drops a UUID dummy column to invalidate old
-table storage, installs the scan-free guard atomically with its rowid baseline,
-then releases the exclusive before the long postings scan. Reads continue;
-overlapping writers may receive a transaction conflict and should retry.
-Creation also invalidates DuckDB's reservoir sample.
+Creation itself closes stale-snapshot races. The first index on a table briefly
+takes an exclusive checkpoint lock, adds and drops a UUID dummy column to
+invalidate old table storage, installs the scan-free guard atomically with its
+rowid baseline, then releases the exclusive before the long postings scan.
+Reads continue; overlapping writers may receive a transaction conflict and
+should retry. Creation also invalidates DuckDB's reservoir sample.
 
-The normal guard depends on every existing physical `VARCHAR`, so updates to
-those columns become full row rewrites. A `VARCHAR` added later does not make an
-existing ngram index incorrect, but it is outside that guard's coverage; to
-index the new column, first add an explicit ART on it or drop/rebuild the
-table's ngram indexes. DuckDB also refuses column/table rename and dependent
-DROP/ALTER operations while the native guard exists.
+A table has one guard. It depends on every physical `VARCHAR` the table has
+when its first index is created, so updates to those columns become full row
+rewrites, and a later index on any of them records the same guard and runs no
+barrier. A `VARCHAR` added afterwards is outside the guard's coverage: to index
+it, drop the table's ngram indexes and rebuild them. DuckDB also refuses
+column/table rename and dependent DROP/ALTER operations while the guard exists.
+Concurrent drops of a table's last two indexes each see the other's registry
+row and both leave the guard, which the next `create_ngram_index` on the table
+removes before it builds; a drop concurrent with a create on the same table can
+yield an index that is `SCAN_ONLY` from birth, whose remedy is to drop and
+re-create it.
 
 Load the extension before writing a guarded table. Stock v1.5.5 can SELECT it,
 but INSERT/UPDATE fail on the unknown index type, DELETE may busy-spin in the
@@ -197,7 +208,7 @@ guard is the main ordinary example.
 
 The implementation and recovery proof are in
 [docs/stale-updates.md](docs/stale-updates.md). There are no probabilistic row
-witnesses or undetected update/vacuum miss cases in format 3.
+witnesses or undetected update/vacuum miss cases.
 
 ---
 
@@ -282,7 +293,7 @@ rows.
 `PRAGMA ngram_compact('logs')` merges the posting-list rows that share a key.
 Each refresh appends a new generation of rows rather than rewriting existing
 blobs, so a table that has been refreshed many times reads more rows per probe
-than it needs to. The ordinary form is shadow-only: it performs zero base-table
+than it needs to. The ordinary form is index-only: it performs zero base-table
 row reads and deliberately retains postings for deleted rows, which fetch and
 recheck already remove from exact results.
 `PRAGMA ngram_compact('logs', purge = true)` additionally drops those dead
@@ -292,11 +303,6 @@ postings.
 generation lands in a fresh range of rowids, so successive generations barely
 share `(gram, segment_no)` keys. Refresh performs a validated, byte-sorted
 stats-only fold itself, so stats history is no longer a reason to compact.
-
-An older format-3 index remains exact, but its unsorted stats may prune poorly
-until the next refresh (including a no-op refresh), compact, or rebuild rewrites
-them. The fold is transactional and filtered lookup skips its deleted MVCC row
-groups, although their file space can remain allocated until a checkpoint.
 
 Compaction is mainly for **delete-heavy or interleaved workloads**. Check
 `fragmented_keys` and `generations` in `ngram_index_stats` before running it,
@@ -332,11 +338,6 @@ PRAGMA drop_ngram_index('logs', 'message');
 PRAGMA create_ngram_index('logs', 'message');
 ```
 
-An explicit native ART is not needed for normal ngram correctness. Its one
-remaining lifecycle use is as a creation protector when an existing DuckDB
-index dependency prevents the ADD/DROP barrier, or when indexing a `VARCHAR`
-added after the existing broad guards were created.
-
 ### Reading `ngram_index_stats`
 
 ```sql
@@ -354,7 +355,7 @@ PRAGMA ngram_index_stats('logs');
 | `fragmented_keys` | keys stored as more than one row; the compaction target |
 | `generations` | build plus refresh generations present |
 | `posting_entries`, `postings_bytes` | total postings and their encoded size |
-| `stale_reason` | `NULL` when the guard proves the indexed prefix safe; otherwise the identity, compatibility, or rowid-reuse uncertainty forcing scan/rebuild |
+| `stale_reason` | `NULL` when the guard proves the indexed prefix safe; otherwise the guard uncertainty forcing scan/rebuild |
 
 ---
 
@@ -380,24 +381,27 @@ Indexes are supported on `VARCHAR` columns of DuckDB base tables. Views,
 temporary tables, tables in foreign catalogs (SQLite, Postgres, …), tables with
 generated columns, and tables with a user column named `rowid` are rejected.
 
-Each new index receives a canonical UUIDv4 `index_ref` and its own opaque
-storage schema. `PRAGMA ngram_indexes` lists registered indexes and
-pre-registry legacy allocations across attached DuckDB catalogs. Use the
-catalog-qualified status/drop forms whenever the base table or indexed column
-has disappeared; copied attached databases may legitimately contain the same
-UUID, so the catalog name is part of the public identity.
+Each new index receives a canonical UUIDv4 `index_ref`. Its metadata is one
+row of `__ngram.registry`; its postings and per-gram statistics are the tables
+`__ngram.segments_<id>` and `__ngram.stats_<id>`, named by the id without
+dashes. `PRAGMA ngram_indexes` lists every index across attached DuckDB
+catalogs. Use the catalog-qualified status/drop forms whenever the base table
+or indexed column has disappeared; copied attached databases may legitimately
+contain the same UUID, so the catalog name is part of the public identity.
 
-Lifecycle status is deliberately conservative:
+Lifecycle status has four values:
 
 | Status | Meaning |
 | --- | --- |
-| `READY` | Exact storage, owner, and rowid guard validate; indexed reads may accelerate. |
-| `SCAN_ONLY` | The allocation is owned but identity/guard safety is uncertain; exhaustive queries scan. |
-| `ORPHAN` | The recorded base table or column is absent. Stable-ID drop remains available. |
-| `REPLACED` | Same-session identity proves a different table now occupies the recorded name. Stable-ID drop never touches it. |
-| `LEGACY_REBUILD` | A pre-registry v2 allocation is visible and drop-only. |
-| `UNREGISTERED` | Structurally valid opaque v3 storage lost its registry row and can be removed by its derived UUID. |
-| `MISSING_STORAGE` / `MALFORMED` | Required proof is missing or catalog objects are corrupt. Drop fails closed with manual-repair guidance. |
+| `READY` | The registry row, both storage tables, and the rowid guard validate; indexed reads may accelerate. |
+| `SCAN_ONLY` | The table and column exist but the guard is missing, replaced, incompatible, or cannot exclude rowid reuse; exhaustive queries scan and maintenance refuses. |
+| `ORPHAN` | The recorded base table or column is absent. Drop by id remains available. |
+| `MALFORMED` | The row is unreadable (another storage format, corrupt values), a storage table is missing, or an object in `__ngram` has no row. The reason names the cause. A row is dropped by id; an object without a row is dropped by hand. |
+
+A database written by an earlier storage format lists each of its indexes as
+`MALFORMED` with the format in the reason. `drop_ngram_index_by_id` removes
+such an index, guard included, once its recorded guard token still matches;
+`create_ngram_index` then builds a current one.
 
 DuckDB v1.5.5 refuses table and indexed-column rename while the physical guard
 exists, including case-only rename. Moving a table between schemas and renaming
@@ -410,11 +414,11 @@ ALTER TABLE old_name RENAME TO new_name;
 PRAGMA create_ngram_index('new_name', 'column');
 ```
 
-The registry and opaque schemas are extension-owned ordinary catalog objects.
+The registry and storage tables are extension-owned ordinary catalog objects.
 Do not edit them directly. Identifiable corruption remains observable, but
-there is intentionally no force-drop or rebind API: without an exact meta/guard
-proof, automated cleanup could delete a replacement object or strand a live
-guard.
+there is intentionally no force-drop or rebind API: without the registry row's
+guard token, automated cleanup could delete a replacement object or strand a
+live guard.
 
 ### Maintenance
 
@@ -480,8 +484,8 @@ scans into `NGRAM_INDEX_SCAN`. It fires for `contains(col, 'lit')`,
 It declines — leaving an ordinary sequential scan — for `_` wildcards, `ESCAPE`
 clauses, anchored/prefix/suffix patterns, `NOT LIKE`, `OR`-ed predicates,
 expressions over the column (`lower(col) LIKE …`), needles shorter than the gram
-size, tables with no index on that column, and any state where identity checks
-or the rowid guard cannot prove the indexed prefix safe.
+size, tables with no index on that column, and any state where the rowid guard
+cannot prove the indexed prefix safe.
 
 `EXPLAIN` shows which happened:
 

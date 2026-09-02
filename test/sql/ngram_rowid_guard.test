@@ -129,8 +129,8 @@ statement ok
 PRAGMA create_ngram_index('reused', 's');
 
 statement ok
-SET VARIABLE reused_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
-                              FROM __ngram.registry WHERE table_name='reused' AND column_name='s');
+SET VARIABLE reused_id = (SELECT replace(index_id::VARCHAR, '-', '')
+                          FROM __ngram.registry WHERE table_name='reused' AND column_name='s');
 
 statement ok
 DELETE FROM reused WHERE rowid >= 122880;
@@ -174,7 +174,7 @@ SELECT count(*), min(rowid), max(rowid) FROM ngram_candidates('reused', 's', 're
 
 query I
 SELECT count(*) FROM ngram_candidates('reused', 's', 'reuse needle') c,
-     query('SELECT * FROM ' || getvariable('reused_schema') || '.meta') m
+     (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('reused_id')) m
 WHERE c.rowid > m.hwm_rowid;
 ----
 0

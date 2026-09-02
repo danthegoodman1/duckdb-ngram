@@ -23,7 +23,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (bench_path, log, mb, ngram_storage_schema, require_duckdb,  # noqa: E402
+from common import (bench_path, log, mb, ngram_index_ref, ngram_storage_table, require_duckdb,  # noqa: E402
                     run_sql, write_json)
 
 #! LEB128 byte count of a non-negative value.
@@ -36,9 +36,8 @@ BITS = "CASE WHEN {x} <= 0 THEN 1 ELSE (floor(log2({x})) + 1)::BIGINT END"
 BLOCK = 32  #! finest block granularity; larger blocks are rolled up from it
 
 
-def build_blocks(db, settings, storage):
+def build_blocks(db, settings, segments):
     """One heavy pass: per 32-delta block, its width, count and varint cost."""
-    segments = "%s.segments" % storage
     sql = """
 CREATE OR REPLACE TABLE blk AS
 WITH p AS (
@@ -94,8 +93,8 @@ def main():
     require_duckdb()
     db = bench_path(args.db) if not os.path.isabs(args.db) else args.db
     settings = {"threads": args.threads, "memory_limit": "'%s'" % args.memory_limit}
-    storage_schema = ngram_storage_schema(db, args.table, args.column, settings)
-    segments = "%s.segments" % storage_schema
+    index_ref = ngram_index_ref(db, args.table, args.column, settings)
+    segments = ngram_storage_table(index_ref, "segments")
     report = {"db": db}
 
     actual = scalar_row(db, settings, """
@@ -120,7 +119,7 @@ SELECT coalesce(sum(count_distinct_blocks), 0)::BIGINT FROM (
         % (int(storage[0]), mb(int(storage[0]) * 262144)))
 
     if not args.skip_build:
-        report["analysis_seconds"] = build_blocks(db, settings, storage_schema)
+        report["analysis_seconds"] = build_blocks(db, settings, segments)
 
     # ---- model validation: rebuild the current format's byte total ----
     model = scalar_row(db, settings, """

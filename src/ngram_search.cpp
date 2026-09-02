@@ -160,10 +160,6 @@ struct QueryBindData : public TableFunctionData {
 	//! ngram_search semantics if a prepared query outlives its index.
 	GramOptions bound_options;
 
-	ShadowTarget Target() const {
-		return ShadowTarget {schema_name, table_name, column_name, location.shadow_schema};
-	}
-
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<QueryBindData>(*this);
 	}
@@ -228,9 +224,8 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 	result.catalog_name = target.catalog_name;
 	result.schema_name = target.schema_name;
 	result.table_name = target.table_name;
-	// the catalog's spelling: `column` may carry the user's casing (from col :=)
-	// or the shadow table's casing (from meta_* discovery), and later name
-	// comparisons and shadow lookups must be casing-stable
+	// the catalog's spelling: `column` may carry the user's casing (from col :=),
+	// and later name comparisons and owner keys must be casing-stable
 	result.column_name = col.Name();
 }
 
@@ -242,13 +237,12 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 //! case-sensitive index matching is exact byte-wise `contains`. Results are
 //! exhaustive in every admitted state. Rows past the high-water mark and
 //! transaction-local rows are found by a brute-force tail scan; deleted rows
-//! are hidden by visibility and discarded by recheck. A per-index non-ART
+//! are hidden by visibility and discarded by recheck. The table's non-ART
 //! rowid guard makes covered-column updates delete+insert and prevents vacuum
 //! from moving live rowids. If that guard is missing, incompatible, replaced,
 //! or cannot exclude reuse of a discarded trailing range, this function scans
-//! the whole table instead of probing postings. Proven stale identity takes
-//! the same exhaustive fallback; malformed present index objects still raise.
-//! Recheck makes false positives impossible in every path.
+//! the whole table instead of probing postings. Malformed present index
+//! objects still raise. Recheck makes false positives impossible in every path.
 static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<QueryBindData>();
@@ -288,13 +282,10 @@ static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunction
 	if (!found) {
 		throw InvalidInputException("ngram_search: indexed column vanished during binding");
 	}
-	auto &tx = DuckTransaction::Get(context, table_entry.ParentCatalog());
 	if (!IndexLocationAvailable(context, target, result->location)) {
 		throw CatalogException("ngram_search: index storage is unavailable");
 	}
-	auto &meta = ResolveExistingTable(context, result->catalog_name, result->location.shadow_schema,
-	                                  result->location.MetaTable(), "ngram index meta table");
-	result->bound_options = ReadMeta(context, tx, meta, result->Target()).options;
+	result->bound_options = ReadMeta(context, result->catalog_name, result->location).options;
 	return_types = result->types;
 	names = result->names;
 	return std::move(result);
@@ -322,7 +313,7 @@ static unique_ptr<FunctionData> CandidatesBind(ClientContext &context, TableFunc
 }
 
 //===----------------------------------------------------------------------===//
-// Execution-time shadow-table access
+// Execution-time storage-table access
 //===----------------------------------------------------------------------===//
 
 DuckTableEntry &ResolveExistingTable(ClientContext &context, const string &catalog, const string &schema,
@@ -404,141 +395,6 @@ static void ScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTab
 		}
 		fn(chunk);
 	}
-}
-
-//! Read the single meta row through `projection`, validating that there is
-//! exactly one and that no value is NULL. Runs once per column group so that
-//! the format version can be checked before columns that only exist in some
-//! versions are touched.
-static void ScanMetaRow(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
-                        const ShadowTarget &bind, const vector<StorageIndex> &column_ids,
-                        const vector<LogicalType> &types, const std::function<void(DataChunk &, idx_t)> &read_row) {
-	idx_t rows = 0;
-	ScanShadowTable(context, tx, meta_entry.GetStorage(), column_ids, types, nullptr, [&](DataChunk &chunk) {
-		for (idx_t r = 0; r < chunk.size(); r++) {
-			if (++rows > 1) {
-				throw InvalidInputException("ngram: meta table for %s.%s holds more than one row; the index is "
-				                            "malformed",
-				                            bind.table_name, bind.column_name);
-			}
-			for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
-				if (chunk.GetValue(c, r).IsNull()) {
-					throw InvalidInputException("ngram: meta table for %s.%s contains NULLs; the index is malformed",
-					                            bind.table_name, bind.column_name);
-				}
-			}
-			read_row(chunk, r);
-		}
-	});
-	if (rows == 0) {
-		throw CatalogException("ngram: meta table for %s.%s is empty; the index is malformed", bind.table_name,
-		                       bind.column_name);
-	}
-}
-
-MetaHeader ReadMetaHeader(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
-                          const ShadowTarget &bind) {
-	MetaHeader result;
-	vector<StorageIndex> column_ids;
-	vector<LogicalType> types;
-	AddShadowColumn(meta_entry, "format_version", LogicalTypeId::INTEGER, column_ids, types);
-	AddShadowColumn(meta_entry, "schema_name", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "table_name", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "column_name", LogicalTypeId::VARCHAR, column_ids, types);
-	ScanMetaRow(context, tx, meta_entry, bind, column_ids, types, [&](DataChunk &chunk, idx_t r) {
-		result.format_version = chunk.GetValue(0, r).GetValue<int64_t>();
-		result.schema_name = StringValue::Get(chunk.GetValue(1, r));
-		result.table_name = StringValue::Get(chunk.GetValue(2, r));
-		result.column_name = StringValue::Get(chunk.GetValue(3, r));
-	});
-	return result;
-}
-
-int64_t ReadMetaFormatVersion(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
-                              const ShadowTarget &bind) {
-	auto header = ReadMetaHeader(context, tx, meta_entry, bind);
-	if (!StringUtil::CIEquals(header.schema_name, bind.schema_name) ||
-	    !StringUtil::CIEquals(header.table_name, bind.table_name)) {
-		throw CatalogException("ngram shadow schema collision: %s belongs to the index on %s.%s, not to "
-		                       "%s.%s; no usable ngram index exists",
-		                       bind.shadow_schema, header.schema_name, header.table_name, bind.schema_name,
-		                       bind.table_name);
-	}
-	return header.format_version;
-}
-
-MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry, const ShadowTarget &bind) {
-	MetaInfo info;
-	auto format_version = ReadMetaFormatVersion(context, tx, meta_entry, bind);
-	if (format_version != NGRAM_FORMAT_VERSION) {
-		// never guess at another version's column layout
-		throw InvalidInputException(
-		    "ngram: the index on %s.%s uses meta format_version %lld, but this version of the extension writes and "
-		    "reads format_version %lld; drop and rebuild the index",
-		    bind.table_name, bind.column_name, format_version, NGRAM_FORMAT_VERSION);
-	}
-	vector<StorageIndex> column_ids;
-	vector<LogicalType> types;
-	AddShadowColumn(meta_entry, "gram_size", LogicalTypeId::INTEGER, column_ids, types);
-	AddShadowColumn(meta_entry, "case_insensitive", LogicalTypeId::BOOLEAN, column_ids, types);
-	AddShadowColumn(meta_entry, "hwm_rowid", LogicalTypeId::BIGINT, column_ids, types);
-	AddShadowColumn(meta_entry, "schema_fingerprint", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "table_oid", LogicalTypeId::BIGINT, column_ids, types);
-	AddShadowColumn(meta_entry, "instance_id", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "column_name", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "catalog_oid", LogicalTypeId::BIGINT, column_ids, types);
-	AddShadowColumn(meta_entry, "column_type", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "guard_name", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(meta_entry, "guard_token", LogicalTypeId::VARCHAR, column_ids, types);
-	ScanMetaRow(context, tx, meta_entry, bind, column_ids, types, [&](DataChunk &chunk, idx_t r) {
-		auto gram_size = chunk.GetValue(0, r).GetValue<int64_t>();
-		if (gram_size < 1) {
-			throw InvalidInputException("ngram: meta table for %s.%s records gram_size %lld; the index is "
-			                            "malformed",
-			                            bind.table_name, bind.column_name, gram_size);
-		}
-		info.options.gram_size = static_cast<idx_t>(gram_size);
-		info.options.case_insensitive = chunk.GetValue(1, r).GetValue<bool>();
-		info.hwm_rowid = chunk.GetValue(2, r).GetValue<int64_t>();
-		if (info.hwm_rowid < -1 || info.hwm_rowid >= MAX_ROW_ID) {
-			throw InvalidInputException("ngram: meta table for %s.%s records hwm_rowid %lld; the index is malformed",
-			                            bind.table_name, bind.column_name, info.hwm_rowid);
-		}
-		info.schema_fingerprint = StringValue::Get(chunk.GetValue(3, r));
-		info.table_oid = chunk.GetValue(4, r).GetValue<int64_t>();
-		info.instance_id = StringValue::Get(chunk.GetValue(5, r));
-		info.column_name = StringValue::Get(chunk.GetValue(6, r));
-		if (!StringUtil::CIEquals(info.column_name, bind.column_name)) {
-			throw InvalidInputException("ngram: meta table for %s.%s records column_name %s; the index is malformed",
-			                            bind.table_name, bind.column_name, info.column_name);
-		}
-		info.catalog_oid = chunk.GetValue(7, r).GetValue<int64_t>();
-		info.column_type = StringValue::Get(chunk.GetValue(8, r));
-		info.guard_name = StringValue::Get(chunk.GetValue(9, r));
-		info.guard_token = StringValue::Get(chunk.GetValue(10, r));
-		static constexpr const char *OPAQUE = "__ngram_idx_";
-		if (StringUtil::StartsWith(bind.shadow_schema, OPAQUE) &&
-		    info.guard_name != "__ngram_rowid_guard_" + bind.shadow_schema.substr(strlen(OPAQUE))) {
-			throw InvalidInputException("ngram: registered meta guard name does not match its opaque index ID");
-		}
-	});
-	return info;
-}
-
-//! The candidate-only API has no exhaustive-table substitute: when a detector
-//! proves the index stale, returning its partial prefix would violate the
-//! candidate contract, so it fails with the repair instead.
-static void ThrowIfCandidatesCertainlyStale(ClientContext &context, DuckTableEntry &base, const MetaInfo &info,
-                                            const QueryBindData &bind) {
-	auto reason = CertainStaleReason(info, ComputeTableFingerprint(context, base));
-	if (reason.empty()) {
-		return;
-	}
-	throw InvalidInputException(
-	    "ngram_candidates: the ngram index on %s.%s is stale and cannot be used: %s. Rebuild it: PRAGMA "
-	    "drop_ngram_index('%s', '%s') then PRAGMA create_ngram_index('%s', '%s')",
-	    bind.table_name, bind.column_name, reason, bind.table_name, bind.column_name, bind.table_name,
-	    bind.column_name);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1437,29 +1293,17 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	state->vacuum_lock = DuckTransactionManager::Get(storage.GetAttached()).SharedVacuumLock();
 
 	state->options = bind.bound_options;
-	ResolvedTarget target {bind.catalog_name,
-	                       bind.schema_name,
-	                       bind.table_name,
-	                       bind.column_name,
-	                       ShadowSchemaName(bind.schema_name, bind.table_name),
-	                       &base};
+	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name, &base};
 	if (!IndexLocationAvailable(context, target, bind.location, true)) {
 		state->fallback_reason = "index unavailable";
 	} else {
-		auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-		                                  bind.location.MetaTable(), "ngram index meta table");
-		auto info = ReadMeta(context, *state->core.tx, meta, bind.Target());
+		auto info = ReadMeta(context, bind.catalog_name, bind.location);
 		state->options = info.options;
-		auto stale_reason = CertainStaleReason(info, ComputeTableFingerprint(context, base));
-		if (!stale_reason.empty()) {
-			state->fallback_reason = "index stale";
+		auto guard_reason = RowIdGuardReason(context, base, info);
+		if (!guard_reason.empty()) {
+			state->fallback_reason = "rowid guard: " + guard_reason;
 		} else {
-			auto guard_reason = RowIdGuardReason(context, base, info);
-			if (!guard_reason.empty()) {
-				state->fallback_reason = "rowid guard: " + guard_reason;
-			} else {
-				state->core.hwm = info.hwm_rowid;
-			}
+			state->core.hwm = info.hwm_rowid;
 		}
 	}
 	vector<idx_t> requested_to_fetch;
@@ -1523,10 +1367,10 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 		state->fallback_reason = "needle shorter than gram size";
 		state->core.hwm = -1;
 	} else {
-		auto segments = TryResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-		                                        bind.location.SegmentsTable(), "ngram index segments table");
-		auto stats = TryResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-		                                     bind.location.StatsTable(), "ngram index stats table");
+		auto segments = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
+		                                        "ngram index segments table");
+		auto stats = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.StatsTable(),
+		                                     "ngram index stats table");
 		if (!segments || !stats) {
 			state->fallback_reason = "index unavailable";
 			state->core.hwm = -1;
@@ -1652,19 +1496,11 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 	state->tx = &DuckTransaction::Get(context, base.ParentCatalog());
 	state->vacuum_lock = DuckTransactionManager::Get(storage.GetAttached()).SharedVacuumLock();
 
-	ResolvedTarget target {bind.catalog_name,
-	                       bind.schema_name,
-	                       bind.table_name,
-	                       bind.column_name,
-	                       ShadowSchemaName(bind.schema_name, bind.table_name),
-	                       &base};
+	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name, &base};
 	if (!IndexLocationAvailable(context, target, bind.location)) {
 		throw InvalidInputException("ngram_candidates: index storage was removed after binding");
 	}
-	auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-	                                  bind.location.MetaTable(), "ngram index meta table");
-	auto info = ReadMeta(context, *state->tx, meta, bind.Target());
-	ThrowIfCandidatesCertainlyStale(context, base, info, bind);
+	auto info = ReadMeta(context, bind.catalog_name, bind.location);
 	state->hwm = info.hwm_rowid;
 	auto guard_reason = RowIdGuardReason(context, base, info);
 
@@ -1674,10 +1510,10 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 	} else if (decomposition.too_short) {
 		state->all_rowids = true;
 	} else {
-		auto &segments = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-		                                      bind.location.SegmentsTable(), "ngram index segments table");
-		auto &stats = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
-		                                   bind.location.StatsTable(), "ngram index stats table");
+		auto &segments = ResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
+		                                      "ngram index segments table");
+		auto &stats = ResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.StatsTable(),
+		                                   "ngram index stats table");
 		state->probe = PlanIndexProbe(context, *state->tx, segments, stats, decomposition.grams,
 		                              MaxGramsPerQuery(context), state->hwm, storage.GetTotalRows(), -1, 1);
 		if (!state->probe->admitted) {

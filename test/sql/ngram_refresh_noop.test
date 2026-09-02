@@ -24,7 +24,7 @@ statement ok
 PRAGMA create_ngram_index('t', 's');
 
 statement ok
-SET VARIABLE t_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE t_id = (SELECT replace(index_id::VARCHAR, '-', '')
                          FROM __ngram.registry WHERE table_name='t' AND column_name='s');
 
 statement ok
@@ -32,7 +32,7 @@ SET ngram_auto_accelerate = true;
 
 # the stats table is past the host bug's batch threshold
 query I
-SELECT count(*) >= 122880 FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats');
+SELECT count(*) >= 122880 FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'));
 ----
 true
 
@@ -62,11 +62,11 @@ s	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
 # NULL and fails the equality below.
 statement ok
 SET VARIABLE stats_fp = (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-                         FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats'));
+                         FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id')));
 
 statement ok
 SET VARIABLE segments_fp = (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
-                            FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments'));
+                            FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id')));
 
 #===----------------------------------------------------------------------===#
 # no-op refresh: the tail is empty, so the packed delta is empty
@@ -101,9 +101,9 @@ SELECT count(*) FROM (
 
 query II
 SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats')) = getvariable('stats_fp'),
+        FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'))) = getvariable('stats_fp'),
        (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
-        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments')) = getvariable('segments_fp');
+        FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
 ----
 true	true
 
@@ -133,9 +133,9 @@ physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
 
 query II
 SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats')) = getvariable('stats_fp'),
+        FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'))) = getvariable('stats_fp'),
        (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
-        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments')) = getvariable('segments_fp');
+        FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
 ----
 true	true
 
@@ -172,9 +172,9 @@ SELECT count(*) FROM (
 
 query II
 SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats')) = getvariable('stats_fp'),
+        FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'))) = getvariable('stats_fp'),
        (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
-        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments')) = getvariable('segments_fp');
+        FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
 ----
 true	true
 
@@ -248,9 +248,9 @@ SELECT count(*) FROM (
 
 query II
 SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats')) = getvariable('stats_fp'),
+        FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'))) = getvariable('stats_fp'),
        (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
-        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments')) = getvariable('segments_fp');
+        FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
 ----
 true	true
 

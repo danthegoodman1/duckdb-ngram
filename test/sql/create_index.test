@@ -20,26 +20,27 @@ statement ok
 PRAGMA create_ngram_index('docs', 's');
 
 statement ok
-SET VARIABLE docs_s_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE docs_s_id = (SELECT replace(index_id::VARCHAR, '-', '')
                               FROM __ngram.registry WHERE table_name = 'docs' AND column_name = 's');
 
-# shadow tables exist
+# the segments and stats tables exist, named by the index id
 query I
-SELECT count(*) FROM duckdb_tables() WHERE schema_name = getvariable('docs_s_schema');
+SELECT count(*) FROM duckdb_tables()
+WHERE schema_name = '__ngram' AND table_name IN ('segments_' || getvariable('docs_s_id'), 'stats_' || getvariable('docs_s_id'));
 ----
-3
+2
 
-# options round-trip through the meta table
+# options round-trip through the registry row
 query IIIIII
 SELECT format_version, schema_name, table_name, column_name, gram_size, case_insensitive
-FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('docs_s_id'));
 ----
-3	main	docs	s	3	true
+4	main	docs	s	3	true
 
 # hwm covers all rows at build time
 query I
 SELECT hwm_rowid = (SELECT max(rowid) FROM docs)
-FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('docs_s_id'));
 ----
 true
 
@@ -47,25 +48,25 @@ true
 query I
 SELECT count(*) FROM (
 	(SELECT gram, unnest(ngram_decode_postings(postings)) rid
-	 FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.segments')
+	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_s_id'))
 	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL)
 	UNION ALL
 	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL
 	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid
-	 FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.segments'))
+	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_s_id')))
 );
 ----
 0
 
 # stats agree with the segments table
 query I
-SELECT count(*) FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.stats');
+SELECT count(*) FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_s_id'));
 ----
 44
 
 query II
 SELECT row_count, segment_count
-FROM query('SELECT * FROM ' || getvariable('docs_s_schema') || '.stats') WHERE gram = 'hel';
+FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_s_id')) WHERE gram = 'hel';
 ----
 2	1
 
@@ -110,20 +111,26 @@ PRAGMA ngram_index_stats('unindexed');
 ----
 No ngram indexes
 
-# The first broad guard covers every VARCHAR that existed at build time, so a
-# second index needs no second ALTER barrier. Updating that future-indexable
-# VARCHAR is therefore already delete+insert and advances the first index's
-# tail.
+# The first index creates the table's one rowid guard, covering every VARCHAR
+# present at that moment; a later index on such a column records the same
+# guard and runs no barrier. Updating that column is therefore already
+# delete+insert and advances the first index's tail.
 statement ok
 UPDATE docs SET t = 'tent often entered';
 
 statement ok
 PRAGMA create_ngram_index('docs', 't', gram = 2, case_insensitive = false);
 
-query I
-SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE '__ngram_idx_%';
+query III
+SELECT count(*), count(DISTINCT guard_name), count(DISTINCT guard_token) FROM __ngram.registry WHERE table_name = 'docs';
 ----
-6
+2	1	1
+
+query II
+SELECT (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry'),
+       (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'docs');
+----
+4	1
 
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
@@ -131,32 +138,34 @@ PRAGMA ngram_index_stats('docs');
 s	3	true	5	11	6	44	44	0	1	48	136	NULL
 t	2	false	11	11	0	12	12	0	1	72	96	NULL
 
-# dropping one column's index leaves the other intact
+# dropping one column's index leaves the other and the shared guard intact
 statement ok
 PRAGMA drop_ngram_index('docs', 's');
 
-query I
-SELECT count(*) FROM duckdb_tables() WHERE schema_name LIKE '__ngram_idx_%';
+query II
+SELECT (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry'),
+       (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'docs');
 ----
-3
+2	1
 
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
 t	2	false	11	11	0	12	12	0	1	72	96	NULL
 
-# dropping the last index removes the shadow schema
+# dropping the last index removes its storage tables and the table's guard
 statement ok
 PRAGMA drop_ngram_index('docs', 't');
 
-query I
-SELECT count(*) FROM duckdb_schemas() WHERE schema_name LIKE '__ngram_idx_%';
+query II
+SELECT (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry'),
+       (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'docs');
 ----
-0
+0	0
 
-# A VARCHAR added after the first broad guard leaves the old index healthy but
-# is not retrospectively covered. A committed explicit ART on that new target
-# supplies the safe creation protector for its own ngram index.
+# A VARCHAR added after the table's guard was created leaves the old index
+# healthy but is outside the guard's coverage. Indexing it requires dropping
+# the table's ngram indexes and rebuilding them.
 statement ok
 CREATE TABLE added_column(s VARCHAR);
 
@@ -178,10 +187,13 @@ PRAGMA ngram_refresh('added_column');
 statement error
 PRAGMA create_ngram_index('added_column', 'later');
 ----
-no existing v3 rowid guard safely covers later
+drop the table's ngram indexes and rebuild them
 
 statement ok
-CREATE INDEX added_column_later_art ON added_column(later);
+PRAGMA drop_ngram_index('added_column', 's');
+
+statement ok
+PRAGMA create_ngram_index('added_column', 's');
 
 statement ok
 PRAGMA create_ngram_index('added_column', 'later');
@@ -231,14 +243,14 @@ statement ok
 PRAGMA create_ngram_index('empty_docs', 's');
 
 statement ok
-SET VARIABLE empty_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE empty_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name = 'empty_docs');
 
 query IIII
 SELECT hwm_rowid,
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('empty_schema') || '.segments')),
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('empty_schema') || '.stats')), gram_size
-FROM query('SELECT * FROM ' || getvariable('empty_schema') || '.meta');
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('empty_id'))),
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.stats_' || getvariable('empty_id'))), gram_size
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('empty_id'));
 ----
 -1	0	0	3
 
@@ -311,8 +323,8 @@ SELECT count(*) FROM __ngram.registry WHERE table_name = 'my.table';
 ----
 0
 
-# Opaque UUID storage removes the old non-injective collision between
-# (schema a, table b_c) and (schema a_b, table c).
+# Id-named storage cannot collide for (schema a, table b_c) and
+# (schema a_b, table c).
 statement ok
 CREATE SCHEMA a;
 
@@ -355,7 +367,7 @@ statement ok
 PRAGMA drop_ngram_index('a_b.c', 's');
 
 # DuckDB folds only ASCII bytes for identifiers. SQL lower() is Unicode-aware,
-# so opaque owner keys must keep Ä and ä distinct identifiers.
+# so owner keys must keep Ä and ä distinct identifiers.
 statement ok
 SET default_collation = 'nocase';
 
@@ -416,7 +428,7 @@ SELECT count(*) FROM __ngram.registry WHERE table_name = 'case_drop';
 # Current-schema macros must not be able to shadow internal runtime functions
 # used by generated maintenance SQL.
 statement ok
-CREATE MACRO __ngram_maintenance_guard(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) AS error('shadow guard called');
+CREATE MACRO __ngram_maintenance_guard(a, b, c, d, e, f, g, h, i, j, k, l, m, n) AS error('shadow guard called');
 
 statement ok
 CREATE MACRO trigrams(a, b, c) AS error('shadow trigrams called');

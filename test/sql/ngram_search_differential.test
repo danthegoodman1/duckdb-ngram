@@ -29,7 +29,7 @@ statement ok
 PRAGMA create_ngram_index('corpus', 's');
 
 statement ok
-SET VARIABLE corpus_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE corpus_id = (SELECT replace(index_id::VARCHAR, '-', '')
                               FROM __ngram.registry WHERE table_name='corpus' AND column_name='s');
 
 # grow a tail past the high-water mark with the same generator
@@ -83,7 +83,7 @@ query I
 SELECT count(*) FROM (
 	SELECT rowid FROM corpus
 	WHERE contains(lower(s), lower('${needle}')) AND rowid <=
-	      (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('corpus_schema') || '.meta'))
+	      (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('corpus_id')))
 	EXCEPT SELECT rowid FROM ngram_candidates('corpus', 's', '${needle}'));
 ----
 0

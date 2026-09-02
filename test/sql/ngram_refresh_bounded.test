@@ -20,7 +20,7 @@ statement ok
 PRAGMA create_ngram_index('docs', 's');
 
 statement ok
-SET VARIABLE docs_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE docs_id = (SELECT replace(index_id::VARCHAR, '-', '')
                             FROM __ngram.registry WHERE table_name='docs' AND column_name='s');
 
 statement ok
@@ -45,7 +45,7 @@ s	4	17	12
 
 # the reported mark is the recorded mark, and the reported tail is real
 query II
-SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.meta')),
+SELECT (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('docs_id'))),
        (SELECT count(*) FROM docs WHERE rowid > 17);
 ----
 17	12
@@ -153,7 +153,7 @@ statement ok
 PRAGMA create_ngram_index('owned', 's');
 
 statement ok
-SET VARIABLE owned_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE owned_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name='owned' AND column_name='s');
 
 statement ok
@@ -169,7 +169,7 @@ s	3	6	5
 
 query II
 SELECT hwm_rowid, (SELECT count(*) > 0 FROM ngram_candidates('owned', 's', 'tail'))
-FROM query('SELECT * FROM ' || getvariable('owned_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('owned_id'));
 ----
 6	true
 
@@ -178,7 +178,7 @@ ROLLBACK;
 
 query II
 SELECT hwm_rowid, (SELECT count(*) FROM ngram_candidates('owned', 's', 'tail'))
-FROM query('SELECT * FROM ' || getvariable('owned_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('owned_id'));
 ----
 3	0
 
@@ -195,7 +195,7 @@ COMMIT;
 
 query II
 SELECT hwm_rowid, (SELECT count(*) FROM ngram_candidates('owned', 's', 'tail'))
-FROM query('SELECT * FROM ' || getvariable('owned_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('owned_id'));
 ----
 6	3
 
@@ -304,11 +304,11 @@ statement ok
 PRAGMA create_ngram_index('twin_b', 's');
 
 statement ok
-SET VARIABLE twin_a_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE twin_a_id = (SELECT replace(index_id::VARCHAR, '-', '')
                               FROM __ngram.registry WHERE table_name='twin_a' AND column_name='s');
 
 statement ok
-SET VARIABLE twin_b_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE twin_b_id = (SELECT replace(index_id::VARCHAR, '-', '')
                               FROM __ngram.registry WHERE table_name='twin_b' AND column_name='s');
 
 statement ok
@@ -334,24 +334,24 @@ PRAGMA ngram_refresh('twin_b', 100);
 endloop
 
 query II
-SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.meta')),
-       (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.meta'));
+SELECT (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('twin_a_id'))),
+       (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('twin_b_id')));
 ----
 1049	1049
 
 query I
 SELECT count(*) FROM (
 	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
-	 query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments')))
+	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id'))))
 	 EXCEPT
 	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
-	 query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments'))))
+	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id')))))
 	UNION ALL
 	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
-	 query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments')))
+	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id'))))
 	 EXCEPT
 	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
-	 query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments'))))
+	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id')))))
 );
 ----
 0
@@ -360,10 +360,10 @@ SELECT count(*) FROM (
 query II
 SELECT
 	(SELECT count(*) FROM (SELECT gram, r FROM ngram_unpack_postings(
-		(SELECT gram, segment_no, postings FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments')))
+		(SELECT gram, segment_no, postings FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id'))))
 		GROUP BY ALL HAVING count(*) > 1)),
 	(SELECT count(*) FROM (SELECT gram, r FROM ngram_unpack_postings(
-		(SELECT gram, segment_no, postings FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments')))
+		(SELECT gram, segment_no, postings FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id'))))
 		GROUP BY ALL HAVING count(*) > 1));
 ----
 0	0
@@ -372,8 +372,8 @@ SELECT
 # twice (a bound smaller than a segment ends mid-segment); a compaction folds
 # the two indexes back into the same rows, byte for byte
 query I
-SELECT (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments')) >
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments'));
+SELECT (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id'))) >
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id')));
 ----
 true
 
@@ -385,22 +385,22 @@ PRAGMA ngram_compact('twin_b', purge = true);
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments') EXCEPT ALL
-	 SELECT * FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments'))
+	(SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id')) EXCEPT ALL
+	 SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id')))
 	UNION ALL
-	(SELECT * FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.segments') EXCEPT ALL
-	 SELECT * FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.segments'))
+	(SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id')) EXCEPT ALL
+	 SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id')))
 );
 ----
 0
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.stats') EXCEPT ALL
-	 SELECT * FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.stats'))
+	(SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('twin_a_id')) EXCEPT ALL
+	 SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('twin_b_id')))
 	UNION ALL
-	(SELECT * FROM query('SELECT * FROM ' || getvariable('twin_b_schema') || '.stats') EXCEPT ALL
-	 SELECT * FROM query('SELECT * FROM ' || getvariable('twin_a_schema') || '.stats'))
+	(SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('twin_b_id')) EXCEPT ALL
+	 SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('twin_a_id')))
 );
 ----
 0
@@ -426,7 +426,7 @@ statement ok
 PRAGMA create_ngram_index('crossing', 's');
 
 statement ok
-SET VARIABLE crossing_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE crossing_id = (SELECT replace(index_id::VARCHAR, '-', '')
                                 FROM __ngram.registry WHERE table_name='crossing' AND column_name='s');
 
 statement ok
@@ -447,10 +447,10 @@ s	151424	1199999	0
 query II
 SELECT
 	(SELECT count(*) FROM (SELECT gram, segment_no FROM
-	 query('SELECT * FROM ' || getvariable('crossing_schema') || '.segments')
+	 query('SELECT * FROM __ngram.segments_' || getvariable('crossing_id'))
 		WHERE segment_no > 0 GROUP BY ALL HAVING count(*) > 1)),
 	(SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM
-	 query('SELECT * FROM ' || getvariable('crossing_schema') || '.segments')
+	 query('SELECT * FROM __ngram.segments_' || getvariable('crossing_id'))
 		WHERE segment_no = 0 GROUP BY ALL HAVING count(*) > 1));
 ----
 0	true
@@ -566,12 +566,12 @@ INSERT INTO reborn VALUES (1, 'a tent'), (2, 'another tent');
 statement error
 PRAGMA ngram_refresh('reborn', 1);
 ----
-dropped and re-created
+rowid guard is missing
 
 statement error
 PRAGMA ngram_refresh('reborn');
 ----
-dropped and re-created
+rowid guard is missing
 
 statement ok
 PRAGMA drop_ngram_index('reborn', 's');
@@ -679,7 +679,7 @@ statement ok
 PRAGMA create_ngram_index('vac.main.t', 's');
 
 statement ok
-SET VARIABLE vac_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE vac_id = (SELECT replace(index_id::VARCHAR, '-', '')
                            FROM vac.__ngram.registry WHERE table_name='t' AND column_name='s');
 
 statement ok
@@ -699,7 +699,7 @@ CHECKPOINT vac;
 # live rowids did not move across the checkpoint
 query II
 SELECT (SELECT max(rowid) FROM vac.t),
-	(SELECT hwm_rowid FROM query('SELECT * FROM vac.' || getvariable('vac_schema') || '.meta'));
+	(SELECT hwm_rowid FROM (SELECT * FROM vac.__ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('vac_id')));
 ----
 59999	24999
 

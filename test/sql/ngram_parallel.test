@@ -19,7 +19,7 @@ statement ok
 PRAGMA create_ngram_index('big', 's');
 
 statement ok
-SET VARIABLE big_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE big_id = (SELECT replace(index_id::VARCHAR, '-', '')
                            FROM __ngram.registry WHERE table_name='big' AND column_name='s');
 
 # --- explicit path: identical to brute force, in both directions ---
@@ -252,7 +252,7 @@ query I
 SELECT count(*) FROM (
 	SELECT rowid FROM big
 	WHERE contains(s, 'payload') AND rowid <=
-	      (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('big_schema') || '.meta'))
+	      (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('big_id')))
 	EXCEPT SELECT rowid FROM probe_one WHERE needle = 'payload');
 ----
 0

@@ -4,14 +4,15 @@
 // ngram/index_pragmas.hpp
 //
 // create_ngram_index / drop_ngram_index / ngram_index_stats pragmas, plus the
-// shadow-storage naming scheme and target resolution shared with the query
-// path (ngram_search / ngram_candidates).
+// registry (one row per index, holding its metadata) and the storage-table
+// naming shared with the query path (ngram_search / ngram_candidates).
 //
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
 
@@ -19,50 +20,41 @@ class TableCatalogEntry;
 
 namespace ngram {
 
+struct MetaInfo;
+
 //! Postings are bucketed by rowid range: segment_no = rowid >> SEGMENT_SHIFT.
 //! Build and query must agree on this constant.
 constexpr int64_t SEGMENT_SHIFT = 20;
 
-//! The schema holding a base table's shadow tables (ngram_<schema>_<table>)
-string ShadowSchemaName(const string &schema, const string &table);
-
-//! Per-column shadow tables inside the shadow schema (ngram_<schema>_<table>)
-string MetaTableName(const string &column);
-string SegmentsTableName(const string &column);
-string StatsTableName(const string &column);
+//! The schema holding the registry and every index's two storage tables.
+constexpr const char *NGRAM_SCHEMA = "__ngram";
 
 struct ResolvedTarget {
 	string catalog_name;
 	string schema_name;
 	string table_name;
 	string column_name;
-	string shadow_schema;
 	//! The resolved base table; valid for the duration of the resolving statement.
 	optional_ptr<TableCatalogEntry> entry;
 };
 
-//! A registered UUID or strict legacy locator plus its bound storage identity.
+//! One registry row's identity: the index id, the column it indexes, and the
+//! registry table it was read from. Storage tables are named by the id.
 struct IndexLocation {
 	string index_ref;
-	string shadow_schema;
 	string column_name;
 	idx_t registry_oid = 0;
-	idx_t schema_oid = 0;
-	idx_t meta_oid = 0;
-	idx_t segments_oid = 0;
-	idx_t stats_oid = 0;
+	string guard_name;
+	string guard_token;
 
-	bool Registered() const {
-		return index_ref.rfind("legacy:", 0) != 0;
-	}
-	string MetaTable() const {
-		return Registered() ? "meta" : MetaTableName(column_name);
+	string Hex() const {
+		return StringUtil::Replace(index_ref, "-", "");
 	}
 	string SegmentsTable() const {
-		return Registered() ? "segments" : SegmentsTableName(column_name);
+		return "segments_" + Hex();
 	}
 	string StatsTable() const {
-		return Registered() ? "stats" : StatsTableName(column_name);
+		return "stats_" + Hex();
 	}
 };
 
@@ -75,22 +67,36 @@ struct IndexLocation {
 ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, const string &column_name,
                              bool require_column);
 
-//! Resolve registered or pre-registry legacy allocations owned by `target`.
-vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarget &target,
-                                      bool ignore_registry_corruption = false);
+//! The registry rows owned by `target`: the one for its column, or every row of
+//! its table when column_name is empty. A row this extension cannot use (other
+//! format, corrupt values) raises with its reason; `lenient` skips such rows
+//! and an unreadable registry instead, for the optimizer's decline path.
+vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient = false);
 void RequireUniqueIndexColumns(const vector<IndexLocation> &indexes);
-void RequireExclusiveOwnerAllocation(ClientContext &context, const ResolvedTarget &target, const string &index_ref);
+
+//! Registry rows of `target`'s table, other than `except_ref`, that record
+//! `guard_name`. The table's guard is dropped only when this is zero.
+idx_t OtherGuardReferences(ClientContext &context, const ResolvedTarget &target, const string &guard_name,
+                           const string &except_ref);
 
 void ValidateRegistryForCreate(ClientContext &context, const string &catalog_name, idx_t expected_registry_oid,
                                bool expected_bootstrap);
 
-//! False means removed; partial storage or corruption raises. A replaced
-//! schema, table, or registry row raises by default, which is what the
-//! maintenance and candidate paths need. The exhaustive read paths pass
-//! `changed_is_absent` so a replaced identity also reads as false and the
-//! query falls back to the exact scan.
+//! False means the registry row is gone. A replaced registry table or a row
+//! whose owner changed raises by default, which is what the maintenance and
+//! candidate paths need. The exhaustive read paths pass `changed_is_absent`
+//! so a replaced identity also reads as false and the query falls back to the
+//! exact scan.
 bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target, const IndexLocation &location,
                             bool changed_is_absent = false);
+
+//! The metadata of `location`'s registry row (gram options, high-water mark,
+//! guard name and token). Throws when the row is gone or unusable.
+MetaInfo ReadMeta(ClientContext &context, const string &catalog_name, const IndexLocation &location);
+
+//! Committed rowid space the table has allocated (tombstoned rows included),
+//! i.e. max committed rowid + 1.
+int64_t TableTotalRows(TableCatalogEntry &table);
 
 //! Quote an identifier / a string literal, or qualify a built-in function so
 //! generated SQL cannot resolve a same-named macro from the current schema.

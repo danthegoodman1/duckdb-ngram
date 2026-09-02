@@ -5,8 +5,8 @@
 //
 // The index-probe core shared by the explicit query path (ngram_search /
 // ngram_candidates, src/ngram_search.cpp) and the transparent optimizer
-// rewrite (src/ngram_rewrite.cpp): shadow-table resolution, meta reading, and
-// the rarest-first posting-list intersection. Definitions live in
+// rewrite (src/ngram_rewrite.cpp): storage-table resolution and the
+// rarest-first posting-list intersection. Definitions live in
 // src/ngram_search.cpp.
 //
 //===----------------------------------------------------------------------===//
@@ -51,34 +51,16 @@ DuckTableEntry &ResolveExistingTable(ClientContext &context, const string &catal
 optional_ptr<DuckTableEntry> TryResolveExistingTable(ClientContext &context, const string &catalog,
                                                      const string &schema, const string &name, const char *what);
 
-//! Identity of the index a query runs against, for ownership validation and
-//! error messages in shadow-table reads.
-struct ShadowTarget {
-	string schema_name;
-	string table_name;
-	string column_name;
-	string shadow_schema;
-};
-
 struct MetaInfo {
 	GramOptions options;
 	//! Highest committed rowid the index covers; rows past it are found by a
 	//! brute-force tail scan.
 	int64_t hwm_rowid = -1;
-	//! The indexed column, as the meta row records it.
+	//! The indexed column, as the registry row records it.
 	string column_name;
-	//! Table facts recorded at build/refresh, compared against the table's
-	//! current facts to detect staleness the index cannot repair (see
-	//! ngram/maintenance.hpp).
-	string schema_fingerprint;
-	//! The indexed column's own type, checked when the table's identity is
-	//! proven and the full column list therefore says nothing about it.
-	string column_type;
-	int64_t table_oid = 0;
-	int64_t catalog_oid = 0;
-	string instance_id;
-	//! Exact zero-posting DuckDB index that prevents rowid-moving vacuum and
-	//! latches reuse of a truncated trailing rowid range.
+	//! The table's zero-posting DuckDB index that prevents rowid-moving vacuum
+	//! and latches reuse of a truncated trailing rowid range. Its name and
+	//! random token are the only proof that postings still describe the table.
 	string guard_name;
 	string guard_token;
 };
@@ -139,24 +121,6 @@ struct ProbePlan {
 	atomic<idx_t> decoded_rowids {0};
 	unique_ptr<ProbeMemoryReservation> memory_reservation;
 };
-
-struct MetaHeader {
-	int64_t format_version = -1;
-	string schema_name, table_name, column_name;
-};
-
-//! Read and validate the single meta row of an index (format version,
-//! ownership, gram options, high-water mark); throws when the shadow tables do
-//! not look like this extension built them for `target`.
-MetaInfo ReadMeta(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry, const ShadowTarget &target);
-
-MetaHeader ReadMetaHeader(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
-                          const ShadowTarget &target);
-
-//! Read only the common ownership/version prefix. Used by DROP to recognize
-//! the known guard-less v2 layout without weakening normal readers.
-int64_t ReadMetaFormatVersion(ClientContext &context, DuckTransaction &tx, DuckTableEntry &meta_entry,
-                              const ShadowTarget &target);
 
 //! Build a segment manifest and admit its decoded work before touching a
 //! postings blob. A negative candidate_fraction disables that gate (used by

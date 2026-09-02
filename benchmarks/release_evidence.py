@@ -111,6 +111,11 @@ STATS_COLUMNS = tuple(
     "distinct_grams segments fragmented_keys generations posting_entries postings_bytes stale_reason".split()
 )
 REGISTRY_COLUMNS = tuple(
+    "database_name index_ref schema_name table_name column_name format_version status reason".split()
+)
+#! Artifacts collected under storage format 3 recorded this listing shape. They
+#! stay verifiable until the corpus is re-collected under format 4.
+FORMAT3_REGISTRY_COLUMNS = tuple(
     "database_name kind index_ref schema_name table_name column_name storage_schema "
     "format_version status reason".split()
 )
@@ -452,7 +457,7 @@ def integer_list(value, length, where):
         fail("%s must be an integer list of length %d" % (where, length))
     for index, item in enumerate(value):
         integer(item, "%s[%d]" % (where, index))
-def validate_run(record, pair, stage, corpus):
+def validate_run(record, pair, stage, corpus, registry_columns):
     exact(record, RUN_KEYS, "run")
     if record["pair"] != pair or record["stage"] != stage:
         fail("run pairing/order differs")
@@ -484,20 +489,25 @@ def validate_run(record, pair, stage, corpus):
             integer(state[index], "build.state[%d]" % index)
     expected = [corpus["rows"] - 1, corpus["rows"] - 1, 0]
     registry = state[13]
-    if type(registry) is not list or len(registry) != len(REGISTRY_COLUMNS):
+    if type(registry) is not list or len(registry) != len(registry_columns):
         fail("invalid registry evidence")
-    if any(type(registry[index]) is not str for index in (0, 1, 2, 3, 4, 5, 6, 8)):
+    row = dict(zip(registry_columns, registry))
+    if any(type(row[name]) is not str for name in registry_columns if name not in ("format_version", "reason")):
         fail("invalid registry strings")
-    integer(registry[7], "registry.format", 1)
+    integer(row["format_version"], "registry.format", 1)
     if state[3:6] != expected or state[9] != 1 or state[12] is not None:
         fail("index maintenance gate failed")
-    if registry[1] != "registered" or registry[3:6] != ["main", "docs", "text"]:
+    if [row["schema_name"], row["table_name"], row["column_name"]] != ["main", "docs", "text"]:
         fail("registry identity mismatch")
-    if registry[0] != "run-%d" % pair:
+    if row["database_name"] != "run-%d" % pair:
         fail("registry database mismatch")
-    if registry[7:] != [3, "READY", None]:
+    format3 = registry_columns == FORMAT3_REGISTRY_COLUMNS
+    if row["status"] != "READY" or row["reason"] is not None or row["format_version"] != (3 if format3 else 4):
         fail("registry status/format mismatch")
-    if not INDEX_REF.fullmatch(registry[2]) or registry[6] != "__ngram_idx_" + registry[2].replace("-", "_"):
+    if not INDEX_REF.fullmatch(row["index_ref"]):
+        fail("registry allocation mismatch")
+    if format3 and (row["kind"] != "registered"
+                    or row["storage_schema"] != "__ngram_idx_" + row["index_ref"].replace("-", "_")):
         fail("registry allocation mismatch")
     for index in (6, 7, 10, 11):
         if state[index] < 1:
@@ -511,7 +521,11 @@ def validate_artifact(artifact, *, provenance=False, source=False, binary=None):
     exact(artifact, top_keys, "artifact")
     fixed_top = {"schema": SCHEMA, "benchmark_id": BENCHMARK_ID}
     pinned(artifact, fixed_top, "artifact")
-    frozen(artifact["protocol"], PROTOCOL, "protocol")
+    protocol = artifact["protocol"]
+    registry_columns = REGISTRY_COLUMNS
+    if type(protocol) is dict and protocol.get("registry_columns") == list(FORMAT3_REGISTRY_COLUMNS):
+        registry_columns = FORMAT3_REGISTRY_COLUMNS
+    frozen(protocol, dict(PROTOCOL, registry_columns=list(registry_columns)), "protocol")
     timestamp = string(artifact["created_utc"], "created_utc", UTC)
     try:
         parsed = time.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
@@ -555,7 +569,7 @@ def validate_artifact(artifact, *, provenance=False, source=False, binary=None):
         fail("expected three run pairs")
     expected_runs = [(pair, stage) for pair in range(1, 4) for stage in ("load", "build")]
     for record, (pair, stage) in zip(runs, expected_runs):
-        validate_run(record, pair, stage, corpus)
+        validate_run(record, pair, stage, corpus, registry_columns)
     build_states = [record["state"][:13] for record in runs[1::2]]
     if any(state != build_states[0] for state in build_states[1:]):
         fail("build states differ")
@@ -955,12 +969,9 @@ def index_state(binary, database):
     if len(registry) != 1 or tuple(registry[0]) != REGISTRY_COLUMNS:
         fail("registry column contract mismatch")
     observed = registry[0]
-    expected_storage = "__ngram_idx_" + observed["index_ref"].replace("-", "_")
     if (
-        observed["kind"] != "registered"
-        or not INDEX_REF.fullmatch(observed["index_ref"])
-        or observed["storage_schema"] != expected_storage
-        or observed["format_version"] != 3
+        not INDEX_REF.fullmatch(observed["index_ref"])
+        or observed["format_version"] != 4
         or observed["status"] != "READY"
         or observed["reason"] is not None
     ):
@@ -1241,8 +1252,7 @@ def fixture():
                  state=[10, 0, 9, 10, 1000, "3" * 64])
         )
         ref = "11111111-1111-4111-8111-111111111111"
-        registry = ["run-%d" % pair, "registered", ref, "main", "docs", "text",
-                    "__ngram_idx_" + ref.replace("-", "_"), 3, "READY", None]
+        registry = ["run-%d" % pair, ref, "main", "docs", "text", 4, "READY", None]
         index_state_fixture = ["text", 3, False, 9, 9, 0, 8, 20, 0, 1, 100, 500, None, registry]
         runs.append(
             dict(common, stage="build", storage=[2000 + pair, 8192, 0, 0], state=index_state_fixture)
@@ -1295,7 +1305,7 @@ def cli_smoke(binary):
             fail("real CLI relation digest smoke differs")
         run([str(binary), str(database)], stdin=BUILD_SQL)
         state = index_state(binary, database)
-        if state[:3] != ["text", 3, False] or state[13][8] != "READY":
+        if state[:3] != ["text", 3, False] or state[13][6] != "READY":
             fail("real CLI index metadata smoke differs")
         exact_parity(binary, database, b"alpha".hex())
         samples = query_campaign(binary, database)

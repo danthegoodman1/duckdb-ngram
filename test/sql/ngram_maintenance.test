@@ -14,7 +14,7 @@ statement ok
 PRAGMA create_ngram_index('docs', 's');
 
 statement ok
-SET VARIABLE docs_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE docs_id = (SELECT replace(index_id::VARCHAR, '-', '')
                             FROM __ngram.registry WHERE table_name='docs' AND column_name='s');
 
 #===----------------------------------------------------------------------===#
@@ -50,7 +50,7 @@ SELECT count(*) FROM ngram_candidates('docs', 's', 'tent') WHERE rowid > 2;
 
 query I
 SELECT hwm_rowid = (SELECT max(rowid) FROM docs)
-FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('docs_id'));
 ----
 true
 
@@ -64,7 +64,7 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 # the refresh appended a generation rather than rewriting the index
 query I
 SELECT count(DISTINCT generation)
-FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.segments');
+FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_id'));
 ----
 2
 
@@ -73,8 +73,8 @@ statement ok
 PRAGMA ngram_refresh('docs');
 
 query II
-SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.meta')),
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.segments'));
+SELECT (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('docs_id'))),
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_id')));
 ----
 6	45
 
@@ -109,7 +109,7 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 
 query I
 SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM
-	query('SELECT * FROM ' || getvariable('docs_schema') || '.segments')
+	query('SELECT * FROM __ngram.segments_' || getvariable('docs_id'))
 	GROUP BY gram, segment_no HAVING count(*) > 1);
 ----
 true
@@ -120,27 +120,27 @@ PRAGMA ngram_compact('docs');
 # every (gram, segment_no) is one row again
 query I
 SELECT count(*) FROM (SELECT gram, segment_no FROM
-	query('SELECT * FROM ' || getvariable('docs_schema') || '.segments')
+	query('SELECT * FROM __ngram.segments_' || getvariable('docs_id'))
 	GROUP BY gram, segment_no HAVING count(*) > 1);
 ----
 0
 
 # stats hold one row per gram, matching the merged segments
 query I
-SELECT count(*) FROM (SELECT gram FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.stats')
+SELECT count(*) FROM (SELECT gram FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_id'))
 	GROUP BY gram HAVING count(*) > 1);
 ----
 0
 
 query I
 SELECT count(*) FROM (
-	(SELECT gram, row_count FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.stats')
+	(SELECT gram, row_count FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_id'))
 	 EXCEPT SELECT gram, sum(rowid_count)::BIGINT
-	 FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.segments') GROUP BY gram)
+	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_id')) GROUP BY gram)
 	UNION ALL
 	(SELECT gram, sum(rowid_count)::BIGINT
-	 FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.segments') GROUP BY gram
-	 EXCEPT SELECT gram, row_count FROM query('SELECT * FROM ' || getvariable('docs_schema') || '.stats'))
+	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_id')) GROUP BY gram
+	 EXCEPT SELECT gram, row_count FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_id')))
 );
 ----
 0
@@ -168,7 +168,7 @@ PRAGMA ngram_compact('docs');
 
 query I
 SELECT count(*) FROM (SELECT gram, segment_no FROM
-	query('SELECT * FROM ' || getvariable('docs_schema') || '.segments')
+	query('SELECT * FROM __ngram.segments_' || getvariable('docs_id'))
 	GROUP BY gram, segment_no HAVING count(*) > 1);
 ----
 0
@@ -317,21 +317,21 @@ statement ok
 PRAGMA create_ngram_index('compact_collation', 's', case_insensitive = false);
 
 statement ok
-SET VARIABLE collation_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE collation_id = (SELECT replace(index_id::VARCHAR, '-', '')
                                  FROM __ngram.registry
                                  WHERE table_name='compact_collation' AND column_name='s');
 
 query II
 SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
        count(*) FILTER (WHERE encode(gram) = encode('aaa'))
-FROM query('SELECT * FROM ' || getvariable('collation_schema') || '.stats');
+FROM query('SELECT * FROM __ngram.stats_' || getvariable('collation_id'));
 ----
 1	1
 
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,rowid FROM ' || getvariable('collation_schema') || '.stats'))
+	FROM query('SELECT gram,rowid FROM __ngram.stats_' || getvariable('collation_id')))
 WHERE out_of_order;
 ----
 0
@@ -347,14 +347,14 @@ PRAGMA ngram_refresh('compact_collation');
 query II
 SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
        count(*) FILTER (WHERE encode(gram) = encode('aaa'))
-FROM query('SELECT * FROM ' || getvariable('collation_schema') || '.stats');
+FROM query('SELECT * FROM __ngram.stats_' || getvariable('collation_id'));
 ----
 1	1
 
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,rowid FROM ' || getvariable('collation_schema') || '.stats'))
+	FROM query('SELECT gram,rowid FROM __ngram.stats_' || getvariable('collation_id')))
 WHERE out_of_order;
 ----
 0
@@ -362,7 +362,7 @@ WHERE out_of_order;
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (PARTITION BY generation ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,generation,rowid FROM ' || getvariable('collation_schema') || '.segments'))
+	FROM query('SELECT gram,generation,rowid FROM __ngram.segments_' || getvariable('collation_id')))
 WHERE out_of_order;
 ----
 0
@@ -381,7 +381,7 @@ SELECT (SELECT count(*) FROM ngram_search('compact_collation', 'Aaa')),
 2	2	2
 
 query II
-SELECT row_count, segment_count FROM query('SELECT * FROM ' || getvariable('collation_schema') || '.stats')
+SELECT row_count, segment_count FROM query('SELECT * FROM __ngram.stats_' || getvariable('collation_id'))
 WHERE encode(gram) = encode('Aaa');
 ----
 2	1
@@ -389,14 +389,14 @@ WHERE encode(gram) = encode('Aaa');
 query II
 SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
        count(*) FILTER (WHERE encode(gram) = encode('aaa'))
-FROM query('SELECT * FROM ' || getvariable('collation_schema') || '.segments');
+FROM query('SELECT * FROM __ngram.segments_' || getvariable('collation_id'));
 ----
 1	1
 
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,rowid FROM ' || getvariable('collation_schema') || '.stats'))
+	FROM query('SELECT gram,rowid FROM __ngram.stats_' || getvariable('collation_id')))
 WHERE out_of_order;
 ----
 0
@@ -404,7 +404,7 @@ WHERE out_of_order;
 query I
 SELECT count(*) FROM (
 	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,rowid FROM ' || getvariable('collation_schema') || '.segments'))
+	FROM query('SELECT gram,rowid FROM __ngram.segments_' || getvariable('collation_id')))
 WHERE out_of_order;
 ----
 0
@@ -449,11 +449,11 @@ statement ok
 PRAGMA create_ngram_index('two', 'b');
 
 statement ok
-SET VARIABLE two_a_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE two_a_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name='two' AND column_name='a');
 
 statement ok
-SET VARIABLE two_b_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE two_b_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name='two' AND column_name='b');
 
 statement ok
@@ -463,8 +463,8 @@ statement ok
 PRAGMA ngram_refresh('two', col = 'a');
 
 query II
-SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('two_a_schema') || '.meta')),
-       (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('two_b_schema') || '.meta'));
+SELECT (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('two_a_id'))),
+       (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('two_b_id')));
 ----
 1	0
 
@@ -483,8 +483,8 @@ statement ok
 PRAGMA ngram_refresh('two');
 
 query II
-SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('two_a_schema') || '.meta')),
-       (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('two_b_schema') || '.meta'));
+SELECT (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('two_a_id'))),
+       (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('two_b_id')));
 ----
 1	1
 
@@ -524,13 +524,13 @@ statement ok con1
 PRAGMA create_ngram_index('local_rows', 's');
 
 statement ok con1
-SET VARIABLE local_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE local_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name='local_rows' AND column_name='s');
 
 # the index stops at the last committed rowid; the uncommitted row is found by
 # the tail scan
 query I con1
-SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('local_schema') || '.meta');
+SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('local_id'));
 ----
 0
 
@@ -544,7 +544,7 @@ statement ok con1
 PRAGMA ngram_refresh('local_rows');
 
 query I con1
-SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('local_schema') || '.meta');
+SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('local_id'));
 ----
 0
 
@@ -552,7 +552,7 @@ statement ok con1
 COMMIT;
 
 statement ok
-SET VARIABLE local_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE local_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name='local_rows' AND column_name='s');
 
 # after the commit the row has a real rowid past the mark, and a refresh picks
@@ -568,7 +568,7 @@ statement ok
 PRAGMA ngram_refresh('local_rows');
 
 query II
-SELECT (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('local_schema') || '.meta')),
+SELECT (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('local_id'))),
        (SELECT count(*) FROM ngram_candidates('local_rows', 's', 'tent'));
 ----
 1	2
@@ -592,7 +592,7 @@ statement ok
 PRAGMA create_ngram_index('atomic', 's');
 
 statement ok
-SET VARIABLE atomic_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE atomic_id = (SELECT replace(index_id::VARCHAR, '-', '')
                               FROM __ngram.registry WHERE table_name='atomic' AND column_name='s');
 
 statement ok
@@ -606,8 +606,8 @@ PRAGMA ngram_refresh('atomic');
 
 query II
 SELECT hwm_rowid,
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments'))
-FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta');
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id')))
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('atomic_id'));
 ----
 1	14
 
@@ -621,8 +621,8 @@ FORCE CHECKPOINT;
 
 query II
 SELECT hwm_rowid,
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments'))
-FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta');
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id')))
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('atomic_id'));
 ----
 0	4
 
@@ -637,8 +637,8 @@ COMMIT;
 
 query II
 SELECT hwm_rowid,
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments'))
-FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta');
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id')))
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('atomic_id'));
 ----
 1	14
 
@@ -651,15 +651,15 @@ SELECT count(*) FROM ngram_candidates('atomic', 's', 'tent');
 # unit, including its stats rewrite and scratch tables.
 statement ok
 CREATE TEMP TABLE phase13_segments_before AS
-SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments');
+SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id'));
 
 statement ok
 CREATE TEMP TABLE phase13_stats_before AS
-SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.stats');
+SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('atomic_id'));
 
 statement ok
 CREATE TEMP TABLE phase13_meta_before AS
-SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta');
+SELECT * FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('atomic_id'));
 
 statement ok
 BEGIN;
@@ -669,7 +669,7 @@ PRAGMA ngram_compact('atomic');
 
 query I
 SELECT count(*) FROM (SELECT gram, segment_no FROM
-	query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments')
+	query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id'))
 	GROUP BY gram, segment_no HAVING count(*) > 1);
 ----
 0
@@ -680,21 +680,21 @@ ROLLBACK;
 query III
 SELECT (SELECT count(*) FROM (
 	(SELECT * FROM phase13_segments_before EXCEPT
-	 SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments'))
+	 SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id')))
 	UNION ALL
-	(SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.segments')
+	(SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id'))
 	 EXCEPT SELECT * FROM phase13_segments_before))),
        (SELECT count(*) FROM (
 	(SELECT * FROM phase13_stats_before EXCEPT
-	 SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.stats'))
+	 SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('atomic_id')))
 	UNION ALL
-	(SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.stats')
+	(SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('atomic_id'))
 	 EXCEPT SELECT * FROM phase13_stats_before))),
        (SELECT count(*) FROM (
 	(SELECT * FROM phase13_meta_before EXCEPT
-	 SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta'))
+	 SELECT * FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('atomic_id')))
 	UNION ALL
-	(SELECT * FROM query('SELECT * FROM ' || getvariable('atomic_schema') || '.meta')
+	(SELECT * FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('atomic_id'))
 	 EXCEPT SELECT * FROM phase13_meta_before)));
 ----
 0	0	0
@@ -725,7 +725,7 @@ statement ok
 PRAGMA create_ngram_index('compact_empty', 's');
 
 statement ok
-SET VARIABLE compact_empty_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE compact_empty_id = (SELECT replace(index_id::VARCHAR, '-', '')
                                      FROM __ngram.registry
                                      WHERE table_name='compact_empty' AND column_name='s');
 
@@ -737,9 +737,9 @@ PRAGMA ngram_compact('compact_empty', purge = true);
 
 query III
 SELECT hwm_rowid,
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('compact_empty_schema') || '.segments')),
-       (SELECT count(*) FROM query('SELECT * FROM ' || getvariable('compact_empty_schema') || '.stats'))
-FROM query('SELECT * FROM ' || getvariable('compact_empty_schema') || '.meta');
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('compact_empty_id'))),
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.stats_' || getvariable('compact_empty_id')))
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('compact_empty_id'));
 ----
 -1	0	0
 

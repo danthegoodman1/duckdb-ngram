@@ -282,7 +282,7 @@ EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM empty_tail WHERE contains(s,
 ----
 analyzed_plan	<REGEX>:.*"Ngram Mode": "index \(<= 0 candidates, 0 decoded rowids\)".*
 
-# The C++ lifecycle harness mutates opaque meta/stats/segments to retain the
+# The C++ harness mutates registry rows and storage tables to retain the
 # HWM, stats-fragmentation, NULL-row, and segment-capacity corruption matrix on
 # explicit and transparent paths.
 

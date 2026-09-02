@@ -104,7 +104,7 @@ statement ok
 PRAGMA create_ngram_index('race', 's');
 
 statement ok
-SET VARIABLE race_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+SET VARIABLE race_id = (SELECT replace(index_id::VARCHAR, '-', '')
                             FROM __ngram.registry WHERE table_name='race' AND column_name='s');
 
 concurrentloop c 0 4
@@ -131,7 +131,7 @@ endloop
 # appended, so the mark is behind the table and ahead of where it started
 query I
 SELECT hwm_rowid > 499 AND hwm_rowid < (SELECT max(rowid) FROM race)
-FROM query('SELECT * FROM ' || getvariable('race_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('race_id'));
 ----
 true
 
@@ -140,7 +140,7 @@ true
 query I
 SELECT count(*) FROM (
 	SELECT rowid FROM race
-	WHERE rowid <= (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('race_schema') || '.meta'))
+	WHERE rowid <= (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('race_id')))
 	  AND contains(lower(s), 'tent')
 	EXCEPT
 	SELECT rowid FROM ngram_candidates('race', 's', 'tent')
@@ -166,7 +166,7 @@ query II
 SELECT
 	(SELECT count(*) FROM (
 		SELECT rowid FROM race
-		WHERE rowid <= (SELECT hwm_rowid FROM query('SELECT * FROM ' || getvariable('race_schema') || '.meta'))
+		WHERE rowid <= (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('race_id')))
 		  AND contains(lower(s), 'tent')
 		EXCEPT
 		SELECT rowid FROM ngram_candidates('race', 's', 'tent'))),
@@ -179,6 +179,6 @@ SELECT
 
 query I
 SELECT hwm_rowid = (SELECT max(rowid) FROM race)
-FROM query('SELECT * FROM ' || getvariable('race_schema') || '.meta');
+FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('race_id'));
 ----
 true

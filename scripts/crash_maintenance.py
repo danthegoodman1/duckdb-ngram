@@ -66,22 +66,24 @@ def run(db, script, allow_error=False, timeout=900):
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def storage_schema(db):
+def index_ref(db):
     _, catalog_out, _ = run(db, "SELECT current_database();")
     catalog = next(csv.reader(catalog_out.splitlines()))[0]
     _, out, _ = run(db, "PRAGMA ngram_indexes;")
     rows = [row for row in csv.reader(out.splitlines())
-            if len(row) == 10 and row[0] == catalog and row[1] == "registered"
-            and row[3:6] == ["main", "corpus", "s"] and row[7] == "3"
-            and row[8] in ("READY", "SCAN_ONLY")]
+            if len(row) == 8 and row[0] == catalog
+            and row[2:5] == ["main", "corpus", "s"] and row[5] == "4"
+            and row[6] in ("READY", "SCAN_ONLY")]
     if len(rows) != 1:
-        raise RuntimeError("expected one canonical registered corpus.s allocation")
-    index_ref, schema = rows[0][2], rows[0][6]
-    if (not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", index_ref)
-            or not re.fullmatch(r"__ngram_idx_[0-9a-f]{8}_[0-9a-f]{4}_4[0-9a-f]{3}_[89ab][0-9a-f]{3}_[0-9a-f]{12}", schema)
-            or schema != "__ngram_idx_" + index_ref.replace("-", "_")):
-        raise RuntimeError("public corpus.s allocation identity is not canonical")
-    return schema
+        raise RuntimeError("expected one format-4 corpus.s index")
+    ref = rows[0][1]
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", ref):
+        raise RuntimeError("public corpus.s index id is not a canonical UUIDv4")
+    return ref
+
+
+def storage_table(ref, part):
+    return "__ngram.%s_%s" % (part, ref.replace("-", ""))
 
 
 def build_corpus(db, rng, rows):
@@ -103,14 +105,15 @@ def append_tail(db, rng, start, rows):
 
 def index_state(db):
     """The facts a half-applied maintenance operation would disagree on."""
-    storage = storage_schema(db)
-    _, out, _ = run(db, "SELECT (SELECT hwm_rowid FROM {0}.meta), "
-                        "(SELECT count(*) FROM {0}.segments), "
-                        "(SELECT coalesce(sum(rowid_count), 0) FROM {0}.segments), "
+    ref = index_ref(db)
+    _, out, _ = run(db, "SELECT (SELECT hwm_rowid FROM __ngram.registry WHERE index_id = '{ref}'::UUID), "
+                        "(SELECT count(*) FROM {segments}), "
+                        "(SELECT coalesce(sum(rowid_count), 0) FROM {segments}), "
                         "s.n, s.hash_sum, s.hash_xor FROM (SELECT count(*) AS n, "
                         "coalesce(sum(hash(encode(gram), row_count, segment_count))::VARCHAR, '0') AS hash_sum, "
                         "coalesce(bit_xor(hash(encode(gram), row_count, segment_count))::VARCHAR, '0') AS hash_xor "
-                        "FROM {0}.stats) s;".format(storage))
+                        "FROM {stats}) s;".format(ref=ref, segments=storage_table(ref, "segments"),
+                                                  stats=storage_table(ref, "stats")))
     line = [l for l in out.strip().splitlines() if l]
     return line[-1] if line else None
 
@@ -118,10 +121,10 @@ def index_state(db):
 def postings_digest(db):
     """The decoded index itself: every (gram, rowid) posting, summarised so two
     databases can be compared without materialising both."""
-    storage = storage_schema(db)
+    ref = index_ref(db)
     _, out, _ = run(db, "SELECT count(*), coalesce(sum(hash(gram || ':' || r))::VARCHAR, '0') "
                         "FROM ngram_unpack_postings("
-                        "(SELECT gram, segment_no, postings FROM {0}.segments));".format(storage))
+                        "(SELECT gram, segment_no, postings FROM {0}));".format(storage_table(ref, "segments")))
     line = [l for l in out.strip().splitlines() if l]
     return line[-1] if line else None
 

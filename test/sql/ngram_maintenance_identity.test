@@ -1,13 +1,11 @@
 # name: test/sql/ngram_maintenance_identity.test
-# description: when a table's identity is proven, and what follows from it
+# description: the rowid guard is the table's identity; what the host refuses while it exists
 # group: [sql]
 
-# The index records the table's catalog oid, the oid of the attached database
-# it lives in, and a token for the running instance. Together they say "this is
-# the very object the index was built from" — but only inside the instance and
-# the attach incarnation that minted them: ATTACH mints fresh oids for
-# everything it loads, so a DETACH + re-ATTACH renumbers a healthy table just
-# as a DROP + re-CREATE does.
+# The registry row records the guard's name and random token. While the guard
+# exists DuckDB refuses every ALTER except ADD COLUMN, SET DEFAULT, foreign-key
+# bookkeeping and comments, and drops the guard with its table, so a matching
+# guard proves the table is the one the index was built from.
 
 load __TEST_DIR__/ngram_identity.db
 
@@ -93,17 +91,8 @@ ALTER TABLE t RENAME TO T;
 ----
 entries that depend on it
 
-# Exact opaque object spelling is part of the corruption contract. Dynamic DDL
-# cannot be expressed through SQLLogic's query() table function, so the C++
-# lifecycle harness pins case-mutated schema/table observation and hot-path
-# refusal without weakening this test's host-rename assertions.
-
 #===----------------------------------------------------------------------===#
-# DETACH + re-ATTACH is not a re-creation
-#
-# Both the database and the table are handed new oids, so the recorded pair
-# stops proving anything — but proving nothing must read as "healthy", not as
-# "re-created".
+# DETACH + re-ATTACH keeps the guard and stays healthy
 #===----------------------------------------------------------------------===#
 
 # (the pragmas take a catalog-qualified name in full three-part form: a
@@ -179,9 +168,8 @@ PRAGMA drop_ngram_index('side.main.docs', 's');
 statement ok
 PRAGMA create_ngram_index('side.main.docs', 's');
 
-# A real re-creation inside the new incarnation is still proof: the rebuild
-# above recorded the new identity, so the oids are comparable again. Exact
-# search scans the replacement rather than trusting stale postings.
+# DROP TABLE takes the guard with it. A new table under the same name has no
+# guard, so exact search scans the replacement rather than trusting postings.
 statement ok
 DROP TABLE side.docs;
 
@@ -220,7 +208,7 @@ PRAGMA ngram_refresh('t');
 statement ok
 ALTER TABLE t ADD COLUMN appended VARCHAR;
 
-# appended columns keep every recorded column in place: still healthy
+# ADD COLUMN is the one shape change the guard allows: still healthy
 query I
 SELECT count(*) FROM ngram_search('t', 'tent');
 ----

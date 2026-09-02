@@ -1,5 +1,5 @@
 # name: test/sql/ngram_lifecycle.test
-# description: opaque registry lifecycle and catalog-qualified ID APIs
+# description: registry lifecycle, the four index states, one guard per table, catalog-qualified ID APIs
 # group: [sql]
 
 require ngram
@@ -18,16 +18,34 @@ SELECT count(*), count(DISTINCT owner_key), count(DISTINCT index_id) FROM __ngra
 ----
 1	1	1
 
-query IIIIII
-SELECT registry_version, typeof(index_id), typeof(owner_key), schema_name, table_name, column_name
+# The registry row is the metadata row; the guard is named by the first index.
+query IIIIIIIIIII
+SELECT registry_version, typeof(index_id), typeof(owner_key), schema_name, table_name, column_name,
+       format_version, gram_size, case_insensitive, hwm_rowid,
+       guard_name = '__ngram_guard_' || replace(index_id::VARCHAR, '-', '')
 FROM __ngram.registry;
 ----
-1	UUID	BLOB	main	lifecycle_docs	s
+2	UUID	BLOB	main	lifecycle_docs	s	4	3	true	1	true
 
-query TTTTTTITTT
+query I
+SELECT count(*) FROM duckdb_columns()
+WHERE schema_name = '__ngram' AND table_name = 'registry' AND NOT is_nullable;
+----
+12
+
+# Postings and stats live in two tables named by the index id.
+query I
+SELECT count(*) FROM duckdb_tables() t, __ngram.registry r
+WHERE t.schema_name = '__ngram'
+  AND t.table_name IN ('segments_' || replace(r.index_id::VARCHAR, '-', ''),
+                       'stats_' || replace(r.index_id::VARCHAR, '-', ''));
+----
+2
+
+query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	registered	<REGEX>:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}	main	lifecycle_docs	s	<REGEX>:__ngram_idx_[0-9a-f_]{36}	3	READY	NULL
+memory	<REGEX>:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}	main	lifecycle_docs	s	4	READY	NULL
 
 query I
 SELECT count(*) FROM ngram_search('lifecycle_docs', 'hell');
@@ -62,34 +80,120 @@ ALTER SCHEMA main RENAME TO renamed_main;
 ----
 not yet supported
 
-# A second registered column preserves the protector rules while using a
-# separate opaque allocation.
+# A second index on the table records the same guard: one physical index.
 statement ok
 PRAGMA create_ngram_index('LIFECYCLE_DOCS', 'T');
 
-query II
-SELECT count(*), count(DISTINCT regexp_replace(schema_name, '^__ngram_idx_', ''))
-FROM duckdb_schemas() WHERE schema_name LIKE '__ngram_idx_%';
+query III
+SELECT count(*), count(DISTINCT guard_name), count(DISTINCT guard_token) FROM __ngram.registry;
 ----
-2	2
-
-# Registered table/column drop remains routed through stable ID internally.
-statement ok
-PRAGMA drop_ngram_index('LIFECYCLE_DOCS', 'T');
+2	1	1
 
 query I
-SELECT count(*) FROM __ngram.registry;
+SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'lifecycle_docs';
 ----
 1
 
-# Ordinary base drop produces an observable/removable orphan.
+query I
+SELECT count(*) FROM ngram_search('lifecycle_docs', 'second', col := 't');
+----
+1
+
+# Dropping one index keeps the other READY and keeps the shared guard.
+statement ok
+PRAGMA drop_ngram_index('LIFECYCLE_DOCS', 'T');
+
+query TTTTTITT
+PRAGMA ngram_indexes;
+----
+memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	4	READY	NULL
+
+query II
+SELECT (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'lifecycle_docs'),
+       (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry');
+----
+1	2
+
+# ORPHAN: dropping the base table drops its guard with it; the registry row
+# stays addressable by id.
 statement ok
 DROP TABLE lifecycle_docs;
 
-query TTTTTTITTT
+query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	registered	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	<REGEX>:__ngram_idx_[0-9a-f_]{36}	3	ORPHAN	<REGEX>:.*base table is missing.*
+memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	4	ORPHAN	<REGEX>:.*base table is missing.*
+
+# SCAN_ONLY: a new table under the recorded name has no guard, so every exact
+# query scans it and maintenance refuses.
+statement ok
+CREATE TABLE lifecycle_docs(s VARCHAR, t VARCHAR);
+
+statement ok
+INSERT INTO lifecycle_docs VALUES ('hello again', 'x');
+
+query TTTTTITT
+PRAGMA ngram_indexes;
+----
+memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	4	SCAN_ONLY	<REGEX>:.*rowid guard is missing.*
+
+query I
+SELECT count(*) FROM ngram_search('lifecycle_docs', 'hell');
+----
+1
+
+statement error
+PRAGMA ngram_refresh('lifecycle_docs');
+----
+rowid guard is missing
+
+# Drop removes the row and both storage tables; the replacement table is untouched.
+statement ok
+PRAGMA drop_ngram_index('lifecycle_docs', 's');
+
+query III
+SELECT (SELECT count(*) FROM lifecycle_docs),
+       (SELECT count(*) FROM __ngram.registry),
+       (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry');
+----
+1	0	0
+
+# MALFORMED: a database written by an earlier storage format lists drop-only,
+# with the format in the reason. The transparent path declines; the explicit
+# path and create name the remedy; a read-only catalog cannot be dropped from.
+statement ok
+ATTACH 'test/fixtures/format3.duckdb' AS f3 (READ_ONLY);
+
+query TTTTTITT
+PRAGMA ngram_indexes;
+----
+f3	a03b02be-5f8a-4c43-92c9-5969ea3e178f	main	docs	s	3	MALFORMED	<REGEX>:index format 3 .*predates format 4.*drop_ngram_index_by_id.*
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+query I
+SELECT count(*) FROM f3.docs WHERE s LIKE '%tent%';
+----
+2
+
+statement error
+SELECT count(*) FROM ngram_search('f3.main.docs', 'tent');
+----
+drop it with drop_ngram_index_by_id
+
+statement error
+PRAGMA create_ngram_index('f3.main.docs', 't');
+----
+predates format 4
+
+statement error
+PRAGMA drop_ngram_index_by_id('f3', 'a03b02be-5f8a-4c43-92c9-5969ea3e178f');
+----
+read-only
+
+statement ok
+DETACH f3;
 
 # Strict textual refs reject noncanonical and injection-shaped inputs.
 statement error

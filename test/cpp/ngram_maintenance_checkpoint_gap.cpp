@@ -2401,6 +2401,8 @@ int main(int argc, char **argv) {
 		TestCatalogIdentity(unique + ".catalog", unique + ".clone");
 		if (argc == 3) {
 			TestFormat3Fixture(argv[2], unique + ".format3");
+		} else {
+			std::cerr << "format3-fixture skipped: no fixture path given\n";
 		}
 		TestRegistryCorruption();
 		TestExecutionIdentityRaces();

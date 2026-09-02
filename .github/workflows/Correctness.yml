@@ -224,4 +224,4 @@ jobs:
           timeout 600s build/ci-debug/test/unittest 'test/sql/ngram_maintenance.test'
           race_db="$RUNNER_TEMP/ngram-checkpoint-gap.db"
           test ! -e "$race_db"
-          timeout 600s build/ci-debug/extension/ngram/ngram_checkpoint_gap_test "$race_db"
+          timeout 1800s build/ci-debug/extension/ngram/ngram_checkpoint_gap_test "$race_db" test/fixtures/format3.duckdb

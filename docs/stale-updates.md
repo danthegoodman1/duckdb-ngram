@@ -97,10 +97,19 @@ reuse the protection proof without another ADD/DROP barrier.
   live row. If a later committed append reuses any rowid at or below the
   guard's maximum, `unsafe_reuse` latches before the append becomes visible.
 
-Guard mutation is intentionally conservative, not rollback-aware. If the guard
-observes a reused rowid and a later UNIQUE index rejects that commit, no row is
-written but the guard remains unsafe. Exactness is preserved; the cost is a
-full-scan fallback until the ngram index is rebuilt.
+Guard mutation is not rollback-aware, so the guard tells a reused range from a
+retried one by the checkpoint that reuse requires. Each time an append advances
+the maximum, the guard records the database header's checkpoint iteration. An
+append that starts at or below the maximum latches `unsafe_reuse` only when
+that iteration has changed since the advance, or when either value is unknown:
+an in-memory database (its checkpoints vacuum but leave no header counter), a
+checkpoint in progress, or a guard bound from disk or WAL. A commit that a later
+UNIQUE index rejects has advanced the maximum before the host rolls its rows
+back; the next append starts at the same rowid, finds the same iteration, and
+leaves the guard usable. A vacuum that reclaims trailing rowids needs the
+exclusive vacuum lock, which every inserting transaction holds shared from its
+first insert through its commit, so it always falls strictly between two
+appends and always writes a new header iteration.
 
 ## Query and maintenance behavior
 

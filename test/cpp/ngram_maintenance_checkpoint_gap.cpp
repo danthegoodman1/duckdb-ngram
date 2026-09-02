@@ -293,7 +293,11 @@ static void ExpectPreparedWriteFailure(Connection &con, PreparedStatement &prepa
 }
 
 static int64_t PreparedScalar(PreparedStatement &prepared) {
-	auto result = prepared.Execute();
+	// Materialize: a streamed result keeps the statement's transaction and
+	// operator states alive until the connection's next statement, which would
+	// block a creation barrier taken by another connection in the meantime.
+	vector<Value> values;
+	auto result = prepared.Execute(values, false);
 	if (result->HasError()) {
 		throw std::runtime_error("prepared query failed: " + result->GetError());
 	}
@@ -896,9 +900,11 @@ static void TestVacuumAndConflict(const string &path) {
 		throw std::runtime_error("non-ART guard did not prevent moving vacuum with rebuild enabled");
 	}
 
-	// Guard mutation is deliberately conservative rather than transactional. If
-	// a later UNIQUE index rejects a reused rowid after the guard sees it, no row
-	// commits but the guard stays unsafe and exact search falls back until rebuild.
+	// The checkpoint above reclaimed rowids 122880 and up, so an append into
+	// them is a real reuse even when a later UNIQUE index rejects the commit:
+	// the guard latches before the host rolls the rows back, and exact search
+	// falls back until rebuild. TestRejectedCommitKeepsGuard covers the rejected
+	// commit into a fresh range, which must not latch.
 	Check(con, "CREATE TABLE conflict_rows AS SELECT i id, CASE WHEN i=42 THEN 'conflict needle' ELSE 'x' END s "
 	           "FROM range(130000) t(i)");
 	Check(con, "PRAGMA create_ngram_index('conflict_rows', 's')");
@@ -923,6 +929,52 @@ static void TestVacuumAndConflict(const string &path) {
 	            ->ToString()
 	            .find("NGRAM_INDEX_SCAN") != string::npos) {
 		throw std::runtime_error("rejected append did not conservatively force exact scan fallback");
+	}
+}
+
+static void TestRejectedCommitKeepsGuard(const string &path) {
+	// A commit that a later UNIQUE index rejects has already advanced the
+	// guard's maximum when the host rolls its rows back, so the next append
+	// starts at the same rowid. No checkpoint ran between the two appends, so
+	// no vacuum can have reclaimed that range, and the guard stays usable.
+	RemoveDatabase(path);
+	DuckDB db(path);
+	LoadNgram(db);
+	Connection con(db);
+	Check(con, "SET checkpoint_threshold='1TB'");
+	Check(con, "SET ngram_auto_accelerate=true");
+	Check(con, "CREATE TABLE retried(id INTEGER, s VARCHAR)");
+	Check(con, "INSERT INTO retried SELECT i, 'row ' || i FROM range(1000) t(i)");
+	Check(con, "PRAGMA create_ngram_index('retried', 's')");
+	// Created after the guard, so a commit visits the guard first and the ART
+	// second.
+	Check(con, "CREATE UNIQUE INDEX retried_unique ON retried(id)");
+	Connection first(db), second(db);
+	Check(first, "BEGIN");
+	Check(first, "INSERT INTO retried VALUES (1000, 'first writer needle')");
+	Check(second, "INSERT INTO retried VALUES (1000, 'second writer needle')");
+	auto rejected = first.Query("COMMIT");
+	if (!rejected->HasError() || rejected->GetError().find("duplicate key") == string::npos ||
+	    ScalarInt64(con, "SELECT count(*) FROM retried") != 1001) {
+		throw std::runtime_error("UNIQUE index did not reject the duplicate commit: " +
+		                         (rejected->HasError() ? rejected->GetError() : rejected->ToString()));
+	}
+	// The retried range: the next append starts at the rowid the rejected
+	// commit consumed.
+	Check(con, "INSERT INTO retried VALUES (1001, 'retried needle')");
+	auto stats = Query(con, "PRAGMA ngram_index_stats('retried')");
+	if (!stats->GetValue(12, 0).IsNull()) {
+		throw std::runtime_error("rejected commit latched the guard: " + stats->GetValue(12, 0).ToString());
+	}
+	if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('retried', 'needle')") != 2 ||
+	    ScalarInt64(con, "SELECT count(*) FROM retried WHERE s LIKE '%needle%'") != 2 ||
+	    Query(con, "EXPLAIN SELECT * FROM retried WHERE s LIKE '%needle%'")->ToString().find("NGRAM_INDEX_SCAN") ==
+	        string::npos) {
+		throw std::runtime_error("index mode was lost after a rejected commit into a fresh rowid range");
+	}
+	Check(con, "PRAGMA ngram_refresh('retried')");
+	if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('retried', 'needle')") != 2) {
+		throw std::runtime_error("refresh after a rejected commit lost a row");
 	}
 }
 
@@ -2275,7 +2327,8 @@ static void TestExecutionIdentityRaces() {
 	}
 
 	// Replacing any exact table at the same opaque name is never consumed by a
-	// plan that captured the original OID.
+	// plan that captured the original OID: the exhaustive adapters scan
+	// instead, and the candidate-only adapter raises.
 	for (auto &part : vector<string> {"meta", "segments", "stats"}) {
 		DuckDB db(nullptr);
 		LoadNgram(db);
@@ -2291,11 +2344,37 @@ static void TestExecutionIdentityRaces() {
 		auto candidate = setup.Prepare("SELECT count(*) FROM ngram_candidates('swapped_part','s','needle')");
 		Check(ddl, "DROP TABLE " + table);
 		Check(ddl, "CREATE TABLE " + table + " AS SELECT * FROM backup_" + part);
-		ExpectPreparedError(*exact, "changed after");
-		if (PreparedScalar(*transparent) != 1) {
-			throw std::runtime_error("transparent replacement race did not fall back for " + part);
+		// F4 coverage for IndexLocationAvailable(..., changed_is_absent): the stale exact plan scans instead of raising.
+		if (PreparedScalar(*exact) != 1 || PreparedScalar(*transparent) != 1) {
+			throw std::runtime_error("prepared exhaustive query did not fall back after " + part + " replacement");
 		}
 		ExpectPreparedError(*candidate, "changed after");
+	}
+
+	// A LIKE plan prepared under auto-acceleration by a reader keeps returning
+	// the matching rows across a drop and re-create of the same index by the
+	// writing connection. This covers the prepared statement surviving another
+	// connection's DDL and does not reach the changed_is_absent fallback: the
+	// re-created index lives in a new opaque schema, so a stale plan resolves
+	// as absent, and a prepared base-table scan re-binds after any catalog
+	// change before it executes.
+	{
+		DuckDB db(nullptr);
+		LoadNgram(db);
+		Connection reader(db), ddl(db);
+		Check(ddl, "CREATE TABLE recreated(s VARCHAR)");
+		Check(ddl, "INSERT INTO recreated VALUES ('x marks the row'), ('no match')");
+		Check(ddl, "PRAGMA create_ngram_index('recreated','s')");
+		Check(reader, "SET ngram_auto_accelerate=true");
+		auto like = reader.Prepare("SELECT count(*) FROM recreated WHERE s LIKE '%x%'");
+		if (like->HasError() || PreparedScalar(*like) != 1) {
+			throw std::runtime_error("prepared LIKE did not find the row before the index was re-created");
+		}
+		Check(ddl, "PRAGMA drop_ngram_index('recreated','s')");
+		Check(ddl, "PRAGMA create_ngram_index('recreated','s')");
+		if (PreparedScalar(*like) != 1) {
+			throw std::runtime_error("prepared LIKE did not find the row after the index was re-created");
+		}
 	}
 
 	// Dropping and rebuilding the same owner invalidates cached exact,
@@ -2469,9 +2548,9 @@ static void TestExecutionIdentityRaces() {
 		           "owner_key BLOB UNIQUE NOT NULL, schema_name VARCHAR NOT NULL, table_name VARCHAR NOT NULL, "
 		           "column_name VARCHAR NOT NULL)");
 		Check(ddl, "INSERT INTO __ngram.registry SELECT * FROM registry_backup");
-		ExpectPreparedError(*exact, "registry changed");
-		if (PreparedScalar(*transparent) != 1) {
-			throw std::runtime_error("transparent registry replacement race was not exact");
+		// F4 coverage for IndexLocationAvailable(..., changed_is_absent) on a replaced registry table.
+		if (PreparedScalar(*exact) != 1 || PreparedScalar(*transparent) != 1) {
+			throw std::runtime_error("exhaustive registry replacement race was not exact");
 		}
 		ExpectPreparedError(*candidate, "registry changed");
 		auto error = ExecuteRemainingForError(planned, drop);
@@ -2711,6 +2790,7 @@ int main(int argc, char **argv) {
 		TestCreationSchedules(unique + ".creation");
 		TestProtectorsAndDrop(unique + ".protectors");
 		TestVacuumAndConflict(unique + ".vacuum");
+		TestRejectedCommitKeepsGuard(unique + ".retried");
 		TestWALAndStock(argv[0], unique + ".wal");
 		TestUnboundCheckpointSeal(argv[0], unique + ".seal");
 		TestCleanShutdownSeal(unique + ".clean");
@@ -2727,6 +2807,7 @@ int main(int argc, char **argv) {
 		RemoveDatabase(unique + ".creation");
 		RemoveDatabase(unique + ".protectors");
 		RemoveDatabase(unique + ".vacuum");
+		RemoveDatabase(unique + ".retried");
 		RemoveDatabase(unique + ".wal");
 		RemoveDatabase(unique + ".seal");
 		RemoveDatabase(unique + ".clean");

@@ -9,3 +9,8 @@ __pycache__/
 .Rhistory
 .cache/
 .tmp/
+.claude/
+.agents/
+.codex/
+*.db
+*.db.wal

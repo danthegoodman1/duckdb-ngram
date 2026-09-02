@@ -165,10 +165,14 @@ and reuse latch. Behavior is fail closed:
 A malformed, wrong-kind, or colliding meta/shadow object is corruption rather
 than staleness and raises on every path.
 
-`ngram_index_stats.stale_reason` explains the latter two states. The unsafe
-state is intentionally conservative: a later UNIQUE index can reject a commit
-after the guard observed a reused rowid, leaving no new row but still requiring
-a rebuild. That costs performance, never correctness.
+`ngram_index_stats.stale_reason` explains the latter two states. The guard
+records the checkpoint iteration each time its maximum advances and latches
+unsafe only when an append at or below the maximum finds a different iteration,
+which is the only way a vacuumed rowid can come back. A commit that a later
+UNIQUE index rejects leaves no row and leaves the guard usable when the next
+append finds the same iteration; a checkpoint between the two appends, an
+in-memory database, a checkpoint in progress, or a freshly reopened file makes
+that check conservative. The unsafe state costs performance, never correctness.
 
 Creation itself closes stale-snapshot races. The first build briefly takes an
 exclusive checkpoint lock, adds and drops a UUID dummy column to invalidate old
@@ -315,8 +319,8 @@ it does not separately validate superseded stats rows.
 Rebuild when `ngram_index_stats.stale_reason` is non-`NULL` or maintenance says
 the rowid guard cannot prove the indexed prefix safe. Common causes are actual
 reuse of a vacuumed trailing range, an extension-free/context-free checkpoint,
-a missing or re-created guard, incompatible persisted guard state, or a
-conservative latch left by a commit that a later constraint rejected.
+a missing or re-created guard, incompatible persisted guard state, or an
+append at or below the guard's maximum in an in-memory database.
 
 Ordinary UPDATE, DELETE, checkpoint, append, and reopen in isolation do not
 require a rebuild. A trailing DELETE + checkpoint + later rowid reuse is the
@@ -547,7 +551,8 @@ index** over nonempty line-per-row `enwik9`. These are not cold-cache, large-sca
 shipped-default claims. Raw evidence: [`benchmarks/artifacts/enwik9-current-v1.json`](benchmarks/artifacts/enwik9-current-v1.json).
 
 - Engine commit: `b6a388c8c39f`; build commit: `b6a388c8c39f`; DuckDB v1.5.5 / source d8cdaa33;
-  static-extension release CLI.
+  static-extension release CLI. The numbers describe the engine commit's `src/**` and are
+  re-collected on release; later commits keep this block until the next collection.
 - Corpus: 10,920,423 rows, 0.919 GiB of UTF-8 text; three fresh load/build pairs.
 - Timed load—fresh CLI and absent DB through create, hex decode, insert, CHECKPOINT—was
   2.299 s median (2.170–2.401 s). Timed index build—fresh CLI through create-index and
@@ -569,11 +574,15 @@ The timed campaign adds one warmup per variant after untimed parity/EXPLAIN exec
 twenty-one measured observations per variant using a fixed-seed interleaving on one connection.
 Timer resolution is one millisecond. Exact ngram_search and scan counts match every observation;
 candidate counts are a separately measured lossy superset.
-Validate checked source/tool provenance, then check generated documentation:
+`check` verifies the artifact, the pinned gitlinks, commit ancestry, and this rendered block on
+any commit; `--current-source` also requires `src/**` and the tool to hash to the artifact's
+records, which holds at the engine commit and on release tags. `validate` applies the strict
+check to any artifact path:
 
 ```sh
-python3 benchmarks/release_evidence.py validate --artifact benchmarks/artifacts/enwik9-current-v1.json
 python3 benchmarks/release_evidence.py check
+python3 benchmarks/release_evidence.py check --current-source
+python3 benchmarks/release_evidence.py validate --artifact benchmarks/artifacts/enwik9-current-v1.json
 ```
 
 Optional `--binary` validation requires the exact CLI/SHA recorded for the artifact build commit;

@@ -313,7 +313,7 @@ public:
 				continue;
 			}
 			if (held.creation_lock) {
-				throw InternalException("ngram creation barrier is already held for this catalog");
+				throw InvalidInputException("ngram creation barrier is already held for this catalog");
 			}
 			held.creation_lock = std::move(creation_lock);
 			held.creation_table = &original_table;
@@ -325,7 +325,7 @@ public:
 			held.transaction_id = transaction.transaction_id;
 			return;
 		}
-		throw InternalException("ngram creation barrier has no maintenance fence");
+		throw InvalidInputException("ngram creation barrier has no maintenance fence");
 	}
 
 	void FinishCreation(DuckTransaction &transaction, DataTable &current_table, const string &schema_name,
@@ -778,16 +778,22 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		          "(generation), 0) + 1 FROM " + segments +
 		          "), postings, rowid_count, min_rowid, max_rowid FROM " + packed + " ORDER BY " +
 		          SystemFunction("encode") + "(gram), segment_no;\n";
-		// Append this delta before the validated fold below. Use only the encoded
-		// key for grouping so session collations cannot merge byte-distinct grams.
-		script += "INSERT INTO " + stats + " SELECT " + SystemFunction("decode") + "(gram_key), " +
-		          SystemFunction("sum") + "(rowid_count)::BIGINT, " + SystemFunction("count") +
-		          "(*)::BIGINT FROM (SELECT " + SystemFunction("encode") + "(gram) AS gram_key, rowid_count FROM " +
-		          packed + ") GROUP BY gram_key ORDER BY gram_key;\n";
-		// Refresh generations are individually ordered but DuckDB can place
-		// several small appends in one row group, widening that row group's zone
-		// map to the whole gram domain. Fold stats to one globally ordered row per
-		// gram in this transaction so filtered reads stay independent of history.
+		// Fold the existing stats and this delta into one byte-ordered row per
+		// gram in a single statement, then replace the table. Refresh generations
+		// are individually ordered but DuckDB can place several small appends in
+		// one row group, widening that row group's zone map to the whole gram
+		// domain, so the whole table is rewritten in one global order. Historical
+		// rows are validated on the way; delta rows are fresh and each is one
+		// segment. Only the encoded key is grouped so session collations cannot
+		// merge byte-distinct grams.
+		//
+		// The delta is folded here rather than appended to stats first because
+		// DuckDB v1.5.5 leaves a table reading zero rows for the rest of the
+		// process after an empty batch INSERT ... ORDER BY, a DELETE, and a batch
+		// INSERT of at least 122,880 rows into it in one transaction
+		// (docs/upstream/duckdb-empty-batch-insert.md). A refresh with an empty
+		// tail has an empty delta, so no statement may insert into stats before
+		// the DELETE below.
 		auto invalid_stats = "gram IS NULL OR row_count IS NULL OR segment_count IS NULL OR row_count <= 0 OR "
 		                     "segment_count <= 0";
 		auto stats_error = SystemFunction("error") + "('ngram: invalid stats row; the index is malformed')";
@@ -797,7 +803,10 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 		          SystemFunction("encode") + "(gram) AS gram_key, CASE WHEN " + invalid_stats + " THEN " +
 		          stats_error + " ELSE row_count END AS checked_row_count, CASE WHEN " + invalid_stats + " THEN " +
 		          stats_error + " ELSE segment_count END AS checked_segment_count FROM " + stats +
-		          ") GROUP BY gram_key ORDER BY gram_key;\n";
+		          " UNION ALL SELECT " + SystemFunction("encode") +
+		          "(gram) AS gram_key, rowid_count::BIGINT AS checked_row_count, "
+		          "1::BIGINT AS checked_segment_count FROM " +
+		          packed + ") GROUP BY gram_key ORDER BY gram_key;\n";
 		script += "DELETE FROM " + stats + ";\n";
 		script += "INSERT INTO " + stats + " SELECT * FROM " + folded_stats + " ORDER BY " +
 		          SystemFunction("encode") + "(gram);\n";
@@ -1016,6 +1025,10 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		// manual upgrade path that collapses and byte-orders an old v3 stats
 		// history without requiring another append. No persisted layout marker
 		// justifies making repeated no-key calls cheaper at the cost of a schema.
+		// Nothing inserts into stats before this DELETE, and nothing deletes
+		// from segments after the possibly empty insert above, so neither table
+		// takes the v1.5.5 empty-insert, delete, reinsert shape that empties a
+		// table in-process (docs/upstream/duckdb-empty-batch-insert.md).
 		script += "DELETE FROM " + stats + ";\n";
 		script += "INSERT INTO " + stats + " SELECT " + SystemFunction("decode") + "(gram_key), " +
 		          SystemFunction("sum") + "(rowid_count)::BIGINT, " + SystemFunction("count") +

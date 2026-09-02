@@ -335,8 +335,8 @@ static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet
 			continue;
 		}
 		if (entry.first >= scanned_types.size()) {
-			throw InternalException("ngram accelerated scan: table filter references column %llu of %llu scanned",
-			                        entry.first, scanned_types.size());
+			throw InvalidInputException("ngram accelerated scan: table filter references column %llu of %llu scanned",
+			                            entry.first, scanned_types.size());
 		}
 		BoundReferenceExpression column(scanned_types[entry.first], entry.first);
 		auto expr = entry.second->ToExpression(column);
@@ -357,7 +357,7 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 	auto &base = ResolveExistingTable(context, bind.catalog_name, bind.schema_name, bind.table_name, "table");
 	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name,
 	                       ShadowSchemaName(bind.schema_name, bind.table_name), &base};
-	if (!IndexLocationAvailable(context, target, bind.location)) {
+	if (!IndexLocationAvailable(context, target, bind.location, true)) {
 		state.fallback_reason = "index unavailable";
 		return false;
 	}
@@ -438,7 +438,7 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 			state->core.fetch_types.emplace_back(LogicalType::ROW_TYPE);
 			state->fetched_columns.push_back("rowid");
 		} else if (col_idx.IsVirtualColumn()) {
-			throw InternalException("ngram accelerated scan: unsupported column reference in scan");
+			throw InvalidInputException("ngram accelerated scan: unsupported column reference in scan");
 		} else if (col_idx.HasType()) {
 			state->core.fetch_types.push_back(col_idx.GetScanType());
 			state->fetched_columns.push_back(columns.GetColumn(col_idx.ToLogical()).Name() + " (extract)");

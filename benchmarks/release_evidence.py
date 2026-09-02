@@ -39,6 +39,7 @@ DUCKDB_VERSION = "v1.5.5"
 DUCKDB_SOURCE = "d8cdaa33"
 ENGINE_FILES = ("CMakeLists.txt", "Makefile", "extension_config.cmake", "vcpkg.json")
 SUBMODULES = ("duckdb", "extension-ci-tools")
+PINNED_LINKS = {"duckdb": DUCKDB_GITLINK, "extension-ci-tools": CI_GITLINK}
 
 SOURCE_PAGE = "https://www.mattmahoney.net/dc/textdata.html"
 ARCHIVE_URL = "https://www.mattmahoney.net/dc/enwik9.zip"
@@ -259,16 +260,14 @@ def engine_paths(commit=None):
         for path in git(*command, "--", "src", *ENGINE_FILES).stdout.splitlines()
         if path.startswith("src/") or path in ENGINE_FILES
     )
-def assert_engine_clean(engine_status, links, submodule_heads, submodule_status):
+def assert_engine_clean(engine_status, links, pins_returncode, pins_output):
     if engine_status:
         fail("engine inputs are dirty or untracked:\n%s" % engine_status)
-    expected = {"duckdb": DUCKDB_GITLINK, "extension-ci-tools": CI_GITLINK}
-    if links != expected:
+    if links != PINNED_LINKS:
         fail("pinned gitlink mismatch")
-    for name in SUBMODULES:
-        if submodule_heads.get(name) != links[name] or submodule_status.get(name):
-            fail("dirty submodule %s" % name)
-def engine_digest(commit=None, require_clean=False):
+    if pins_returncode:
+        fail("submodule checkout differs from the pinned gitlinks:\n%s" % pins_output)
+def engine_digest(commit=None):
     records = []
     for path in engine_paths(commit):
         if commit:
@@ -289,29 +288,25 @@ def engine_digest(commit=None, require_clean=False):
             links[match.group(2)] = match.group(1)
     if set(links) != set(SUBMODULES):
         fail("invalid engine gitlinks")
-    if require_clean:
-        status = git(
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            "--",
-            "src",
-            *ENGINE_FILES,
-        ).stdout.strip()
-        heads = {}
-        dirt = {}
-        for name in SUBMODULES:
-            heads[name] = run(["git", "rev-parse", "HEAD"], cwd=ROOT / name).stdout.strip()
-            dirt[name] = run(
-                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-                cwd=ROOT / name,
-            ).stdout.strip()
-        assert_engine_clean(status, links, heads, dirt)
     for name, sha in links.items():
         records.append("gitlink\t%s\t%s\n" % (sha, name))
     records.append("runtime-source\t%s\tduckdb-source-id\n" % DUCKDB_SOURCE)
     digest = hashlib.sha256("".join(sorted(records)).encode()).hexdigest()
     return digest, links
+def working_tree_clean(links):
+    """Fail unless src/**, the engine files, and both submodule trees hold exactly what HEAD records."""
+    status = git(
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--",
+        "src",
+        *ENGINE_FILES,
+    ).stdout.strip()
+    # scripts/verify_pins.sh is the one checkout-versus-gitlink check shared
+    # with the Correctness workflow.
+    pins = run(["bash", str(ROOT / "scripts" / "verify_pins.sh")], check=False)
+    assert_engine_clean(status, links, pins.returncode, pins.stdout + pins.stderr)
 def missing_commit_policy(exists, shallow, label):
     if not exists and not shallow:
         fail("missing %s commit in full clone" % label)
@@ -328,18 +323,12 @@ def commit_relationship(engine_commit, build_commit):
             fail("engine/build ancestry mismatch")
         return True
     return False
-def validate_source(engine):
-    current_digest, links = engine_digest(require_clean=True)
-    if current_digest != engine["digest_sha256"]:
-        fail("engine digest mismatch")
-    if links != {"duckdb": DUCKDB_GITLINK, "extension-ci-tools": CI_GITLINK}:
+def validate_provenance(engine):
+    """What `check` enforces on every commit: the working tree's gitlinks are the
+    pinned ones and the artifact's commits are ancestors of HEAD."""
+    if engine_digest()[1] != PINNED_LINKS:
         fail("current gitlinks mismatch")
-    if commit_relationship(engine["engine_commit"], engine["build_commit"]):
-        for commit in {engine["engine_commit"], engine["build_commit"]}:
-            if engine_digest(commit=commit)[0] != current_digest:
-                fail("recorded/current engine digest mismatch")
-    if file_digest(TOOL) != engine["tool_sha256"]:
-        fail("tool hash mismatch")
+    commit_relationship(engine["engine_commit"], engine["build_commit"])
     current = git("rev-parse", "HEAD").stdout.strip()
     shallow = git("rev-parse", "--is-shallow-repository").stdout.strip() == "true"
     build_exists = object_exists(engine["build_commit"])
@@ -348,6 +337,36 @@ def validate_source(engine):
         "merge-base", "--is-ancestor", engine["build_commit"], current, check=False
     ).returncode:
         fail("artifact build is not current/ancestor")
+def source_matches(engine, current_digest, recorded_digests, tool_digest):
+    """The digest comparisons behind `check --current-source`, separated from
+    the git reads so both outcomes are testable on any tree."""
+    if current_digest != engine["digest_sha256"]:
+        fail(
+            "engine digest mismatch: the working tree's src/** and engine files digest to %s, "
+            "the artifact records %s for engine commit %s; the numbers describe that commit and "
+            "are re-collected on release" % (current_digest, engine["digest_sha256"], engine["engine_commit"][:12])
+        )
+    for commit, digest in sorted(recorded_digests.items()):
+        if digest != current_digest:
+            fail("recorded/current engine digest mismatch at %s" % commit[:12])
+    if tool_digest != engine["tool_sha256"]:
+        fail(
+            "tool hash mismatch: this tool digests to %s, the artifact records %s"
+            % (tool_digest, engine["tool_sha256"])
+        )
+def validate_source(engine):
+    """What `check --current-source`, `validate`, and `collect` add to the
+    provenance checks: the clean working tree and this tool hash to what the
+    artifact records."""
+    current_digest, links = engine_digest()
+    recorded = {}
+    if commit_relationship(engine["engine_commit"], engine["build_commit"]):
+        recorded = {
+            commit: engine_digest(commit=commit)[0]
+            for commit in {engine["engine_commit"], engine["build_commit"]}
+        }
+    source_matches(engine, current_digest, recorded, file_digest(TOOL))
+    working_tree_clean(links)
 def query_order():
     generator = random.Random(QUERY_SEED)
     pairs = []
@@ -483,7 +502,9 @@ def validate_run(record, pair, stage, corpus):
     for index in (6, 7, 10, 11):
         if state[index] < 1:
             fail("nonpositive index stats")
-def validate_artifact(artifact, *, check_source=False, binary=None):
+def validate_artifact(artifact, *, provenance=False, source=False, binary=None):
+    """`provenance` adds the gitlink and ancestry checks; `source` adds the
+    working-tree digest and tool hash checks on top of them."""
     top_keys = (
         "schema benchmark_id created_utc protocol engine corpus machine settings runs query_cells query_samples"
     ).split()
@@ -576,7 +597,9 @@ def validate_artifact(artifact, *, check_source=False, binary=None):
         if sample[3] != cell_map[sample[0]]["matches"]:
             fail("exact ngram_search/scan count parity differs")
     summaries(artifact)
-    if check_source:
+    if provenance or source:
+        validate_provenance(engine)
+    if source:
         validate_source(engine)
     if binary:
         validate_binary(Path(binary), engine)
@@ -675,7 +698,8 @@ def render_block(artifact, results=False):
 +shipped-default claims. Raw evidence: [`{artifact}`]({link}).
 +
 +- Engine commit: `{engine}`; build commit: `{build}`; DuckDB {duckdb} / source {source};
-+  static-extension release CLI.
++  static-extension release CLI. The numbers describe the engine commit's `src/**` and are
++  re-collected on release; later commits keep this block until the next collection.
 +- Corpus: {rows} rows, {gib} GiB of UTF-8 text; three fresh load/build pairs.
 +- Timed load—fresh CLI and absent DB through create, hex decode, insert, CHECKPOINT—was
 +  {load} s median ({load_range} s). Timed index build—fresh CLI through create-index and
@@ -693,11 +717,15 @@ def render_block(artifact, results=False):
 +twenty-one measured observations per variant using a fixed-seed interleaving on one connection.
 +Timer resolution is one millisecond. Exact ngram_search and scan counts match every observation;
 +candidate counts are a separately measured lossy superset.
-+Validate checked source/tool provenance, then check generated documentation:
++`check` verifies the artifact, the pinned gitlinks, commit ancestry, and this rendered block on
++any commit; `--current-source` also requires `src/**` and the tool to hash to the artifact's
++records, which holds at the engine commit and on release tags. `validate` applies the strict
++check to any artifact path:
 +
 +```sh
-+{command} validate --artifact {artifact}
 +{command} check
++{command} check --current-source
++{command} validate --artifact {artifact}
 +```
 +
 +Optional `--binary` validation requires the exact CLI/SHA recorded for the artifact build commit;
@@ -751,9 +779,9 @@ def canonical_artifact(path):
     if Path(path).resolve() != expected.resolve() or not expected.is_file():
         fail("docs require the canonical artifact")
     return expected
-def render_docs(artifact_path, output_root=None, check=False):
+def render_docs(artifact_path, output_root=None, check=False, current_source=False):
     artifact = load_artifact(canonical_artifact(artifact_path))
-    validate_artifact(artifact, check_source=True)
+    validate_artifact(artifact, provenance=True, source=current_source)
     readme = replace_block(README.read_text(), render_block(artifact), "README.md")
     results = replace_block(RESULTS.read_text(), render_block(artifact, True), "benchmarks/RESULTS.md")
     lint_rendered(readme, results)
@@ -1163,7 +1191,8 @@ def collect(args):
         fail("output root/artifact already exists")
     output_root.parent.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(mode=0o700)
-    digest, links = engine_digest(require_clean=True)
+    digest, links = engine_digest()
+    working_tree_clean(links)
     build_commit = git("rev-parse", "HEAD").stdout.strip()
     if commit_relationship(ENGINE_COMMIT, build_commit):
         if engine_digest(commit=ENGINE_COMMIT)[0] != digest:
@@ -1194,7 +1223,7 @@ def collect(args):
     )
     if file_digest(TOOL) != tool_hash or file_digest(binary) != cli_hash:
         fail("tool or CLI changed during collection")
-    validate_artifact(artifact, check_source=True, binary=binary)
+    validate_artifact(artifact, provenance=True, source=True, binary=binary)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = artifact_path.with_name(artifact_path.name + ".tmp")
     temporary.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n")
@@ -1325,12 +1354,24 @@ def tests(binary):
     expect_failure("noncanonical render", lambda: canonical_artifact(TOOL))
     expect_failure("full missing commit", lambda: missing_commit_policy(False, False, "engine"))
     missing_commit_policy(False, True, "engine")
-    links = {"duckdb": DUCKDB_GITLINK, "extension-ci-tools": CI_GITLINK}
-    heads = dict(links)
-    clean = {name: "" for name in SUBMODULES}
-    expect_failure("untracked engine", lambda: assert_engine_clean("?? src/x.cpp", links, heads, clean))
-    dirty_submodule = dict(clean, duckdb="?? rogue")
-    expect_failure("dirty submodule", lambda: assert_engine_clean("", links, heads, dirty_submodule))
+    links = dict(PINNED_LINKS)
+    expect_failure("untracked engine", lambda: assert_engine_clean("?? src/x.cpp", links, 0, ""))
+    expect_failure("dirty submodule", lambda: assert_engine_clean("", links, 1, "verify_pins: duckdb differs"))
+    assert_engine_clean("", links, 0, "")
+    # The fixture records digests no tree produces: `check` (provenance only)
+    # accepts it on this tree, `check --current-source` rejects it.
+    validate_artifact(artifact, provenance=True)
+    expect_failure("stale source digest", lambda: validate_artifact(artifact, source=True))
+    current_digest = engine_digest()[0]
+    tool_digest = file_digest(TOOL)
+    matching = dict(artifact["engine"], digest_sha256=current_digest, tool_sha256=tool_digest)
+    source_matches(matching, current_digest, {ENGINE_COMMIT: current_digest}, tool_digest)
+    expect_failure("changed source", lambda: source_matches(matching, "0" * 64, {}, tool_digest))
+    expect_failure(
+        "changed recorded source",
+        lambda: source_matches(matching, current_digest, {ENGINE_COMMIT: "0" * 64}, tool_digest),
+    )
+    expect_failure("changed tool", lambda: source_matches(matching, current_digest, {}, "0" * 64))
     if sql_literal("a ' quote \\ path") != "'a '' quote \\ path'":
         fail("DuckDB SQL string literal escaping differs")
     if any(smoke_runtime_matches(value, ENGINE_COMMIT) for value in ("", "b6", "0000000")):
@@ -1355,7 +1396,7 @@ def tests(binary):
         fake.file_size = RAW_BYTES
         expect_failure("unsafe archive member", lambda: validate_archive_member([fake]))
     block_hash = hashlib.sha256(render_block(artifact).encode()).hexdigest()
-    if block_hash != "13079373645ac69d9dc0d01595fe079e33a6ac0bfe5dd472eed34fc22025c658":
+    if block_hash != "0ea7db47c55173105ae8a90d77e73de9e7dba7ae8c9d125e082baafd97acd384":
         fail("full rendered Markdown golden differs")
     expect_failure("missing marker", lambda: replace_block("plain", BEGIN + END, "fixture"))
     expect_failure("duplicate marker", lambda: replace_block(BEGIN + BEGIN + END, BEGIN + END, "x"))
@@ -1375,6 +1416,11 @@ def main():
     children["render"].add_argument("--output-root", required=True)
     for name in ("generate", "check"):
         children[name].add_argument("--artifact", default=str(ROOT / ARTIFACT_REL))
+    for name in ("render", "generate", "check"):
+        children[name].add_argument(
+            "--current-source", action="store_true",
+            help="also require the clean working tree's src/** and this tool to hash to the artifact's records",
+        )
     children["test"].add_argument("--binary", default=str(ROOT / "build/release/duckdb"))
     args = parser.parse_args()
     try:
@@ -1382,13 +1428,16 @@ def main():
             collect(args)
         elif args.command == "validate":
             artifact = load_artifact(args.artifact)
-            validate_artifact(artifact, check_source=True, binary=args.binary)
+            validate_artifact(artifact, provenance=True, source=True, binary=args.binary)
             suffix = ", current CLI" if args.binary else ""
             print("release_evidence validation: PASS (current source/tool%s)" % suffix)
         elif args.command == "render":
-            render_docs(args.artifact, args.output_root)
+            render_docs(args.artifact, args.output_root, current_source=args.current_source)
         elif args.command in ("generate", "check"):
-            render_docs(args.artifact, check=args.command == "check")
+            render_docs(args.artifact, check=args.command == "check", current_source=args.current_source)
+            if args.command == "check":
+                scope = "current source/tool" if args.current_source else "pins, ancestry, rendered docs"
+                print("release_evidence check: PASS (artifact, %s)" % scope)
         else:
             tests(args.binary)
     except EvidenceError as exc:

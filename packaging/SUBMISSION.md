@@ -51,17 +51,20 @@ boundaries. No collision.
 
 - [ ] **The repository is public.** Community extensions "must be public,
       open-source, and hosted on GitHub". This repo is private today.
-- [x] **The full platform matrix is green in this repo's CI.** Done in Phase 9:
-      `exclude_archs` is gone from `.github/workflows/MainDistributionPipeline.yml`,
-      and run
+- [ ] **The full platform matrix is green in this repo's CI on the current
+      head.** A run on the current head is pending. `exclude_archs` is gone from
+      `.github/workflows/MainDistributionPipeline.yml`, and the last green run,
       [31415223698](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/31415223698)
-      is green at `duckdb_version: v1.5.5` / `ci_tools_version: v1.5.5` across
-      all ten default archs — Linux amd64/arm64, macOS amd64/arm64, Windows
-      amd64/arm64/mingw, and wasm mvp/eh/threads. That workflow *is* the one
-      community CI calls, so this is the real predictor. Re-run it against the
-      exact commit being submitted, since it is a mutable branch ref on the
-      tooling side (`extension-ci-tools` `v1.5.5` is `refs/heads/v1.5.5`, not a
-      tag) and upstream can move it.
+      on commit `ccac5b0` (2026-08-10), covered all ten default archs at
+      `duckdb_version: v1.5.5` / `ci_tools_version: v1.5.5` — Linux amd64/arm64,
+      macOS amd64/arm64, Windows amd64/arm64/mingw, and wasm mvp/eh/threads. The
+      storage format and the maintenance scripts have changed since, so that run
+      is history, not evidence for this tree. The workflow now runs on pushes to
+      `main`, on `v*` tags, on pull requests, and on dispatch; dispatch it
+      against the exact commit being submitted and record the run here. It *is*
+      the workflow community CI calls, and its tooling side is a mutable branch
+      ref (`extension-ci-tools` `v1.5.5` is `refs/heads/v1.5.5`, not a tag), so
+      upstream can move it.
 - [x] **Set `excluded_platforms`** in the descriptor from whatever that run
       shows failing, using the `;`-separated syntax
       (e.g. `"wasm_mvp;wasm_eh;wasm_threads"`). Nothing failed, so the key stays

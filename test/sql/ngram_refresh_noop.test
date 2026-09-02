@@ -1,0 +1,261 @@
+# name: test/sql/ngram_refresh_noop.test
+# description: no-op refresh, bounded refresh, and compact keep queries correct in the same process
+# group: [sql]
+
+require ngram
+
+# DuckDB v1.5.5 leaves a table reading zero rows for the rest of the process
+# when one transaction runs an empty batch INSERT ... ORDER BY into it, then
+# DELETE FROM it, then a batch INSERT ... ORDER BY of at least 122,880 rows
+# (docs/upstream/duckdb-empty-batch-insert.md). A refresh with nothing past
+# the high-water mark rewrites the stats table in one transaction, so its
+# generated script must never insert into stats before the DELETE. The stats
+# table here holds about 262,000 rows: 150,000 rows of 40 random symbols drawn
+# from 90, folded to 64 by the case-insensitive index.
+
+statement ok
+CREATE TABLE t AS
+SELECT i,
+       list_aggregate(list_transform(range(40), lambda x: chr(33 + (hash(i * 40 + x) % 90)::INTEGER)), 'string_agg', '')
+       || CASE WHEN i % 50000 = 7 THEN ' noop needle' ELSE '' END AS s
+FROM range(150000) r(i);
+
+statement ok
+PRAGMA create_ngram_index('t', 's');
+
+statement ok
+SET VARIABLE t_schema = (SELECT '__ngram_idx_' || replace(index_id::VARCHAR, '-', '_')
+                         FROM __ngram.registry WHERE table_name='t' AND column_name='s');
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+# the stats table is past the host bug's batch threshold
+query I
+SELECT count(*) >= 122880 FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats');
+----
+true
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+3
+
+query I
+SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+3
+
+query II
+EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+# postings_bytes depends on the postings codec, so it only has to be positive
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('t');
+----
+s	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
+
+# Byte-exact fingerprints of both shadow tables. A no-op call must leave the
+# stats and segments tables equal to these; an emptied stats table hashes to
+# NULL and fails the equality below.
+statement ok
+SET VARIABLE stats_fp = (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
+                         FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats'));
+
+statement ok
+SET VARIABLE segments_fp = (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+                            FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments'));
+
+#===----------------------------------------------------------------------===#
+# no-op refresh: the tail is empty, so the packed delta is empty
+#===----------------------------------------------------------------------===#
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+3
+
+query I
+SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+3
+
+query II
+EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT i FROM ngram_search('t', 'a1b') EXCEPT ALL SELECT i FROM t WHERE contains(lower(s), 'a1b'))
+	UNION ALL
+	(SELECT i FROM t WHERE contains(lower(s), 'a1b') EXCEPT ALL SELECT i FROM ngram_search('t', 'a1b'))
+);
+----
+0
+
+query II
+SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
+        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats')) = getvariable('stats_fp'),
+       (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments')) = getvariable('segments_fp');
+----
+true	true
+
+#===----------------------------------------------------------------------===#
+# no-op bounded refresh: the bound covers the whole (empty) tail
+#===----------------------------------------------------------------------===#
+
+query IIII
+PRAGMA ngram_refresh('t', 1000);
+----
+s	0	149999	0
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+3
+
+query I
+SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+3
+
+query II
+EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+query II
+SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
+        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats')) = getvariable('stats_fp'),
+       (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments')) = getvariable('segments_fp');
+----
+true	true
+
+#===----------------------------------------------------------------------===#
+# no-op compact: no key has more than one row, so nothing is merged
+#===----------------------------------------------------------------------===#
+
+statement ok
+PRAGMA ngram_compact('t');
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+3
+
+query I
+SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+3
+
+query II
+EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT i FROM ngram_search('t', 'a1b') EXCEPT ALL SELECT i FROM t WHERE contains(lower(s), 'a1b'))
+	UNION ALL
+	(SELECT i FROM t WHERE contains(lower(s), 'a1b') EXCEPT ALL SELECT i FROM ngram_search('t', 'a1b'))
+);
+----
+0
+
+query II
+SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
+        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats')) = getvariable('stats_fp'),
+       (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments')) = getvariable('segments_fp');
+----
+true	true
+
+# the same stats the build reported, after every in-process no-op call
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('t');
+----
+s	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
+
+#===----------------------------------------------------------------------===#
+# the same three calls after a checkpoint
+#===----------------------------------------------------------------------===#
+
+statement ok
+CHECKPOINT;
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+3
+
+query I
+SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+3
+
+query IIII
+PRAGMA ngram_refresh('t', 1000);
+----
+s	0	149999	0
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+3
+
+query I
+SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+3
+
+statement ok
+PRAGMA ngram_compact('t');
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+3
+
+query I
+SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+3
+
+query II
+EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT i FROM ngram_search('t', 'a1b') EXCEPT ALL SELECT i FROM t WHERE contains(lower(s), 'a1b'))
+	UNION ALL
+	(SELECT i FROM t WHERE contains(lower(s), 'a1b') EXCEPT ALL SELECT i FROM ngram_search('t', 'a1b'))
+);
+----
+0
+
+query II
+SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
+        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.stats')) = getvariable('stats_fp'),
+       (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+        FROM query('SELECT * FROM ' || getvariable('t_schema') || '.segments')) = getvariable('segments_fp');
+----
+true	true
+
+# the same stats the build reported, after the checkpointed round
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('t');
+----
+s	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL

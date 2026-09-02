@@ -8,7 +8,8 @@ index** over nonempty line-per-row `enwik9`. These are not cold-cache, large-sca
 shipped-default claims. Raw evidence: [`benchmarks/artifacts/enwik9-current-v1.json`](artifacts/enwik9-current-v1.json).
 
 - Engine commit: `b6a388c8c39f`; build commit: `b6a388c8c39f`; DuckDB v1.5.5 / source d8cdaa33;
-  static-extension release CLI.
+  static-extension release CLI. The numbers describe the engine commit's `src/**` and are
+  re-collected on release; later commits keep this block until the next collection.
 - Corpus: 10,920,423 rows, 0.919 GiB of UTF-8 text; three fresh load/build pairs.
 - Timed load—fresh CLI and absent DB through create, hex decode, insert, CHECKPOINT—was
   2.299 s median (2.170–2.401 s). Timed index build—fresh CLI through create-index and
@@ -30,11 +31,15 @@ The timed campaign adds one warmup per variant after untimed parity/EXPLAIN exec
 twenty-one measured observations per variant using a fixed-seed interleaving on one connection.
 Timer resolution is one millisecond. Exact ngram_search and scan counts match every observation;
 candidate counts are a separately measured lossy superset.
-Validate checked source/tool provenance, then check generated documentation:
+`check` verifies the artifact, the pinned gitlinks, commit ancestry, and this rendered block on
+any commit; `--current-source` also requires `src/**` and the tool to hash to the artifact's
+records, which holds at the engine commit and on release tags. `validate` applies the strict
+check to any artifact path:
 
 ```sh
-python3 benchmarks/release_evidence.py validate --artifact benchmarks/artifacts/enwik9-current-v1.json
 python3 benchmarks/release_evidence.py check
+python3 benchmarks/release_evidence.py check --current-source
+python3 benchmarks/release_evidence.py validate --artifact benchmarks/artifacts/enwik9-current-v1.json
 ```
 
 Optional `--binary` validation requires the exact CLI/SHA recorded for the artifact build commit;

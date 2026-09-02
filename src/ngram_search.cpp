@@ -286,7 +286,7 @@ static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunction
 		position++;
 	}
 	if (!found) {
-		throw InternalException("ngram_search: indexed column vanished during binding");
+		throw InvalidInputException("ngram_search: indexed column vanished during binding");
 	}
 	auto &tx = DuckTransaction::Get(context, table_entry.ParentCatalog());
 	if (!IndexLocationAvailable(context, target, result->location)) {
@@ -1438,7 +1438,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	state->options = bind.bound_options;
 	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name,
 	                       ShadowSchemaName(bind.schema_name, bind.table_name), &base};
-	if (!IndexLocationAvailable(context, target, bind.location)) {
+	if (!IndexLocationAvailable(context, target, bind.location, true)) {
 		state->fallback_reason = "index unavailable";
 	} else {
 		auto &meta = ResolveExistingTable(context, bind.catalog_name, bind.location.shadow_schema,
@@ -1474,7 +1474,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 			continue;
 		}
 		if (col_idx.IsVirtualColumn()) {
-			throw InternalException("ngram_search: unsupported virtual column");
+			throw InvalidInputException("ngram_search: unsupported virtual column");
 		}
 		requested_to_fetch.push_back(state->core.fetch_types.size());
 		state->core.fetch_column_ids.push_back(base.GetStorageIndex(col_idx));

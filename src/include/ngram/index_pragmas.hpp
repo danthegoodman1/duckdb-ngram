@@ -77,8 +77,13 @@ void RequireExclusiveOwnerAllocation(ClientContext &context, const ResolvedTarge
 void ValidateRegistryForCreate(ClientContext &context, const string &catalog_name, idx_t expected_registry_oid,
                                bool expected_bootstrap);
 
-//! False means removed; partial storage, replacement, or corruption raises.
-bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target, const IndexLocation &location);
+//! False means removed; partial storage or corruption raises. A replaced
+//! schema, table, or registry row raises by default, which is what the
+//! maintenance and candidate paths need. The exhaustive read paths pass
+//! `changed_is_absent` so a replaced identity also reads as false and the
+//! query falls back to the exact scan.
+bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target, const IndexLocation &location,
+                            bool changed_is_absent = false);
 
 //! Quote an identifier / a string literal, or qualify a built-in function so
 //! generated SQL cannot resolve a same-named macro from the current schema.

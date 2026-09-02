@@ -12,14 +12,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# The two build jobs restore a compiler cache keyed on the pinned duckdb gitlink
+# and the extension sources. The cache holds compiled objects only: every run
+# still configures and links a build tree from nothing, so the fresh-build
+# assertions below keep their meaning while the DuckDB core compiles once per
+# pin. The third job needs no build: it runs the strict evidence check on
+# release tags and manual dispatches.
+
 jobs:
   release-correctness:
     name: Release suite and fixed-seed checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
-      CCACHE_DISABLE: 1
-      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -30,29 +36,45 @@ jobs:
           submodules: recursive
 
       - name: Verify submodule pins
+        id: pins
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git ls-tree HEAD duckdb | awk '{print $3}')" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
-          test "$(git ls-tree HEAD extension-ci-tools | awk '{print $3}')" = 72e76e99cd7fee45a99739cd118ec2db64e034ec
-          test "$(git -C duckdb rev-parse HEAD)" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
-          test "$(git -C extension-ci-tools rev-parse HEAD)" = 72e76e99cd7fee45a99739cd118ec2db64e034ec
-          submodule_status="$(git submodule status --recursive)"
-          printf '%s\n' "$submodule_status"
-          ! printf '%s\n' "$submodule_status" | grep -Eq '^[-+U]'
+          scripts/verify_pins.sh
+          echo "duckdb=$(git ls-tree HEAD duckdb | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Check generated fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/gen_trigram_fixtures.py
+          git diff --exit-code -- test/sql/trigrams_fixtures.test
+
+      - name: Restore compiler cache
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ccache-release-${{ steps.pins.outputs.duckdb }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}
+          restore-keys: |
+            ccache-release-${{ steps.pins.outputs.duckdb }}-
+          max-size: 1G
 
       - name: Build release
         shell: bash
         run: |
           set -euo pipefail
           test ! -e build/release
-          timeout 1200s make release GEN=ninja
+          # DuckDB's CMake picks ccache up as the compiler launcher when it is
+          # on PATH. A cold cache compiles the whole core, hence the budget.
+          timeout 3600s make release GEN=ninja
+          ccache --show-stats
 
       - name: Run release and evidence gates
         shell: bash
         run: |
           set -euo pipefail
           timeout 600s make test_release
+          # The artifact, pins, ancestry, and rendered block; release-evidence-strict
+          # adds the src/** digest and tool hash on tags and dispatches.
           timeout 600s python3 benchmarks/release_evidence.py check
           timeout 600s python3 benchmarks/release_evidence.py test --binary build/release/duckdb
 
@@ -65,13 +87,39 @@ jobs:
           timeout 600s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 20 --rows 4000 --seed 20261316
           timeout 600s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 20 --rows 4000 --seed 20261318 --no-stale-expected
 
+  release-evidence-strict:
+    name: Release evidence matches current source
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONHASHSEED: 0
+    steps:
+      - name: Check out pinned sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify submodule pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/verify_pins.sh
+
+      - name: Check evidence against current source
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 600s python3 benchmarks/release_evidence.py check --current-source
+
   debug-sanitizers:
     name: Focused ASAN, UBSAN, and race checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
-      CCACHE_DISABLE: 1
-      CMAKE_BUILD_PARALLEL_LEVEL: 1
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -82,16 +130,20 @@ jobs:
           submodules: recursive
 
       - name: Verify submodule pins
+        id: pins
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git ls-tree HEAD duckdb | awk '{print $3}')" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
-          test "$(git ls-tree HEAD extension-ci-tools | awk '{print $3}')" = 72e76e99cd7fee45a99739cd118ec2db64e034ec
-          test "$(git -C duckdb rev-parse HEAD)" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
-          test "$(git -C extension-ci-tools rev-parse HEAD)" = 72e76e99cd7fee45a99739cd118ec2db64e034ec
-          submodule_status="$(git submodule status --recursive)"
-          printf '%s\n' "$submodule_status"
-          ! printf '%s\n' "$submodule_status" | grep -Eq '^[-+U]'
+          scripts/verify_pins.sh
+          echo "duckdb=$(git ls-tree HEAD duckdb | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler cache
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ccache-debug-asan-${{ steps.pins.outputs.duckdb }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}
+          restore-keys: |
+            ccache-debug-asan-${{ steps.pins.outputs.duckdb }}-
+          max-size: 2G
 
       - name: Build focused sanitizer targets
         shell: bash
@@ -113,7 +165,8 @@ jobs:
             -DDUCKDB_DEBUG_LINK_JOBS=1 \
             -DCMAKE_BUILD_TYPE=Debug \
             -S duckdb -B build/ci-debug
-          timeout 1800s cmake --build build/ci-debug --target unittest ngram_checkpoint_gap_test
+          timeout 5400s cmake --build build/ci-debug --target unittest ngram_checkpoint_gap_test
+          ccache --show-stats
 
       - name: Verify sanitizer configuration and linkage
         shell: bash

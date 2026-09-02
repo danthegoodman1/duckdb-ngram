@@ -86,6 +86,27 @@ static uint64_t CheckpointIteration(AttachedDatabase &db) {
 	return storage.InMemory() ? 0 : storage.GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
 }
 
+//! The header checkpoint iteration as an append may read it, or invalid when
+//! no value can be read safely. An in-memory database has no header although
+//! its checkpoints still vacuum trailing deleted row groups. While a file
+//! checkpoint is active, its WriteHeader may be incrementing the plain counter
+//! on another thread; the active-checkpoint flag is atomic. A checkpoint that
+//! starts after this check cannot reach WriteHeader before the calling commit
+//! ends: it must first take every table's exclusive checkpoint lock, and the
+//! committing writer holds its own table's shared lock through
+//! DataTable::AppendLock until its flush finishes.
+static optional_idx ObservableCheckpointIteration(AttachedDatabase &db) {
+	auto &storage = db.GetStorageManager();
+	if (storage.InMemory()) {
+		return optional_idx();
+	}
+	auto &manager = db.GetTransactionManager().Cast<DuckTransactionManager>();
+	if (manager.GetActiveCheckpoint() != MAX_TRANSACTION_ID) {
+		return optional_idx();
+	}
+	return storage.GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
+}
+
 static bool RowIdGuardRuntimeCompatible() {
 	return host_runtime_state.load() == HostRuntimeState::COMPATIBLE;
 }
@@ -141,33 +162,35 @@ public:
 	RowIdGuard(const string &name, const vector<column_t> &column_ids, TableIOManager &io_manager,
 	           const vector<unique_ptr<Expression>> &expressions, AttachedDatabase &db, string token_p,
 	           int64_t max_seen_p, bool unsafe_reuse_p, bool protection_compatible_p,
-	           optional_idx checkpoint_iteration_p)
+	           optional_idx checkpoint_iteration_p, optional_idx advance_iteration_p)
 	    : BoundIndex(name, NGRAM_ROWID_GUARD_TYPE, IndexConstraintType::NONE, column_ids, io_manager, expressions, db),
 	      token(std::move(token_p)), max_seen(max_seen_p), unsafe_reuse(unsafe_reuse_p),
-	      protection_compatible(protection_compatible_p), checkpoint_iteration(checkpoint_iteration_p) {
+	      protection_compatible(protection_compatible_p), checkpoint_iteration(checkpoint_iteration_p),
+	      advance_iteration(advance_iteration_p) {
 	}
 
 	ErrorData Append(IndexLock &, DataChunk &chunk, Vector &row_ids) override {
+		if (chunk.size() == 0) {
+			return ErrorData();
+		}
 		if (row_ids.GetVectorType() == VectorType::SEQUENCE_VECTOR) {
 			int64_t start, increment;
 			SequenceVector::GetSequence(row_ids, start, increment);
-			if (increment == 1 && chunk.size() > 0) {
-				auto last = start + NumericCast<int64_t>(chunk.size() - 1);
-				unsafe_reuse = unsafe_reuse || start <= max_seen;
-				max_seen = MaxValue(max_seen, last);
+			if (increment == 1) {
+				Observe(start, start + NumericCast<int64_t>(chunk.size() - 1));
 				return ErrorData();
 			}
 		}
 		row_ids.Flatten(chunk.size());
 		auto ids = FlatVector::GetData<row_t>(row_ids);
-		for (idx_t i = 0; i < chunk.size(); i++) {
+		auto first = NumericCast<int64_t>(ids[0]);
+		auto last = first;
+		for (idx_t i = 1; i < chunk.size(); i++) {
 			auto rowid = NumericCast<int64_t>(ids[i]);
-			if (rowid <= max_seen) {
-				unsafe_reuse = true;
-			} else {
-				max_seen = rowid;
-			}
+			first = MinValue(first, rowid);
+			last = MaxValue(last, rowid);
 		}
+		Observe(first, last);
 		return ErrorData();
 	}
 
@@ -259,6 +282,33 @@ public:
 	}
 
 private:
+	//! Fold one appended rowid range into the guard. A range at or below
+	//! max_seen has two possible histories. Either a checkpoint vacuumed fully
+	//! deleted trailing row groups and the table handed their rowids out again,
+	//! which must latch, or an earlier commit advanced max_seen and then failed
+	//! in a later index (a UNIQUE ART rejecting a duplicate key), so no row
+	//! landed and the same range is handed out again, which must not. A vacuum
+	//! needs the exclusive vacuum lock, which every inserting transaction holds
+	//! shared from its first insert to the end of its commit, so a vacuum can
+	//! only fall strictly between two appends and every file checkpoint bumps
+	//! the header iteration. The range therefore latches only when the
+	//! iteration differs from the one recorded at the last advance, or when
+	//! either value is unknown (in-memory database, a checkpoint in progress, or
+	//! a guard bound from disk or WAL).
+	void Observe(int64_t first, int64_t last) {
+		if (first <= max_seen) {
+			auto current = ObservableCheckpointIteration(db);
+			if (!advance_iteration.IsValid() || !current.IsValid() ||
+			    current.GetIndex() != advance_iteration.GetIndex()) {
+				unsafe_reuse = true;
+			}
+		}
+		if (last > max_seen) {
+			max_seen = last;
+			advance_iteration = ObservableCheckpointIteration(db);
+		}
+	}
+
 	void ApplyCheckpointSeal(uint64_t current_iteration) {
 		if (!checkpoint_iteration.IsValid()) {
 			return;
@@ -288,7 +338,11 @@ private:
 	int64_t max_seen;
 	bool unsafe_reuse;
 	bool protection_compatible;
+	//! Persisted seal, compared once against the current iteration after bind.
 	optional_idx checkpoint_iteration;
+	//! Header iteration observed when max_seen last advanced; invalid until an
+	//! append in this process advances it.
+	optional_idx advance_iteration;
 };
 
 class GuardBuildGlobalState final : public IndexBuildGlobalState {
@@ -330,7 +384,8 @@ static unique_ptr<IndexBuildGlobalState> GuardBuildGlobalInit(IndexBuildInitGlob
 	auto max_seen = total_rows == 0 ? int64_t(-1) : NumericCast<int64_t>(total_rows - 1);
 	state->index = make_uniq<RowIdGuard>(input.info.index_name, input.storage_ids, TableIOManager::Get(storage),
 	                                      input.expressions, storage.db, UUID::ToString(UUID::GenerateRandomUUID()),
-	                                      max_seen, false, true, optional_idx());
+	                                      max_seen, false, true, optional_idx(),
+	                                      ObservableCheckpointIteration(storage.db));
 	return std::move(state);
 }
 
@@ -355,7 +410,7 @@ static unique_ptr<BoundIndex> GuardCreateInstance(CreateIndexInput &input) {
 	auto stored = ReadStoredGuardState(input.storage_info);
 	return make_uniq<RowIdGuard>(input.name, input.column_ids, input.table_io_manager, input.unbound_expressions,
 	                              input.db, std::move(stored.token), stored.max_seen, stored.unsafe_reuse,
-	                              stored.protection_compatible, stored.checkpoint_iteration);
+	                              stored.protection_compatible, stored.checkpoint_iteration, optional_idx());
 }
 
 static IndexType GuardIndexType();
@@ -426,7 +481,15 @@ static unique_ptr<RowIdGuard::State> ReadGuardState(DuckTableEntry &table, const
 		     stored.checkpoint_iteration.GetIndex() != checkpoint_iteration.GetIndex())) {
 			stored.unsafe_reuse = true;
 		}
-		if (unbound.HasBufferedReplays()) {
+		bool buffered;
+		{
+			// DataTable::AppendToIndexes buffers replay chunks under entry.lock
+			// while IndexEntries() holds only the list lock; take the same lock
+			// to read the buffer.
+			lock_guard<mutex> entry_guard(entry.lock);
+			buffered = unbound.HasBufferedReplays();
+		}
+		if (buffered) {
 			// The exact rowid effects are deliberately left to DuckDB's replay
 			// binder; until then, one full scan is the only safe answer.
 			stored.unsafe_reuse = true;

@@ -1031,7 +1031,17 @@ void RequireUniqueIndexColumns(const vector<IndexLocation> &indexes) {
 	}
 }
 
-bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target, const IndexLocation &location) {
+bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target, const IndexLocation &location,
+                            bool changed_is_absent) {
+	// Every identity change below is a plan that outlived the objects it was
+	// bound to. Maintenance and candidate callers must not act on the
+	// replacement, so they raise; the exhaustive read paths scan instead.
+	auto replaced = [&](const string &message) -> bool {
+		if (changed_is_absent) {
+			return false;
+		}
+		throw InvalidInputException(message);
+	};
 	auto current_schema = ExistingSchemaOid(context, target.catalog_name, location.shadow_schema);
 	auto current_meta = ExistingTableOid(context, target.catalog_name, location.shadow_schema, location.MetaTable());
 	auto current_segments =
@@ -1040,7 +1050,7 @@ bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target
 	auto changed = [](idx_t expected, idx_t current) { return current && current != expected; };
 	if (changed(location.schema_oid, current_schema) || changed(location.meta_oid, current_meta) ||
 	    changed(location.segments_oid, current_segments) || changed(location.stats_oid, current_stats)) {
-		throw InvalidInputException("ngram: storage schema or tables changed after the index operation was prepared");
+		return replaced("ngram: storage schema or tables changed after the index operation was prepared");
 	}
 	auto absent = !current_schema || !current_meta || !current_segments || !current_stats;
 	if (!location.Registered()) {
@@ -1063,8 +1073,8 @@ bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target
 	if (!location.registry_oid) {
 		for (auto &row : registry.rows) {
 			if (row.index_ref == location.index_ref) {
-				throw InvalidInputException("ngram: registry row %s appeared after the index operation was prepared",
-				                            location.index_ref);
+				return replaced(StringUtil::Format(
+				    "ngram: registry row %s appeared after the index operation was prepared", location.index_ref));
 			}
 		}
 		return !absent;
@@ -1073,7 +1083,7 @@ bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target
 		if (!current_schema && !current_meta && !current_segments && !current_stats) {
 			return false;
 		}
-		throw InvalidInputException("ngram: registry changed after the index operation was prepared");
+		return replaced("ngram: registry changed after the index operation was prepared");
 	}
 	idx_t matches = 0;
 	for (auto &row : registry.rows) {
@@ -1083,16 +1093,16 @@ bool IndexLocationAvailable(ClientContext &context, const ResolvedTarget &target
 		matches++;
 		if (row.owner_key != OwnerKey(target.schema_name, target.table_name, location.column_name) ||
 		    location.shadow_schema != RegisteredStorageSchema(row.index_ref)) {
-			throw InvalidInputException("ngram: registry row %s changed after the index operation was prepared",
-			                            location.index_ref);
+			return replaced(StringUtil::Format(
+			    "ngram: registry row %s changed after the index operation was prepared", location.index_ref));
 		}
 	}
 	if (matches != 1) {
 		if (!current_schema && !current_meta && !current_segments && !current_stats && matches == 0) {
 			return false;
 		}
-		throw InvalidInputException("ngram: registry row %s was removed after the index operation was prepared",
-		                            location.index_ref);
+		return replaced(StringUtil::Format(
+		    "ngram: registry row %s was removed after the index operation was prepared", location.index_ref));
 	}
 	return !absent;
 }

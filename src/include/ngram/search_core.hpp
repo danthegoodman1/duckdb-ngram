@@ -1,14 +1,6 @@
 //===----------------------------------------------------------------------===//
-//                         ngram
-//
-// ngram/search_core.hpp
-//
-// The index-probe core shared by the explicit query path (ngram_search /
-// ngram_candidates, src/ngram_search.cpp) and the transparent optimizer
-// rewrite (src/ngram_rewrite.cpp): storage-table resolution and the
-// rarest-first posting-list intersection. Definitions live in
-// src/ngram_search.cpp.
-//
+// ngram/search_core.hpp: storage-table access, shadow-table scans, and the fetch/scan/emit state machine shared by
+// ngram_search and NGRAM_INDEX_SCAN.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -17,20 +9,16 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
-#include "ngram/trigram.hpp"
+#include "ngram/probe.hpp"
 
 namespace duckdb {
 
 class DataTable;
 class DuckTableEntry;
 class DuckTransaction;
-class BufferManager;
 class TableFilterSet;
 
 namespace ngram {
-
-//! ngram index queries probe at most this many of the needle's rarest grams.
-idx_t MaxGramsPerQuery(ClientContext &context);
 
 //! Initialize a committed + transaction-local storage scan. Equivalent to
 //! DataTable::InitializeScan, except that a table with no committed rows
@@ -51,93 +39,33 @@ DuckTableEntry &ResolveExistingTable(ClientContext &context, const string &catal
 optional_ptr<DuckTableEntry> TryResolveExistingTable(ClientContext &context, const string &catalog,
                                                      const string &schema, const string &name, const char *what);
 
-struct MetaInfo {
-	GramOptions options;
-	//! Highest committed rowid the index covers; rows past it are found by a
-	//! brute-force tail scan.
-	int64_t hwm_rowid = -1;
-	//! The indexed column, as the registry row records it.
-	string column_name;
-	//! The table's zero-posting DuckDB index that prevents rowid-moving vacuum
-	//! and latches reuse of a truncated trailing rowid range. Its name and
-	//! random token are the only proof that postings still describe the table.
-	string guard_name;
-	string guard_token;
-};
+//! The base table a query was bound against, or `changed_message` (with the
+//! table name as its argument) when a prepared statement outlived a DROP plus
+//! CREATE that changed the logical schema.
+DuckTableEntry &ResolveBoundBase(ClientContext &context, const string &catalog, const string &schema,
+                                 const string &table, const vector<string> &names, const vector<LogicalType> &types,
+                                 const char *changed_message);
 
-class ProbeMemoryReservation {
-public:
-	ProbeMemoryReservation(BufferManager &manager, idx_t size);
-	~ProbeMemoryReservation();
-	void Grow(idx_t size);
+//! Append the storage index and type of `column_name` to a projection, or
+//! throw if the table does not look like this extension built it.
+void AddShadowColumn(DuckTableEntry &entry, const string &column_name, LogicalTypeId expected,
+                     vector<StorageIndex> &column_ids, vector<LogicalType> &types);
 
-private:
-	BufferManager &manager;
-	idx_t size;
-};
+void ThrowIfInterrupted(ClientContext &context);
 
-//! One visible segments-table row needed by the selected grams. The shared
-//! vacuum fence keeps posting_rowid stable between manifest scan and fetch.
-struct ProbeDescriptor {
-	ProbeDescriptor() = default;
-	ProbeDescriptor(int64_t segment_no_p, idx_t gram_index_p, row_t posting_rowid_p, idx_t posting_count_p)
-	    : segment_no(segment_no_p), gram_index(gram_index_p), posting_rowid(posting_rowid_p),
-	      posting_count(posting_count_p) {
-	}
-	int64_t segment_no = 0;
-	idx_t gram_index = 0;
-	row_t posting_rowid = 0;
-	idx_t posting_count = 0;
-};
+//! Scan an entire table (committed storage plus this transaction's local rows)
+//! through the caller's transaction, invoking fn per non-empty chunk.
+void ScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
+                     const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
+                     optional_ptr<TableFilterSet> filters, const std::function<void(DataChunk &)> &fn);
 
-//! One rowid segment admitted for bounded probing. Its descriptors occupy the
-//! half-open range [descriptor_begin, descriptor_end) in ProbePlan.
-struct ProbeSegment {
-	ProbeSegment() = default;
-	ProbeSegment(int64_t segment_no_p, idx_t descriptor_begin_p, idx_t descriptor_end_p)
-	    : segment_no(segment_no_p), descriptor_begin(descriptor_begin_p), descriptor_end(descriptor_end_p) {
-	}
-	int64_t segment_no = 0;
-	idx_t descriptor_begin = 0;
-	idx_t descriptor_end = 0;
-};
-
-//! Pre-decoding admission result and the immutable work manifest shared by
-//! candidate-source workers. Its size follows segment rows, never postings or
-//! final candidates.
-struct ProbePlan {
-	DuckTableEntry *segments_entry = nullptr;
-	int64_t hwm = -1;
-	vector<string> grams;
-	vector<ProbeDescriptor> descriptors;
-	vector<ProbeSegment> segments;
-	atomic<idx_t> next_segment {0};
-	idx_t candidate_upper_bound = 0;
-	idx_t max_threads = 0;
-	bool admitted = false;
-	string decline_reason;
-	idx_t stats_rows_scanned = 0;
-	idx_t stats_chunks_scanned = 0;
-	atomic<idx_t> decoded_rowids {0};
-	unique_ptr<ProbeMemoryReservation> memory_reservation;
-};
-
-//! Build a segment manifest and admit its decoded work before touching a
-//! postings blob. A negative candidate_fraction disables that gate (used by
-//! ngram_candidates, which has no full-result scan substitute). worker_cap is
-//! one for that serial API and unlimited for parallel exact scans.
-unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
-                                     DuckTableEntry &stats_entry, const vector<string> &grams, idx_t max_grams,
-                                     int64_t hwm, idx_t table_rows, double candidate_fraction, idx_t worker_cap);
-
-//! Claim, decode, union and intersect one admitted rowid segment. Returns
-//! false when no segment remains. Candidate rowids are sorted and belong to
-//! the claimed segment; segment_ordinal supplies deterministic global order.
-bool NextCandidateSegment(ClientContext &context, DuckTransaction &tx, ProbePlan &plan, vector<row_t> &candidates,
-                          idx_t &segment_ordinal);
-
-//! Shared query-resource settings.
-double MaxCandidateFraction(ClientContext &context);
+//! Scan a whole table in parallel, one row group per claim. `body` is called
+//! once per chunk with the worker's own index so it can accumulate into a
+//! private slot.
+void ParallelScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
+                             const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
+                             optional_ptr<TableFilterSet> filters, idx_t workers,
+                             const std::function<void(DataChunk &, idx_t)> &body);
 
 enum class SearchCorePhase : uint8_t { FETCH, SCAN, DONE };
 

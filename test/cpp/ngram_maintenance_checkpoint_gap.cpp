@@ -11,6 +11,7 @@
 #include "duckdb/transaction/local_storage.hpp"
 #include "core_functions_extension.hpp"
 #include "ngram_extension.hpp"
+#include "ngram/fence.hpp"
 #include "ngram/rowid_guard.hpp"
 
 #include <chrono>
@@ -790,7 +791,7 @@ static void TestSharedGuardAndDrop(const string &path) {
 		}
 		SetRowIdGuardBindState(con, "drop_binding", guard, IndexBindState::UNBOUND, true);
 		auto drop = Expand(con, "PRAGMA drop_ngram_index('drop_binding', 's')");
-		auto next = ExecuteThrough(con, drop, ngram::NGRAM_ROWID_GUARD_VALIDATE);
+		auto next = ExecuteThrough(con, drop, ngram::NGRAM_MAINTENANCE_GUARD);
 		if (!RowIdGuardIsBound(con, "drop_binding")) {
 			throw std::runtime_error("drop validation succeeded before the exact guard became bound");
 		}

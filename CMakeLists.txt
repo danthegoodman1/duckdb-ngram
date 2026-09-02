@@ -13,9 +13,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/ngram_extension.cpp src/trigram.cpp src/trigrams_function.cpp src/postings_codec.cpp
-                      src/pack_postings.cpp src/index_pragmas.cpp src/ngram_maintenance.cpp src/ngram_search.cpp
-                      src/ngram_rewrite.cpp src/rowid_guard.cpp)
+set(EXTENSION_SOURCES
+    src/ngram_extension.cpp
+    src/settings.cpp
+    src/gram.cpp
+    src/postings.cpp
+    src/catalog.cpp
+    src/index_state.cpp
+    src/rowid_guard.cpp
+    src/fence.cpp
+    src/build_sql.cpp
+    src/maintenance_sql.cpp
+    src/pragmas.cpp
+    src/probe.cpp
+    src/search_core.cpp
+    src/search_functions.cpp
+    src/rewrite.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

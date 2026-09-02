@@ -1,44 +1,69 @@
 //===----------------------------------------------------------------------===//
-//                         ngram
-//
-// ngram/rowid_guard.hpp
-//
-// A zero-posting DuckDB index used only to keep rowids stable and to detect
-// reuse of a vacuumed trailing rowid range.
-//
+// ngram/rowid_guard.hpp: the NGRAM_ROWID_GUARD index type: a zero-posting DuckDB index that keeps rowids stable and
+// records reuse of a vacuumed trailing range.
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/execution/index/bound_index.hpp"
 
 namespace duckdb {
 
+class AttachedDatabase;
 class DuckTableEntry;
+class Index;
 
 namespace ngram {
 
-struct MetaInfo;
-
 constexpr const char *NGRAM_ROWID_GUARD_TYPE = "NGRAM_ROWID_GUARD";
-constexpr const char *NGRAM_ROWID_GUARD_VALIDATE = "__ngram_rowid_guard_validate";
+//! The persisted storage option holding a guard's incarnation token.
+constexpr const char *NGRAM_GUARD_TOKEN_OPTION = "ngram_guard_token";
 
 //! Record the runtime reported by the host's built-in pragma_version(). A
 //! mismatch latches fail-closed for this process but does not prevent loading
 //! the extension to inspect or drop an existing guard.
 void InitializeRowIdGuardHostRuntime(ExtensionLoader &loader);
 
-//! Register the custom non-ART index type.
+//! Register the custom non-ART index type and the bind-at-load callbacks.
 void RegisterRowIdGuard(ExtensionLoader &loader);
 
-//! Return the internally minted token of an exact, freshly installed guard.
-//! Throws before the creation fence is released when the physical guard does
-//! not match the planned table, name, type, or target-column dependency.
-string InstalledRowIdGuardToken(DuckTableEntry &table, const string &column_name, const string &guard_name);
+//! True when the host is the pinned DuckDB build; the guard's checkpoint
+//! internals are only trusted then.
+bool RowIdGuardRuntimeCompatible();
+void RequirePinnedRuntime();
+string HostRuntimeMismatchReason();
 
-//! Empty when the exact guard recorded by meta proves the indexed rowid
-//! prefix safe; otherwise a reason that makes callers scan or reject.
-string RowIdGuardReason(ClientContext &context, DuckTableEntry &table, const MetaInfo &meta);
+//! The header checkpoint iteration of `db` (0 for an in-memory database).
+uint64_t CheckpointIteration(AttachedDatabase &db);
+
+//! What a guard persists in its index storage options, as read back.
+struct StoredGuardState {
+	string token;
+	int64_t max_seen = -1;
+	bool unsafe_reuse = true;
+	bool protection_compatible = false;
+	optional_idx checkpoint_iteration;
+};
+StoredGuardState ReadStoredGuardState(const IndexStorageInfo &storage);
+
+//! The state a read path needs from one guard.
+struct RowIdGuardState {
+	string token;
+	int64_t max_seen;
+	bool unsafe_reuse;
+	bool protection_compatible;
+	vector<column_t> column_ids;
+};
+
+//! The live state of a bound guard, applying its pending persisted seal
+//! against `current_iteration` when one is given.
+RowIdGuardState ReadBoundGuardState(Index &index, optional_idx current_iteration);
+
+//! Whether every unbound guard on `table` is well-formed enough to bind.
+//! DuckDB's v1.5.5 bind state stays poisoned by a malformed expression, so
+//! callers screen first.
+bool CanBindRowIdGuards(DuckTableEntry &table, bool require_compatible);
 
 } // namespace ngram
 } // namespace duckdb

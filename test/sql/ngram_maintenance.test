@@ -924,3 +924,95 @@ SELECT count(*) FROM ngram_search('"my.table"', 'tent');
 
 statement ok
 PRAGMA drop_ngram_index('"my.table"', 'sträße select');
+
+#===----------------------------------------------------------------------===#
+# several maintenance pragmas in one query string
+#
+# the statement preprocessor expands every pragma of the string in one
+# transaction and then runs the scripts one after another; a script's
+# execution-time handles outlive the commits of the scripts ahead of it
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE pair(s VARCHAR, u VARCHAR, v VARCHAR);
+
+statement ok
+INSERT INTO pair VALUES ('alpha tent', 'beta tent', 'kappa tent'), ('gamma tent', 'delta tent', 'omega tent');
+
+statement ok
+PRAGMA create_ngram_index('pair', 's');
+
+# two creates sharing the guard the first index installed
+statement ok
+PRAGMA create_ngram_index('pair', 'u'); PRAGMA create_ngram_index('pair', 'v');
+
+# no stale_reason: every index is READY
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('pair');
+----
+s	3	true	1	1	0	12	12	0	1	16	40	NULL
+u	3	true	1	1	0	10	10	0	1	15	35	NULL
+v	3	true	1	1	0	12	12	0	1	16	40	NULL
+
+query III
+SELECT (SELECT count(*) FROM ngram_search('pair', 'alpha', col := 's')),
+       (SELECT count(*) FROM ngram_search('pair', 'delta', col := 'u')),
+       (SELECT count(*) FROM ngram_search('pair', 'omega', col := 'v'));
+----
+1	1	1
+
+statement ok
+INSERT INTO pair VALUES ('alpha again', 'delta again', 'omega again');
+
+statement ok
+PRAGMA ngram_refresh('pair', col = 'u'); PRAGMA ngram_refresh('pair', col = 'v');
+
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('pair');
+----
+s	3	true	1	2	1	12	12	0	1	16	40	NULL
+u	3	true	2	2	0	15	19	4	2	24	62	NULL
+v	3	true	2	2	0	17	21	4	2	25	67	NULL
+
+# the refreshed indexes answer from their postings, the other from its tail scan
+query IIII
+SELECT (SELECT count(*) FROM ngram_candidates('pair', 'u', 'again')),
+       (SELECT count(*) FROM ngram_search('pair', 'again', col := 's')),
+       (SELECT count(*) FROM ngram_search('pair', 'again', col := 'u')),
+       (SELECT count(*) FROM ngram_search('pair', 'again', col := 'v'));
+----
+1	1	1	1
+
+statement ok
+PRAGMA drop_ngram_index('pair', 'u'); PRAGMA drop_ngram_index('pair', 'v');
+
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('pair');
+----
+s	3	true	1	2	1	12	12	0	1	16	40	NULL
+
+query III
+SELECT (SELECT count(*) FROM __ngram.registry WHERE table_name = 'pair'),
+       (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'pair'),
+       (SELECT count(*) FROM ngram_search('pair', 'again', col := 's'));
+----
+1	1	1
+
+# Each script is planned when the string is expanded, before the scripts ahead
+# of it run. A guardless table's first two indexes in one string are both
+# planned as the guard's installer, so the second is refused at execution.
+statement ok
+CREATE TABLE pair_other(s VARCHAR, u VARCHAR);
+
+statement ok
+INSERT INTO pair_other VALUES ('sigma tent', 'tau tent');
+
+statement error
+PRAGMA create_ngram_index('pair_other', 's'); PRAGMA create_ngram_index('pair_other', 'u');
+----
+the ngram indexes on pair_other changed while the statement was being prepared; run it again
+
+query I
+SELECT column_name FROM __ngram.registry WHERE table_name = 'pair_other';
+----
+s

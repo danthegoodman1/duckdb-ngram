@@ -1,13 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         ngram
-//
-// ngram/trigram.hpp
-//
-// Shared gram extraction and needle decomposition. Normalization (case
-// folding) is defined here and nowhere else: index build and query-time
-// needle decomposition both go through NormalizeString, so the two sides can
-// never disagree — a mismatch is the one bug class that silently drops rows.
-//
+// ngram/gram.hpp: normalization, gram extraction, needle decomposition, and trigrams().
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -17,6 +9,9 @@
 namespace duckdb {
 namespace ngram {
 
+//! Normalization (case folding) is defined once, here: index build and
+//! query-time needle decomposition both go through NormalizeString, so the two
+//! sides cannot disagree, which is the one bug class that silently drops rows.
 struct GramOptions {
 	idx_t gram_size = 3;
 	bool case_insensitive = true;
@@ -56,7 +51,7 @@ struct NeedleDecomposition {
 
 NeedleDecomposition DecomposeNeedle(const char *data, idx_t len, const GramOptions &options);
 
-void RegisterTrigramsFunction(ExtensionLoader &loader);
+void RegisterGram(ExtensionLoader &loader);
 
 } // namespace ngram
 } // namespace duckdb

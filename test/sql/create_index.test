@@ -428,7 +428,7 @@ SELECT count(*) FROM __ngram.registry WHERE table_name = 'case_drop';
 # Current-schema macros must not be able to shadow internal runtime functions
 # used by generated maintenance SQL.
 statement ok
-CREATE MACRO __ngram_maintenance_guard(a, b, c, d, e, f, g, h, i, j, k, l, m, n) AS error('shadow guard called');
+CREATE MACRO __ngram_maintenance_guard(a) AS error('shadow guard called');
 
 statement ok
 CREATE MACRO trigrams(a, b, c) AS error('shadow trigrams called');

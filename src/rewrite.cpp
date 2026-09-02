@@ -1,31 +1,18 @@
-#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/common/insertion_order_preserving_map.hpp"
-#include "duckdb/common/string_util.hpp"
-#include "duckdb/common/unordered_set.hpp"
-#include "duckdb/execution/expression_executor.hpp"
-#include "duckdb/function/table_function.hpp"
-#include "duckdb/main/client_context.hpp"
-#include "duckdb/main/config.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
-#include "ngram/index_pragmas.hpp"
-#include "ngram/maintenance.hpp"
-#include "ngram/ngram_rewrite.hpp"
-#include "ngram/rowid_guard.hpp"
+#include "ngram/catalog.hpp"
+#include "ngram/index_state.hpp"
 #include "ngram/search_core.hpp"
-#include "ngram/trigram.hpp"
+#include "ngram/settings.hpp"
+#include "ngram_extension.hpp"
 
 namespace duckdb {
 namespace ngram {
@@ -33,68 +20,26 @@ namespace ngram {
 //===----------------------------------------------------------------------===//
 // The transparent query path.
 //
-// A post-optimize OptimizerExtension walks the plan for LogicalGet(seq_scan)
-// nodes whose pushed-down table_filters contain contains(col, 'needle'),
-// LIKE ('~~'), or ILIKE ('~~*') over a column with an ngram index, and swaps
-// get.function / get.bind_data for the NGRAM_INDEX_SCAN table function.
-// Everything else on the node (table_index, returned types/names, column ids,
-// projection ids, the filters themselves) is left untouched, so column
-// bindings and EXPLAIN filter rendering are unchanged.
+// A post-optimize OptimizerExtension swaps get.function / get.bind_data of a
+// seq_scan LogicalGet whose pushed-down table_filters contain
+// contains(col, 'needle'), LIKE ('~~') or ILIKE ('~~*') over an indexed column
+// for the NGRAM_INDEX_SCAN table function; everything else on the node stays,
+// so column bindings and EXPLAIN filter rendering are unchanged.
 //
-// NGRAM_INDEX_SCAN reuses the Phase 3 pipeline: probe the index for candidate
-// rowids, fetch them through DataTable::Fetch, recheck every fetched row
-// against ALL pushed filters (evaluated exactly, via
-// TableFilter::ToExpression — the original query predicate, so query
-// semantics never depend on index normalization), then run a storage tail
-// scan (rowid > high-water mark, covering unindexed and transaction-local
-// rows) with the same filters applied natively by the storage scan. Indexed
-// execution holds a shared vacuum lock through candidate fetch and the
-// rowid-filtered tail; an unfiltered full scan releases it first.
+// NGRAM_INDEX_SCAN runs the search core: candidates from the probe, fetched
+// and rechecked against ALL pushed filters (TableFilter::ToExpression, so
+// semantics never depend on index normalization), then the tail scan with the
+// same filters applied natively. Fallbacks never re-plan: a dropped index,
+// changed options, a failed guard verdict or the selectivity gate degrade the
+// same table function to a full storage scan, what the seq scan would have
+// cost. Non-qualifying shapes and a failed plan-time guard verdict skip the
+// rewrite (TryRewriteGet).
 //
-// Both phases use the shared search core. Probe workers claim one bounded
-// rowid segment at a time, fetch/recheck it, then claim another; storage scan
-// workers use DuckDB's row-group cursor for the tail. Nothing about
-// exhaustiveness changes, and ordered sinks use the reported batch indexes to
-// restore deterministic segment-then-tail order.
-//
-// Fallbacks never re-plan: when the index cannot be used at execution time
-// (dropped index, changed options, selectivity gate) the same table function
-// degrades to a full storage scan with the filters applied natively — a
-// parallel scan over every row group, i.e. what the seq scan it replaced
-// would have cost. The rewrite itself is skipped (leaving the native seq
-// scan) for every non-qualifying shape; see TryRewriteGet.
-//
-// Case semantics (superset invariant): contains/LIKE are case-sensitive and
-// may probe both case-sensitive and case-insensitive indexes (folding merges
-// classes, so a CI index's candidates are a superset; recheck applies the
-// case-sensitive predicate). ILIKE is case-insensitive and may only probe
-// case-insensitive indexes; probing a CS index with an ILIKE needle would
-// miss case-variant matches and is never done.
-//
-// Staleness: the same rowid-guard verdict as the explicit path makes this
-// path decline instead. At plan time it leaves the sequential scan intact; at
-// execution time the replacement performs one full scan. Updates, vacuum,
-// reopen, and uncertain guard state therefore cannot make a rewritten
-// predicate omit rows.
+// Case semantics: contains/LIKE are case-sensitive and may probe either index
+// flavor (folding merges classes, so a CI index's candidates are a superset,
+// and recheck applies the exact predicate); ILIKE may only probe a
+// case-insensitive index, since a CS index would miss case variants.
 //===----------------------------------------------------------------------===//
-
-//! The density gate runs after metadata planning but before postings decode;
-//! its job is choosing between fetching candidates and scanning the table.
-//! Measured fetch cost is ~250-300 ns per candidate at
-//! every scale, and a parallel scan of the whole table costs ~0.04 s at 1 GB,
-//! ~0.35 s at 10 GB and ~3.5 s at 100 GB, which puts the break-even at 1.6%,
-//! 1.3% and 1.1% of rows respectively. One percent is that crossover, rounded
-//! toward scanning. The previous 0.05 was set before fetch was parallel and is
-//! four to five times too permissive: at 100 GB it let a 6.3%-selectivity
-//! needle spend 34.4 s on the index path where the fallback needs 20.1 s and a
-//! plain scan 4.6 s (benchmarks/RESULTS.md).
-static bool AutoAccelerateEnabled(ClientContext &context) {
-	Value value;
-	if (context.TryGetCurrentSetting("ngram_auto_accelerate", value) && !value.IsNull()) {
-		return value.GetValue<bool>();
-	}
-	return false;
-}
 
 //===----------------------------------------------------------------------===//
 // Bind data
@@ -294,28 +239,6 @@ struct NgramScanLocalState final : public LocalTableFunctionState {
 // Execution: init
 //===----------------------------------------------------------------------===//
 
-static DuckTableEntry &ResolveRewriteBase(ClientContext &context, const NgramScanBindData &bind) {
-	auto &base = ResolveExistingTable(context, bind.catalog_name, bind.schema_name, bind.table_name, "table");
-	// a cached plan can outlive DROP+CREATE; re-validate the schema the query
-	// was planned against
-	idx_t position = 0;
-	for (auto &col : base.GetColumns().Logical()) {
-		if (col.Generated() || position >= bind.base_types.size() || col.Name() != bind.base_names[position] ||
-		    col.Type() != bind.base_types[position]) {
-			throw InvalidInputException("ngram accelerated scan: table %s changed since the query was planned; "
-			                            "re-prepare the statement",
-			                            bind.table_name);
-		}
-		position++;
-	}
-	if (position != bind.base_types.size()) {
-		throw InvalidInputException(
-		    "ngram accelerated scan: table %s changed since the query was planned; re-prepare the statement",
-		    bind.table_name);
-	}
-	return base;
-}
-
 //! The conjunction of every non-optional pushed filter over the scanned
 //! chunk. Optional filters (zone-map hints, dynamic TopN/join filters) are
 //! skipped: their contract says executing them is not required for
@@ -352,16 +275,16 @@ static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet
 static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind, NgramScanGlobalState &state) {
 	auto &base = ResolveExistingTable(context, bind.catalog_name, bind.schema_name, bind.table_name, "table");
 	ResolvedTarget target {bind.catalog_name, bind.schema_name, bind.table_name, bind.column_name, &base};
-	if (!IndexLocationAvailable(context, target, bind.location, true)) {
+	auto verdict = ValidateIndex(context, target, bind.location);
+	if (verdict.availability != IndexAvailability::AVAILABLE) {
 		state.fallback_reason = "index unavailable";
 		return false;
 	}
-	auto info = ReadMeta(context, bind.catalog_name, bind.location);
-	auto guard_reason = RowIdGuardReason(context, base, info);
-	if (!guard_reason.empty()) {
-		state.fallback_reason = "rowid guard: " + guard_reason;
+	if (!verdict.reason.empty()) {
+		state.fallback_reason = "rowid guard: " + verdict.reason;
 		return false;
 	}
+	auto &info = verdict.meta;
 	auto usable = UsableNeedles(bind.needles, info.options);
 	if (usable.empty()) {
 		// only possible when the index was rebuilt with different options
@@ -411,7 +334,9 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 	auto &bind = input.bind_data->Cast<NgramScanBindData>();
 	auto state = make_uniq<NgramScanGlobalState>();
 
-	auto &base = ResolveRewriteBase(context, bind);
+	auto &base = ResolveBoundBase(
+	    context, bind.catalog_name, bind.schema_name, bind.table_name, bind.base_names, bind.base_types,
+	    "ngram accelerated scan: table %s changed since the query was planned; re-prepare the statement");
 	auto &storage = base.GetStorage();
 	state->core.storage = &storage;
 	state->core.tx = &DuckTransaction::Get(context, base.ParentCatalog());
@@ -630,14 +555,14 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		if (!found) {
 			continue;
 		}
-		if (!IndexLocationAvailable(context, resolved, location)) {
+		auto verdict = ValidateIndex(context, resolved, location);
+		if (verdict.availability == IndexAvailability::CHANGED) {
+			throw InvalidInputException(verdict.reason);
+		}
+		if (verdict.availability != IndexAvailability::AVAILABLE || !verdict.reason.empty()) {
 			continue;
 		}
-		auto info = ReadMeta(context, catalog_name, location);
-		if (!RowIdGuardReason(context, table->Cast<DuckTableEntry>(), info).empty()) {
-			continue;
-		}
-		auto usable = UsableNeedles(needles, info.options);
+		auto usable = UsableNeedles(needles, verdict.meta.options);
 		if (usable.empty()) {
 			// short needles, or ILIKE against a case-sensitive index
 			continue;
@@ -689,10 +614,6 @@ static void NgramOptimizeFunction(OptimizerExtensionInput &input, unique_ptr<Log
 
 void RegisterRewrite(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
-	config.AddExtensionOption("ngram_auto_accelerate",
-	                          "rewrite contains/LIKE/ILIKE filters over ngram-indexed columns into index scans "
-	                          "(opt-in; exact queries fall back when probe resources or density are too high)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	OptimizerExtension extension;
 	extension.optimize_function = NgramOptimizeFunction;
 	OptimizerExtension::Register(config, std::move(extension));

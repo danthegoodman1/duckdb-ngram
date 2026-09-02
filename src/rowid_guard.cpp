@@ -1,40 +1,19 @@
 #include "ngram/rowid_guard.hpp"
 
-#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
-#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
-#include "duckdb/common/exception.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
-#include "duckdb/execution/index/bound_index.hpp"
-#include "duckdb/execution/index/index_type.hpp"
-#include "duckdb/execution/index/unbound_index.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/schema/physical_create_index.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/config.hpp"
-#include "duckdb/main/attached_database.hpp"
-#include "duckdb/main/client_context.hpp"
-#include "duckdb/main/connection.hpp"
 #include "duckdb/main/connection_manager.hpp"
-#include "duckdb/main/database.hpp"
-#include "duckdb/main/database_manager.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/planner/operator/logical_create_index.hpp"
 #include "duckdb/planner/extension_callback.hpp"
-#include "duckdb/parser/expression/columnref_expression.hpp"
-#include "duckdb/storage/data_table.hpp"
+#include "duckdb/planner/operator/logical_create_index.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
-#include "duckdb/storage/table_io_manager.hpp"
 #include "duckdb/storage/table/append_state.hpp"
-#include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
-#include "ngram/index_pragmas.hpp"
-#include "ngram/maintenance.hpp"
-#include "ngram/search_core.hpp"
 
-#include <algorithm>
 #include <atomic>
 
 namespace duckdb {
@@ -55,7 +34,6 @@ static constexpr idx_t MIN_SOURCE_ID_LENGTH = 7;
 static constexpr const char *DUCKDB_SOURCE_ID = "d8cdaa33";
 static constexpr const char *OPTION_VERSION = "ngram_guard_version";
 static constexpr const char *OPTION_SOURCE = "ngram_duckdb_source_id";
-static constexpr const char *OPTION_TOKEN = "ngram_guard_token";
 static constexpr const char *OPTION_CHECKPOINT = "ngram_guard_checkpoint_iteration";
 static constexpr const char *OPTION_PROTECTION = "ngram_guard_protection_compatible";
 
@@ -93,7 +71,7 @@ void InitializeRowIdGuardHostRuntime(ExtensionLoader &loader) {
 	host_runtime_state.compare_exchange_strong(expected, HostRuntimeState::COMPATIBLE);
 }
 
-static uint64_t CheckpointIteration(AttachedDatabase &db) {
+uint64_t CheckpointIteration(AttachedDatabase &db) {
 	auto &storage = db.GetStorageManager();
 	return storage.InMemory() ? 0 : storage.GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
 }
@@ -119,8 +97,13 @@ static optional_idx ObservableCheckpointIteration(AttachedDatabase &db) {
 	return storage.GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
 }
 
-static bool RowIdGuardRuntimeCompatible() {
+bool RowIdGuardRuntimeCompatible() {
 	return host_runtime_state.load() == HostRuntimeState::COMPATIBLE;
+}
+
+string HostRuntimeMismatchReason() {
+	return StringUtil::Format("the host runtime does not match pinned DuckDB %s commit %s", DUCKDB_VERSION,
+	                          DUCKDB_SOURCE_COMMIT);
 }
 
 static const Value &RequireOption(const case_insensitive_map_t<Value> &options, const char *name) {
@@ -131,21 +114,13 @@ static const Value &RequireOption(const case_insensitive_map_t<Value> &options, 
 	return entry->second;
 }
 
-struct StoredGuardState {
-	string token;
-	int64_t max_seen = -1;
-	bool unsafe_reuse = true;
-	bool protection_compatible = false;
-	optional_idx checkpoint_iteration;
-};
-
-static StoredGuardState ReadStoredGuardState(const IndexStorageInfo &storage) {
+StoredGuardState ReadStoredGuardState(const IndexStorageInfo &storage) {
 	StoredGuardState result;
 	try {
 		if (!storage.IsValid()) {
 			return result;
 		}
-		result.token = StringValue::Get(RequireOption(storage.options, OPTION_TOKEN));
+		result.token = StringValue::Get(RequireOption(storage.options, NGRAM_GUARD_TOKEN_OPTION));
 		result.max_seen = RequireOption(storage.options, OPTION_MAX_SEEN).GetValue<int64_t>();
 		result.unsafe_reuse = RequireOption(storage.options, OPTION_UNSAFE).GetValue<bool>();
 		auto version = RequireOption(storage.options, OPTION_VERSION).GetValue<int64_t>();
@@ -236,9 +211,6 @@ public:
 	void VerifyAllocations(IndexLock &) override {
 	}
 
-	void VerifyBuffers(IndexLock &) override {
-	}
-
 	void ResetStorage(IndexLock &) override {
 		unsafe_reuse = true;
 	}
@@ -276,15 +248,7 @@ public:
 		return result;
 	}
 
-	struct State {
-		string token;
-		int64_t max_seen;
-		bool unsafe_reuse;
-		bool protection_compatible;
-		vector<column_t> column_ids;
-	};
-
-	State GetState(optional_idx current_iteration = optional_idx()) {
+	RowIdGuardState GetState(optional_idx current_iteration) {
 		lock_guard<mutex> guard(lock);
 		if (current_iteration.IsValid()) {
 			ApplyCheckpointSeal(current_iteration.GetIndex());
@@ -294,18 +258,15 @@ public:
 
 private:
 	//! Fold one appended rowid range into the guard. A range at or below
-	//! max_seen has two possible histories. Either a checkpoint vacuumed fully
-	//! deleted trailing row groups and the table handed their rowids out again,
-	//! which must latch, or an earlier commit advanced max_seen and then failed
-	//! in a later index (a UNIQUE ART rejecting a duplicate key), so no row
-	//! landed and the same range is handed out again, which must not. A vacuum
-	//! needs the exclusive vacuum lock, which every inserting transaction holds
-	//! shared from its first insert to the end of its commit, so a vacuum can
-	//! only fall strictly between two appends and every file checkpoint bumps
-	//! the header iteration. The range therefore latches only when the
-	//! iteration differs from the one recorded at the last advance, or when
-	//! either value is unknown (in-memory database, a checkpoint in progress, or
-	//! a guard bound from disk or WAL).
+	//! max_seen has two histories: a checkpoint vacuumed fully deleted trailing
+	//! row groups and the table reissued their rowids, which must latch, or an
+	//! earlier commit advanced max_seen and then failed in a later index (a
+	//! UNIQUE ART rejecting a key), so the same range is reissued, which must
+	//! not. Every inserting transaction holds the vacuum lock shared from its
+	//! first insert to the end of its commit and every file checkpoint bumps
+	//! the header iteration, so the range latches only when the iteration
+	//! differs from the one recorded at the last advance or either is unknown
+	//! (in-memory database, checkpoint in progress, guard bound from disk/WAL).
 	void Observe(int64_t first, int64_t last) {
 		if (first <= max_seen) {
 			auto current = ObservableCheckpointIteration(db);
@@ -334,7 +295,7 @@ private:
 		result.root = 0;
 		result.options[OPTION_VERSION] = Value::BIGINT(GUARD_VERSION);
 		result.options[OPTION_SOURCE] = Value(DUCKDB_SOURCE_ID);
-		result.options[OPTION_TOKEN] = Value(token);
+		result.options[NGRAM_GUARD_TOKEN_OPTION] = Value(token);
 		result.options[OPTION_MAX_SEEN] = Value::BIGINT(serialized_max_seen);
 		result.options[OPTION_UNSAFE] = Value::BOOLEAN(serialized_unsafe_reuse);
 		result.options[OPTION_CHECKPOINT] = Value::UBIGINT(checkpoint_iteration);
@@ -367,7 +328,7 @@ public:
 
 class GuardBuildLocalState final : public IndexBuildLocalState {};
 
-static void RequirePinnedRuntime() {
+void RequirePinnedRuntime() {
 	if (!RowIdGuardRuntimeCompatible()) {
 		throw InvalidInputException("ngram rowid guard requires host DuckDB %s built from commit %s", DUCKDB_VERSION,
 		                            DUCKDB_SOURCE_COMMIT);
@@ -453,176 +414,13 @@ static IndexType GuardIndexType() {
 	return result;
 }
 
-static unique_ptr<RowIdGuard::State> ReadGuardState(DuckTableEntry &table, const string &column_name,
-                                                    const string &guard_name, string &reason,
-                                                    optional_idx checkpoint_iteration = optional_idx()) {
-	if (guard_name.empty()) {
-		reason = "the index does not record a valid rowid guard";
-		return nullptr;
-	}
-	auto &storage = table.GetStorage();
-	auto has_column = table.ColumnExists(column_name);
-	StorageIndex expected_column;
-	if (has_column) {
-		expected_column = table.GetStorageIndex(ColumnIndex(table.GetColumn(column_name).Logical().index));
-	}
-	for (auto &entry : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
-		auto &index = *entry.index;
-		if (index.GetIndexName() != guard_name) {
-			continue;
-		}
-		if (entry.bind_state.load() == IndexBindState::BINDING) {
-			reason = "the recorded rowid guard is in an uncertain bind state";
-			return nullptr;
-		}
-		if (!has_column || index.GetIndexType() != NGRAM_ROWID_GUARD_TYPE ||
-		    std::find(index.GetColumnIds().begin(), index.GetColumnIds().end(), expected_column.GetPrimaryIndex()) ==
-		        index.GetColumnIds().end()) {
-			reason = "the recorded rowid guard has the wrong type or column dependency";
-			return nullptr;
-		}
-		if (index.IsBound()) {
-			return make_uniq<RowIdGuard::State>(index.Cast<RowIdGuard>().GetState(checkpoint_iteration));
-		}
-		auto &unbound = index.Cast<UnboundIndex>();
-		auto stored = ReadStoredGuardState(unbound.GetStorageInfo());
-		if (checkpoint_iteration.IsValid() &&
-		    (!stored.checkpoint_iteration.IsValid() ||
-		     stored.checkpoint_iteration.GetIndex() != checkpoint_iteration.GetIndex())) {
-			stored.unsafe_reuse = true;
-		}
-		bool buffered;
-		{
-			// DataTable::AppendToIndexes buffers replay chunks under entry.lock
-			// while IndexEntries() holds only the list lock; take the same lock
-			// to read the buffer.
-			lock_guard<mutex> entry_guard(entry.lock);
-			buffered = unbound.HasBufferedReplays();
-		}
-		if (buffered) {
-			// The exact rowid effects are deliberately left to DuckDB's replay
-			// binder; until then, one full scan is the only safe answer.
-			stored.unsafe_reuse = true;
-		}
-		auto result = make_uniq<RowIdGuard::State>();
-		result->token = std::move(stored.token);
-		result->max_seen = stored.max_seen;
-		result->unsafe_reuse = stored.unsafe_reuse;
-		result->protection_compatible = stored.protection_compatible;
-		result->column_ids = index.GetColumnIds();
-		return result;
-	}
-	reason = "the recorded rowid guard is missing";
-	return nullptr;
-}
-
-string InstalledRowIdGuardToken(DuckTableEntry &table, const string &column_name, const string &guard_name) {
-	RequirePinnedRuntime();
-	string reason;
-	auto guard = ReadGuardState(table, column_name, guard_name, reason);
-	if (!guard) {
-		throw TransactionException("ngram creation cannot finish because the fresh rowid guard is unavailable: %s",
-		                           reason);
-	}
-	if (!guard->protection_compatible) {
-		throw TransactionException(
-		    "ngram creation cannot finish because the fresh rowid guard is incompatible with this extension build");
-	}
-	return guard->token;
-}
-
-static bool CanBindRowIdGuards(DuckTableEntry &table, bool require_compatible);
-
-//! Empty when the guard named by a registry row is absent or is exactly the
-//! recorded incarnation (name, type, table, token); otherwise why the drop
-//! must not touch the index carrying that name.
-static string RowIdGuardDropReason(ClientContext &context, DuckTableEntry &table, const string &guard_name,
-                                   const string &guard_token, bool bind_unbound = true) {
-	if (guard_name.empty() || guard_token.empty()) {
-		return "the index does not record a valid rowid guard name and token";
-	}
-
-	auto &storage = table.GetStorage();
-	EntryLookupInfo lookup(CatalogType::INDEX_ENTRY, guard_name);
-	auto catalog_entry = Catalog::GetEntry(context, table.ParentCatalog().GetName(), table.ParentSchema().name, lookup,
-	                                       OnEntryNotFound::RETURN_NULL);
-	if (catalog_entry) {
-		auto &index_entry = catalog_entry->Cast<DuckIndexEntry>();
-		if (index_entry.index_type != NGRAM_ROWID_GUARD_TYPE ||
-		    &index_entry.GetDataTableInfo() != storage.GetDataTableInfo().get()) {
-			return "an index with the recorded guard name belongs to a different table or type";
-		}
-	}
-
-	bool needs_bind = false;
-	for (auto &entry : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
-		auto &index = *entry.index;
-		if (index.GetIndexName() != guard_name) {
-			continue;
-		}
-		if (!catalog_entry) {
-			return "the recorded rowid guard exists in table storage but not in the index catalog";
-		}
-		if (entry.bind_state.load() == IndexBindState::BINDING) {
-			return "the recorded rowid guard is being bound; retry the drop";
-		}
-		if (index.GetIndexType() != NGRAM_ROWID_GUARD_TYPE) {
-			return "the recorded rowid guard has the wrong type";
-		}
-		string token;
-		if (index.IsBound()) {
-			token = index.Cast<RowIdGuard>().GetState().token;
-		} else {
-			auto &options = index.Cast<UnboundIndex>().GetStorageInfo().options;
-			auto token_entry = options.find(OPTION_TOKEN);
-			if (token_entry == options.end() || token_entry->second.IsNull()) {
-				return "the unbound rowid guard does not persist an incarnation token";
-			}
-			token = StringValue::Get(token_entry->second);
-			needs_bind = true;
-		}
-		if (token != guard_token) {
-			return "the recorded rowid guard was dropped and re-created";
-		}
-		if (!needs_bind) {
-			return string();
-		}
-		break;
-	}
-	if (needs_bind) {
-		if (!bind_unbound) {
-			return "the recorded rowid guard remained unbound; retry the drop";
-		}
-		// BindIndexes binds every guard of this type. Pre-screen all of them so
-		// no malformed expression can leave DuckDB's v1.5.5 bind state poisoned.
-		// Persisted state/source mismatches are intentionally tolerated by
-		// GuardCreateInstance and become bound quarantine guards.
-		if (!CanBindRowIdGuards(table, false)) {
-			return "an unbound rowid guard cannot be safely bound; retry after other guard activity finishes";
-		}
-		try {
-			storage.GetDataTableInfo()->BindIndexes(context, NGRAM_ROWID_GUARD_TYPE);
-		} catch (std::exception &ex) {
-			return StringUtil::Format("the recorded rowid guard could not be bound safely: %s",
-			                          ErrorData(ex).RawMessage());
-		}
-		// Success is safe only after re-reading the catalog and physical entry as
-		// BOUND. A bound index cannot later enter the raw-pointer BINDING path.
-		return RowIdGuardDropReason(context, table, guard_name, guard_token, false);
-	}
-	if (catalog_entry) {
-		return "the recorded rowid guard is cataloged but missing from table storage";
-	}
-	return string();
-}
-
 struct GuardTableName {
 	string catalog;
 	string schema;
 	string table;
 };
 
-static bool CanBindRowIdGuards(DuckTableEntry &table, bool require_compatible) {
+bool CanBindRowIdGuards(DuckTableEntry &table, bool require_compatible) {
 	if (require_compatible && !RowIdGuardRuntimeCompatible()) {
 		return false;
 	}
@@ -733,22 +531,8 @@ public:
 	}
 };
 
-//! The execution-time check before a generated drop script drops a guard:
-//! (catalog, schema, table, guard_name, guard_token).
-static void RowIdGuardValidateFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto output = FlatVector::GetData<bool>(result);
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto &table = ResolveExistingTable(context, args.GetValue(0, row).ToString(), args.GetValue(1, row).ToString(),
-		                                   args.GetValue(2, row).ToString(), "ngram index base table");
-		auto reason =
-		    RowIdGuardDropReason(context, table, args.GetValue(3, row).ToString(), args.GetValue(4, row).ToString());
-		if (!reason.empty()) {
-			throw InvalidInputException("ngram rowid guard validation failed: %s", reason);
-		}
-		output[row] = true;
-	}
+RowIdGuardState ReadBoundGuardState(Index &index, optional_idx current_iteration) {
+	return index.Cast<RowIdGuard>().GetState(current_iteration);
 }
 
 void RegisterRowIdGuard(ExtensionLoader &loader) {
@@ -756,65 +540,6 @@ void RegisterRowIdGuard(ExtensionLoader &loader) {
 	auto &types = config.GetIndexTypes();
 	types.RegisterIndexType(GuardIndexType());
 	ExtensionCallback::Register(config, make_shared_ptr<RowIdGuardBindCallback>());
-
-	auto validate = ScalarFunction(
-	    NGRAM_ROWID_GUARD_VALIDATE,
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	    LogicalType::BOOLEAN, RowIdGuardValidateFunction);
-	validate.stability = FunctionStability::VOLATILE;
-	validate.SetFallible();
-	loader.RegisterFunction(validate);
-}
-
-static unique_ptr<RowIdGuard::State> ReadExactGuard(DuckTableEntry &table, const MetaInfo &meta, string &reason,
-                                                    optional_idx checkpoint_iteration = optional_idx()) {
-	if (!RowIdGuardRuntimeCompatible()) {
-		reason = StringUtil::Format("the host runtime does not match pinned DuckDB %s commit %s", DUCKDB_VERSION,
-		                            DUCKDB_SOURCE_COMMIT);
-		return nullptr;
-	}
-	if (meta.guard_token.empty()) {
-		reason = "the index does not record a valid rowid guard";
-		return nullptr;
-	}
-	auto state = ReadGuardState(table, meta.column_name, meta.guard_name, reason, checkpoint_iteration);
-	if (!state) {
-		return nullptr;
-	}
-	if (state->token != meta.guard_token) {
-		reason = "the recorded rowid guard was dropped and re-created";
-		return nullptr;
-	}
-	if (!state->protection_compatible) {
-		reason = "the recorded rowid guard is incompatible with this extension build";
-		return nullptr;
-	}
-	return state;
-}
-
-string RowIdGuardReason(ClientContext &context, DuckTableEntry &table, const MetaInfo &meta) {
-	if (!RowIdGuardRuntimeCompatible()) {
-		return StringUtil::Format("the host runtime does not match pinned DuckDB %s commit %s", DUCKDB_VERSION,
-		                          DUCKDB_SOURCE_COMMIT);
-	}
-	auto &manager = DuckTransaction::Get(context, table.ParentCatalog()).GetTransactionManager();
-	unique_ptr<StorageLockKey> checkpoint_lock;
-	if (!ContextOwnsCreationBarrier(context, manager)) {
-		checkpoint_lock = manager.SharedCheckpointLock();
-	}
-	auto checkpoint_iteration = CheckpointIteration(table.GetStorage().db);
-	string reason;
-	auto state = ReadExactGuard(table, meta, reason, checkpoint_iteration);
-	if (!state) {
-		return reason;
-	}
-	if (state->max_seen < meta.hwm_rowid) {
-		return "the rowid guard has not observed the index high-water mark";
-	}
-	if (state->unsafe_reuse) {
-		return "the rowid guard cannot exclude reuse of rowids already covered by the ngram index";
-	}
-	return string();
 }
 
 } // namespace ngram

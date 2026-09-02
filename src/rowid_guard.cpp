@@ -211,6 +211,11 @@ public:
 	void VerifyAllocations(IndexLock &) override {
 	}
 
+	// The BoundIndex default throws; DEBUG builds call this on every bound index
+	// after appends (duckdb/src/storage/local_storage.cpp:626, data_table.cpp:430 and :1352).
+	void VerifyBuffers(IndexLock &) override {
+	}
+
 	void ResetStorage(IndexLock &) override {
 		unsafe_reuse = true;
 	}

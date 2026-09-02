@@ -440,7 +440,7 @@ Status ledger:
 | Incomplete | Test | 22A: Maintenance versus search races | Missing: `concurrentloop` blocks in `ngram_refresh_concurrent.test` and `ngram_search_concurrent.test` with `statement maybe` on conflicts. |
 | Incomplete | Test | 22B: Long strings and Unicode ILIKE parity | Missing: rows over 4 KiB and 64 KiB with needles straddling 4 KiB in `ngram_search_differential.test` and `scripts` corpus; Kelvin sign, dotted I, capital sharp s, Cherokee, Deseret needles in `ngram_rewrite.test`. |
 | Incomplete | Test | 22C: Committed format fixture | Missing: a small format-4 database under `test/fixtures/` opened read-only and queried. |
-| Incomplete | Work | 22D: Harness split and determinism | Missing: per-mechanism files; SQL-only cases moved; `--only`; latch-based cancellation; timing report-only. |
+| Incomplete | Work | 22D: Harness split and determinism | Missing: per-mechanism files; SQL-only cases moved; `--only`; latch-based cancellation; timing report-only; the harness's POSIX-only child-process code (`<sys/wait.h>`, `WIFEXITED`) either gains a Windows path or the target is documented as Linux-only, since the distribution matrix never compiles it today. |
 | Incomplete | Work | 22E: Shared Python harness core | Missing: `scripts/ngramharness/{cli,corpus,oracle}.py`; three drivers under about 120 lines each. |
 | Incomplete | Work | 22F: Nightly lane and warnings | Missing: `.github/workflows/Nightly.yml`; ASAN selector adds the concurrency files; `NGRAM_WERROR` option; `tidy-check` step; `cmake_minimum_required` at 3.10 or later. |
 | Incomplete | Gate | Nightly green, deterministic harness | Missing: nightly run URL; grep proving no `_ms >` assertions remain; line counts. |
@@ -486,6 +486,6 @@ Status ledger:
 | Incomplete | Doc | 23A: README diet and `docs/` split | Missing: README line count; new `docs/*.md` files; every moved section linked. |
 | Incomplete | Doc | 23B: Plans and design note relocated | Missing: `docs/plan/`, `docs/design.md`, README reference removed. |
 | Incomplete | Doc | 23C: Template boilerplate rewritten or deleted | Missing: `docs/UPDATING.md`, `test/README.md`, `scripts/extension-upload.sh` deleted, `vcpkg.json` trimmed. |
-| Incomplete | Doc | 23D: Benchmark documents and packaging | Missing: single-owner evidence block; three stale references fixed; `prepare` subcommand; golden trimmed; `SUBMISSION.md` and `description.yml` corrected. |
+| Incomplete | Doc | 23D: Benchmark documents and packaging | Missing: single-owner evidence block; three stale references fixed; `prepare` subcommand; golden trimmed; `SUBMISSION.md` and `description.yml` corrected (including `description.yml:65`, which still lists the two literal source-id forms the guard no longer requires); `release_evidence.py` `runtime_identity` adopts the guard's commit-prefix rule instead of the exact `d8cdaa33` compare so the repo carries one definition of the host pin. |
 | Incomplete | Work | 23E: Re-collected evidence and release tag | Missing: new `enwik9-current-v1.json` after Phase 20; matrix run URL on the tag commit; tag `v0.1.0`. |
 | Incomplete | Gate | Traceable docs on a green matrix | Missing: check output, README line count, run URL, tag. |

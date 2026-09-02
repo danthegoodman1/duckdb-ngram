@@ -799,7 +799,7 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 	}
 	std::stable_sort(order.begin(), order.end(),
 	                 [&](idx_t a, idx_t b) { return all_stats[a].row_count < all_stats[b].row_count; });
-	order.resize(MinValue(order.size(), max_grams));
+	order.resize(MinValue<idx_t>(order.size(), max_grams));
 	vector<GramStats> selected_stats;
 	selected_stats.reserve(order.size());
 	plan->grams.reserve(order.size());

@@ -46,6 +46,14 @@ static constexpr const char *OPTION_MAX_SEEN = "ngram_guard_max_seen";
 static constexpr const char *OPTION_UNSAFE = "ngram_guard_unsafe_reuse";
 static constexpr int64_t GUARD_VERSION = 1;
 static constexpr const char *DUCKDB_VERSION = "v1.5.5";
+//! The DuckDB commit the guard is pinned to. A host reports an abbreviation of
+//! it as pragma_version().source_id whose length follows the build's git
+//! configuration: eight characters from a full clone, ten in the official binary.
+static constexpr const char *DUCKDB_SOURCE_COMMIT = "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa";
+static constexpr idx_t MIN_SOURCE_ID_LENGTH = 7;
+//! The source tag persisted in every guard's storage options and compared
+//! exactly on read. Guards already on disk carry this literal, so it stays
+//! fixed independently of how the host abbreviates the commit.
 static constexpr const char *DUCKDB_SOURCE_ID = "d8cdaa33";
 static constexpr const char *OPTION_VERSION = "ngram_guard_version";
 static constexpr const char *OPTION_SOURCE = "ngram_duckdb_source_id";
@@ -57,6 +65,14 @@ enum class HostRuntimeState : uint8_t { UNKNOWN, COMPATIBLE, INCOMPATIBLE };
 
 static atomic<HostRuntimeState> host_runtime_state {HostRuntimeState::UNKNOWN};
 
+//! True when source is an abbreviation of DUCKDB_SOURCE_COMMIT with at least
+//! MIN_SOURCE_ID_LENGTH characters.
+static bool SourceIdMatchesPinnedCommit(const string &source) {
+	const string commit(DUCKDB_SOURCE_COMMIT);
+	return source.size() >= MIN_SOURCE_ID_LENGTH && source.size() <= commit.size() &&
+	       commit.compare(0, source.size(), source) == 0;
+}
+
 void InitializeRowIdGuardHostRuntime(ExtensionLoader &loader) {
 	bool compatible = false;
 	try {
@@ -67,7 +83,7 @@ void InitializeRowIdGuardHostRuntime(ExtensionLoader &loader) {
 		if (!result->HasError()) {
 			auto version = result->GetValue(0, 0).ToString();
 			auto source = result->GetValue(1, 0).ToString();
-			compatible = version == DUCKDB_VERSION && (source == DUCKDB_SOURCE_ID || source == "d8cdaa33fd");
+			compatible = version == DUCKDB_VERSION && SourceIdMatchesPinnedCommit(source);
 		}
 	} catch (std::exception &) {
 	}
@@ -355,8 +371,8 @@ class GuardBuildLocalState final : public IndexBuildLocalState {};
 
 static void RequirePinnedRuntime() {
 	if (!RowIdGuardRuntimeCompatible()) {
-		throw InvalidInputException("ngram rowid guard requires host DuckDB %s source %s or d8cdaa33fd", DUCKDB_VERSION,
-		                            DUCKDB_SOURCE_ID);
+		throw InvalidInputException("ngram rowid guard requires host DuckDB %s built from commit %s", DUCKDB_VERSION,
+		                            DUCKDB_SOURCE_COMMIT);
 	}
 }
 
@@ -816,8 +832,8 @@ void RegisterRowIdGuard(ExtensionLoader &loader) {
 static unique_ptr<RowIdGuard::State> ReadExactGuard(DuckTableEntry &table, const MetaInfo &meta, string &reason,
                                                     optional_idx checkpoint_iteration = optional_idx()) {
 	if (!RowIdGuardRuntimeCompatible()) {
-		reason = StringUtil::Format("the host runtime does not match pinned DuckDB %s source %s or d8cdaa33fd",
-		                            DUCKDB_VERSION, DUCKDB_SOURCE_ID);
+		reason = StringUtil::Format("the host runtime does not match pinned DuckDB %s commit %s", DUCKDB_VERSION,
+		                            DUCKDB_SOURCE_COMMIT);
 		return nullptr;
 	}
 	if (meta.guard_token.empty()) {
@@ -841,8 +857,8 @@ static unique_ptr<RowIdGuard::State> ReadExactGuard(DuckTableEntry &table, const
 
 string RowIdGuardReason(ClientContext &context, DuckTableEntry &table, const MetaInfo &meta) {
 	if (!RowIdGuardRuntimeCompatible()) {
-		return StringUtil::Format("the host runtime does not match pinned DuckDB %s source %s or d8cdaa33fd",
-		                          DUCKDB_VERSION, DUCKDB_SOURCE_ID);
+		return StringUtil::Format("the host runtime does not match pinned DuckDB %s commit %s", DUCKDB_VERSION,
+		                          DUCKDB_SOURCE_COMMIT);
 	}
 	auto &manager = DuckTransaction::Get(context, table.ParentCatalog()).GetTransactionManager();
 	unique_ptr<StorageLockKey> checkpoint_lock;

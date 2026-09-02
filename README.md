@@ -616,10 +616,12 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
 - Guarded tables require `ngram` to be loaded for supported DML. Without it,
   treat the base table as read-only; v1.5.5 DELETE may busy-spin while trying
   to bind the unknown custom index type.
-- The rowid guard is pinned to host-reported DuckDB v1.5.5 source
-  `d8cdaa33` (local build) or `d8cdaa33fd` (official binary). Other hosts load
-  only for fail-closed inspection and cleanup; create/query/maintenance refuse
-  to trust the custom index internals.
+- The rowid guard is pinned to host-reported DuckDB v1.5.5 built from commit
+  `d8cdaa33fd…`; it accepts any abbreviation of that commit with seven or more
+  characters as `pragma_version().source_id` (`d8cdaa33` from a local build,
+  `d8cdaa33fd` from the official binary). Other hosts load only for
+  fail-closed inspection and cleanup; create/query/maintenance refuse to trust
+  the custom index internals.
 - A first build invalidates DuckDB's reservoir sample and may make overlapping
   writers retry. Guard dependencies restrict column/table rename and dependent
   DROP/ALTER operations until the ngram index is dropped. On v1.5.5, table

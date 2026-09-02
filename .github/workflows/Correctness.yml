@@ -18,6 +18,11 @@ concurrency:
 # assertions below keep their meaning while the DuckDB core compiles once per
 # pin. The third job needs no build: it runs the strict evidence check on
 # release tags and manual dispatches.
+#
+# The shallow checkouts fetch no tags, so DuckDB's CMake cannot git-describe the
+# pinned submodule commit. OVERRIDE_GIT_DESCRIBE names the tag instead; the
+# built library then reports v1.5.5 with the commit's abbreviated hash from
+# pragma_version(), which the rowid guard and the C++ harness pin against.
 
 jobs:
   release-correctness:
@@ -26,6 +31,7 @@ jobs:
     timeout-minutes: 90
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 3
+      OVERRIDE_GIT_DESCRIBE: v1.5.5
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -120,6 +126,7 @@ jobs:
     timeout-minutes: 120
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
+      OVERRIDE_GIT_DESCRIBE: v1.5.5
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -152,6 +159,7 @@ jobs:
           test ! -e build/ci-debug
           timeout 600s cmake -G Ninja \
             -DEXTENSION_STATIC_BUILD=1 \
+            -DOVERRIDE_GIT_DESCRIBE="$OVERRIDE_GIT_DESCRIBE" \
             -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
             -DUNITTEST_ROOT_DIRECTORY="$GITHUB_WORKSPACE" \
             -DENABLE_UNITTEST_CPP_TESTS=FALSE \
@@ -174,6 +182,7 @@ jobs:
           set -euo pipefail
           for expected in \
             CMAKE_BUILD_TYPE:STRING=Debug \
+            OVERRIDE_GIT_DESCRIBE:UNINITIALIZED=v1.5.5 \
             ENABLE_SANITIZER:BOOL=ON \
             ENABLE_UBSAN:BOOL=ON \
             EXTENSION_STATIC_BUILD:BOOL=1 \

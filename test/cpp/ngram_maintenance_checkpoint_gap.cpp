@@ -476,7 +476,12 @@ static void TestCreationSchedules(const string &path) {
 		auto version = Query(host, "SELECT library_version, source_id FROM system.main.pragma_version()");
 		auto library_version = version->GetValue(0, 0).ToString();
 		auto source_id = version->GetValue(1, 0).ToString();
-		if (library_version != "v1.5.5" || (source_id != "d8cdaa33" && source_id != "d8cdaa33fd")) {
+		// The extension's pin: v1.5.5 built from this commit, with source_id an
+		// abbreviation of it that has at least seven characters.
+		const string pinned_commit = "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa";
+		bool pinned_source = source_id.size() >= 7 && source_id.size() <= pinned_commit.size() &&
+		                     pinned_commit.compare(0, source_id.size(), source_id) == 0;
+		if (library_version != "v1.5.5" || !pinned_source) {
 			throw std::runtime_error("host pragma_version is outside the pinned rowid-guard runtime");
 		}
 	}

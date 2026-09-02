@@ -489,14 +489,18 @@ static vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string
 		observed.location = LocationOf(row, registry.oid);
 		observed.format_version = row.format_version;
 		observed.legacy = registry.legacy_shape;
+		// The row consumes its storage entry; whatever remains in storage
+		// afterwards has no registry row. Read the entry before erasing it.
+		bool storage_complete = false;
 		auto tables = storage.find(row.index_ref);
 		if (tables != storage.end()) {
+			storage_complete = tables->second.first && tables->second.second;
 			storage.erase(tables);
 		}
 		if (!row.error.empty()) {
 			observed.status = "MALFORMED";
 			observed.reason = row.error;
-		} else if (tables == storage.end() || !tables->second.first || !tables->second.second) {
+		} else if (!storage_complete) {
 			observed.status = "MALFORMED";
 			observed.reason = "a storage table is missing";
 		} else {

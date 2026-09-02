@@ -8,10 +8,13 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Run the deterministic preprocessing/checkpoint gap harness beside the
-# SQLLogicTests in every native test configuration.
+# SQLLogicTests on Linux and macOS. The harness uses POSIX process control and
+# is not built on Windows, whose environment sets OS=Windows_NT for make.
+ifneq ($(OS),Windows_NT)
 test_release_internal: ngram_checkpoint_gap_release
 test_debug_internal: ngram_checkpoint_gap_debug
 test_reldebug_internal: ngram_checkpoint_gap_reldebug
+endif
 
 .PHONY: ngram_checkpoint_gap_release ngram_checkpoint_gap_debug ngram_checkpoint_gap_reldebug
 ngram_checkpoint_gap_release:

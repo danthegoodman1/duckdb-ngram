@@ -360,25 +360,24 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 		observed.reason = std::move(reason);
 		return observed;
 	};
-	// Storage tables present in the schema, by index id: (segments, stats).
-	unordered_map<string, pair<bool, bool>> storage;
+	// Segments tables present in the schema, by index id.
+	unordered_set<string> storage;
 	vector<ObservedIndex> foreign;
 	auto schema = Catalog::GetSchema(context, catalog_name, NGRAM_SCHEMA, OnEntryNotFound::RETURN_NULL);
 	if (schema) {
 		schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
 			string index_ref;
-			bool segments = false;
 			bool table = entry.type == CatalogType::TABLE_ENTRY && entry.Cast<TableCatalogEntry>().IsDuckTable();
 			if (table && StringUtil::CIEquals(entry.name, REGISTRY_TABLE)) {
 				return;
 			}
-			if (!table || !ParseStorageName(entry.name, index_ref, segments)) {
+			if (!table || !ParseStorageName(entry.name, index_ref)) {
 				foreign.push_back(
 				    malformed(entry.name, StringUtil::Format("%s.%s is not a storage table of this extension",
 				                                             NGRAM_SCHEMA, entry.name)));
 				return;
 			}
-			(segments ? storage[index_ref].first : storage[index_ref].second) = true;
+			storage.insert(index_ref);
 		});
 	}
 	for (auto &row : registry.rows) {
@@ -390,27 +389,21 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 		observed.format_version = row.format_version;
 		observed.legacy = registry.legacy_shape;
 		// The row consumes its storage entry; whatever remains in storage
-		// afterwards has no registry row. Read the entry before erasing it.
-		bool storage_complete = false;
-		auto tables = storage.find(row.index_ref);
-		if (tables != storage.end()) {
-			storage_complete = tables->second.first && tables->second.second;
-			storage.erase(tables);
-		}
+		// afterwards has no registry row.
+		bool storage_present = storage.erase(row.index_ref) > 0;
 		if (!row.error.empty()) {
 			observed.status = "MALFORMED";
 			observed.reason = row.error;
-		} else if (!storage_complete) {
+		} else if (!storage_present) {
 			observed.status = "MALFORMED";
-			observed.reason = "a storage table is missing";
+			observed.reason = "the segments table is missing";
 		} else {
 			ClassifyBase(context, row.meta, observed);
 		}
 		result.push_back(std::move(observed));
 	}
 	for (auto &orphaned : storage) {
-		result.push_back(
-		    malformed(orphaned.first, registry_error.empty() ? "storage has no registry row" : registry_error));
+		result.push_back(malformed(orphaned, registry_error.empty() ? "storage has no registry row" : registry_error));
 	}
 	result.insert(result.end(), std::make_move_iterator(foreign.begin()), std::make_move_iterator(foreign.end()));
 	return result;

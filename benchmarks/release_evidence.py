@@ -114,7 +114,7 @@ REGISTRY_COLUMNS = tuple(
     "database_name index_ref schema_name table_name column_name format_version status reason".split()
 )
 #! Artifacts collected under storage format 3 recorded this listing shape. They
-#! stay verifiable until the corpus is re-collected under format 4.
+#! stay verifiable until the corpus is re-collected under the current format.
 FORMAT3_REGISTRY_COLUMNS = tuple(
     "database_name kind index_ref schema_name table_name column_name storage_schema "
     "format_version status reason".split()
@@ -502,7 +502,7 @@ def validate_run(record, pair, stage, corpus, registry_columns):
     if row["database_name"] != "run-%d" % pair:
         fail("registry database mismatch")
     format3 = registry_columns == FORMAT3_REGISTRY_COLUMNS
-    if row["status"] != "READY" or row["reason"] is not None or row["format_version"] != (3 if format3 else 4):
+    if row["status"] != "READY" or row["reason"] is not None or row["format_version"] != (3 if format3 else 5):
         fail("registry status/format mismatch")
     if not INDEX_REF.fullmatch(row["index_ref"]):
         fail("registry allocation mismatch")
@@ -971,7 +971,7 @@ def index_state(binary, database):
     observed = registry[0]
     if (
         not INDEX_REF.fullmatch(observed["index_ref"])
-        or observed["format_version"] != 4
+        or observed["format_version"] != 5
         or observed["status"] != "READY"
         or observed["reason"] is not None
     ):
@@ -1252,7 +1252,7 @@ def fixture():
                  state=[10, 0, 9, 10, 1000, "3" * 64])
         )
         ref = "11111111-1111-4111-8111-111111111111"
-        registry = ["run-%d" % pair, ref, "main", "docs", "text", 4, "READY", None]
+        registry = ["run-%d" % pair, ref, "main", "docs", "text", 5, "READY", None]
         index_state_fixture = ["text", 3, False, 9, 9, 0, 8, 20, 0, 1, 100, 500, None, registry]
         runs.append(
             dict(common, stage="build", storage=[2000 + pair, 8192, 0, 0], state=index_state_fixture)

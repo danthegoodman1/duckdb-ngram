@@ -72,10 +72,10 @@ def index_ref(db):
     _, out, _ = run(db, "PRAGMA ngram_indexes;")
     rows = [row for row in csv.reader(out.splitlines())
             if len(row) == 8 and row[0] == catalog
-            and row[2:5] == ["main", "corpus", "s"] and row[5] == "4"
+            and row[2:5] == ["main", "corpus", "s"] and row[5] == "5"
             and row[6] in ("READY", "SCAN_ONLY")]
     if len(rows) != 1:
-        raise RuntimeError("expected one format-4 corpus.s index")
+        raise RuntimeError("expected one format-5 corpus.s index")
     ref = rows[0][1]
     if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", ref):
         raise RuntimeError("public corpus.s index id is not a canonical UUIDv4")
@@ -110,8 +110,8 @@ def index_state(db):
                         "(SELECT count(*) FROM {segments}), "
                         "(SELECT coalesce(sum(rowid_count), 0) FROM {segments}), "
                         "s.n, s.hash_sum, s.hash_xor FROM (SELECT count(*) AS n, "
-                        "coalesce(sum(hash(encode(gram), row_count, segment_count))::VARCHAR, '0') AS hash_sum, "
-                        "coalesce(bit_xor(hash(encode(gram), row_count, segment_count))::VARCHAR, '0') AS hash_xor "
+                        "coalesce(sum(hash(gram_key, row_count, segment_count))::VARCHAR, '0') AS hash_sum, "
+                        "coalesce(bit_xor(hash(gram_key, row_count, segment_count))::VARCHAR, '0') AS hash_xor "
                         "FROM {stats}) s;".format(ref=ref, segments=storage_table(ref, "segments"),
                                                   stats=storage_table(ref, "stats")))
     line = [l for l in out.strip().splitlines() if l]
@@ -119,12 +119,12 @@ def index_state(db):
 
 
 def postings_digest(db):
-    """The decoded index itself: every (gram, rowid) posting, summarised so two
+    """The decoded index itself: every (gram_key, rowid) posting, summarised so two
     databases can be compared without materialising both."""
     ref = index_ref(db)
-    _, out, _ = run(db, "SELECT count(*), coalesce(sum(hash(gram || ':' || r))::VARCHAR, '0') "
+    _, out, _ = run(db, "SELECT count(*), coalesce(sum(hash(gram_key || ':' || r))::VARCHAR, '0') "
                         "FROM ngram_unpack_postings("
-                        "(SELECT gram, segment_no, postings FROM {0}));".format(storage_table(ref, "segments")))
+                        "(SELECT gram_key, segment_no, postings FROM {0}));".format(storage_table(ref, "segments")))
     line = [l for l in out.strip().splitlines() if l]
     return line[-1] if line else None
 

@@ -19,7 +19,7 @@ namespace ngram {
 //! Build and query must agree on this constant.
 constexpr int64_t SEGMENT_SHIFT = 20;
 
-//! The schema holding the registry and every index's two storage tables.
+//! The schema holding the registry and every index's segments table.
 constexpr const char *NGRAM_SCHEMA = "__ngram";
 constexpr const char *REGISTRY_TABLE = "registry";
 constexpr int32_t REGISTRY_VERSION = 2;
@@ -27,9 +27,10 @@ constexpr int32_t REGISTRY_VERSION = 2;
 constexpr const char *GUARD_PREFIX = "__ngram_guard_";
 
 //! Storage layout this extension version writes and reads: the registry row
-//! carries the metadata, and postings and stats live in two tables named by
-//! the index id. Every reader lists other versions as drop-only.
-constexpr int64_t NGRAM_FORMAT_VERSION = 4;
+//! carries the metadata, and postings live in one segments table named by the
+//! index id, keyed by the fixed-width gram key (GramKey). Every reader lists
+//! other versions as drop-only.
+constexpr int64_t NGRAM_FORMAT_VERSION = 5;
 
 struct ResolvedTarget {
 	string catalog_name;
@@ -44,7 +45,7 @@ struct ResolvedTarget {
 };
 
 //! One registry row's identity: the index id, the column it indexes, and the
-//! registry table it was read from. Storage tables are named by the id.
+//! registry table it was read from. The segments table is named by the id.
 struct IndexLocation {
 	string index_ref;
 	string column_name;
@@ -57,9 +58,6 @@ struct IndexLocation {
 	}
 	string SegmentsTable() const {
 		return "segments_" + Hex();
-	}
-	string StatsTable() const {
-		return "stats_" + Hex();
 	}
 };
 
@@ -103,6 +101,13 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 //! current shape. A registry version 1 database must be emptied by id first.
 RegistrySnapshot ReadRegistryForCreate(ClientContext &context, const string &catalog_name);
 
+//! A registry row owned by a target: its location and the metadata every read
+//! path validates, read together so a bind needs one registry pass.
+struct OwnedIndex {
+	IndexLocation location;
+	MetaInfo meta;
+};
+
 //! The locations of `target`'s rows in `registry` (see ExistingIndexes).
 vector<IndexLocation> Locations(const RegistrySnapshot &registry, const ResolvedTarget &target, bool lenient);
 IndexLocation LocationOf(const RegistryRow &row, idx_t registry_oid);
@@ -121,6 +126,8 @@ ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, 
 //! format, corrupt values) raises with its reason; `lenient` skips such rows
 //! and an unreadable registry instead, for the optimizer's decline path.
 vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient = false);
+//! ExistingIndexes with each row's metadata alongside its location.
+vector<OwnedIndex> OwnedIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient = false);
 void RequireUniqueIndexColumns(const vector<IndexLocation> &indexes);
 
 //! Registry rows of `target`'s table, other than `except_ref`, that record
@@ -139,8 +146,8 @@ vector<string> PrefixedGuardNames(ClientContext &context, DuckTableEntry &table)
 //! meta table, or empty when that table cannot be read.
 string LegacyGuardToken(ClientContext &context, const string &catalog_name, const string &schema_name);
 
-//! The index id named by a storage table (segments_<hex> or stats_<hex>).
-bool ParseStorageName(const string &name, string &index_ref, bool &segments);
+//! The index id named by a segments table (segments_<hex>).
+bool ParseStorageName(const string &name, string &index_ref);
 bool IsCanonicalUUID(const string &value);
 
 //! The length-framed, case-folded (schema, table, column) key of a registry
@@ -158,7 +165,7 @@ string Ident(const string &name);
 string Lit(const string &value);
 string SystemFunction(const string &name);
 
-//! A storage table (or the registry) of `catalog_name` as a qualified name.
+//! A segments table (or the registry) of `catalog_name` as a qualified name.
 string StorageTable(const string &catalog_name, const string &table);
 string Registry(const string &catalog_name);
 

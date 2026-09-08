@@ -7,7 +7,7 @@
 namespace duckdb {
 namespace ngram {
 
-//! Batch indexes: every fetch batch of an admitted segment precedes every
+//! Batch indexes: every fetch chunk of an admitted segment precedes every
 //! storage batch, so ordered sinks restore candidate-then-tail order.
 static constexpr idx_t FETCH_BATCHES_PER_SEGMENT = (idx_t(1) << SEGMENT_SHIFT) / STANDARD_VECTOR_SIZE;
 
@@ -88,28 +88,8 @@ void ThrowIfInterrupted(ClientContext &context) {
 	}
 }
 
-void ScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
-                     const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
-                     optional_ptr<TableFilterSet> filters, const std::function<void(DataChunk &)> &fn) {
-	TableScanState state;
-	InitializeExhaustiveScan(context, tx, storage, state, column_ids, filters);
-	DataChunk chunk;
-	chunk.Initialize(Allocator::Get(context), types);
-	while (true) {
-		ThrowIfInterrupted(context);
-		chunk.Reset();
-		storage.Scan(tx, chunk, state);
-		if (chunk.size() == 0) {
-			break;
-		}
-		fn(chunk);
-	}
-}
-
-//! Run `body(unit)` for every unit in [0, units) across the scheduler's
-//! threads, or inline when there is only one of either. The stats scan is a
-//! read-only pass whose atomic results are order-independent, so it needs no
-//! operator pipeline of its own.
+//! The manifest scans are read-only passes whose per-unit results live in
+//! slots their unit owns, so they need no operator pipeline of their own.
 namespace {
 
 class IndexedTask : public BaseExecutorTask {
@@ -140,8 +120,7 @@ private:
 //! per-thread TableScanState already carries here.
 static const vector<ColumnIndex> NO_COLUMN_INDEXES;
 
-static void ParallelForEachUnit(ClientContext &context, idx_t units, idx_t workers,
-                                const std::function<void(idx_t)> &body) {
+void ParallelForEachUnit(ClientContext &context, idx_t units, idx_t workers, const std::function<void(idx_t)> &body) {
 	if (units == 0) {
 		return;
 	}
@@ -157,31 +136,6 @@ static void ParallelForEachUnit(ClientContext &context, idx_t units, idx_t worke
 		executor.ScheduleTask(make_uniq<IndexedTask>(executor, cursor, units, body));
 	}
 	executor.WorkOnTasks();
-}
-
-void ParallelScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
-                             const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
-                             optional_ptr<TableFilterSet> filters, idx_t workers,
-                             const std::function<void(DataChunk &, idx_t)> &body) {
-	ParallelTableScanState parallel_state;
-	storage.InitializeParallelScan(context, parallel_state, NO_COLUMN_INDEXES);
-	ParallelForEachUnit(context, workers, workers, [&](idx_t worker) {
-		TableScanState scan;
-		scan.Initialize(column_ids, &context, filters);
-		DataChunk chunk;
-		chunk.Initialize(Allocator::Get(context), types);
-		while (storage.NextParallelScan(context, parallel_state, scan) != 0) {
-			while (true) {
-				ThrowIfInterrupted(context);
-				chunk.Reset();
-				storage.Scan(tx, chunk, scan);
-				if (chunk.size() == 0) {
-					break;
-				}
-				body(chunk, worker);
-			}
-		}
-	});
 }
 
 static idx_t SearchCoreScanUnits(ClientContext &context, DataTable &storage, const SearchCoreGlobal &state) {
@@ -205,18 +159,24 @@ void FinalizeSearchCore(ClientContext &context, SearchCoreGlobal &state) {
 		state.scan_filters = make_uniq<TableFilterSet>();
 	}
 	if (state.probe && state.hwm >= 0) {
+		// the fetch projection carries the rowid for range-scanned batches and
+		// the tail scan filters on it; an extra trailing column leaves every
+		// output and recheck position unchanged
 		optional_idx rowid_position;
-		for (idx_t i = 0; i < state.scan_column_ids.size(); i++) {
-			if (state.scan_column_ids[i].IsRowIdColumn()) {
+		for (idx_t i = 0; i < state.fetch_column_ids.size(); i++) {
+			if (state.fetch_column_ids[i].IsRowIdColumn()) {
 				rowid_position = i;
 				break;
 			}
 		}
 		if (!rowid_position.IsValid()) {
-			rowid_position = state.scan_column_ids.size();
+			rowid_position = state.fetch_column_ids.size();
+			state.fetch_column_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
+			state.fetch_types.emplace_back(LogicalType::ROW_TYPE);
 			state.scan_column_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
 			state.scan_types.emplace_back(LogicalType::ROW_TYPE);
 		}
+		state.fetch_rowid_position = rowid_position.GetIndex();
 		state.scan_filters->PushFilter(
 		    ColumnIndex(rowid_position.GetIndex()),
 		    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHAN, Value::BIGINT(state.hwm)));
@@ -247,6 +207,100 @@ static bool SearchCoreYieldEmpty(TableFunctionInput &data) {
 	return true;
 }
 
+enum class BatchClaim : uint8_t { CLAIMED, EXHAUSTED, WAITING };
+
+//! Take the next candidate batch for `local`: from a published segment when
+//! one has batches left, otherwise by claiming the next admitted segment,
+//! decoding it and publishing it. EXHAUSTED once every segment is decoded and
+//! every batch handed out; WAITING when another worker is still decoding and
+//! the async protocol asks this one to yield rather than block.
+static BatchClaim ClaimCandidateBatch(ClientContext &context, TableFunctionInput &data, SearchCoreGlobal &global,
+                                      SearchCoreLocal &local) {
+	auto &plan = *global.probe;
+	auto &queue = global.candidates;
+	while (true) {
+		ThrowIfInterrupted(context);
+		idx_t ordinal;
+		{
+			std::unique_lock<mutex> guard(queue.lock);
+			if (!queue.ready.empty()) {
+				auto &front = queue.ready.front();
+				local.candidates = front.rowids;
+				local.segment_ordinal = front.segment_ordinal;
+				local.candidate_offset = front.next_offset;
+				local.candidate_end = MinValue<idx_t>(front.next_offset + FETCH_BATCH_ROWS, front.rowids->size());
+				front.next_offset = local.candidate_end;
+				if (front.next_offset >= front.rowids->size()) {
+					queue.ready.pop_front();
+				}
+				return BatchClaim::CLAIMED;
+			}
+			// the claim and the decoding count change together under the lock,
+			// so a worker that sees no segment left and nobody decoding is done
+			ordinal = plan.next_segment.fetch_add(1);
+			if (ordinal >= plan.segments.size()) {
+				if (queue.decoding == 0) {
+					return BatchClaim::EXHAUSTED;
+				}
+				queue.published.wait_for(guard, std::chrono::milliseconds(1));
+				if (queue.ready.empty() && queue.decoding > 0 &&
+				    data.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
+					return BatchClaim::WAITING;
+				}
+				continue;
+			}
+			queue.decoding++;
+		}
+		auto rowids = make_shared_ptr<vector<row_t>>();
+		try {
+			DecodeCandidateSegment(context, *global.tx, plan, ordinal, local.decode, *rowids);
+		} catch (...) {
+			std::lock_guard<mutex> guard(queue.lock);
+			queue.decoding--;
+			queue.published.notify_all();
+			throw;
+		}
+		std::lock_guard<mutex> guard(queue.lock);
+		queue.decoding--;
+		if (!rowids->empty()) {
+			queue.ready.emplace_back(ordinal, std::move(rowids));
+		}
+		queue.published.notify_all();
+	}
+}
+
+//! A claimed batch whose rowids fill at least half of their span is read with
+//! one rowid-range scan instead of a fetch per row: the scan decompresses
+//! whole vectors and takes no per-row lock, while DataTable::Fetch locks the
+//! row-group tree for every row and decodes FSST strings one at a time
+//! (measured 3.8 us per fetched row against 0.13 us for uncompressed strings).
+//! Rows of the span that are not candidates cannot match, so rechecking them
+//! changes no result. The rowid filters prune every other row group by zone
+//! map and are exact within the range, so no row of another batch is read.
+static constexpr idx_t RANGE_SCAN_MIN_ROWS = 256;
+
+static bool StartRangeScan(ClientContext &context, SearchCoreGlobal &global, SearchCoreLocal &local) {
+	auto &rowids = *local.candidates;
+	auto batch_rows = local.candidate_end - local.candidate_offset;
+	auto first = rowids[local.candidate_offset];
+	auto last = rowids[local.candidate_end - 1];
+	if (batch_rows < RANGE_SCAN_MIN_ROWS || NumericCast<idx_t>(last - first) + 1 > 2 * batch_rows) {
+		return false;
+	}
+	local.range_filters = make_uniq<TableFilterSet>();
+	local.range_filters->PushFilter(
+	    ColumnIndex(global.fetch_rowid_position),
+	    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::BIGINT(first)));
+	local.range_filters->PushFilter(
+	    ColumnIndex(global.fetch_rowid_position),
+	    make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::BIGINT(last)));
+	local.range_state = make_uniq<TableScanState>();
+	InitializeExhaustiveScan(context, *global.tx, *global.storage, *local.range_state, global.fetch_column_ids,
+	                         local.range_filters.get());
+	local.candidate_offset = local.candidate_end;
+	return true;
+}
+
 static void SearchCoreEmit(SearchCoreGlobal &global, SearchCoreLocal &local, DataChunk &source, idx_t count,
                            DataChunk &output) {
 	D_ASSERT(output.ColumnCount() == global.output_ids.size());
@@ -271,26 +325,43 @@ void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchC
 			// before decoding another segment or transitioning to the tail scan.
 			local.fetch_chunk.Reset();
 			local.fetch_state = ColumnFetchState();
-			if (local.candidate_offset >= local.candidates.size()) {
-				local.candidates.clear();
-				local.candidate_offset = 0;
-				if (!NextCandidateSegment(context, *global.tx, *global.probe, local.candidates,
-				                          local.segment_ordinal)) {
-					local.phase = SearchCorePhase::SCAN;
+			if (local.range_state) {
+				global.storage->Scan(*global.tx, local.fetch_chunk, *local.range_state);
+				if (local.fetch_chunk.size() == 0) {
+					local.range_state.reset();
+					local.range_filters.reset();
+					if (SearchCoreYieldEmpty(data)) {
+						return;
+					}
 					continue;
 				}
-				if (local.candidates.empty()) {
-					continue;
+			} else {
+				if (local.candidate_offset >= local.candidate_end) {
+					local.candidates.reset();
+					auto claim = ClaimCandidateBatch(context, data, global, local);
+					if (claim == BatchClaim::WAITING) {
+						data.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+						return;
+					}
+					if (claim == BatchClaim::EXHAUSTED) {
+						local.phase = SearchCorePhase::SCAN;
+						continue;
+					}
+					// every chunk of the batch, fetched or range-scanned, carries
+					// the batch's index; one thread emits them in order
+					local.batch_index = local.segment_ordinal * FETCH_BATCHES_PER_SEGMENT +
+					                    local.candidate_offset / STANDARD_VECTOR_SIZE;
+					if (StartRangeScan(context, global, local)) {
+						continue;
+					}
 				}
+				auto offset = local.candidate_offset;
+				auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, local.candidate_end - offset);
+				Vector rowids(LogicalType::ROW_TYPE, reinterpret_cast<data_ptr_t>(local.candidates->data() + offset));
+				local.candidate_offset += count;
+				global.storage->Fetch(*global.tx, local.fetch_chunk, global.fetch_column_ids, rowids, count,
+				                      local.fetch_state);
 			}
-			auto offset = local.candidate_offset;
-			auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, local.candidates.size() - offset);
-			local.batch_index = local.segment_ordinal * FETCH_BATCHES_PER_SEGMENT + offset / STANDARD_VECTOR_SIZE;
-			Vector rowids(LogicalType::ROW_TYPE,
-			              reinterpret_cast<data_ptr_t>(local.candidates.data() + local.candidate_offset));
-			local.candidate_offset += count;
-			global.storage->Fetch(*global.tx, local.fetch_chunk, global.fetch_column_ids, rowids, count,
-			                      local.fetch_state);
 			auto hits = local.fetch_chunk.size() == 0 ? 0 : recheck(local.fetch_chunk, local.sel);
 			if (hits == 0) {
 				if (SearchCoreYieldEmpty(data)) {

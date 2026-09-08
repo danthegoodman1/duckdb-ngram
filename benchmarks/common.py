@@ -141,10 +141,10 @@ def ngram_index_ref(db_path, table, column, settings=None):
     rows = [
         row for row in run_sql(db_path, "PRAGMA ngram_indexes;", settings=settings, meter=False).rows
         if len(row) == 8 and row[0] == catalog and row[2] == "main"
-        and row[3] == table and row[4] == column and row[5] == "4" and row[6] == "READY"
+        and row[3] == table and row[4] == column and row[5] == "5" and row[6] == "READY"
     ]
     if len(rows) != 1:
-        raise RuntimeError("expected one READY format-4 ngram index for main.%s.%s" % (table, column))
+        raise RuntimeError("expected one READY format-5 ngram index for main.%s.%s" % (table, column))
     index_ref = rows[0][1]
     if not _NGRAM_INDEX_REF.fullmatch(index_ref):
         raise RuntimeError("public ngram index id is not canonical for main.%s.%s" % (table, column))

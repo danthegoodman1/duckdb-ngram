@@ -202,8 +202,8 @@ IndexLocation LocationOf(const RegistryRow &row, idx_t registry_oid) {
 	return location;
 }
 
-vector<IndexLocation> Locations(const RegistrySnapshot &registry, const ResolvedTarget &target, bool lenient) {
-	vector<IndexLocation> result;
+static vector<OwnedIndex> Owned(const RegistrySnapshot &registry, const ResolvedTarget &target, bool lenient) {
+	vector<OwnedIndex> result;
 	for (auto &row : registry.rows) {
 		if (!RowBelongsTo(row, target)) {
 			continue;
@@ -215,12 +215,25 @@ vector<IndexLocation> Locations(const RegistrySnapshot &registry, const Resolved
 			throw InvalidInputException("ngram: the index on %s.%s (%s) is unusable: %s", target.table_name,
 			                            row.column_name, row.index_ref, row.error);
 		}
-		result.push_back(LocationOf(row, registry.oid));
+		result.push_back(OwnedIndex {LocationOf(row, registry.oid), row.meta});
 	}
 	return result;
 }
 
-vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient) {
+static vector<IndexLocation> LocationsOf(vector<OwnedIndex> owned) {
+	vector<IndexLocation> result;
+	result.reserve(owned.size());
+	for (auto &index : owned) {
+		result.push_back(std::move(index.location));
+	}
+	return result;
+}
+
+vector<IndexLocation> Locations(const RegistrySnapshot &registry, const ResolvedTarget &target, bool lenient) {
+	return LocationsOf(Owned(registry, target, lenient));
+}
+
+vector<OwnedIndex> OwnedIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient) {
 	RegistrySnapshot registry;
 	try {
 		registry = ReadRegistry(context, target.catalog_name);
@@ -235,7 +248,11 @@ vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarg
 		}
 		throw;
 	}
-	return Locations(registry, target, lenient);
+	return Owned(registry, target, lenient);
+}
+
+vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient) {
+	return LocationsOf(OwnedIndexes(context, target, lenient));
 }
 
 void RequireUniqueIndexColumns(const vector<IndexLocation> &indexes) {
@@ -289,18 +306,12 @@ void ValidateRegistryForCreate(ClientContext &context, const string &catalog_nam
 	}
 }
 
-bool ParseStorageName(const string &name, string &index_ref, bool &segments) {
+bool ParseStorageName(const string &name, string &index_ref) {
 	auto lower = StringUtil::Lower(name);
-	string hex;
-	if (StringUtil::StartsWith(lower, "segments_")) {
-		hex = lower.substr(strlen("segments_"));
-		segments = true;
-	} else if (StringUtil::StartsWith(lower, "stats_")) {
-		hex = lower.substr(strlen("stats_"));
-		segments = false;
-	} else {
+	if (!StringUtil::StartsWith(lower, "segments_")) {
 		return false;
 	}
+	auto hex = lower.substr(strlen("segments_"));
 	if (hex.size() != 32) {
 		return false;
 	}

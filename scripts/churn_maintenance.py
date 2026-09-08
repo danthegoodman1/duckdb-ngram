@@ -78,9 +78,9 @@ class Db:
         _, out, _ = self.run("PRAGMA ngram_indexes;")
         rows = [row for row in csv.reader(out.splitlines())
                 if len(row) == 8 and row[0] == catalog
-                and row[2:5] == ["main", "corpus", "s"] and row[5] == "4" and row[6] == "READY"]
+                and row[2:5] == ["main", "corpus", "s"] and row[5] == "5" and row[6] == "READY"]
         if len(rows) != 1:
-            raise RuntimeError("expected one READY format-4 corpus.s index")
+            raise RuntimeError("expected one READY format-5 corpus.s index")
         ref = rows[0][1]
         if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", ref):
             raise RuntimeError("public corpus.s index id is not a canonical UUIDv4")

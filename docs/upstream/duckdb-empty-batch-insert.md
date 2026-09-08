@@ -11,11 +11,12 @@ file: reopening it returns them all. The same statements with `threads=1`, or
 without the empty insert, return every row at every stage.
 
 The `ngram` extension hit this through `PRAGMA ngram_refresh` on an index whose
-tail was empty: the generated script appended an empty delta to the stats table,
-deleted the table, and reinserted the folded rows. Every later query on that
-index in the process failed with "the index is malformed" until the file was
-reopened. The refresh script no longer inserts into the stats table before the
-delete.
+tail was empty: the generated script appended an empty delta to a per-gram
+statistics table, deleted the table, and reinserted the folded rows. Every later
+query on that index in the process failed with "the index is malformed" until
+the file was reopened. That table no longer exists; refresh only appends to the
+segments table, and compaction deletes from it before it inserts, so no
+generated script takes this shape.
 
 ## Environment
 

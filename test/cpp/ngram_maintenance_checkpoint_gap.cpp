@@ -113,7 +113,7 @@ static string TestUUID(uint64_t value) {
 	return buffer;
 }
 
-//! `[catalog.]__ngram.<part>_<hex>` for part in {segments, stats}.
+//! `[catalog.]__ngram.<part>_<hex>`; the only part is segments.
 static string StorageTable(Connection &con, const string &table_name, const string &column_name, const string &part,
                            const string &catalog_name = string()) {
 	auto catalog = catalog_name.empty() ? string() : catalog_name + ".";
@@ -122,7 +122,6 @@ static string StorageTable(Connection &con, const string &table_name, const stri
 
 static void DropStorage(Connection &con, const string &table_name, const string &column_name) {
 	Check(con, "DROP TABLE " + StorageTable(con, table_name, column_name, "segments"));
-	Check(con, "DROP TABLE " + StorageTable(con, table_name, column_name, "stats"));
 }
 
 static idx_t StorageTableCount(Connection &con) {
@@ -650,10 +649,10 @@ static void TestSharedGuardAndDrop(const string &path) {
 		Check(con, "INSERT INTO other_format VALUES ('other needle')");
 		Check(con, "PRAGMA create_ngram_index('other_format', 's')");
 		auto other_ref = IndexRef(con, "other_format", "s");
-		Check(con, "UPDATE __ngram.registry SET format_version=5 WHERE table_name='other_format'");
+		Check(con, "UPDATE __ngram.registry SET format_version=6 WHERE table_name='other_format'");
 		ExpectStatus(con, catalog, other_ref, "MALFORMED");
-		ExpectError(con, "PRAGMA drop_ngram_index('other_format', 's')", "format 5");
-		ExpectError(con, "SELECT * FROM ngram_search('other_format', 'needle')", "format 5");
+		ExpectError(con, "PRAGMA drop_ngram_index('other_format', 's')", "format 6");
+		ExpectError(con, "SELECT * FROM ngram_search('other_format', 'needle')", "format 6");
 		Check(con, "SET ngram_auto_accelerate=true");
 		if (ScalarInt64(con, "SELECT count(*) FROM other_format WHERE s LIKE '%needle%'") != 1) {
 			throw std::runtime_error("an unreadable registry row did not decline transparent acceleration");
@@ -661,7 +660,7 @@ static void TestSharedGuardAndDrop(const string &path) {
 		DropByRef(con, catalog, other_ref);
 		if (HasRowIdGuard(con, "other_format") ||
 		    ScalarInt64(con, "SELECT count(*) FROM __ngram.registry WHERE table_name='other_format'") != 0 ||
-		    StorageTableCount(con) != 4) {
+		    StorageTableCount(con) != 2) {
 			throw std::runtime_error("generic drop of another format left guard, row, or storage");
 		}
 
@@ -706,7 +705,7 @@ static void TestSharedGuardAndDrop(const string &path) {
 		}
 		ExpectError(con, "PRAGMA create_ngram_index('overlap', 'a')", "drop the table's ngram indexes");
 		Check(con, "PRAGMA drop_ngram_index('overlap', 'b')");
-		if (HasRowIdGuard(con, "overlap") || StorageTableCount(con) != 4) {
+		if (HasRowIdGuard(con, "overlap") || StorageTableCount(con) != 2) {
 			throw std::runtime_error("dropping the last index left a guard or storage");
 		}
 
@@ -1301,7 +1300,7 @@ static void TestStorageCorruption() {
 	        string::npos) {
 		throw std::runtime_error("an unreadable format did not decline transparent acceleration");
 	}
-	Check(con, "UPDATE __ngram.registry SET format_version=4 WHERE table_name='versioned'");
+	Check(con, "UPDATE __ngram.registry SET format_version=5 WHERE table_name='versioned'");
 	Check(con, "PRAGMA ngram_refresh('versioned')");
 
 	// Compaction validates every selected row and every failure is atomic.
@@ -1311,13 +1310,11 @@ static void TestStorageCorruption() {
 	Check(con, "INSERT INTO compact_bad VALUES ('aaa')");
 	Check(con, "PRAGMA ngram_refresh('compact_bad')");
 	auto compact_segments = StorageTable(con, "compact_bad", "s", "segments");
-	Check(con, "UPDATE " + compact_segments + " SET segment_no=NULL WHERE gram='aaa'");
+	Check(con, "UPDATE " + compact_segments + " SET segment_no=NULL WHERE gram_key=ngram_gram_key('aaa')");
 	ExpectError(con, "PRAGMA ngram_compact('compact_bad')", "malformed segments-table key");
-	Check(con, "UPDATE " + compact_segments + " SET segment_no=0, gram=NULL");
+	Check(con, "UPDATE " + compact_segments + " SET segment_no=0, gram_key=NULL");
 	ExpectError(con, "PRAGMA ngram_compact('compact_bad', purge=true)", "malformed segments-table key");
-	Check(con, "UPDATE " + compact_segments + " SET gram='aa'");
-	ExpectError(con, "PRAGMA ngram_compact('compact_bad')", "malformed segments-table key");
-	Check(con, "UPDATE " + compact_segments + " SET gram='aaa'");
+	Check(con, "UPDATE " + compact_segments + " SET gram_key=ngram_gram_key('aaa')");
 	Check(con, "UPDATE " + compact_segments +
 	               " SET postings=ngram_encode_postings([1048576]::BIGINT[]), rowid_count=1, "
 	               "min_rowid=1048576, max_rowid=1048576 WHERE generation=0");
@@ -1333,25 +1330,35 @@ static void TestStorageCorruption() {
 		throw std::runtime_error("failed compaction changed malformed segment generations");
 	}
 
-	// Refresh validates the old stats layout before atomically rewriting it.
-	Check(con, "CREATE TABLE refresh_bad_stats(s VARCHAR)");
-	Check(con, "INSERT INTO refresh_bad_stats VALUES ('aaa')");
-	Check(con, "PRAGMA create_ngram_index('refresh_bad_stats', 's')");
-	auto refresh_segments = StorageTable(con, "refresh_bad_stats", "s", "segments");
-	auto refresh_stats = StorageTable(con, "refresh_bad_stats", "s", "stats");
-	Check(con, "UPDATE " + refresh_stats + " SET row_count=-1, segment_count=-1 WHERE encode(gram)=encode('aaa')");
-	Check(con, "INSERT INTO " + refresh_stats + " VALUES ('aaa', 2, 2)");
-	Check(con, "INSERT INTO refresh_bad_stats VALUES ('aaa')");
-	ExpectError(con, "PRAGMA ngram_refresh('refresh_bad_stats')", "invalid stats row");
-	auto refresh_digest = ScalarString(
-	    con, "SELECT concat((SELECT hwm_rowid FROM " + OwnerRow("refresh_bad_stats", "s") +
-	             "),':',(SELECT count(*) FROM " + refresh_segments + "),':',(SELECT max(generation) FROM " +
-	             refresh_segments + "),':',(SELECT count(*) FROM " + refresh_stats +
-	             "),':',(SELECT min(row_count) FROM " + refresh_stats + "),':',(SELECT max(row_count) FROM " +
-	             refresh_stats + "),':',(SELECT sum(row_count) FROM " + refresh_stats + "))");
-	if (refresh_digest != "0:1:0:2:-1:2:1") {
-		throw std::runtime_error("failed refresh changed malformed stats state: " + refresh_digest);
+	// The manifest is bounded against the query memory budget as it is
+	// collected: a key with more segment rows than the budget admits declines
+	// before any posting is decoded (the exact paths scan, the candidate API
+	// reports the reason), and the same rows are read once the budget allows.
+	Check(con, "CREATE TABLE wide_manifest(id INTEGER, s VARCHAR)");
+	Check(con, "INSERT INTO wide_manifest VALUES (1, 'aaaa'), (2, 'nothing')");
+	Check(con, "PRAGMA create_ngram_index('wide_manifest', 's')");
+	auto wide_segments = StorageTable(con, "wide_manifest", "s", "segments");
+	Check(con, "INSERT INTO " + wide_segments +
+	               " SELECT gram_key, segment_no, g, postings, rowid_count, min_rowid, max_rowid FROM " +
+	               wide_segments + ", range(1, 80000) t(g) WHERE gram_key=ngram_gram_key('aaa')");
+	Check(con, "SET memory_limit='16MB'");
+	if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('wide_manifest', 'aaaa')") != 1 ||
+	    ScalarInt64(con, "SELECT count(*) FROM wide_manifest WHERE contains(s, 'aaaa')") != 1) {
+		throw std::runtime_error("manifest decline changed exact results");
 	}
+	if (Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('wide_manifest', 'aaaa')")
+	        ->GetValue(1, 0)
+	        .ToString()
+	        .find("full scan fallback: segment manifest exceeds query memory budget") == string::npos) {
+		throw std::runtime_error("a manifest past the budget did not decline the probe");
+	}
+	ExpectError(con, "SELECT count(*) FROM ngram_candidates('wide_manifest', 's', 'aaaa')",
+	            "segment manifest exceeds query memory budget");
+	Check(con, "RESET memory_limit");
+	// within budget the same rows are read and fail at admission, where the
+	// injected generations' counts exceed the segment's two rows
+	ExpectError(con, "SELECT count(*) FROM ngram_candidates('wide_manifest', 's', 'aaaa')",
+	            "gram posting count exceeds its segment rowid range");
 
 	// Missing storage after bind is availability, not corruption.
 	Check(con, "CREATE TABLE unavailable(id INTEGER, s VARCHAR)");
@@ -1389,27 +1396,24 @@ static void TestStorageCorruption() {
 	Check(con, "UPDATE __ngram.registry SET hwm_rowid=36028797018960000 WHERE table_name='bad_hwm'");
 	ExpectError(con, "SELECT count(*) FROM ngram_candidates('bad_hwm', 's', 'aaaa')", "hwm_rowid 36028797018960000");
 
-	// Impossible stats/capacity and NULL requested rows remain structural errors.
-	Check(con, "CREATE TABLE bad_stats(id INTEGER, s VARCHAR)");
-	Check(con, "INSERT INTO bad_stats VALUES (1, 'aaaa'), (2, 'aaaa')");
-	Check(con, "PRAGMA create_ngram_index('bad_stats', 's')");
-	auto bad_stats = StorageTable(con, "bad_stats", "s", "stats");
-	Check(con, "UPDATE " + bad_stats + " SET row_count=1000000, segment_count=1000000 WHERE gram='aaa'");
-	ExpectError(con, "SELECT count(*) FROM ngram_search('bad_stats', 'aaaa')",
-	            "stats describe more segment rows than exist");
-	ExpectError(con, "SELECT count(*) FROM bad_stats WHERE contains(s, 'aaaa')",
-	            "stats describe more segment rows than exist");
-	Check(con, "UPDATE " + bad_stats + " SET row_count=NULL WHERE gram='aaa'");
-	if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('bad_stats', 'bad')") != 0) {
-		throw std::runtime_error("unrequested malformed stats row poisoned another gram");
+	// NULL requested rows and impossible capacities remain structural errors,
+	// and a malformed row of another key is never read.
+	Check(con, "CREATE TABLE bad_rows(id INTEGER, s VARCHAR)");
+	Check(con, "INSERT INTO bad_rows VALUES (1, 'aaaa'), (2, 'aaaa')");
+	Check(con, "PRAGMA create_ngram_index('bad_rows', 's')");
+	auto bad_rows = StorageTable(con, "bad_rows", "s", "segments");
+	Check(con, "UPDATE " + bad_rows + " SET rowid_count=NULL WHERE gram_key=ngram_gram_key('aaa')");
+	if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('bad_rows', 'bad')") != 0) {
+		throw std::runtime_error("unrequested malformed segments row poisoned another gram");
 	}
-	ExpectError(con, "SELECT count(*) FROM ngram_search('bad_stats', 'aaaa')", "requested stats row contains NULLs");
+	ExpectError(con, "SELECT count(*) FROM ngram_search('bad_rows', 'aaaa')", "segments table contains NULLs");
+	ExpectError(con, "SELECT count(*) FROM bad_rows WHERE contains(s, 'aaaa')", "segments table contains NULLs");
 
 	Check(con, "CREATE TABLE bad_capacity(id INTEGER, s VARCHAR)");
 	Check(con, "INSERT INTO bad_capacity VALUES (1, 'aaaa'), (2, 'aaaa')");
 	Check(con, "PRAGMA create_ngram_index('bad_capacity', 's')");
-	Check(con, "UPDATE " + StorageTable(con, "bad_capacity", "s", "stats") + " SET row_count=3 WHERE gram='aaa'");
-	Check(con, "UPDATE " + StorageTable(con, "bad_capacity", "s", "segments") + " SET rowid_count=3 WHERE gram='aaa'");
+	Check(con, "UPDATE " + StorageTable(con, "bad_capacity", "s", "segments") +
+	               " SET rowid_count=3 WHERE gram_key=ngram_gram_key('aaa')");
 	ExpectError(con, "SELECT count(*) FROM ngram_search('bad_capacity', 'aaaa')",
 	            "gram posting count exceeds its segment rowid range");
 	ExpectError(con, "SELECT count(*) FROM bad_capacity WHERE contains(s, 'aaaa')",
@@ -1426,14 +1430,14 @@ static void TestStorageCorruption() {
 	Check(con, "RESET ngram_max_candidate_fraction");
 
 	// Present wrong-kind owned storage is fatal; absence alone may decline.
-	Check(con, "CREATE TABLE wrong_stats(id INTEGER, s VARCHAR)");
-	Check(con, "INSERT INTO wrong_stats VALUES (1, 'aaaa')");
-	Check(con, "PRAGMA create_ngram_index('wrong_stats', 's')");
-	auto wrong_ref = IndexRef(con, "wrong_stats", "s");
-	auto wrong_table = StorageTable(con, "wrong_stats", "s", "stats");
+	Check(con, "CREATE TABLE wrong_storage(id INTEGER, s VARCHAR)");
+	Check(con, "INSERT INTO wrong_storage VALUES (1, 'aaaa')");
+	Check(con, "PRAGMA create_ngram_index('wrong_storage', 's')");
+	auto wrong_ref = IndexRef(con, "wrong_storage", "s");
+	auto wrong_table = StorageTable(con, "wrong_storage", "s", "segments");
 	Check(con, "DROP TABLE " + wrong_table);
-	Check(con, "CREATE VIEW " + wrong_table + " AS SELECT 1 AS not_stats");
-	ExpectError(con, "SELECT count(*) FROM wrong_stats WHERE contains(s, 'aaaa')", "wrong catalog type");
+	Check(con, "CREATE VIEW " + wrong_table + " AS SELECT 1 AS not_segments");
+	ExpectError(con, "SELECT count(*) FROM wrong_storage WHERE contains(s, 'aaaa')", "wrong catalog type");
 	ExpectStatus(con, "memory", wrong_ref, "MALFORMED");
 	Check(con, "DROP VIEW " + wrong_table);
 	DropByRef(con, "memory", wrong_ref);
@@ -1442,9 +1446,8 @@ static void TestStorageCorruption() {
 	Check(con, "CREATE TABLE late_bad AS SELECT i::INTEGER id, CASE WHEN i IN (0,1,1048576) "
 	           "THEN 'aaaa'::VARCHAR ELSE NULL::VARCHAR END s FROM range(1048578) t(i)");
 	Check(con, "PRAGMA create_ngram_index('late_bad', 's')");
-	Check(con, "UPDATE " + StorageTable(con, "late_bad", "s", "stats") + " SET row_count=5 WHERE gram='aaa'");
 	Check(con, "UPDATE " + StorageTable(con, "late_bad", "s", "segments") +
-	               " SET rowid_count=3 WHERE gram='aaa' AND segment_no=1");
+	               " SET rowid_count=3 WHERE gram_key=ngram_gram_key('aaa') AND segment_no=1");
 	Check(con, "SET ngram_max_probe_rowids=1");
 	ExpectError(con, "SELECT count(*) FROM ngram_search('late_bad', 'aaaa')",
 	            "gram posting count exceeds its segment rowid range");
@@ -1586,7 +1589,7 @@ static void TestRegistryBootstrapAndConflicts() {
 		Check(con, "CREATE TABLE bootstrap_fail(s VARCHAR)");
 		auto failed = Expand(con, "PRAGMA create_ngram_index('bootstrap_fail','s')");
 		ExecuteBeforeCommit(con, failed);
-		if (ScalarInt64(con, "SELECT count(*) FROM __ngram.registry") != 1 || StorageTableCount(con) != 2 ||
+		if (ScalarInt64(con, "SELECT count(*) FROM __ngram.registry") != 1 || StorageTableCount(con) != 1 ||
 		    !HasRowIdGuard(con, "bootstrap_fail")) {
 			throw std::runtime_error("full bootstrap allocation was not staged before rollback");
 		}
@@ -1611,7 +1614,7 @@ static void TestRegistryBootstrapAndConflicts() {
 			throw std::runtime_error("second concurrent bootstrap did not fail its stale plan: " + bootstrap_error);
 		}
 		Rollback(bootstrap_b);
-		if (ScalarInt64(con, "SELECT count(*) FROM __ngram.registry") != 1 || StorageTableCount(con) != 2 ||
+		if (ScalarInt64(con, "SELECT count(*) FROM __ngram.registry") != 1 || StorageTableCount(con) != 1 ||
 		    HasRowIdGuard(con, "bootstrap_b")) {
 			throw std::runtime_error("failed concurrent bootstrap leaked its owner allocation");
 		}
@@ -1644,7 +1647,7 @@ static void TestRegistryBootstrapAndConflicts() {
 		}
 		Rollback(second);
 		if (ScalarInt64(second, "SELECT count(*) FROM __ngram.registry WHERE table_name='duplicate'") != 1 ||
-		    StorageTableCount(second) != 2) {
+		    StorageTableCount(second) != 1) {
 			throw std::runtime_error("concurrent duplicate retry leaked an allocation");
 		}
 	}
@@ -1750,7 +1753,7 @@ static void TestFormat3Fixture(const string &fixture, const string &path) {
 		throw std::runtime_error("format-3 fixture was not listed MALFORMED with its format");
 	}
 	auto ref = listed->GetValue(1, 0).ToString();
-	ExpectError(con, "PRAGMA create_ngram_index('f3.main.docs', 't')", "predates format 4");
+	ExpectError(con, "PRAGMA create_ngram_index('f3.main.docs', 't')", "predates format 5");
 	// The token-checked drop removes the guard, the row, the old storage schema
 	// and, with the last row, the old registry; the table is untouched and a
 	// fresh index is READY.
@@ -1785,7 +1788,6 @@ static void TestRegistryCorruption() {
 		auto ref = IndexRef(con, "recoverable", "s");
 		auto guard = GuardName(con, "recoverable", "s");
 		auto segments = StorageTable(con, "recoverable", "s", "segments");
-		auto stats = StorageTable(con, "recoverable", "s", "stats");
 		if (whole_registry) {
 			Check(con, "DROP TABLE __ngram.registry");
 		} else {
@@ -1797,7 +1799,6 @@ static void TestRegistryCorruption() {
 		Check(con, "PRAGMA create_ngram_index('unblocked','s')");
 		Check(con, "PRAGMA drop_ngram_index('unblocked','s')");
 		Check(con, "DROP TABLE " + segments);
-		Check(con, "DROP TABLE " + stats);
 		Check(con, "DROP INDEX " + guard);
 		if (Query(con, "PRAGMA ngram_indexes")->RowCount() != 0) {
 			throw std::runtime_error("manual cleanup of orphaned storage left a listing");
@@ -1865,7 +1866,7 @@ static void TestRegistryCorruption() {
 		Check(con, "PRAGMA create_ngram_index('unblocked','s')");
 		if (field.first == "owner_key") {
 			DropByRef(con, catalog, ref);
-			if (HasRowIdGuard(con, "row_bad") || StorageTableCount(con) != 2) {
+			if (HasRowIdGuard(con, "row_bad") || StorageTableCount(con) != 1) {
 				throw std::runtime_error("generic drop of a row with a bad owner key left guard or storage");
 			}
 		}
@@ -1904,9 +1905,9 @@ static void TestRegistryCorruption() {
 		}
 	}
 
-	// Either storage table is required. Absence declines transparent
+	// The segments table is required. Absence declines transparent
 	// acceleration exactly and is droppable; a present wrong-kind object is fatal.
-	for (auto &part : vector<string> {"segments", "stats"}) {
+	for (auto &part : vector<string> {"segments"}) {
 		DuckDB db(nullptr);
 		LoadNgram(db);
 		Connection con(db);
@@ -1974,7 +1975,7 @@ static void TestExecutionIdentityRaces() {
 	const string catalog = "memory";
 	// Plans bound to a removed storage table treat the index as unavailable for
 	// exhaustive adapters, while candidate-only execution reports the loss.
-	for (auto &part : vector<string> {"segments", "stats"}) {
+	for (auto &part : vector<string> {"segments"}) {
 		DuckDB db(nullptr);
 		LoadNgram(db);
 		Connection con(db);
@@ -1997,7 +1998,7 @@ static void TestExecutionIdentityRaces() {
 
 	// Storage tables carry no identity of their own: one re-created at the same
 	// name with the same content is read, and every adapter stays exact.
-	for (auto &part : vector<string> {"segments", "stats"}) {
+	for (auto &part : vector<string> {"segments"}) {
 		DuckDB db(nullptr);
 		LoadNgram(db);
 		Connection setup(db), ddl(db);
@@ -2285,8 +2286,10 @@ static void TestQueryCancellation() {
 	Connection con(db);
 	Check(con, "SET threads=1");
 	Check(con, "SET ngram_max_candidate_fraction=1.0");
-	Check(con, "CREATE TABLE cancel_rows AS SELECT i::BIGINT id, 'aaaaaaaa payload'::VARCHAR s "
-	           "FROM range(200000) t(i)");
+	// every third row matches: sparse candidates take the per-row fetch path,
+	// which is slow enough for the interrupt below to land inside it
+	Check(con, "CREATE TABLE cancel_rows AS SELECT i::BIGINT id, CASE WHEN i % 3 = 0 THEN 'aaaaaaaa payload' "
+	           "ELSE 'zzzz' END::VARCHAR s FROM range(600000) t(i)");
 	Check(con, "PRAGMA create_ngram_index('cancel_rows', 's')");
 	Check(con, "SET memory_limit='64MB'");
 	unique_ptr<MaterializedQueryResult> result;
@@ -2310,41 +2313,27 @@ static void TestQueryCancellation() {
 	// storage digest and every scratch table to roll back before reuse.
 	Check(con, "SET memory_limit='512MB'");
 	auto cancel_segments = StorageTable(con, "cancel_rows", "s", "segments");
-	auto cancel_stats = StorageTable(con, "cancel_rows", "s", "stats");
-	Check(con, "CREATE TEMP TABLE cancel_split AS SELECT gram, segment_no, generation, "
+	Check(con, "CREATE TEMP TABLE cancel_split AS SELECT gram_key, segment_no, generation, "
 	           "struct_extract(segment, 'postings') AS postings, "
 	           "struct_extract(segment, 'rowid_count') AS rowid_count, "
 	           "struct_extract(segment, 'min_rowid') AS min_rowid, "
 	           "struct_extract(segment, 'max_rowid') AS max_rowid FROM ("
-	           "SELECT gram, segment_no, r % 32 AS generation, ngram_pack_segment(r) AS segment "
-	           "FROM ngram_unpack_postings((SELECT gram, segment_no, postings "
+	           "SELECT gram_key, segment_no, r % 32 AS generation, ngram_pack_segment(r) AS segment "
+	           "FROM ngram_unpack_postings((SELECT gram_key, segment_no, postings "
 	           "FROM " +
-	               cancel_segments + ")) GROUP BY gram, segment_no, generation)");
+	               cancel_segments + ")) GROUP BY gram_key, segment_no, generation)");
 	Check(con, "DELETE FROM " + cancel_segments);
 	Check(con, "INSERT INTO " + cancel_segments +
 	               " SELECT * FROM cancel_split "
-	               "ORDER BY encode(gram), segment_no, generation");
-	Check(con, "DELETE FROM " + cancel_stats);
-	Check(con, "INSERT INTO " + cancel_stats +
-	               " SELECT decode(gram_key), sum(rowid_count)::BIGINT, "
-	               "count(*)::BIGINT FROM (SELECT encode(gram) AS gram_key, rowid_count "
-	               "FROM " +
-	               cancel_segments + ") GROUP BY gram_key ORDER BY gram_key");
+	               "ORDER BY gram_key, segment_no, generation");
 	Check(con, "DROP TABLE cancel_split");
 	auto maintenance_digest = [&]() {
-		return ScalarString(
-		    con,
-		    "SELECT concat("
-		    "(SELECT count(*) || ':' || sum(hash(gram,segment_no,generation,postings,rowid_count,min_rowid,max_rowid)) "
-		    "FROM " +
-		        cancel_segments +
-		        "), '|', "
-		        "(SELECT count(*) || ':' || sum(hash(gram,row_count,segment_count)) "
-		        "FROM " +
-		        cancel_stats +
-		        "), "
-		        "'|', (SELECT hwm_rowid FROM " +
-		        OwnerRow("cancel_rows", "s") + "))");
+		return ScalarString(con, "SELECT concat("
+		                         "(SELECT count(*) || ':' || "
+		                         "sum(hash(gram_key,segment_no,generation,postings,rowid_count,min_rowid,max_rowid)) "
+		                         "FROM " +
+		                             cancel_segments + "), '|', (SELECT hwm_rowid FROM " +
+		                             OwnerRow("cancel_rows", "s") + "))");
 	};
 	auto before = maintenance_digest();
 	for (auto &pragma :

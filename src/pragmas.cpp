@@ -145,7 +145,6 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 	auto total_rows = TableTotalRows(*target.entry);
 	auto base = target.Qualified();
 	auto count = SystemFunction("count");
-	auto encode = SystemFunction("encode");
 	auto subquery = [](const string &select) {
 		return "(SELECT " + select + ")";
 	};
@@ -155,7 +154,6 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 	});
 	for (auto &location : indexes) {
 		auto segments = StorageTable(target.catalog_name, location.SegmentsTable());
-		auto stats = StorageTable(target.catalog_name, location.StatsTable());
 		auto verdict = ValidateIndex(context, target, location);
 		if (verdict.availability != IndexAvailability::AVAILABLE) {
 			throw CatalogException("ngram: index %s no longer exists; was it dropped after binding?",
@@ -173,10 +171,10 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 		    "SELECT m.column_name, m.gram_size, m.case_insensitive, m.hwm_rowid, " + to_string(total_rows - 1) +
 		    "::BIGINT AS table_max_rowid, " +
 		    subquery(count + "(*) FROM " + base + " WHERE rowid > m.hwm_rowid AND rowid < " + to_string(MAX_ROW_ID)) +
-		    " AS remaining_tail, " + subquery(count + "(DISTINCT " + encode + "(gram)) FROM " + stats) +
-		    " AS distinct_grams, " + subquery(count + "(*) FROM " + segments) + " AS segments, " +
-		    subquery(count + "(*) FROM (SELECT " + encode + "(gram) AS gram_key, segment_no FROM " + segments +
-		             " GROUP BY " + encode + "(gram), segment_no HAVING " + count + "(*) > 1)") +
+		    " AS remaining_tail, " + subquery(count + "(DISTINCT gram_key) FROM " + segments) + " AS distinct_grams, " +
+		    subquery(count + "(*) FROM " + segments) + " AS segments, " +
+		    subquery(count + "(*) FROM (SELECT gram_key, segment_no FROM " + segments +
+		             " GROUP BY gram_key, segment_no HAVING " + count + "(*) > 1)") +
 		    " AS fragmented_keys, " + subquery(count + "(DISTINCT generation) FROM " + segments) + " AS generations, " +
 		    subquery("coalesce(" + SystemFunction("sum") + "(rowid_count), 0) FROM " + segments) +
 		    " AS posting_entries, " +

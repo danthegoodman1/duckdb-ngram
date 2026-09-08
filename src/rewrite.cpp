@@ -181,7 +181,7 @@ static vector<RewriteNeedle> UsableNeedles(const vector<RewriteNeedle> &needles,
 			continue;
 		}
 		auto decomposition = DecomposeNeedle(needle.text.data(), needle.text.size(), options);
-		if (!decomposition.too_short && !decomposition.grams.empty()) {
+		if (!decomposition.too_short && !decomposition.keys.empty()) {
 			usable.push_back(needle);
 		}
 	}
@@ -295,26 +295,18 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 	// a matching row must contain every needle, hence every gram of every
 	// needle: one intersection over the union of gram sets is exactly the
 	// per-needle candidate-set intersection
-	vector<string> grams;
-	unordered_set<string> seen;
+	vector<uhugeint_t> keys;
 	for (auto &needle : usable) {
-		auto decomposition = DecomposeNeedle(needle.text.data(), needle.text.size(), info.options);
-		for (auto &gram : decomposition.grams) {
-			if (seen.insert(gram).second) {
-				grams.push_back(gram);
-			}
-		}
+		MergeKeys(keys, DecomposeNeedle(needle.text.data(), needle.text.size(), info.options).keys);
 	}
 	auto segments = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
 	                                        "ngram index segments table");
-	auto stats = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.StatsTable(),
-	                                     "ngram index stats table");
-	if (!segments || !stats) {
+	if (!segments) {
 		state.fallback_reason = "index unavailable";
 		return false;
 	}
 	auto probe =
-	    PlanIndexProbe(context, *state.core.tx, *segments, *stats, grams, MaxGramsPerQuery(context), info.hwm_rowid,
+	    PlanIndexProbe(context, *state.core.tx, *segments, keys, MaxGramsPerQuery(context), info.hwm_rowid,
 	                   state.core.storage->GetTotalRows(), MaxCandidateFraction(context), DConstants::INVALID_INDEX);
 	state.candidate_count = probe->candidate_upper_bound;
 	if (!probe->admitted) {
@@ -526,7 +518,7 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 	auto catalog_name = table->ParentCatalog().GetName();
 	auto schema_name = table->ParentSchema().name;
 	ResolvedTarget resolved {catalog_name, schema_name, table->name, string(), table};
-	auto locations = ExistingIndexes(context, resolved, true);
+	auto owned = OwnedIndexes(context, resolved, true);
 
 	for (auto &entry : get.table_filters.filters) {
 		if (entry.first >= columns.LogicalColumnCount()) {
@@ -541,28 +533,24 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		if (needles.empty()) {
 			continue;
 		}
-		IndexLocation location;
-		bool found = false;
-		for (auto &candidate : locations) {
-			if (StringUtil::CIEquals(candidate.column_name, column.Name())) {
-				if (found) {
+		optional_ptr<const OwnedIndex> index;
+		for (auto &candidate : owned) {
+			if (StringUtil::CIEquals(candidate.location.column_name, column.Name())) {
+				if (index) {
 					return;
 				}
-				location = candidate;
-				found = true;
+				index = &candidate;
 			}
 		}
-		if (!found) {
+		if (!index) {
 			continue;
 		}
-		auto verdict = ValidateIndex(context, resolved, location);
-		if (verdict.availability == IndexAvailability::CHANGED) {
-			throw InvalidInputException(verdict.reason);
-		}
-		if (verdict.availability != IndexAvailability::AVAILABLE || !verdict.reason.empty()) {
+		// the row was read in this statement's snapshot, so the plan-time
+		// verdict is the guard's alone; execution revalidates row and guard
+		if (!RowIdGuardReason(context, table->Cast<DuckTableEntry>(), index->meta).empty()) {
 			continue;
 		}
-		auto usable = UsableNeedles(needles, verdict.meta.options);
+		auto usable = UsableNeedles(needles, index->meta.options);
 		if (usable.empty()) {
 			// short needles, or ILIKE against a case-sensitive index
 			continue;
@@ -572,7 +560,7 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		bind->catalog_name = catalog_name;
 		bind->schema_name = schema_name;
 		bind->table_name = table->name;
-		bind->location = location;
+		bind->location = index->location;
 		bind->column_name = column.Name();
 		bind->needles = std::move(usable);
 		for (auto &col : columns.Logical()) {

@@ -360,9 +360,9 @@ SET VARIABLE cased_id = (SELECT replace(index_id::VARCHAR, '-', '')
 
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE schema_name = '__ngram' AND table_name IN ('segments_' || getvariable('cased_id'), 'stats_' || getvariable('cased_id'));
+WHERE schema_name = '__ngram' AND table_name = 'segments_' || getvariable('cased_id');
 ----
-2
+1
 
 query I
 SELECT column_name FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('cased_id'));

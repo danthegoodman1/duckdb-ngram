@@ -66,25 +66,25 @@ vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_
 
 string PackPartitionStatement(const string &packed, bool first, const string &pair_source) {
 	string statement = first ? "CREATE TEMP TABLE " + packed + " AS " : "INSERT INTO " + packed + " ";
-	return statement + "SELECT " + SystemFunction("decode") + "(gram_key) AS gram, segment_no, " +
-	       SystemFunction("struct_extract") + "(segment, 'postings') AS postings, " + SystemFunction("struct_extract") +
+	return statement + "SELECT gram_key, segment_no, " + SystemFunction("struct_extract") +
+	       "(segment, 'postings') AS postings, " + SystemFunction("struct_extract") +
 	       "(segment, 'rowid_count') AS rowid_count, " + SystemFunction("struct_extract") +
 	       "(segment, 'min_rowid') AS min_rowid, " + SystemFunction("struct_extract") +
-	       "(segment, 'max_rowid') AS max_rowid FROM (" + "SELECT " + SystemFunction("encode") +
-	       "(gram) AS gram_key, segment_no, " + SystemFunction("ngram_pack_segment") + "(r) AS segment FROM (" +
-	       pair_source + ") GROUP BY gram_key, segment_no);\n";
+	       "(segment, 'max_rowid') AS max_rowid FROM (SELECT gram_key, segment_no, " +
+	       SystemFunction("ngram_pack_segment") + "(r) AS segment FROM (" + pair_source +
+	       ") GROUP BY gram_key, segment_no);\n";
 }
 
 string PackRangesStatements(const string &packed, const ResolvedTarget &target, const string &column_name,
                             const GramOptions &options, const vector<pair<int64_t, int64_t>> &ranges) {
 	auto column = Ident(column_name);
-	auto grams = SystemFunction("unnest") + "(" + SystemFunction("trigrams") + "(" + column + ", " +
-	             to_string(options.gram_size) + ", " + (options.case_insensitive ? "true" : "false") + ")) AS gram";
+	auto keys = SystemFunction("unnest") + "(" + SystemFunction("ngram_gram_keys") + "(" + column + ", " +
+	            to_string(options.gram_size) + ", " + (options.case_insensitive ? "true" : "false") + ")) AS gram_key";
 	string script;
 	for (idx_t i = 0; i < ranges.size(); i++) {
 		script += PackPartitionStatement(
 		    packed, i == 0,
-		    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, " + grams + " FROM " +
+		    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, " + keys + " FROM " +
 		        target.Qualified() + " WHERE rowid >= " + to_string(ranges[i].first) +
 		        " AND rowid <= " + to_string(ranges[i].second) + " AND " + column + " IS NOT NULL");
 	}
@@ -266,17 +266,17 @@ string CreateIndexScript(ClientContext &context, const ResolvedTarget &target, c
 	ResolveCreateGuard(context, table, target, siblings, location);
 
 	auto segments = StorageTable(target.catalog_name, location.SegmentsTable());
-	auto stats = StorageTable(target.catalog_name, location.StatsTable());
 	auto total_rows = TableTotalRows(table);
 
 	// No BEGIN/COMMIT here: the statement preprocessor wraps a multi-statement
 	// pragma expansion in a transaction itself. The build runs through DuckDB's
 	// engine, so it is parallel and can spill: one statement per rowid-range
-	// partition groups that partition's (gram, segment_no, rowid) pairs into
+	// partition groups that partition's (gram_key, segment_no, rowid) pairs into
 	// segment rows with ngram_pack_segment, the partitions land in a temp table,
-	// and that table is written to the segments table in gram order. Segments
+	// and that table is written to the segments table in key order. Segments
 	// are bucketed by rowid range, which lets a rowid-range partition hold whole
-	// keys; duplicate (gram, rowid) pairs survive until the codec dedupes.
+	// keys. The segments table is the whole index: a probe reads each needle
+	// key's rows to rank the grams, so no separate statistics are kept.
 	string script;
 	string fence = ScratchName("fence");
 	string packed = ScratchName("build_packed");
@@ -309,20 +309,13 @@ string CreateIndexScript(ClientContext &context, const ResolvedTarget &target, c
 	    context, EstimateGramCount(context, table, location.column_name, 0, total_rows - 1, options.gram_size));
 	script += PackRangesStatements(packed, target, location.column_name, options,
 	                               SegmentAlignedRanges(0, total_rows - 1, partitions));
-	// gram order is what makes the probe's `gram = ?` filter prune row groups by
-	// zone map, so the segments table is written sorted even though the
-	// partitions produced their rows in rowid order
+	// key order is what makes the probe's `gram_key = ?` filter prune row groups
+	// and column segments by zone map, so the segments table is written sorted
+	// even though the partitions produced their rows in rowid order
 	script += "CREATE TABLE " + segments +
 	          " AS "
-	          "SELECT gram, segment_no, 0 AS generation, postings, rowid_count, min_rowid, max_rowid FROM " +
-	          packed + " ORDER BY " + SystemFunction("encode") + "(gram), segment_no;\n";
-	script += "CREATE TABLE " + stats +
-	          " AS "
-	          "SELECT " +
-	          SystemFunction("decode") + "(gram_key) AS gram, " + SystemFunction("sum") +
-	          "(rowid_count)::BIGINT AS row_count, " + SystemFunction("count") + "(*)::BIGINT AS segment_count FROM " +
-	          "(SELECT " + SystemFunction("encode") + "(gram) AS gram_key, rowid_count FROM " + segments +
-	          ") GROUP BY gram_key ORDER BY gram_key;\n";
+	          "SELECT gram_key, segment_no, 0 AS generation, postings, rowid_count, min_rowid, max_rowid FROM " +
+	          packed + " ORDER BY gram_key, segment_no;\n";
 	script += "DROP TABLE " + packed + ";\n";
 	script += "DROP TABLE " + fence + ";\n";
 	return script;
@@ -358,8 +351,6 @@ string DropIndexScript(ClientContext &context, const ObservedIndex &index) {
 		}
 	} else {
 		storage.push_back("DROP TABLE IF EXISTS " + StorageTable(index.catalog_name, index.location.SegmentsTable()) +
-		                  ";\n");
-		storage.push_back("DROP TABLE IF EXISTS " + StorageTable(index.catalog_name, index.location.StatsTable()) +
 		                  ";\n");
 	}
 	// The guard goes with the last index that records it, once the exact

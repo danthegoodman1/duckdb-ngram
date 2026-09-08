@@ -25,7 +25,7 @@ SELECT registry_version, typeof(index_id), typeof(owner_key), schema_name, table
        guard_name = '__ngram_guard_' || replace(index_id::VARCHAR, '-', '')
 FROM __ngram.registry;
 ----
-2	UUID	BLOB	main	lifecycle_docs	s	4	3	true	1	true
+2	UUID	BLOB	main	lifecycle_docs	s	5	3	true	1	true
 
 query I
 SELECT count(*) FROM duckdb_columns()
@@ -33,19 +33,18 @@ WHERE schema_name = '__ngram' AND table_name = 'registry' AND NOT is_nullable;
 ----
 12
 
-# Postings and stats live in two tables named by the index id.
+# Postings live in one segments table named by the index id.
 query I
 SELECT count(*) FROM duckdb_tables() t, __ngram.registry r
 WHERE t.schema_name = '__ngram'
-  AND t.table_name IN ('segments_' || replace(r.index_id::VARCHAR, '-', ''),
-                       'stats_' || replace(r.index_id::VARCHAR, '-', ''));
+  AND t.table_name = 'segments_' || replace(r.index_id::VARCHAR, '-', '');
 ----
-2
+1
 
 query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	<REGEX>:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}	main	lifecycle_docs	s	4	READY	NULL
+memory	<REGEX>:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}	main	lifecycle_docs	s	5	READY	NULL
 
 query I
 SELECT count(*) FROM ngram_search('lifecycle_docs', 'hell');
@@ -106,13 +105,13 @@ PRAGMA drop_ngram_index('LIFECYCLE_DOCS', 'T');
 query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	4	READY	NULL
+memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	5	READY	NULL
 
 query II
 SELECT (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'lifecycle_docs'),
        (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry');
 ----
-1	2
+1	1
 
 # ORPHAN: dropping the base table drops its guard with it; the registry row
 # stays addressable by id.
@@ -122,7 +121,7 @@ DROP TABLE lifecycle_docs;
 query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	4	ORPHAN	<REGEX>:.*base table is missing.*
+memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	5	ORPHAN	<REGEX>:.*base table is missing.*
 
 # SCAN_ONLY: a new table under the recorded name has no guard, so every exact
 # query scans it and maintenance refuses.
@@ -135,7 +134,7 @@ INSERT INTO lifecycle_docs VALUES ('hello again', 'x');
 query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	4	SCAN_ONLY	<REGEX>:.*rowid guard is missing.*
+memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	5	SCAN_ONLY	<REGEX>:.*rowid guard is missing.*
 
 query I
 SELECT count(*) FROM ngram_search('lifecycle_docs', 'hell');
@@ -167,7 +166,7 @@ ATTACH 'test/fixtures/format3.duckdb' AS f3 (READ_ONLY);
 query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-f3	a03b02be-5f8a-4c43-92c9-5969ea3e178f	main	docs	s	3	MALFORMED	<REGEX>:index format 3 .*predates format 4.*drop_ngram_index_by_id.*
+f3	a03b02be-5f8a-4c43-92c9-5969ea3e178f	main	docs	s	3	MALFORMED	<REGEX>:index format 3 .*predates format 5.*drop_ngram_index_by_id.*
 
 statement ok
 SET ngram_auto_accelerate = true;
@@ -185,7 +184,7 @@ drop it with drop_ngram_index_by_id
 statement error
 PRAGMA create_ngram_index('f3.main.docs', 't');
 ----
-predates format 4
+predates format 5
 
 statement error
 PRAGMA drop_ngram_index_by_id('f3', 'a03b02be-5f8a-4c43-92c9-5969ea3e178f');

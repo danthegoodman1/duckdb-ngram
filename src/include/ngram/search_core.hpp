@@ -7,9 +7,14 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "ngram/probe.hpp"
+
+#include <condition_variable>
+#include <deque>
 
 namespace duckdb {
 
@@ -53,21 +58,36 @@ void AddShadowColumn(DuckTableEntry &entry, const string &column_name, LogicalTy
 
 void ThrowIfInterrupted(ClientContext &context);
 
-//! Scan an entire table (committed storage plus this transaction's local rows)
-//! through the caller's transaction, invoking fn per non-empty chunk.
-void ScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
-                     const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
-                     optional_ptr<TableFilterSet> filters, const std::function<void(DataChunk &)> &fn);
-
-//! Scan a whole table in parallel, one row group per claim. `body` is called
-//! once per chunk with the worker's own index so it can accumulate into a
-//! private slot.
-void ParallelScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
-                             const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
-                             optional_ptr<TableFilterSet> filters, idx_t workers,
-                             const std::function<void(DataChunk &, idx_t)> &body);
+//! Run `body(unit)` for every unit in [0, units) across at most `workers` of
+//! the scheduler's threads, or inline when there is only one of either. The
+//! caller's work must be order-independent and must not share mutable state
+//! between units without its own synchronization.
+void ParallelForEachUnit(ClientContext &context, idx_t units, idx_t workers, const std::function<void(idx_t)> &body);
 
 enum class SearchCorePhase : uint8_t { FETCH, SCAN, DONE };
+
+//! One intersected segment whose candidate rowids are being handed out in
+//! FETCH_BATCH_ROWS batches.
+struct PublishedCandidates {
+	PublishedCandidates(idx_t segment_ordinal_p, shared_ptr<vector<row_t>> rowids_p)
+	    : segment_ordinal(segment_ordinal_p), rowids(std::move(rowids_p)) {
+	}
+	idx_t segment_ordinal;
+	shared_ptr<vector<row_t>> rowids;
+	idx_t next_offset = 0;
+};
+
+//! The shared cursor over intersected segments. A fetch worker takes the next
+//! batch of a published segment when one is waiting and otherwise decodes the
+//! next admitted segment and publishes it, so every worker fetches whatever
+//! segment finished decoding rather than only its own.
+struct CandidateQueue {
+	mutex lock;
+	std::condition_variable published;
+	std::deque<PublishedCandidates> ready;
+	//! Segments claimed for decoding and not yet published.
+	idx_t decoding = 0;
+};
 
 //! Projection-neutral execution state shared by ngram_search and the
 //! transparent NGRAM_INDEX_SCAN. Policy-specific init supplies layouts,
@@ -78,7 +98,12 @@ struct SearchCoreGlobal {
 	int64_t hwm = -1;
 	unique_ptr<ProbePlan> probe;
 	atomic<idx_t> next_probe_thread {0};
+	CandidateQueue candidates;
 	idx_t fetch_batch_base = 0;
+	//! Position of the rowid column in the fetch projection while a probe is
+	//! admitted; dense candidate batches are read as rowid-range scans, whose
+	//! range filter references it.
+	idx_t fetch_rowid_position = 0;
 
 	vector<StorageIndex> fetch_column_ids;
 	vector<LogicalType> fetch_types;
@@ -97,9 +122,19 @@ struct SearchCoreLocal {
 	SearchCorePhase phase = SearchCorePhase::FETCH;
 	DataChunk fetch_chunk;
 	ColumnFetchState fetch_state;
-	vector<row_t> candidates;
+	//! The claimed batch: rowids [candidate_offset, candidate_end) of the
+	//! published segment `segment_ordinal`.
+	shared_ptr<vector<row_t>> candidates;
 	idx_t candidate_offset = 0;
+	idx_t candidate_end = 0;
 	idx_t segment_ordinal = 0;
+	ProbeDecodeScratch decode;
+	//! A dense batch in progress as a rowid-range scan; the filters bound the
+	//! scan to the batch's first and last rowid. Both are rebuilt per batch:
+	//! a TableScanState keeps appending to its filter list when initialized
+	//! again.
+	unique_ptr<TableScanState> range_state;
+	unique_ptr<TableFilterSet> range_filters;
 
 	TableScanState scan_state;
 	DataChunk scan_chunk;

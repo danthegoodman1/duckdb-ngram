@@ -41,15 +41,36 @@ void ExtractGrams(const char *data, idx_t len, const GramOptions &options, strin
 	}
 }
 
+//! The storage key of a normalized gram: the leading sorted column of the
+//! segments table, so a probe's `gram_key = ?` is a native fixed-width filter.
+//! Grams of at most 16 bytes (every 3- and 4-gram, since a codepoint is at
+//! most 4 bytes) are byte-packed big-endian into the high bytes with zero
+//! padding below, which preserves byte order; longer grams hash to 64 bits in
+//! the low half under an all-ones high half.
+//!
+//! Collisions only widen. Within one index every gram has gram_size
+//! codepoints, so two distinct byte-packed grams share a key only if one is
+//! the other plus trailing NUL codepoints, which changes the codepoint count;
+//! no byte-packed key of valid UTF-8 starts with eight 0xFF bytes, so it never
+//! meets a hashed key; two hashed grams collide with probability 2^-64. A
+//! collision merges the grams' postings under one key, so each gram's
+//! candidate set becomes a superset and recheck removes the excess. Build and
+//! query derive keys with this one function, so a query gram always finds the
+//! rows the build wrote for it.
+uhugeint_t GramKey(const char *data, idx_t len);
+
 struct NeedleDecomposition {
-	//! Deduplicated grams in first-occurrence order.
-	vector<string> grams;
+	//! Keys of the needle's distinct grams in first-occurrence order.
+	vector<uhugeint_t> keys;
 	//! Needle has fewer than gram_size codepoints: the index cannot be probed and the
 	//! caller must fall back to a full scan (which is still exhaustive).
 	bool too_short = false;
 };
 
 NeedleDecomposition DecomposeNeedle(const char *data, idx_t len, const GramOptions &options);
+
+//! Append the keys of `keys` that are not yet in `target`, keeping order.
+void MergeKeys(vector<uhugeint_t> &target, const vector<uhugeint_t> &keys);
 
 void RegisterGram(ExtensionLoader &loader);
 

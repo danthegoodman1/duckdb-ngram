@@ -1,9 +1,6 @@
 #include "ngram/probe.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/common/string_map_set.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
 #include "ngram/catalog.hpp"
 #include "ngram/postings.hpp"
 #include "ngram/search_core.hpp"
@@ -33,109 +30,6 @@ static idx_t ProbeThreads(ClientContext &context) {
 	return MaxValue<idx_t>(NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()), 1);
 }
 
-static idx_t StatsWorkers(ClientContext &context, DuckTableEntry &stats_entry) {
-	return MaxValue<idx_t>(MinValue(ProbeThreads(context), stats_entry.GetStorage().MaxThreads(context)), 1);
-}
-
-//! Counts recorded for one gram. `segment_count` is the exact number of
-//! visible segment-table rows (including refresh generations), so it also
-//! bounds the manifest before that vector is allowed to grow.
-struct GramStats {
-	idx_t row_count = 0;
-	idx_t segment_count = 0;
-};
-
-struct AtomicGramStats {
-	atomic<idx_t> row_count {0};
-	atomic<idx_t> segment_count {0};
-};
-
-static void CheckedAtomicAdd(atomic<idx_t> &target, idx_t value) {
-	auto current = target.load();
-	while (true) {
-		if (value > std::numeric_limits<idx_t>::max() - current) {
-			throw InvalidInputException("ngram: stats counts overflow; the index is malformed");
-		}
-		if (target.compare_exchange_weak(current, current + value)) {
-			return;
-		}
-	}
-}
-
-static vector<GramStats> ReadGramStats(ClientContext &context, DuckTransaction &tx, DuckTableEntry &stats_entry,
-                                       const vector<string> &grams, idx_t workers, idx_t &rows_scanned,
-                                       idx_t &chunks_scanned) {
-	// string_t keys reference the immutable query grams for this scan. Looking
-	// up a stats value therefore allocates no per-row scratch, even when a
-	// malformed/unrelated stats gram is very large.
-	string_map_t<idx_t> gram_index;
-	for (idx_t i = 0; i < grams.size(); i++) {
-		gram_index.emplace(string_t(grams[i].data(), NumericCast<uint32_t>(grams[i].size())), i);
-	}
-	unique_ptr<AtomicGramStats[]> totals(new AtomicGramStats[grams.size()]);
-
-	vector<StorageIndex> column_ids;
-	vector<LogicalType> types;
-	AddShadowColumn(stats_entry, "gram", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(stats_entry, "row_count", LogicalTypeId::BIGINT, column_ids, types);
-	AddShadowColumn(stats_entry, "segment_count", LogicalTypeId::BIGINT, column_ids, types);
-	vector<Value> gram_values;
-	gram_values.reserve(grams.size());
-	for (auto &gram : grams) {
-		gram_values.emplace_back(gram);
-	}
-	TableFilterSet filters;
-	// Raw storage scans cannot execute an InFilter directly. OptionalFilter
-	// uses it only for row-group pruning; the map below remains the exact row
-	// filter and accumulator across every visible refresh generation.
-	filters.PushFilter(ColumnIndex(0), make_uniq<OptionalFilter>(make_uniq<InFilter>(std::move(gram_values))));
-	atomic<idx_t> scanned_rows {0};
-	atomic<idx_t> scanned_chunks {0};
-	ParallelScanShadowTable(
-	    context, tx, stats_entry.GetStorage(), column_ids, types, &filters, workers,
-	    [&](DataChunk &chunk, idx_t worker) {
-		    scanned_rows.fetch_add(chunk.size());
-		    scanned_chunks.fetch_add(1);
-		    UnifiedVectorFormat gram_format, row_format, segment_format;
-		    chunk.data[0].ToUnifiedFormat(chunk.size(), gram_format);
-		    chunk.data[1].ToUnifiedFormat(chunk.size(), row_format);
-		    chunk.data[2].ToUnifiedFormat(chunk.size(), segment_format);
-		    auto gram_data = UnifiedVectorFormat::GetData<string_t>(gram_format);
-		    auto row_data = UnifiedVectorFormat::GetData<int64_t>(row_format);
-		    auto segment_data = UnifiedVectorFormat::GetData<int64_t>(segment_format);
-		    for (idx_t r = 0; r < chunk.size(); r++) {
-			    auto gram_idx = gram_format.sel->get_index(r);
-			    auto row_idx = row_format.sel->get_index(r);
-			    auto segment_idx = segment_format.sel->get_index(r);
-			    if (!gram_format.validity.RowIsValid(gram_idx)) {
-				    continue;
-			    }
-			    auto entry = gram_index.find(gram_data[gram_idx]);
-			    if (entry == gram_index.end()) {
-				    continue;
-			    }
-			    if (!row_format.validity.RowIsValid(row_idx) || !segment_format.validity.RowIsValid(segment_idx)) {
-				    throw InvalidInputException("ngram: requested stats row contains NULLs; the index is malformed");
-			    }
-			    if (row_data[row_idx] <= 0 || segment_data[segment_idx] <= 0) {
-				    throw InvalidInputException("ngram: invalid gram row in stats table; the index is malformed");
-			    }
-			    auto rows = NumericCast<idx_t>(row_data[row_idx]);
-			    auto segments = NumericCast<idx_t>(segment_data[segment_idx]);
-			    CheckedAtomicAdd(totals[entry->second].row_count, rows);
-			    CheckedAtomicAdd(totals[entry->second].segment_count, segments);
-		    }
-	    });
-	rows_scanned = scanned_rows.load();
-	chunks_scanned = scanned_chunks.load();
-	vector<GramStats> result(grams.size());
-	for (idx_t gram = 0; gram < grams.size(); gram++) {
-		result[gram].row_count = totals[gram].row_count.load();
-		result[gram].segment_count = totals[gram].segment_count.load();
-	}
-	return result;
-}
-
 static bool CheckedAdd(idx_t &target, idx_t value) {
 	if (value > std::numeric_limits<idx_t>::max() - target) {
 		return false;
@@ -158,159 +52,140 @@ static void ThrowProbeOverflow() {
 	throw InvalidInputException("ngram: probe arithmetic overflow");
 }
 
-//! Memory the planner needs before it reads any stats: string copies, hash
-//! nodes and buckets, stats counters, filter values and sort indexes for the
-//! whole needle, without depending on STL node layouts, plus 256 KiB for each
-//! stats worker's scan chunk and state. The scan's row loop allocates no
-//! per-row scratch, and ordinary DuckDB allocator buffers are not charged to
-//! BufferManager reservations.
-static idx_t PreflightProbeBytes(const vector<string> &grams, idx_t stats_workers) {
+//! Memory the planner needs before it reads a segments-table row: per-key
+//! scratch (descriptor vectors, totals, sort indexes, filter values) for the
+//! whole needle, without depending on STL layouts, plus 256 KiB for each
+//! manifest worker's scan chunk and state. Ordinary DuckDB allocator buffers
+//! are not charged to BufferManager reservations.
+static idx_t PreflightProbeBytes(idx_t key_count, idx_t workers) {
 	idx_t preflight_bytes = 4096;
-	idx_t per_gram_bytes;
-	idx_t stats_worker_bytes;
-	if (!CheckedMultiply(grams.size(), idx_t(256), per_gram_bytes) ||
-	    !CheckedMultiply(stats_workers, idx_t(256 * 1024), stats_worker_bytes) ||
-	    !CheckedAdd(preflight_bytes, per_gram_bytes) || !CheckedAdd(preflight_bytes, stats_worker_bytes)) {
+	idx_t per_key_bytes;
+	idx_t worker_bytes;
+	if (!CheckedMultiply(key_count, idx_t(256), per_key_bytes) ||
+	    !CheckedMultiply(workers, idx_t(256 * 1024), worker_bytes) || !CheckedAdd(preflight_bytes, per_key_bytes) ||
+	    !CheckedAdd(preflight_bytes, worker_bytes)) {
 		ThrowProbeOverflow();
-	}
-	for (auto &gram : grams) {
-		idx_t string_bytes;
-		// query gram + stats-filter Value + selected-plan copy (only K are
-		// selected, but charging all grams keeps this a simple upper bound)
-		if (!CheckedMultiply(gram.size(), idx_t(3), string_bytes) || !CheckedAdd(preflight_bytes, string_bytes)) {
-			ThrowProbeOverflow();
-		}
 	}
 	return preflight_bytes;
 }
 
-//! Retain the `max_grams` rarest grams by stats row count, stable on ties, as
-//! the plan's grams with their stats alongside.
-static vector<GramStats> SelectRarestGrams(const vector<string> &grams, const vector<GramStats> &all_stats,
-                                           idx_t max_grams, ProbePlan &plan) {
-	vector<idx_t> order(grams.size());
-	for (idx_t i = 0; i < order.size(); i++) {
-		order[i] = i;
-	}
-	std::stable_sort(order.begin(), order.end(),
-	                 [&](idx_t a, idx_t b) { return all_stats[a].row_count < all_stats[b].row_count; });
-	order.resize(MinValue<idx_t>(order.size(), max_grams));
-	vector<GramStats> selected_stats;
-	selected_stats.reserve(order.size());
-	plan.grams.reserve(order.size());
-	for (auto index : order) {
-		plan.grams.push_back(grams[index]);
-		selected_stats.push_back(all_stats[index]);
-	}
-	return selected_stats;
-}
+//! Bytes the manifest occupies per descriptor row: the descriptor, the
+//! segment slot it may open, and slack for the per-gram scratch.
+static constexpr idx_t MANIFEST_BYTES_PER_ROW = sizeof(ProbeDescriptor) + sizeof(ProbeSegment) + 8;
 
-//! The segment rows the selected stats promise, checked against the segment
-//! rows visible to this transaction.
-static idx_t ExpectedDescriptorCount(DuckTransaction &tx, DuckTableEntry &segments_entry,
-                                     const vector<GramStats> &selected_stats) {
-	idx_t descriptor_count = 0;
-	for (auto &stats : selected_stats) {
-		if (stats.segment_count > stats.row_count) {
-			throw InvalidInputException("ngram: stats segment_count exceeds row_count; the index is malformed");
-		}
-		if (!CheckedAdd(descriptor_count, stats.segment_count)) {
-			ThrowProbeOverflow();
-		}
-	}
-	auto visible_segment_rows = segments_entry.GetStorage().GetTotalRows();
-	if (!CheckedAdd(visible_segment_rows, LocalStorage::Get(tx).AddedRows(segments_entry.GetStorage()))) {
-		ThrowProbeOverflow();
-	}
-	if (descriptor_count > visible_segment_rows) {
-		throw InvalidInputException("ngram: stats describe more segment rows than exist; the index is malformed");
-	}
-	return descriptor_count;
-}
+//! The segments-table rows of one gram, as collected by its manifest scan.
+struct GramRows {
+	vector<ProbeDescriptor> descriptors;
+	idx_t row_count = 0;
+};
 
-//! Bytes the manifest occupies: one descriptor and one segment slot per
-//! promised row, per-gram scratch, and slack.
-static idx_t ManifestBytes(idx_t descriptor_count, idx_t gram_count) {
-	idx_t manifest_bytes;
-	idx_t gram_scratch_bytes;
-	if (!CheckedMultiply(gram_count, sizeof(idx_t), gram_scratch_bytes) ||
-	    !CheckedMultiply(descriptor_count, sizeof(ProbeDescriptor) + sizeof(ProbeSegment), manifest_bytes) ||
-	    !CheckedAdd(manifest_bytes, gram_scratch_bytes) || !CheckedAdd(manifest_bytes, idx_t(4096))) {
-		ThrowProbeOverflow();
-	}
-	return manifest_bytes;
-}
-
-//! Read every visible segments-table row of the selected grams into the
-//! manifest, verifying each against its stats, then order the manifest by
-//! segment, gram and posting rowid.
-static void ReadManifest(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry, int64_t hwm,
-                         const vector<GramStats> &selected_stats, idx_t descriptor_count, ProbePlan &plan) {
-	plan.descriptors.reserve(descriptor_count);
-	plan.segments.reserve(descriptor_count);
+//! Read every visible segments-table row of every needle key, one filtered
+//! scan per key across the scheduler's threads. The key is the table's
+//! leading sorted column, so each `gram_key = ?` scan touches the row groups
+//! and column segments whose zone map admits the key and evaluates the filter
+//! natively on the fixed-width column. Rows are validated against the
+//! high-water mark and the segment capacity as they arrive, and their total
+//! is bounded by `max_rows`; past it the scans stop and the plan declines.
+//! Returns false on that decline.
+static bool CollectGramRows(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
+                            const vector<uhugeint_t> &keys, int64_t hwm, idx_t workers, idx_t max_rows,
+                            vector<GramRows> &per_key, idx_t &rows_scanned) {
 	vector<StorageIndex> column_ids;
 	vector<LogicalType> types;
-	AddShadowColumn(segments_entry, "gram", LogicalTypeId::VARCHAR, column_ids, types);
+	AddShadowColumn(segments_entry, "gram_key", LogicalTypeId::UHUGEINT, column_ids, types);
 	AddShadowColumn(segments_entry, "segment_no", LogicalTypeId::BIGINT, column_ids, types);
 	AddShadowColumn(segments_entry, "rowid_count", LogicalTypeId::BIGINT, column_ids, types);
 	column_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
 	types.emplace_back(LogicalType::ROW_TYPE);
+	auto &storage = segments_entry.GetStorage();
+	auto max_segment = hwm < 0 ? int64_t(-1) : hwm >> SEGMENT_SHIFT;
 
-	vector<idx_t> found_rows(plan.grams.size(), 0);
-	vector<idx_t> found_descriptors(plan.grams.size(), 0);
-	for (idx_t gram_index = 0; gram_index < plan.grams.size(); gram_index++) {
+	atomic<idx_t> total_rows {0};
+	atomic<bool> declined {false};
+	ParallelForEachUnit(context, keys.size(), workers, [&](idx_t key_index) {
+		auto &rows = per_key[key_index];
 		TableFilterSet filters;
 		filters.PushFilter(ColumnIndex(0),
-		                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value(plan.grams[gram_index])));
-		ScanShadowTable(context, tx, segments_entry.GetStorage(), column_ids, types, &filters, [&](DataChunk &chunk) {
-			UnifiedVectorFormat gram_format, segment_format, count_format, rowid_format;
-			chunk.data[0].ToUnifiedFormat(chunk.size(), gram_format);
+		                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::UHUGEINT(keys[key_index])));
+		TableScanState state;
+		InitializeExhaustiveScan(context, tx, storage, state, column_ids, &filters);
+		DataChunk chunk;
+		chunk.Initialize(Allocator::Get(context), types);
+		while (!declined.load()) {
+			ThrowIfInterrupted(context);
+			chunk.Reset();
+			storage.Scan(tx, chunk, state);
+			if (chunk.size() == 0) {
+				return;
+			}
+			if (total_rows.fetch_add(chunk.size()) + chunk.size() > max_rows) {
+				declined.store(true);
+				return;
+			}
+			UnifiedVectorFormat key_format, segment_format, count_format, rowid_format;
+			chunk.data[0].ToUnifiedFormat(chunk.size(), key_format);
 			chunk.data[1].ToUnifiedFormat(chunk.size(), segment_format);
 			chunk.data[2].ToUnifiedFormat(chunk.size(), count_format);
 			chunk.data[3].ToUnifiedFormat(chunk.size(), rowid_format);
-			auto gram_data = UnifiedVectorFormat::GetData<string_t>(gram_format);
+			auto key_data = UnifiedVectorFormat::GetData<uhugeint_t>(key_format);
 			auto segment_data = UnifiedVectorFormat::GetData<int64_t>(segment_format);
 			auto count_data = UnifiedVectorFormat::GetData<int64_t>(count_format);
 			auto rowid_data = UnifiedVectorFormat::GetData<row_t>(rowid_format);
 			for (idx_t r = 0; r < chunk.size(); r++) {
-				auto gram_idx = gram_format.sel->get_index(r);
+				auto key_idx = key_format.sel->get_index(r);
 				auto segment_idx = segment_format.sel->get_index(r);
 				auto count_idx = count_format.sel->get_index(r);
 				auto rowid_idx = rowid_format.sel->get_index(r);
-				if (!gram_format.validity.RowIsValid(gram_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
+				if (!key_format.validity.RowIsValid(key_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
 				    !count_format.validity.RowIsValid(count_idx) || !rowid_format.validity.RowIsValid(rowid_idx)) {
 					throw InvalidInputException("ngram: segments table contains NULLs; the index is malformed");
 				}
-				auto &gram = gram_data[gram_idx];
-				if (gram != string_t(plan.grams[gram_index]) || segment_data[segment_idx] < 0 || hwm < 0 ||
-				    segment_data[segment_idx] > (hwm >> SEGMENT_SHIFT) || count_data[count_idx] <= 0) {
+				if (key_data[key_idx] != keys[key_index] || segment_data[segment_idx] < 0 ||
+				    segment_data[segment_idx] > max_segment || count_data[count_idx] <= 0) {
 					throw InvalidInputException("ngram: invalid segments-table descriptor; the index is malformed");
-				}
-				if (plan.descriptors.size() >= descriptor_count ||
-				    found_descriptors[gram_index] >= selected_stats[gram_index].segment_count) {
-					throw InvalidInputException(
-					    "ngram: segments and stats descriptor counts disagree; the index is malformed");
 				}
 				auto count = NumericCast<idx_t>(count_data[count_idx]);
 				if (count > (idx_t(1) << SEGMENT_SHIFT)) {
 					throw InvalidInputException(
 					    "ngram: segment row_count exceeds its rowid range; the index is malformed");
 				}
-				if (!CheckedAdd(found_rows[gram_index], count)) {
+				if (!CheckedAdd(rows.row_count, count)) {
 					ThrowProbeOverflow();
 				}
-				found_descriptors[gram_index]++;
-				plan.descriptors.push_back(
-				    ProbeDescriptor {segment_data[segment_idx], gram_index, rowid_data[rowid_idx], count});
+				rows.descriptors.emplace_back(segment_data[segment_idx], key_index, rowid_data[rowid_idx], count);
 			}
-		});
-		if (found_descriptors[gram_index] != selected_stats[gram_index].segment_count ||
-		    found_rows[gram_index] != selected_stats[gram_index].row_count) {
-			throw InvalidInputException("ngram: segments and stats counts disagree; the index is malformed");
 		}
+	});
+	rows_scanned = total_rows.load();
+	return !declined.load();
+}
+
+//! Move the `max_grams` rarest grams by posting total, stable on ties, into
+//! the plan as its keys and manifest, ordered by segment, gram and posting
+//! rowid.
+static void SelectRarestGrams(const vector<uhugeint_t> &keys, vector<GramRows> &per_key, idx_t max_grams,
+                              ProbePlan &plan) {
+	vector<idx_t> order(keys.size());
+	for (idx_t i = 0; i < order.size(); i++) {
+		order[i] = i;
 	}
-	if (plan.descriptors.size() != descriptor_count) {
-		throw InvalidInputException("ngram: segments and stats descriptor counts disagree; the index is malformed");
+	std::stable_sort(order.begin(), order.end(),
+	                 [&](idx_t a, idx_t b) { return per_key[a].row_count < per_key[b].row_count; });
+	order.resize(MinValue<idx_t>(order.size(), max_grams));
+	idx_t descriptor_count = 0;
+	for (auto index : order) {
+		descriptor_count += per_key[index].descriptors.size();
+	}
+	plan.keys.reserve(order.size());
+	plan.descriptors.reserve(descriptor_count);
+	for (idx_t gram_index = 0; gram_index < order.size(); gram_index++) {
+		auto &rows = per_key[order[gram_index]];
+		plan.keys.push_back(keys[order[gram_index]]);
+		for (auto &descriptor : rows.descriptors) {
+			plan.descriptors.push_back(descriptor);
+			plan.descriptors.back().gram_index = gram_index;
+		}
+		vector<ProbeDescriptor>().swap(rows.descriptors);
 	}
 	std::sort(plan.descriptors.begin(), plan.descriptors.end(), [](const ProbeDescriptor &a, const ProbeDescriptor &b) {
 		if (a.segment_no != b.segment_no) {
@@ -348,15 +223,16 @@ static idx_t SegmentWorkerBytes(const vector<idx_t> &counts, idx_t segment_capac
 }
 
 //! Group the manifest by rowid segment and admit every segment that carries
-//! all selected grams, accounting the decoded work and the peak per-worker
-//! bytes until the work budget is exceeded, which declines the plan. The
-//! structural checks continue past that point, so a decline in one segment
-//! cannot hide corruption in a later one.
+//! all selected grams, accounting the decoded work, the peak per-worker
+//! decode bytes and the peak candidate bytes a published segment holds, until
+//! the work budget is exceeded, which declines the plan. The structural
+//! checks continue past that point, so a decline in one segment cannot hide
+//! corruption in a later one.
 static void AdmitSegments(ProbePlan &plan, int64_t hwm, idx_t hard_work_limit, idx_t &estimated_decoded_rowids,
-                          idx_t &peak_worker_bytes) {
+                          idx_t &peak_worker_bytes, idx_t &peak_candidate_bytes) {
 	auto &descriptors = plan.descriptors;
 	vector<idx_t> counts;
-	counts.reserve(plan.grams.size());
+	counts.reserve(plan.keys.size());
 	for (idx_t begin = 0; begin < descriptors.size();) {
 		idx_t end = begin + 1;
 		while (end < descriptors.size() && descriptors[end].segment_no == descriptors[begin].segment_no) {
@@ -384,7 +260,7 @@ static void AdmitSegments(ProbePlan &plan, int64_t hwm, idx_t hard_work_limit, i
 		}
 		auto segment_begin = begin;
 		begin = end;
-		if (counts.size() != plan.grams.size()) {
+		if (counts.size() != plan.keys.size()) {
 			continue;
 		}
 		idx_t candidate_bound = segment_capacity;
@@ -392,6 +268,14 @@ static void AdmitSegments(ProbePlan &plan, int64_t hwm, idx_t hard_work_limit, i
 			candidate_bound = MinValue(candidate_bound, count);
 		}
 		plan.segments.push_back(ProbeSegment {descriptors[segment_begin].segment_no, segment_begin, end});
+		// smallest posting list first: every later intersection is bounded by
+		// the smallest list decoded so far
+		auto &gram_order = plan.segments.back().gram_order;
+		gram_order.resize(counts.size());
+		for (idx_t gram = 0; gram < counts.size(); gram++) {
+			gram_order[gram] = gram;
+		}
+		std::stable_sort(gram_order.begin(), gram_order.end(), [&](idx_t a, idx_t b) { return counts[a] < counts[b]; });
 		if (!plan.decline_reason.empty()) {
 			continue;
 		}
@@ -408,46 +292,50 @@ static void AdmitSegments(ProbePlan &plan, int64_t hwm, idx_t hard_work_limit, i
 			ThrowProbeOverflow();
 		}
 		peak_worker_bytes = MaxValue(peak_worker_bytes, SegmentWorkerBytes(counts, segment_capacity));
+		peak_candidate_bytes = MaxValue(peak_candidate_bytes, candidate_bound * sizeof(row_t));
 	}
 }
 
 unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
-                                     DuckTableEntry &stats_entry, const vector<string> &grams, idx_t max_grams,
-                                     int64_t hwm, idx_t table_rows, double candidate_fraction, idx_t worker_cap) {
-	D_ASSERT(!grams.empty());
+                                     const vector<uhugeint_t> &keys, idx_t max_grams, int64_t hwm, idx_t table_rows,
+                                     double candidate_fraction, idx_t worker_cap) {
+	D_ASSERT(!keys.empty());
 	D_ASSERT(worker_cap > 0);
 	auto plan = make_uniq<ProbePlan>();
 	plan->segments_entry = &segments_entry;
 	plan->hwm = hwm;
 
-	// Both callers supply distinct grams. Account the full needle before
-	// copying it or reading stats, then retain the rarest K.
+	// Both callers supply distinct keys. Account the whole needle before
+	// reading a row, collect every key's segment rows, then keep the rarest K.
 	auto memory_budget = ProbeMemoryBudget(context);
-	auto stats_workers = StatsWorkers(context, stats_entry);
-	auto preflight_bytes = PreflightProbeBytes(grams, stats_workers);
+	auto workers = MinValue<idx_t>(ProbeThreads(context), keys.size());
+	auto preflight_bytes = PreflightProbeBytes(keys.size(), workers);
 	if (preflight_bytes > memory_budget) {
 		plan->decline_reason = "query grams exceed query memory budget";
 		return plan;
 	}
 	plan->memory_reservation =
 	    make_uniq<ProbeMemoryReservation>(BufferManager::GetBufferManager(context), preflight_bytes);
-	auto all_stats = ReadGramStats(context, tx, stats_entry, grams, stats_workers, plan->stats_rows_scanned,
-	                               plan->stats_chunks_scanned);
-	auto selected_stats = SelectRarestGrams(grams, all_stats, max_grams, *plan);
-
-	auto descriptor_count = ExpectedDescriptorCount(tx, segments_entry, selected_stats);
-	auto manifest_bytes = ManifestBytes(descriptor_count, plan->grams.size());
-	if (manifest_bytes > memory_budget - preflight_bytes) {
+	auto max_manifest_rows = (memory_budget - preflight_bytes) / MANIFEST_BYTES_PER_ROW;
+	vector<GramRows> per_key(keys.size());
+	if (!CollectGramRows(context, tx, segments_entry, keys, hwm, workers, max_manifest_rows, per_key,
+	                     plan->manifest_rows_scanned)) {
 		plan->decline_reason = "segment manifest exceeds query memory budget";
 		return plan;
 	}
+	SelectRarestGrams(keys, per_key, max_grams, *plan);
+	idx_t manifest_bytes;
+	if (!CheckedMultiply(plan->descriptors.size(), MANIFEST_BYTES_PER_ROW, manifest_bytes)) {
+		ThrowProbeOverflow();
+	}
 	plan->memory_reservation->Grow(manifest_bytes);
 	auto reserved_bytes = preflight_bytes + manifest_bytes;
-	ReadManifest(context, tx, segments_entry, hwm, selected_stats, descriptor_count, *plan);
 
 	idx_t estimated_decoded_rowids = 0;
 	idx_t peak_worker_bytes = 0;
-	AdmitSegments(*plan, hwm, MaxProbeRowids(context), estimated_decoded_rowids, peak_worker_bytes);
+	idx_t peak_candidate_bytes = 0;
+	AdmitSegments(*plan, hwm, MaxProbeRowids(context), estimated_decoded_rowids, peak_worker_bytes,
+	              peak_candidate_bytes);
 	if (!plan->decline_reason.empty()) {
 		return plan;
 	}
@@ -467,24 +355,43 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 		plan->decline_reason = "one posting segment exceeds query memory budget";
 		return plan;
 	}
-	auto possible_workers = (memory_budget - reserved_bytes) / peak_worker_bytes;
+	// Every worker past the first may hold a published segment's candidates
+	// while it decodes the next segment, so it is charged both peaks. Workers
+	// are capped by the fetch batches the candidates fill, so a plan with few
+	// segments and many candidates still fetches in parallel.
+	auto extra_worker_bytes = peak_worker_bytes + peak_candidate_bytes;
+	auto possible_workers = 1 + (memory_budget - reserved_bytes - peak_worker_bytes) / extra_worker_bytes;
+	auto fetch_units =
+	    MaxValue<idx_t>(plan->segments.size(), (plan->candidate_upper_bound + FETCH_BATCH_ROWS - 1) / FETCH_BATCH_ROWS);
 	plan->max_threads = MinValue<idx_t>(
-	    plan->segments.size(), MinValue<idx_t>(worker_cap, MinValue<idx_t>(ProbeThreads(context), possible_workers)));
+	    fetch_units, MinValue<idx_t>(worker_cap, MinValue<idx_t>(ProbeThreads(context), possible_workers)));
 	D_ASSERT(plan->max_threads > 0);
 	idx_t workspace_bytes;
-	if (!CheckedMultiply(peak_worker_bytes, plan->max_threads, workspace_bytes)) {
+	if (!CheckedMultiply(extra_worker_bytes, plan->max_threads - 1, workspace_bytes) ||
+	    !CheckedAdd(workspace_bytes, peak_worker_bytes)) {
 		ThrowProbeOverflow();
 	}
 	plan->memory_reservation->Grow(workspace_bytes);
+	AddShadowColumn(segments_entry, "gram_key", LogicalTypeId::UHUGEINT, plan->decode_column_ids, plan->decode_types);
+	AddShadowColumn(segments_entry, "segment_no", LogicalTypeId::BIGINT, plan->decode_column_ids, plan->decode_types);
+	AddShadowColumn(segments_entry, "postings", LogicalTypeId::BLOB, plan->decode_column_ids, plan->decode_types);
+	AddShadowColumn(segments_entry, "rowid_count", LogicalTypeId::BIGINT, plan->decode_column_ids, plan->decode_types);
 	plan->admitted = true;
 	return plan;
 }
 
+//! Decode the postings of one gram of `segment` into `postings`: every
+//! descriptor row of that gram, fetched in vector-sized batches through the
+//! plan's projection and checked against its manifest entry, unioned across
+//! refresh generations.
 static void DecodeDescriptorRange(ClientContext &context, DuckTransaction &tx, ProbePlan &plan,
-                                  const ProbeSegment &segment, idx_t gram_index, idx_t &descriptor_cursor,
+                                  const ProbeSegment &segment, idx_t gram_index, ProbeDecodeScratch &scratch,
                                   vector<row_t> &postings) {
 	auto &descriptors = plan.descriptors;
-	idx_t begin = descriptor_cursor;
+	idx_t begin = segment.descriptor_begin;
+	while (begin < segment.descriptor_end && descriptors[begin].gram_index != gram_index) {
+		begin++;
+	}
 	idx_t end = begin;
 	idx_t expected = 0;
 	while (end < segment.descriptor_end && descriptors[end].gram_index == gram_index) {
@@ -496,21 +403,15 @@ static void DecodeDescriptorRange(ClientContext &context, DuckTransaction &tx, P
 	if (begin == end) {
 		throw InvalidInputException("ngram: admitted segment is missing a gram; the index is malformed");
 	}
-	descriptor_cursor = end;
-	vector<row_t>().swap(postings);
+	postings.clear();
 	postings.reserve(expected);
 
-	vector<StorageIndex> column_ids;
-	vector<LogicalType> types;
-	AddShadowColumn(*plan.segments_entry, "gram", LogicalTypeId::VARCHAR, column_ids, types);
-	AddShadowColumn(*plan.segments_entry, "segment_no", LogicalTypeId::BIGINT, column_ids, types);
-	AddShadowColumn(*plan.segments_entry, "postings", LogicalTypeId::BLOB, column_ids, types);
-	AddShadowColumn(*plan.segments_entry, "rowid_count", LogicalTypeId::BIGINT, column_ids, types);
-	DataChunk chunk;
-	chunk.Initialize(Allocator::Get(context), types);
-	ColumnFetchState fetch_state;
-	Vector rowids(LogicalType::ROW_TYPE, STANDARD_VECTOR_SIZE);
-	auto rowid_data = FlatVector::GetData<row_t>(rowids);
+	if (!scratch.initialized) {
+		scratch.chunk.Initialize(Allocator::Get(context), plan.decode_types);
+		scratch.initialized = true;
+	}
+	auto &chunk = scratch.chunk;
+	auto rowid_data = FlatVector::GetData<row_t>(scratch.rowids);
 	for (idx_t offset = begin; offset < end; offset += STANDARD_VECTOR_SIZE) {
 		ThrowIfInterrupted(context);
 		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, end - offset);
@@ -518,37 +419,36 @@ static void DecodeDescriptorRange(ClientContext &context, DuckTransaction &tx, P
 			rowid_data[i] = descriptors[offset + i].posting_rowid;
 		}
 		chunk.Reset();
-		// ColumnFetchState retains every pinned block it has seen. Drop the
-		// previous batch only after its BLOBs have been decoded so fragmented
-		// generations cannot accumulate query-wide pins.
-		fetch_state = ColumnFetchState();
-		plan.segments_entry->GetStorage().Fetch(tx, chunk, column_ids, rowids, count, fetch_state);
+		// ColumnFetchState retains every pinned block it has seen. A fresh one
+		// per batch releases the previous batch's BLOBs once they are decoded,
+		// so fragmented generations cannot accumulate query-wide pins.
+		ColumnFetchState fetch_state;
+		plan.segments_entry->GetStorage().Fetch(tx, chunk, plan.decode_column_ids, scratch.rowids, count, fetch_state);
 		if (chunk.size() != count) {
 			throw InvalidInputException("ngram: a manifest posting row vanished; the index is malformed");
 		}
-		UnifiedVectorFormat gram_format, segment_format, blob_format, count_format;
-		chunk.data[0].ToUnifiedFormat(count, gram_format);
+		UnifiedVectorFormat key_format, segment_format, blob_format, count_format;
+		chunk.data[0].ToUnifiedFormat(count, key_format);
 		chunk.data[1].ToUnifiedFormat(count, segment_format);
 		chunk.data[2].ToUnifiedFormat(count, blob_format);
 		chunk.data[3].ToUnifiedFormat(count, count_format);
-		auto gram_data = UnifiedVectorFormat::GetData<string_t>(gram_format);
+		auto key_data = UnifiedVectorFormat::GetData<uhugeint_t>(key_format);
 		auto segment_data = UnifiedVectorFormat::GetData<int64_t>(segment_format);
 		auto blob_data = UnifiedVectorFormat::GetData<string_t>(blob_format);
 		auto count_data = UnifiedVectorFormat::GetData<int64_t>(count_format);
 		for (idx_t r = 0; r < count; r++) {
-			auto gram_idx = gram_format.sel->get_index(r);
+			auto key_idx = key_format.sel->get_index(r);
 			auto segment_idx = segment_format.sel->get_index(r);
 			auto blob_idx = blob_format.sel->get_index(r);
 			auto count_idx = count_format.sel->get_index(r);
-			if (!gram_format.validity.RowIsValid(gram_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
+			if (!key_format.validity.RowIsValid(key_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
 			    !blob_format.validity.RowIsValid(blob_idx) || !count_format.validity.RowIsValid(count_idx)) {
 				throw InvalidInputException("ngram: segments table contains NULLs; the index is malformed");
 			}
-			auto &gram = gram_data[gram_idx];
 			auto &blob = blob_data[blob_idx];
 			auto encoded_count = PostingsCount(blob.GetData(), blob.GetSize());
 			auto &descriptor = descriptors[offset + r];
-			if (gram != string_t(plan.grams[gram_index]) || segment_data[segment_idx] != segment.segment_no ||
+			if (key_data[key_idx] != plan.keys[gram_index] || segment_data[segment_idx] != segment.segment_no ||
 			    count_data[count_idx] <= 0 || NumericCast<idx_t>(count_data[count_idx]) != descriptor.posting_count ||
 			    encoded_count != descriptor.posting_count || encoded_count > expected - postings.size()) {
 				throw InvalidInputException("ngram: posting row disagrees with its manifest; the index is malformed");
@@ -577,26 +477,30 @@ static void DecodeDescriptorRange(ClientContext &context, DuckTransaction &tx, P
 	}
 }
 
-bool NextCandidateSegment(ClientContext &context, DuckTransaction &tx, ProbePlan &plan, vector<row_t> &candidates,
-                          idx_t &segment_ordinal) {
+void DecodeCandidateSegment(ClientContext &context, DuckTransaction &tx, ProbePlan &plan, idx_t segment_ordinal,
+                            ProbeDecodeScratch &scratch, vector<row_t> &candidates) {
+	auto &segment = plan.segments[segment_ordinal];
+	D_ASSERT(!segment.gram_order.empty());
+	DecodeDescriptorRange(context, tx, plan, segment, segment.gram_order[0], scratch, candidates);
+	for (idx_t position = 1; position < segment.gram_order.size() && !candidates.empty(); position++) {
+		DecodeDescriptorRange(context, tx, plan, segment, segment.gram_order[position], scratch, scratch.postings);
+		auto &intersection = scratch.intersection;
+		intersection.clear();
+		intersection.reserve(MinValue(candidates.size(), scratch.postings.size()));
+		std::set_intersection(candidates.begin(), candidates.end(), scratch.postings.begin(), scratch.postings.end(),
+		                      std::back_inserter(intersection));
+		std::swap(candidates, intersection);
+	}
+}
+
+bool NextCandidateSegment(ClientContext &context, DuckTransaction &tx, ProbePlan &plan, ProbeDecodeScratch &scratch,
+                          vector<row_t> &candidates, idx_t &segment_ordinal) {
 	segment_ordinal = plan.next_segment.fetch_add(1);
-	vector<row_t>().swap(candidates);
+	candidates.clear();
 	if (segment_ordinal >= plan.segments.size()) {
 		return false;
 	}
-	auto &segment = plan.segments[segment_ordinal];
-	idx_t descriptor_cursor = segment.descriptor_begin;
-	vector<row_t> postings;
-	DecodeDescriptorRange(context, tx, plan, segment, 0, descriptor_cursor, postings);
-	candidates = std::move(postings);
-	for (idx_t gram = 1; gram < plan.grams.size() && !candidates.empty(); gram++) {
-		DecodeDescriptorRange(context, tx, plan, segment, gram, descriptor_cursor, postings);
-		vector<row_t> intersection;
-		intersection.reserve(MinValue(candidates.size(), postings.size()));
-		std::set_intersection(candidates.begin(), candidates.end(), postings.begin(), postings.end(),
-		                      std::back_inserter(intersection));
-		candidates = std::move(intersection);
-	}
+	DecodeCandidateSegment(context, tx, plan, segment_ordinal, scratch, candidates);
 	return true;
 }
 

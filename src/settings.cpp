@@ -19,10 +19,19 @@ namespace ngram {
 //! candidate set, never drop a match (benchmarks/RESULTS.md).
 static constexpr idx_t DEFAULT_MAX_GRAMS_PER_QUERY = 3;
 
-//! Fetch costs 250-300 ns per candidate at every scale, while a parallel scan
-//! of the whole table costs about 0.04 s at 1 GB, 0.35 s at 10 GB and 3.5 s
-//! at 100 GB, which puts the break-even at 1.6%, 1.3% and 1.1% of rows. One
-//! percent is that crossover rounded toward scanning (benchmarks/RESULTS.md).
+//! The gate compares fetching every candidate against scanning every row.
+//! Measured on enwik9 (10.9M rows, warm, Phase 19): a per-row fetch plus
+//! recheck costs 3.8 us of CPU when the string column segment is FSST
+//! compressed (188 ms for 50,000 consecutive rows on one thread) and 0.13 us
+//! when it is uncompressed (6.4 ms); 68% of the corpus rows are FSST. Sparse
+//! candidates fetch in parallel at 0.22 us of wall time each (32k candidates
+//! over 11 segments: 7.1 ms at 24 threads); dense batches are read as rowid
+//! range scans instead of per-row fetches. A scanned row costs about 50 ns of
+//! CPU (536 ms single-threaded) and 3.6 ns of wall time (39 ms at 24 threads).
+//! The break-even is 1.3% of rows by CPU on FSST segments and 1.6% by wall
+//! time for sparse candidates; one percent sits below both, rounded toward
+//! scanning. Earlier measurements at 1, 10 and 100 GB put the crossover at
+//! 1.6%, 1.3% and 1.1% (benchmarks/RESULTS.md).
 static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.01;
 static constexpr int64_t DEFAULT_MAX_PROBE_ROWIDS = 100000000;
 static constexpr idx_t MAX_PROBE_MEMORY_BYTES = 256ULL * 1024ULL * 1024ULL;

@@ -19,12 +19,12 @@ SET VARIABLE big_id = (SELECT replace(index_id::VARCHAR, '-', '')
 # the index is exactly the brute-force extraction (both directions)
 query I
 SELECT count(*) FROM (
-	(SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	(SELECT gram_key, unnest(ngram_decode_postings(postings)) rid
 	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id'))
-	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM big WHERE s IS NOT NULL)
+	 EXCEPT SELECT DISTINCT ngram_gram_key(unnest(trigrams(s))) gram_key, rowid FROM big WHERE s IS NOT NULL)
 	UNION ALL
-	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM big WHERE s IS NOT NULL
-	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	(SELECT DISTINCT ngram_gram_key(unnest(trigrams(s))) gram_key, rowid FROM big WHERE s IS NOT NULL
+	 EXCEPT SELECT gram_key, unnest(ngram_decode_postings(postings)) rid
 	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id')))
 );
 ----
@@ -36,16 +36,18 @@ SELECT count(DISTINCT segment_no) FROM query('SELECT * FROM __ngram.segments_' |
 ----
 2
 
-# stats totals agree with the segments table
+# every row's count describes its postings, and the segments table is the
+# only storage object of the index
 query I
-SELECT (SELECT sum(row_count) FROM query('SELECT * FROM __ngram.stats_' || getvariable('big_id'))) =
-       (SELECT sum(rowid_count) FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id')))
-   AND (SELECT count(*) FROM query('SELECT * FROM __ngram.stats_' || getvariable('big_id'))) =
-       (SELECT count(DISTINCT gram) FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id')))
-   AND (SELECT sum(segment_count) FROM query('SELECT * FROM __ngram.stats_' || getvariable('big_id'))) =
-       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id')));
+SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('big_id'))
+WHERE rowid_count <> length(ngram_decode_postings(postings));
 ----
-true
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry';
+----
+1
 
 # hwm covers all rows
 query I
@@ -118,16 +120,36 @@ SELECT count(*) FROM (
 
 # one row per key, not one per partition
 query I
-SELECT count(*) = count(DISTINCT (gram, segment_no)) FROM snapshot_three;
+SELECT count(*) = count(DISTINCT (gram_key, segment_no)) FROM snapshot_three;
 ----
 true
 
-# the segments table is written in gram order whatever the partitioning: that
-# is what lets the probe's `gram = ?` filter skip row groups by zone map
+# cross-segment identity on the partitioned fixture: needles whose matches
+# lie in different segments, and one that spans the boundary itself
+foreach needle 1048576 2097152 3145727 000000 999
+
 query I
 SELECT count(*) FROM (
-	SELECT gram < lag(gram) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram, rowid FROM __ngram.segments_' || getvariable('parts_id')))
+	(SELECT s FROM ngram_search('parts', '${needle}') EXCEPT SELECT s FROM parts WHERE contains(s, '${needle}'))
+	UNION ALL
+	(SELECT s FROM parts WHERE contains(s, '${needle}') EXCEPT SELECT s FROM ngram_search('parts', '${needle}'))
+);
+----
+0
+
+endloop
+
+query I
+SELECT count(DISTINCT rowid >> 20) FROM ngram_candidates('parts', 's', '00000');
+----
+3
+
+# the segments table is written in key order whatever the partitioning: that
+# is what lets the probe's `gram_key = ?` filter skip row groups by zone map
+query I
+SELECT count(*) FROM (
+	SELECT gram_key < lag(gram_key) OVER (ORDER BY rowid) AS out_of_order
+	FROM query('SELECT gram_key, rowid FROM __ngram.segments_' || getvariable('parts_id')))
 WHERE out_of_order;
 ----
 0
@@ -211,7 +233,7 @@ SET VARIABLE mem_id = (SELECT replace(index_id::VARCHAR, '-', '')
                            FROM __ngram.registry WHERE table_name = 'mem_corpus');
 
 query I
-SELECT count(*) > 0 FROM query('SELECT * FROM __ngram.stats_' || getvariable('mem_id'));
+SELECT count(*) > 0 FROM query('SELECT * FROM __ngram.segments_' || getvariable('mem_id'));
 ----
 true
 

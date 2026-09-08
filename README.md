@@ -301,8 +301,7 @@ postings.
 
 **On an append-only table, compaction has little to merge.** Each refresh
 generation lands in a fresh range of rowids, so successive generations barely
-share `(gram, segment_no)` keys. Refresh performs a validated, byte-sorted
-stats-only fold itself, so stats history is no longer a reason to compact.
+share `(gram_key, segment_no)` keys.
 
 Compaction is mainly for **delete-heavy or interleaved workloads**. Check
 `fragmented_keys` and `generations` in `ngram_index_stats` before running it,
@@ -314,11 +313,9 @@ That one-BIGINT temp and the selected encoded source are spillable, and can use
 substantial temporary disk alongside the packed output and MVCC-old rows.
 Purging is consequently much more expensive than a merge-only compaction.
 
-Corruption checks follow the data each path reads: a probe validates requested
-gram stats, merge-only compact validates selected segment rows, purge validates
-all segment rows, and the refresh stats fold validates every historical stats
-row it rewrites. Compact rebuilds stats from the resulting segment metadata;
-it does not separately validate superseded stats rows.
+Corruption checks follow the data each path reads: a probe validates the
+segment rows of the needle's grams, merge-only compact validates selected
+segment rows, and purge validates all segment rows.
 
 ### When to rebuild
 
@@ -382,9 +379,10 @@ temporary tables, tables in foreign catalogs (SQLite, Postgres, …), tables wit
 generated columns, and tables with a user column named `rowid` are rejected.
 
 Each new index receives a canonical UUIDv4 `index_ref`. Its metadata is one
-row of `__ngram.registry`; its postings and per-gram statistics are the tables
-`__ngram.segments_<id>` and `__ngram.stats_<id>`, named by the id without
-dashes. `PRAGMA ngram_indexes` lists every index across attached DuckDB
+row of `__ngram.registry`; its postings are the table `__ngram.segments_<id>`,
+named by the id without dashes and sorted by a fixed-width key of each gram
+(`ngram_gram_key`). A query reads the segment rows of every gram of its needle
+to pick the rarest ones, so the index keeps no separate statistics. `PRAGMA ngram_indexes` lists every index across attached DuckDB
 catalogs. Use the catalog-qualified status/drop forms whenever the base table
 or indexed column has disappeared; copied attached databases may legitimately
 contain the same UUID, so the catalog name is part of the public identity.
@@ -396,7 +394,7 @@ Lifecycle status has four values:
 | `READY` | The registry row, both storage tables, and the rowid guard validate; indexed reads may accelerate. |
 | `SCAN_ONLY` | The table and column exist but the guard is missing, replaced, incompatible, or cannot exclude rowid reuse; exhaustive queries scan and maintenance refuses. |
 | `ORPHAN` | The recorded base table or column is absent. Drop by id remains available. |
-| `MALFORMED` | The row is unreadable (another storage format, corrupt values), a storage table is missing, or an object in `__ngram` has no row. The reason names the cause. A row is dropped by id; an object without a row is dropped by hand. |
+| `MALFORMED` | The row is unreadable (another storage format, corrupt values), the segments table is missing, or an object in `__ngram` has no row. The reason names the cause. A row is dropped by id; an object without a row is dropped by hand. |
 
 A database written by an earlier storage format lists each of its indexes as
 `MALFORMED` with the format in the reason. `drop_ngram_index_by_id` removes
@@ -508,6 +506,8 @@ SELECT trigrams('hello');                     -- ['hel', 'ell', 'llo']
 SELECT trigrams('Hello', 4, false);           -- gram size 4, case-sensitive
 SELECT ngram_encode_postings([1, 2, 5]);      -- posting blob codec
 SELECT ngram_decode_postings(blob);
+SELECT ngram_gram_key('hel');                 -- the storage key of one normalized gram
+SELECT ngram_gram_keys('Hello', 3, true);     -- keys of a text's distinct grams, ascending
 ```
 
 ---
@@ -517,7 +517,7 @@ SELECT ngram_decode_postings(blob);
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `ngram_auto_accelerate` | `false` | Whether plain `LIKE`/`contains`/`ILIKE` may be rewritten to use the index. Rewrites are exhaustive and resource-bounded, including guard-, work-, memory-, and density-driven full-scan fallback. It remains opt-in so enabling the extension does not silently change query plans. |
-| `ngram_max_candidate_fraction` | `0.01` | A full-result ngram query whose candidate upper bound exceeds this fraction of the table scans instead. This bounds fetch-and-recheck work after the probe; the raw candidate API does not use this fetch-vs-scan policy. |
+| `ngram_max_candidate_fraction` | `0.01` | A full-result ngram query whose candidate upper bound exceeds this fraction of the table scans instead. This bounds fetch-and-recheck work after the probe; the raw candidate API does not use this fetch-vs-scan policy. The default is the measured break-even on enwik9: fetching and rechecking one sparse candidate costs about 3.8 µs of CPU on an FSST-compressed string segment (0.22 µs of wall time at 24 threads), while scanning a row costs about 50 ns of CPU (3.6 ns of wall time), so the index pays off below roughly 1.3 to 1.6% of rows; dense runs of candidates are read as range scans and cost far less. |
 | `ngram_max_grams_per_query` | `3` | How many of the needle's rarest grams to probe. Each extra gram costs another posting-list decode but can narrow the candidate set; the default balances those costs for natural-language text. |
 | `ngram_max_probe_rowids` | `100000000` | Hard upper bound on posting rowids decoded by one query. Exact query paths scan instead when the estimate exceeds it; `ngram_candidates` returns a resource-limit error. |
 | `ngram_build_partitions` | `0` | How many rowid-range partitions `create_ngram_index`, `ngram_refresh` and `ngram_compact` split their packing pass into. Build and refresh size zero from `memory_limit` using a sample; compact instead uses fine segment-aligned ranges without sampling the base. Because range width is rounded down to whole segments, auto can emit up to nearly twice its 4096-range request. An explicit value overrides either policy. Raise it if a build runs out of memory on unusually long rows, or lower it to pack in fewer passes. The index it produces is identical whatever you set. |

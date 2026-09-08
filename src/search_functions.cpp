@@ -45,7 +45,8 @@ struct QueryBindData : public TableFunctionData {
 	vector<string> names;
 	vector<LogicalType> types;
 	idx_t search_column_idx = 0;
-	//! ngram_search semantics if a prepared query outlives its index.
+	//! The index's options as bound; ngram_search keeps these semantics if a
+	//! prepared query outlives its index.
 	GramOptions bound_options;
 
 	unique_ptr<FunctionData> Copy() const override {
@@ -65,7 +66,7 @@ static string RequireStringArg(const Value &value, const char *fn, const char *a
 
 //! Resolve the base table plus the index for `column` (or the only indexed
 //! column when none is given), filling everything but the search-specific
-//! members of the bind data.
+//! members of the bind data from one registry read.
 static void BindQueryTarget(ClientContext &context, const char *fn, const string &table_input, string column,
                             QueryBindData &result) {
 	auto target = ResolveTarget(context, table_input, string(), false);
@@ -73,24 +74,25 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 		throw BinderException("%s: %s is not a DuckDB base table", fn, table_input);
 	}
 	if (column.empty()) {
-		auto indexed = ExistingIndexes(context, target);
+		auto indexed = OwnedIndexes(context, target);
 		if (indexed.empty()) {
 			throw BinderException("%s: no ngram index exists on %s; build one with PRAGMA create_ngram_index", fn,
 			                      table_input);
 		}
 		if (indexed.size() > 1) {
 			vector<string> columns;
-			for (auto &location : indexed) {
-				columns.push_back(location.column_name);
+			for (auto &index : indexed) {
+				columns.push_back(index.location.column_name);
 			}
 			throw BinderException("%s: %s has ngram indexes on multiple columns (%s); pass col := '...' to choose", fn,
 			                      table_input, StringUtil::Join(columns, ", "));
 		}
-		result.location = indexed[0];
-		column = indexed[0].column_name;
+		result.location = indexed[0].location;
+		result.bound_options = indexed[0].meta.options;
+		column = indexed[0].location.column_name;
 	} else {
 		target.column_name = column;
-		auto indexed = ExistingIndexes(context, target);
+		auto indexed = OwnedIndexes(context, target);
 		if (indexed.empty()) {
 			throw BinderException("%s: no ngram index exists on %s.%s; build one with PRAGMA create_ngram_index", fn,
 			                      table_input, column);
@@ -98,7 +100,8 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 		if (indexed.size() != 1) {
 			throw InvalidInputException("ngram: multiple allocations claim %s.%s", table_input, column);
 		}
-		result.location = indexed[0];
+		result.location = indexed[0].location;
+		result.bound_options = indexed[0].meta.options;
 	}
 	auto &table_entry = *target.entry;
 	if (!table_entry.ColumnExists(column)) {
@@ -164,14 +167,6 @@ static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunction
 	if (!found) {
 		throw InvalidInputException("ngram_search: indexed column vanished during binding");
 	}
-	auto located = LocateIndex(context, target, result->location);
-	if (located.availability == IndexAvailability::CHANGED) {
-		throw InvalidInputException(located.reason);
-	}
-	if (located.availability == IndexAvailability::ABSENT) {
-		throw CatalogException("ngram_search: index storage is unavailable");
-	}
-	result->bound_options = located.meta.options;
 	return_types = result->types;
 	names = result->names;
 	return std::move(result);
@@ -372,13 +367,11 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	} else {
 		auto segments = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
 		                                        "ngram index segments table");
-		auto stats = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.StatsTable(),
-		                                     "ngram index stats table");
-		if (!segments || !stats) {
+		if (!segments) {
 			state->fallback_reason = "index unavailable";
 			state->core.hwm = -1;
 		} else {
-			state->core.probe = PlanIndexProbe(context, *state->core.tx, *segments, *stats, decomposition.grams,
+			state->core.probe = PlanIndexProbe(context, *state->core.tx, *segments, decomposition.keys,
 			                                   MaxGramsPerQuery(context), state->core.hwm, storage.GetTotalRows(),
 			                                   MaxCandidateFraction(context), DConstants::INVALID_INDEX);
 		}
@@ -447,8 +440,7 @@ static InsertionOrderPreservingMap<string> SearchDynamicToString(TableFunctionDy
 		result["Ngram Mode"] =
 		    StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
 		                       state.core.probe->candidate_upper_bound, state.core.probe->decoded_rowids.load());
-		result["Ngram Stats Rows Scanned"] = to_string(state.core.probe->stats_rows_scanned);
-		result["Ngram Stats Chunks Scanned"] = to_string(state.core.probe->stats_chunks_scanned);
+		result["Ngram Manifest Rows Scanned"] = to_string(state.core.probe->manifest_rows_scanned);
 	} else {
 		result["Ngram Mode"] = "full scan fallback: " + state.fallback_reason;
 	}
@@ -476,6 +468,7 @@ struct CandidatesGlobalState : public GlobalTableFunctionState {
 
 	//! Probed mode: decode and emit one admitted rowid segment at a time.
 	unique_ptr<ProbePlan> probe;
+	ProbeDecodeScratch decode;
 	vector<row_t> candidates;
 	idx_t offset = 0;
 	idx_t segment_ordinal = 0;
@@ -517,10 +510,8 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 	} else {
 		auto &segments = ResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
 		                                      "ngram index segments table");
-		auto &stats = ResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.StatsTable(),
-		                                   "ngram index stats table");
-		state->probe = PlanIndexProbe(context, *state->tx, segments, stats, decomposition.grams,
-		                              MaxGramsPerQuery(context), state->hwm, storage.GetTotalRows(), -1, 1);
+		state->probe = PlanIndexProbe(context, *state->tx, segments, decomposition.keys, MaxGramsPerQuery(context),
+		                              state->hwm, storage.GetTotalRows(), -1, 1);
 		if (!state->probe->admitted) {
 			throw InvalidInputException("ngram_candidates: %s", state->probe->decline_reason);
 		}
@@ -558,7 +549,8 @@ static void CandidatesFunction(ClientContext &context, TableFunctionInput &data,
 	while (state.offset >= state.candidates.size()) {
 		state.candidates.clear();
 		state.offset = 0;
-		if (!NextCandidateSegment(context, *state.tx, *state.probe, state.candidates, state.segment_ordinal)) {
+		if (!NextCandidateSegment(context, *state.tx, *state.probe, state.decode, state.candidates,
+		                          state.segment_ordinal)) {
 			return;
 		}
 	}
@@ -578,8 +570,7 @@ static InsertionOrderPreservingMap<string> CandidatesDynamicToString(TableFuncti
 	auto &state = input.global_state->Cast<CandidatesGlobalState>();
 	if (state.probe) {
 		result["Ngram Probe Workers"] = to_string(state.probe->max_threads);
-		result["Ngram Stats Rows Scanned"] = to_string(state.probe->stats_rows_scanned);
-		result["Ngram Stats Chunks Scanned"] = to_string(state.probe->stats_chunks_scanned);
+		result["Ngram Manifest Rows Scanned"] = to_string(state.probe->manifest_rows_scanned);
 		result["Ngram Decoded Rowids"] = to_string(state.probe->decoded_rowids.load());
 	}
 	return result;

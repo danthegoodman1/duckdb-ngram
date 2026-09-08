@@ -341,16 +341,16 @@ SELECT (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(inde
 
 query I
 SELECT count(*) FROM (
-	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
+	(SELECT gram_key, r FROM ngram_unpack_postings((SELECT gram_key, segment_no, postings FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id'))))
 	 EXCEPT
-	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
+	 SELECT gram_key, r FROM ngram_unpack_postings((SELECT gram_key, segment_no, postings FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id')))))
 	UNION ALL
-	(SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
+	(SELECT gram_key, r FROM ngram_unpack_postings((SELECT gram_key, segment_no, postings FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id'))))
 	 EXCEPT
-	 SELECT gram, r FROM ngram_unpack_postings((SELECT gram, segment_no, postings FROM
+	 SELECT gram_key, r FROM ngram_unpack_postings((SELECT gram_key, segment_no, postings FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id')))))
 );
 ----
@@ -359,11 +359,11 @@ SELECT count(*) FROM (
 # no rowid is recorded twice, whichever way the tail was indexed
 query II
 SELECT
-	(SELECT count(*) FROM (SELECT gram, r FROM ngram_unpack_postings(
-		(SELECT gram, segment_no, postings FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id'))))
+	(SELECT count(*) FROM (SELECT gram_key, r FROM ngram_unpack_postings(
+		(SELECT gram_key, segment_no, postings FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id'))))
 		GROUP BY ALL HAVING count(*) > 1)),
-	(SELECT count(*) FROM (SELECT gram, r FROM ngram_unpack_postings(
-		(SELECT gram, segment_no, postings FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id'))))
+	(SELECT count(*) FROM (SELECT gram_key, r FROM ngram_unpack_postings(
+		(SELECT gram_key, segment_no, postings FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id'))))
 		GROUP BY ALL HAVING count(*) > 1));
 ----
 0	0
@@ -390,17 +390,6 @@ SELECT count(*) FROM (
 	UNION ALL
 	(SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id')) EXCEPT ALL
 	 SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id')))
-);
-----
-0
-
-query I
-SELECT count(*) FROM (
-	(SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('twin_a_id')) EXCEPT ALL
-	 SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('twin_b_id')))
-	UNION ALL
-	(SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('twin_b_id')) EXCEPT ALL
-	 SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('twin_a_id')))
 );
 ----
 0
@@ -446,10 +435,10 @@ s	151424	1199999	0
 
 query II
 SELECT
-	(SELECT count(*) FROM (SELECT gram, segment_no FROM
+	(SELECT count(*) FROM (SELECT gram_key, segment_no FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('crossing_id'))
 		WHERE segment_no > 0 GROUP BY ALL HAVING count(*) > 1)),
-	(SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM
+	(SELECT count(*) > 0 FROM (SELECT gram_key, segment_no FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('crossing_id'))
 		WHERE segment_no = 0 GROUP BY ALL HAVING count(*) > 1));
 ----

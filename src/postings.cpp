@@ -182,8 +182,8 @@ static void DecodePostingsFunction(DataChunk &args, ExpressionState &state, Vect
 	}
 }
 
-//! ngram_unpack_postings((SELECT gram, segment_no, postings FROM segments))
-//! reverses the packing: it streams one (gram, segment_no, rowid) row per
+//! ngram_unpack_postings((SELECT gram_key, segment_no, postings FROM segments))
+//! reverses the packing: it streams one (gram_key, segment_no, rowid) row per
 //! posting. Compaction groups its output back through ngram_pack_segment to
 //! merge the segment rows that share a key. Its eight-column form additionally
 //! checks all persisted descriptor fields and the index high-water mark before
@@ -203,17 +203,17 @@ struct UnpackPostingsLocalState : LocalTableFunctionState {
 static unique_ptr<FunctionData> UnpackPostingsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	auto &types = input.input_table_types;
-	if ((types.size() != 3 && types.size() != 8) || types[0].id() != LogicalTypeId::VARCHAR ||
+	if ((types.size() != 3 && types.size() != 8) || types[0].id() != LogicalTypeId::UHUGEINT ||
 	    types[1].id() != LogicalTypeId::BIGINT || types[2].id() != LogicalTypeId::BLOB ||
 	    (types.size() == 8 && (types[3].id() != LogicalTypeId::BIGINT || types[4].id() != LogicalTypeId::BIGINT ||
 	                           types[5].id() != LogicalTypeId::BIGINT || types[6].id() != LogicalTypeId::BIGINT ||
 	                           types[7].id() != LogicalTypeId::BIGINT))) {
 		throw BinderException(
-		    "ngram_unpack_postings expects a table of (gram VARCHAR, segment_no BIGINT, postings BLOB) or its "
+		    "ngram_unpack_postings expects a table of (gram_key UHUGEINT, segment_no BIGINT, postings BLOB) or its "
 		    "checked eight-column form");
 	}
-	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
-	names = {"gram", "segment_no", "r"};
+	return_types = {LogicalType::UHUGEINT, LogicalType::BIGINT, LogicalType::BIGINT};
+	names = {"gram_key", "segment_no", "r"};
 	return make_uniq<TableFunctionData>();
 }
 
@@ -232,9 +232,9 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
                                                  DataChunk &input, DataChunk &output) {
 	auto &state = data_p.local_state->Cast<UnpackPostingsLocalState>();
 
-	UnifiedVectorFormat gram_format, segment_format, blob_format, count_format, min_format, max_format,
+	UnifiedVectorFormat key_format, segment_format, blob_format, count_format, min_format, max_format,
 	    generation_format, hwm_format;
-	input.data[0].ToUnifiedFormat(input.size(), gram_format);
+	input.data[0].ToUnifiedFormat(input.size(), key_format);
 	input.data[1].ToUnifiedFormat(input.size(), segment_format);
 	input.data[2].ToUnifiedFormat(input.size(), blob_format);
 	auto checked = input.ColumnCount() == 8;
@@ -245,7 +245,7 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 		input.data[6].ToUnifiedFormat(input.size(), generation_format);
 		input.data[7].ToUnifiedFormat(input.size(), hwm_format);
 	}
-	auto grams = UnifiedVectorFormat::GetData<string_t>(gram_format);
+	auto keys = UnifiedVectorFormat::GetData<uhugeint_t>(key_format);
 	auto segments = UnifiedVectorFormat::GetData<int64_t>(segment_format);
 	auto blobs = UnifiedVectorFormat::GetData<string_t>(blob_format);
 	auto counts = checked ? UnifiedVectorFormat::GetData<int64_t>(count_format) : nullptr;
@@ -254,14 +254,14 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 	auto generations = checked ? UnifiedVectorFormat::GetData<int64_t>(generation_format) : nullptr;
 	auto hwms = checked ? UnifiedVectorFormat::GetData<int64_t>(hwm_format) : nullptr;
 
-	auto out_gram = FlatVector::GetData<string_t>(output.data[0]);
+	auto out_key = FlatVector::GetData<uhugeint_t>(output.data[0]);
 	auto out_segment = FlatVector::GetData<int64_t>(output.data[1]);
 	auto out_rowid = FlatVector::GetData<int64_t>(output.data[2]);
 
 	idx_t out_count = 0;
 	while (state.input_offset < input.size()) {
 		auto row = state.input_offset;
-		auto gram_idx = gram_format.sel->get_index(row);
+		auto key_idx = key_format.sel->get_index(row);
 		auto segment_idx = segment_format.sel->get_index(row);
 		auto blob_idx = blob_format.sel->get_index(row);
 		auto count_idx = checked ? count_format.sel->get_index(row) : 0;
@@ -269,7 +269,7 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 		auto max_idx = checked ? max_format.sel->get_index(row) : 0;
 		auto generation_idx = checked ? generation_format.sel->get_index(row) : 0;
 		auto hwm_idx = checked ? hwm_format.sel->get_index(row) : 0;
-		if (!gram_format.validity.RowIsValid(gram_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
+		if (!key_format.validity.RowIsValid(key_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
 		    !blob_format.validity.RowIsValid(blob_idx) ||
 		    (checked &&
 		     (!count_format.validity.RowIsValid(count_idx) || !min_format.validity.RowIsValid(min_idx) ||
@@ -303,7 +303,7 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 				output.SetCardinality(out_count);
 				return OperatorResultType::HAVE_MORE_OUTPUT;
 			}
-			out_gram[out_count] = StringVector::AddString(output.data[0], grams[gram_idx]);
+			out_key[out_count] = keys[key_idx];
 			out_segment[out_count] = segments[segment_idx];
 			out_rowid[out_count] = state.rowids[state.rowid_offset++];
 			out_count++;
@@ -316,7 +316,7 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
-//! ngram_pack_segment(rowid) turns the rowids of one (gram, segment_no) group
+//! ngram_pack_segment(rowid) turns the rowids of one (gram_key, segment_no) group
 //! into that key's segment row: the encoded postings blob and the count, min
 //! and max the probe prunes with. Build, refresh and compact all run it under
 //! a plain GROUP BY, which puts the work on DuckDB's radix-partitioned hash

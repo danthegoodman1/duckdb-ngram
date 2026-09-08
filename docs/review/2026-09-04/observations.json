@@ -1,0 +1,233 @@
+{
+  "head": "d3ecccf5a9f95032414ddc4b2360ab3065efb50b",
+  "src_sha256": "447847999fae6ca29f4ae47e9081b0d50f366a508ec7fe73f4c192807a714af1",
+  "binary_sha256": "71ba6939add6effbf7bc1cde4f8bbf1e6cff20b2e5bfced1a741305603523cc2",
+  "runtime": "v1.5.5,d8cdaa33,Variegata",
+  "cases": {
+    "batch_order": [
+      {
+        "threads": 1,
+        "transparent": false,
+        "returncode": 0,
+        "stdout": "1065717\n1100000",
+        "errors": [],
+        "expected_count": 1065717
+      },
+      {
+        "threads": 24,
+        "transparent": false,
+        "returncode": 1,
+        "stdout": "",
+        "errors": [
+          "INTERNAL Error: Pipeline batch index - gotten lower batch index 7 (down from previous batch index of 520)",
+          "FATAL Error: Failed: database has been invalidated because of a previous fatal error. The database must be restarted prior to being used again.",
+          "FATAL Error: Failed: database has been invalidated because of a previous fatal error. The database must be restarted prior to being used again."
+        ],
+        "expected_count": 1065717
+      },
+      {
+        "threads": 24,
+        "transparent": true,
+        "returncode": 1,
+        "stdout": "",
+        "errors": [
+          "INTERNAL Error: Pipeline batch index - gotten lower batch index 2 (down from previous batch index of 519)",
+          "FATAL Error: Failed: database has been invalidated because of a previous fatal error. The database must be restarted prior to being used again.",
+          "FATAL Error: Failed: database has been invalidated because of a previous fatal error. The database must be restarted prior to being used again."
+        ],
+        "expected_count": 1065717
+      }
+    ],
+    "long_needle": [
+      {
+        "needle_bytes": 8192,
+        "wall_s": 0.031,
+        "cpu_s": 0.031282000000000004
+      },
+      {
+        "needle_bytes": 16384,
+        "wall_s": 0.062,
+        "cpu_s": 0.061983
+      },
+      {
+        "needle_bytes": 32768,
+        "wall_s": 0.239,
+        "cpu_s": 0.238646
+      },
+      {
+        "needle_bytes": 65536,
+        "wall_s": 0.965,
+        "cpu_s": 0.964778
+      },
+      {
+        "needle_bytes": 131072,
+        "wall_s": 3.872,
+        "cpu_s": 3.869316
+      }
+    ],
+    "range_cost": {
+      "samples": [
+        {
+          "wall_s": 0.004,
+          "cpu_s": 0.004633
+        },
+        {
+          "wall_s": 0.013,
+          "cpu_s": 0.012666
+        },
+        {
+          "wall_s": 0.004,
+          "cpu_s": 0.004524
+        },
+        {
+          "wall_s": 0.013,
+          "cpu_s": 0.012632999999999998
+        },
+        {
+          "wall_s": 0.005,
+          "cpu_s": 0.004638
+        },
+        {
+          "wall_s": 0.012,
+          "cpu_s": 0.01256
+        },
+        {
+          "wall_s": 0.005,
+          "cpu_s": 0.004438999999999999
+        },
+        {
+          "wall_s": 0.012,
+          "cpu_s": 0.01254
+        },
+        {
+          "wall_s": 0.005,
+          "cpu_s": 0.004406
+        },
+        {
+          "wall_s": 0.012,
+          "cpu_s": 0.012506
+        },
+        {
+          "wall_s": 0.036,
+          "cpu_s": 0.036492
+        },
+        {
+          "wall_s": 0.122,
+          "cpu_s": 0.121898
+        },
+        {
+          "wall_s": 0.037,
+          "cpu_s": 0.036286
+        },
+        {
+          "wall_s": 0.122,
+          "cpu_s": 0.121948
+        },
+        {
+          "wall_s": 0.036,
+          "cpu_s": 0.036206
+        },
+        {
+          "wall_s": 0.122,
+          "cpu_s": 0.122514
+        },
+        {
+          "wall_s": 0.037,
+          "cpu_s": 0.036812
+        },
+        {
+          "wall_s": 0.123,
+          "cpu_s": 0.12252
+        },
+        {
+          "wall_s": 0.036,
+          "cpu_s": 0.036199
+        },
+        {
+          "wall_s": 0.123,
+          "cpu_s": 0.12299
+        }
+      ],
+      "summary": [
+        {
+          "rows": 1100000,
+          "candidates": 50000,
+          "indexed_cpu_p50_s": 0.004524,
+          "native_cpu_p50_s": 0.01256
+        },
+        {
+          "rows": 11000000,
+          "candidates": 50000,
+          "indexed_cpu_p50_s": 0.036286,
+          "native_cpu_p50_s": 0.122514
+        }
+      ],
+      "profiles": {
+        "rowid": {
+          "latency": 0.001832039,
+          "cpu_time": 0.0013576879999999993,
+          "cumulative_rows_scanned": 11000000
+        },
+        "id": {
+          "latency": 0.000435946,
+          "cpu_time": 0.0001763,
+          "cumulative_rows_scanned": 122880
+        }
+      }
+    },
+    "registry_cost": {
+      "registry_rows": 10000,
+      "synthetic_orphan_rows": 9999,
+      "samples": [
+        {
+          "wall_s": 0.001,
+          "cpu_s": 0.000248
+        },
+        {
+          "wall_s": 0.0,
+          "cpu_s": 0.00011
+        },
+        {
+          "wall_s": 0.0,
+          "cpu_s": 9.200000000000001e-05
+        },
+        {
+          "wall_s": 0.0,
+          "cpu_s": 8.8e-05
+        },
+        {
+          "wall_s": 0.0,
+          "cpu_s": 8.7e-05
+        },
+        {
+          "wall_s": 0.01,
+          "cpu_s": 0.009686
+        },
+        {
+          "wall_s": 0.009,
+          "cpu_s": 0.00956
+        },
+        {
+          "wall_s": 0.01,
+          "cpu_s": 0.009562000000000001
+        },
+        {
+          "wall_s": 0.009,
+          "cpu_s": 0.00957
+        },
+        {
+          "wall_s": 0.01,
+          "cpu_s": 0.009516
+        }
+      ],
+      "disabled_cpu_p50_s": 9.200000000000001e-05,
+      "enabled_cpu_p50_s": 0.009562000000000001
+    },
+    "format4_drop": {
+      "fixture_kind": "synthetic format-4 cleanup shape",
+      "before": "format4,61033069-35aa-4460-949b-215078448af6,main,t,s,4,MALFORMED,\"index format 4 is not readable by this extension, which uses format 5; drop it with drop_ngram_index_by_id and rebuild it\"\nformat4,stats_6103306935aa4460949b215078448af6,NULL,NULL,NULL,NULL,MALFORMED,__ngram.stats_6103306935aa4460949b215078448af6 is not a storage table of this extension",
+      "after": "format4,stats_6103306935aa4460949b215078448af6,NULL,NULL,NULL,NULL,MALFORMED,__ngram.stats_6103306935aa4460949b215078448af6 is not a storage table of this extension",
+      "remaining_tables": "registry\nstats_6103306935aa4460949b215078448af6"
+    }
+  }
+}

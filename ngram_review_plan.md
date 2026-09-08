@@ -1,491 +1,432 @@
 # Development Plan: ngram Review Follow-up (Phases 16 to 23)
 
-This plan continues `ngram_index_plan.md`, whose Phases 1 to 15 are complete. It comes from a
-2026-09-01 review of the whole codebase for correctness, performance, architecture, and
-simplicity. Phase numbering continues from 16 so identifiers stay unique across both files.
+This is the active continuation of `ngram_index_plan.md`. Independently audited on
+2026-09-04 against HEAD `d3ecccf5a9f95032414ddc4b2360ab3065efb50b` **plus the dirty
+Phase 19 implementation**. This audit updates the plan; it does not implement the fixes.
+Phase and item identifiers are stable. Phases 16–18 retain historical completion evidence;
+that evidence does not certify the current source or current CI.
 
 ## Overarching Goal
 
-Ship a first release of the `ngram` extension that is correct in every process state, half
-the size it is today, and fast at the fixed per-query cost, without weakening the guarantee:
-every exact query path returns every matching row and no wrong row in every index state.
+Release an exhaustive, durable substring index whose cost and failure behavior are
+predictable. Preserve exact results as a **multiset** under supported DML, maintenance,
+transactions, checkpoints, reopen, and index replacement. An unavailable optimization must
+fall back to a correct scan; recognized corruption may fail the statement cleanly. A query
+must not invalidate the database because of an extension scheduling or validation error.
 
-The review found one defect that breaks every query on an index for the rest of the process
-after a documented maintenance call, no green CI run on the current tree, roughly 1,900 lines
-of production code that defend against states the design itself creates, and a fixed
-per-query cost dominated by string scans of shadow tables rather than by postings work. The
-phases below fix the defect first, make CI true, delete before adding, then cut the fixed
-cost, then settle the public surface before tagging `v0.1.0`.
+Keep the useful architecture: ordinary DuckDB tables own postings, DuckDB owns persistence
+and visibility, and a small native guard protects the rowid mapping. Prefer a narrow adapter
+for the pinned host's storage operations and one exact predicate/execution path. Do not
+replace this with a native postings engine without evidence that smaller changes cannot meet
+the goals. The codec and whole storage design remain revisable; source line count is a
+maintenance signal, not a correctness or release gate.
 
-Non-goals: a native postings backend, migration paths for the unreleased on-disk formats,
-fuzzy or ranked search, and any change to the recheck-everything execution model.
-
-## Review Findings That Drive This Plan
-
-Evidence status: CONFIRMED means reproduced against `build/release/duckdb` in this review or
-confirmed by reading the pinned DuckDB v1.5.5 source; MEASURED means a recorded number.
-
-| ID | Finding | Status | Phase item |
-| --- | --- | --- | --- |
-| F1 | A no-op `ngram_refresh` leaves the in-process stats table empty; every later `ngram_search` and transparent `LIKE` in that process raises "the index is malformed". Root cause is a DuckDB v1.5.5 bug: an empty batch `INSERT ... ORDER BY`, then `DELETE FROM t`, then a batch `INSERT ... ORDER BY` of at least 122,880 rows in one transaction leaves the live table empty until reopen. The refresh script has exactly that shape whenever the packed delta is empty (`src/ngram_maintenance.cpp:783-803`). The README's recommended catch-up loop ends with such a call. | CONFIRMED (plain table and end to end; reopen recovers) | 16A |
-| F2 | The guard latches `unsafe_reuse` after any commit that fails in a later index, with no rowid reuse: `Append` advances `max_seen` unconditionally and `TryDelete` is a no-op (`src/rowid_guard.cpp:150-181`); the host appends to indexes before rows land (`duckdb/src/storage/local_storage.cpp:603-620`). One rejected duplicate key on a UNIQUE index created after the guard forces full scans and refuses maintenance until rebuild. | CONFIRMED by code reading | 16B |
-| F3 | Reuse of rowids above the high-water mark also latches, although the tail scan already covers those rows. | CONFIRMED by code reading | 16B (decision) |
-| F4 | A cached plan errors instead of falling back after drop plus re-create (`src/index_pragmas.cpp:1034-1044` throws on any oid change). Unbound guard replay buffer read without `entry.lock` (`src/rowid_guard.cpp:429`). Extension-owned `InternalException` throws invalidate the whole database. | CONFIRMED by code reading | 16C |
-| F5 | No CI run is green on the current tree: both runs on `8667a91` were cancelled; the last success is `08bb554`, before format 3. The repo is public. README, `packaging/SUBMISSION.md`, and `description.yml` describe CI historically. | CONFIRMED (`gh run list`, `gh repo view`) | 16D |
-| F6 | Rare-needle latency of 7 ms is 77% stats-table scan: the `InFilter` is only a zone-map hint, so every row of each surviving row group is FSST-decoded and hashed (`src/ngram_search.cpp:683-709`); K serial manifest scans add 12%. A 1,000-row table costs 0.5 ms per query. | MEASURED (gdb sampling, enwik9) | 19A, 19B, 19C, 19F |
-| F7 | Fetch parallelism is capped at the number of 2^20-row segments, so a table under 11M rows uses at most 11 threads and one dense segment runs single-threaded (51k candidates: 106 ms at 1 and 24 threads). | MEASURED | 19D |
-| F8 | Refresh rewrites the whole stats table every call (no-op refresh 175 ms, 150 ms of it fold; the DB grows about 6 MB per call until checkpoint). No-op compact costs about 400 ms materializing every segment key. | MEASURED | 19B, 20A |
-| F9 | Build is the hash aggregate: 9.1 s of 9.5 s, 60% parallel efficiency, 12.3 GB RSS for 963M pairs, 8 bytes per in-segment rowid in state. The codec is not the bottleneck (350M postings/s decode); hybrid bitmap containers would save about 1% of bytes on enwik9. | MEASURED | 20B |
-| F10 | Two identity systems overlap: the table fingerprint (oids, instance id, schema fingerprint, column type) and the guard name plus random token. With a guard present DuckDB refuses every ALTER except ADD COLUMN, SET DEFAULT, foreign-key bookkeeping, and comments, and drops indexes with their table (`duckdb/src/catalog/dependency_manager.cpp:642-690, 273-274`), so the guard alone proves identity. | CONFIRMED by reading host source | 17B |
-| F11 | Legacy v2 support, per-index opaque schemas, a separate meta table, 8 lifecycle states (3 reachable through the public API), two creation "protector" paths, a 27-argument execution-time scalar, and 7 unreachable overflow decline strings are all removable without touching the guarantee. Nothing has shipped. | CONFIRMED by code reading (line counts in Phase 17 and 18 ledgers) | 17A, 17C, 17D, 18B, 18C |
-| F12 | The validation triple (meta, stale reason, guard reason) is hand-inlined at 7 call sites; five functions exceed 150 lines (`PlanIndexProbe` 293, `CreateNgramIndexQuery` 230, `ObserveCatalog` 212, `RefreshNgramIndexQuery` 201, `MaintenanceGuardFunction` 159). | CONFIRMED by grep | 18A, 18C, 18D |
-| F13 | Suite gaps: no refresh-or-compact versus search race, no string over 60 bytes, one non-ASCII ILIKE case, no cross-segment search on the partitioned build fixture, two wall-clock assertions in the C++ harness, `crash_maintenance.py` and the concurrency files absent from the sanitizer job. | CONFIRMED by grep | 16A, 22A to 22E |
-| F14 | Documentation drift: `RESULTS.md` is a copy of the README block while three documents describe it as the scale results; `SUBMISSION.md` says the repo is private and lists four of five settings; `description.yml` has `ref: 000...`, an outdated `ngram_refresh` signature, and says acceleration stays opt-in pending bounded materialization; `docs/UPDATING.md` and `test/README.md` are template boilerplate; the `vacuum_rebuild_indexes` sentence is wrong (any index blocks moving vacuum by default). | CONFIRMED by reading | 23A to 23D |
-
-Verified and holding, with no plan item: normalization parity between build, needle
-decomposition, and DuckDB's `ILIKE` (same per-codepoint `utf8proc_tolower`; Kelvin sign, dotted
-I, sharp s, final sigma matched); `LIKE` splitting on `%` is exact because plain `~~` has no
-implicit escape; meta, postings, and base rows are read in one transaction and commit order
-equals rowid order on v1.5.5; the tail filter is row-exact; vacuum with a non-ART index drops
-only trailing fully deleted row groups; UPDATE, ON CONFLICT, INSERT OR REPLACE, and MERGE all
-become delete plus insert on covered columns; the codec rejects overflow, zero deltas, and
-trailing bytes; `DataTable::Fetch` skips invisible rowids; nested shared locks cannot deadlock.
+The guarantee assumes extension-owned registry and postings objects have not been manually
+edited. Recheck prevents false positives; it cannot recover a missing posting after arbitrary
+internal-table deletion. Keep this boundary explicit rather than promising recovery from all
+possible corruption. No migration reader for unreleased formats is required, but advertised
+safe drop/rebuild must actually remove the known owned objects.
 
 ## Implementation Principles
 
-The principles in `ngram_index_plan.md` remain in force. This plan adds:
-
-- The on-disk format is unreleased. Bump the format version freely, ship no migration code,
-  and make a mismatched format drop-only with a rebuild instruction. Exactly one such path
-  exists.
-- The rowid guard, identified by its name and random token, is the single identity anchor for
-  a table and its indexed column. Every read path validates it before touching postings.
-- Delete a state before handling it. A new error string or lifecycle status needs a reachable
-  scenario written down in the ledger.
-- Every performance number in a ledger row comes from a recorded command on the normalized
-  enwik9 corpus (`.tmp/clickhouse-phase15/corpus/enwik9.lines.hex.tsv`, 10,920,423 rows) at 24
-  threads, or from `benchmarks/release_evidence.py`. Prose numbers without a command are gaps.
-- A phase is complete only when `make test_release` passes locally, the Correctness workflow
-  is green on the phase's head commit, and `git diff --check` is clean.
-- `Decision` rows record user-facing choices. The owner confirmed every recommendation on
-  2026-09-01; a new decision row needs the same confirmation before its phase starts.
-- Implementers make the smallest change that closes a row. Reviewers reject growth in
-  production line count for a phase whose goal is deletion.
+- Separate semantic correctness, resource admission, and profitability. Keep an independent
+  bound on cumulative decode work as well as peak memory and candidate fetch cost.
+- Admit extension allocations before allocating them, including temporary capacity, retained
+  decode buffers, query normalization, and queued candidates. Distinguish this accounted
+  memory from DuckDB-managed storage, result buffers, and total process RSS.
+- Use the caller's transaction and row visibility for every read. Preserve the guard,
+  high-water mark, transaction-local tail, and maintenance fence invariants across refactors.
+- A rowid predicate is not proof of physical pruning on the pinned host. Measure visited
+  storage and validate the actual scan API, including delete visibility and local rows.
+- Reuse native predicates and DuckDB scheduling where possible. Avoid a second scheduler or
+  cache whose ordering, cancellation, invalidation, and lifetime need another proof.
+- Query semantics should not depend on which optional index exists. Keep semantic options
+  explicit; use an index only when its normalization can produce a safe candidate superset.
+- Architecture and APIs are open to revision in this audit. New recommendations supersede
+  earlier recommendations where stated; prior approval of an idea is not implementation proof.
+- Record commands, source identity, settings, corpus, thread count, and artifacts for measured
+  claims. Synthetic experiments diagnose mechanisms; they do not replace release benchmarks.
 
 ## Testing Strategy
 
-- Differential oracle first: every accelerated path is compared with brute-force `LIKE` or
-  `contains` in-suite and in the fixed-seed Python harnesses; results must be identical.
-- Each defect in the findings table gets a regression test sized to its trigger. F1 needs an
-  index with at least 122,880 stats rows, so its test builds one and asserts search and `LIKE`
-  in the same process after a no-op refresh and a no-op bounded refresh.
-- CI is the gate: the Correctness workflow on every phase head; the distribution matrix on the
-  release candidate; a nightly job for the full sanitizer suite, the crash harness, and
-  ThreadSanitizer on the concurrency files.
-- Benchmark deltas are recorded per performance phase: enwik9 warm p50 for the rare,
-  moderate, and dense needles, build wall and peak RSS, no-op refresh and compact wall,
-  before and after, with the exact commands.
-- Behavior-neutral refactors prove neutrality with the existing fixed seeds (explicit
-  `20261314`, transparent `20261315`, churn `20261316`, strict churn `20261318`) producing the
-  same pass counts.
+- Compare both directions with `EXCEPT ALL`, with an unaccelerated oracle. Unique input IDs
+  do **not** make `EXCEPT` sensitive to duplicate output. Include duplicate base rows too.
+- Assert the executed mode using `EXPLAIN ANALYZE`; an injected `NGRAM_INDEX_SCAN` can still
+  fall back. Tests of probe scheduling must actually admit the probe.
+- Exercise ordered collectors, `CREATE TABLE AS`, `INSERT SELECT`, and streaming results in
+  addition to counts and set operations. Test unequal work in multiple posting segments at
+  threads 1, 2, 8, and 24; preserve DuckDB's batch-index contract even without SQL `ORDER BY`.
+- Turn every reproduced defect into a small regression; make race schedules deterministic in
+  the C++ harness. Use counters/barriers for invariant tests and timing only for benchmarks.
+- Check extension allocation high-water marks and interruption during normalization, manifest
+  collection, decode, waiting, and fetch. Test a query alone and concurrent admitted queries.
+- Run `make test_release`, relevant sanitizer tests, and fixed-seed differential/churn tests
+  for changed mechanisms. A phase is complete only with its gates and a green Correctness run
+  on its committed source. Distribution and full release evidence gate the release candidate.
+- Keep crash/reopen coverage operational with every format change, rather than deferring it
+  to a later test-infrastructure phase. Run broader nightly tests after focused regressions.
+
+Audit evidence is reproducible with:
+
+```sh
+python3 docs/review/2026-09-04/reproduce.py --binary build/release/duckdb
+# One mechanism, for example:
+python3 docs/review/2026-09-04/reproduce.py --case batch_order
+```
+
+[Recorded observations](docs/review/2026-09-04/observations.json) include binary and source
+SHA-256 identities. The audited `src/` digest is
+`447847999fae6ca29f4ae47e9081b0d50f366a508ec7fe73f4c192807a714af1`.
+The script uses disposable databases. Its format-4 and registry-scale cases are explicitly
+synthetic. It reports defects rather than asserting that the current behavior is correct.
+
+Recommended order: repair 19D and resource admission (19E/19H), then 19I/19F and the format
+closure in 19J. Implement 22A–22C regressions alongside those changes. Rebaseline performance
+before Phase 20; settle semantics in 21H before API renames; finish release infrastructure and
+Phase 23 last. Do not enable acceleration by default while these gates are open.
 
 ## Phase 16: Fix the Refresh Defect and Restore CI Truth
 
 Goal:
-No maintenance call can break queries for the rest of the process, the guard latches unsafe
-only when rowid reuse is possible, and the current tree has a green CI run.
+Maintenance and guard failures do not poison future queries.
 
 Scope:
-- Remove the empty-batch-insert shape from every generated maintenance script, add the
-  regression test, and report the host bug upstream with the plain-table reproduction.
-- Latch `unsafe_reuse` only when an append can reuse a rowid that a checkpoint has discarded.
-- Turn execution-time identity changes on read paths into fallbacks, take `entry.lock` around
-  the unbound replay read, and stop throwing `InternalException` for extension-owned errors.
-- Make the Correctness workflow complete on HEAD, restrict the distribution matrix to `main`,
-  tags, pull requests, and dispatch, and fix the tracked lock file and ignore rules.
-
-Out of scope:
-- Any storage or identity redesign (Phase 17), any latency work (Phase 19).
+- Preserve the empty-insert fix, rejected-commit guard behavior, read-path fallbacks, and CI
+  wiring. Historical findings F1–F5 were addressed here.
 
 Completion gate:
-The F1 regression test passes; the F2 scenario (guard, later UNIQUE index, rejected duplicate
-commit, next insert) leaves `stale_reason` NULL; the Correctness workflow is green on the
-phase head; the distribution matrix has been dispatched on that head with its result recorded.
+Historical gate satisfied on the commits below; current behavior is rechecked by later phases.
 
 Testing plan:
-- New `test/sql/ngram_refresh_noop.test`: at least 150,000 rows of random 90-symbol text (about
-  260,000 distinct trigrams), build, no-op `ngram_refresh`, no-op bounded refresh, no-op
-  `ngram_compact`, then `ngram_search`, `LIKE` under `ngram_auto_accelerate`, and
-  `ngram_index_stats` in the same process; repeat after `CHECKPOINT`.
-- Harness case for F2 using two connections and a UNIQUE ART created after the guard.
-- Harness case for F4: prepare a `LIKE` statement, drop and re-create the index, execute; expect
-  a sequential-scan result rather than an error.
-- Full `make test_release`, the four fixed-seed harness commands, and the workflow runs.
+Keep no-op refresh, rejected commit, replacement, checkpoint, and fixed-seed regressions.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | 16A: Remove the empty-insert-then-delete shape from refresh and compact | Commit `ac55e30`. The packed delta is folded into the single stats rewrite statement (`src/ngram_maintenance.cpp`), so nothing inserts into `stats` before its `DELETE`; compact audited. `test/sql/ngram_refresh_noop.test` (94 assertions) fails on the old script with `segments and stats descriptor counts disagree` and passes now; `docs/upstream/duckdb-empty-batch-insert.md` holds the verified plain-table reproduction. Open owner action: file the upstream DuckDB issue from that note. |
-| Complete | Work | 16B: Latch only on possible reuse | Commit `ac55e30`. Each `max_seen` advance records the header checkpoint iteration; an append at or below `max_seen` latches only when that iteration is unknown or changed (`src/rowid_guard.cpp` `ObservableCheckpointIteration`, `Observe`). Nothing new is persisted; guards bound from disk or WAL and in-memory databases stay conservative; a checkpoint between a rejected commit and its retry still latches. Harness `TestRejectedCommitKeepsGuard` leaves `stale_reason` NULL and keeps `NGRAM_INDEX_SCAN`, and fails on the old code. Reviewer verified every host citation. |
-| Complete | Decision | 16B-2: Treat reuse above the high-water mark as safe | Decided 2026-09-01: deferred. Owner confirmed the recommendation; no work in this plan. Revisit if a user reports full scans after deleting and re-inserting rows above the mark. |
-| Complete | Work | 16C: Read-path fallbacks and small fixes | Commit `ac55e30`. `IndexLocationAvailable(..., changed_is_absent)` makes `SearchInitGlobal` and `TryProbeIndex` fall back to the exact scan on a changed identity; write paths keep the throw. `entry.lock` around `HasBufferedReplays`; six `InternalException` sites are `InvalidInputException`. F4 coverage: the exact-fallback assertions in harness cases `swapped_part` and `registry_swap`; the `NGRAM_INDEX_SCAN` changed branch has no deterministic test because prepared base-table scans re-bind after catalog changes. |
-| Complete | Work | 16D: CI completes on HEAD | Commits `ac55e30`, `cd63a0c`, `20b864a`. Pinned `hendrikmuhs/ccache-action` v1.2.24 keyed on the duckdb gitlink and `src/**`; parallelism 3 release, 2 debug; `OVERRIDE_GIT_DESCRIBE=v1.5.5` in both build jobs because the shallow, tagless submodule checkout otherwise builds a dummy v0.0.1 that the host pin rejects; the pin accepts any 7-to-40 character prefix of commit `d8cdaa33fd...`; fixture-drift step; `scripts/verify_pins.sh` (gitlink match plus clean submodule trees) shared by three jobs and `release_evidence.py`; relaxed `check` on pull requests and `check --current-source` on tags and dispatch; distribution triggers limited to `main`, `v*`, pull requests, dispatch; the POSIX harness hook skipped on Windows; `MinValue<idx_t>` fix for wasm32 and macOS; lock file untracked; `.gitignore` extended; SUBMISSION matrix checkbox unticked pending the release-candidate run. Correctness green on `20b864a`: https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33584571329. Matrix green on all ten default targets: https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33584571470. |
-| Complete | Gate | Queries survive maintenance in-process and CI is green | `ngram_refresh_noop.test` and `TestRejectedCommitKeepsGuard` are in the suite and pass on GitHub. Reviewer approved after six rounds (three on the code, three on CI feedback). Correctness run https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33584571329; matrix run https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33584571470, the first full matrix since Phase 9. |
-| Complete | Test | Regression and workflow evidence | `make test_release`: 2993 assertions in 25 cases locally and in the Correctness release job. Fixed seeds 20261314 1764/0, 20261315 886/0, 20261316 320/0, 20261318 320/0 locally and in CI. Sanitizer job green. `release_evidence.py check` PASS; `verify_pins.sh` exit 0; `git diff --check` clean. Runs: https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33584571329, https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33584571470. |
-
-Plain-table reproduction of the host bug behind F1 (DuckDB v1.5.5, default threads; the
-control without the empty insert returns 200,000 at every stage):
-
-```sql
-CREATE TABLE t AS SELECT i, i::VARCHAR AS s FROM range(200000) r(i);
-CREATE TABLE src AS SELECT i, i::VARCHAR AS s FROM range(200000) r(i);
-BEGIN;
-INSERT INTO t SELECT * FROM src WHERE i < 0 ORDER BY s;   -- empty batch insert
-CREATE TEMP TABLE folded AS SELECT * FROM t;
-DELETE FROM t;
-INSERT INTO t SELECT * FROM folded ORDER BY s;            -- 200,000 rows
-SELECT count(*) FROM t;                                   -- 0 (expected 200000)
-COMMIT;
-SELECT count(*) FROM t;                                   -- 0 until the file is reopened
-```
+| Complete | Work | 16A: Remove the empty-insert-then-delete shape | `ac55e30`; `test/sql/ngram_refresh_noop.test`, [host reproduction](docs/upstream/duckdb-empty-batch-insert.md). The format-5 adaptation is checked again in 19J. Filing the upstream issue was not part of this completed code item. |
+| Complete | Work | 16B: Latch only on possible reuse | `ac55e30`; `RowIdGuard::Observe`, `TestRejectedCommitKeepsGuard`. File checkpoint iteration distinguishes rejected appends from possible trailing-rowid reuse; unknown/in-memory histories remain conservative. |
+| Complete | Decision | 16B-2: Reuse above the high-water mark | Historically deferred on 2026-09-01. No relaxation is justified by this audit. |
+| Complete | Work | 16C: Read-path fallbacks and small fixes | `ac55e30`; replacement cases `swapped_part`/`registry_swap`, unbound replay read under `entry.lock`, extension-owned internal errors removed. This does not cover the new host internal error in 19D. |
+| Complete | Work | 16D: CI completes on phase head | `20b864a`; pinned host/configuration and cache/fixture/pin checks. [Recorded Correctness run](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33584571329). Historical run, not reverified as current CI. |
+| Complete | Gate | In-process maintenance and historical CI | Prior ledger records reviewer approval and [distribution matrix](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33584571470) on `20b864a`. |
+| Complete | Test | Regression and workflow evidence | Historical `make test_release`: 2993 assertions/25 cases; explicit/transparent/churn/strict-churn seeds: 1764/886/320/320 checks, zero failures. |
+| Incomplete | Doc | 16A-2: Upstream report | The reproduction note exists; no submitted DuckDB issue URL is recorded. Optional follow-up, not a local correctness gate. |
 
 ## Phase 17: One Identity Anchor, One Storage Layout (Format 4)
 
 Goal:
-The guard is the only proof of table identity, each index is one registry row plus one or two
-ordinary tables, the lifecycle has four states, and nothing remains of layouts that never
-shipped.
+Keep one guard identity per table and one registry row per index, with understandable lifecycle
+states. This phase describes the completed format-4 restructuring, not the current format.
 
 Scope:
-- Delete legacy v2 support and every pre-registry naming helper.
-- Delete the table fingerprint, `CertainStaleReason`, `InstanceId`, the `REPLACED` status, and the
-  five meta columns that carried them; keep `total_rows` for the tail estimate.
-- Make the registry row the metadata row (index id, owner schema/table/column, gram size, case
-  flag, high-water mark, guard name, guard token, format version). Store postings in
-  `__ngram.segments_<uuid>` and, until Phase 19 decides, stats in `__ngram.stats_<uuid>`. Delete
-  the per-index schema, the meta table, `ReadMetaHeader`, the eight-constraint registry audit,
-  and the `UNREGISTERED` and `MISSING_STORAGE` states.
-- One rowid guard per table, covering every VARCHAR present at its creation, reference-counted
-  through the registry and dropped with the table's last index. Delete both creation
-  protector paths and the native-ART lookup. Indexing a VARCHAR added after the guard requires
-  dropping and rebuilding the table's ngram indexes; the README states this once.
-- Format 4. Any other format is listed as `MALFORMED` with the version in the reason and is
-  drop-only through the token-checked generic drop; no other legacy path exists.
-
-Out of scope:
-- Changing the gram key type or the stats table's existence (Phase 19).
-- Module layout and function splitting (Phase 18).
+- Preserve the removal of redundant fingerprints and legacy readers, shared guards, and safe
+  ownership checks. Historical findings F10/F11 belong here; format-5 cleanup belongs to 19J.
 
 Completion gate:
-Production source shrinks by at least 600 lines; `ngram_indexes` reports only `READY`,
-`SCAN_ONLY`, `ORPHAN`, and `MALFORMED`; every read path calls the guard verdict before any
-postings read; the lifecycle, identity, and guard suites pass with their legacy and
-fingerprint cases deleted rather than adapted.
+The historical restructuring is complete; later changes must preserve ownership and visibility.
 
 Testing plan:
-- Rewrite `test/sql/ngram_lifecycle.test` for four states; delete
-  `ngram_maintenance_identity.test` cases that exist only for the fingerprint, keeping the
-  CREATE OR REPLACE, DROP plus CREATE, reopen, and detach/attach scenarios asserted through
-  the guard verdict.
-- Two indexes on one table share one guard; dropping one keeps the other `READY`; dropping the
-  last removes the guard; a VARCHAR added afterward is refused with the documented message.
-- A format-3 database fixture opens read-only, lists as `MALFORMED`, and drops by id.
-- Fixed-seed harnesses and `make test_release`; Correctness green.
+Keep shared-guard, replacement, concurrent drop, read-only old-format, and drop-by-id tests.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | 17A: Delete legacy v2 | Commits `4243564`, `a4e64ba`, `ef4d88c`. Every pre-registry naming helper, both legacy branches, `LegacyRowIdGuardReason`, the format-2 validate branch, `ReadMetaFormatVersion`, the `LEGACY_REBUILD` status, and the `kind` and `storage_schema` columns are gone; harness legacy cases deleted. `Hex()` stays for the owner-key literal. |
-| Complete | Work | 17B: Guard as sole identity | Commits `4243564`, `a4e64ba`, `ef4d88c`. `TableFingerprint`, `CertainStaleReason`, `InstanceId`, `ThrowIfCandidatesCertainlyStale`, the "index stale" fallback, the fingerprint re-check, `REPLACED`, and five meta columns deleted; `MetaInfo` is options, hwm, column, guard name, guard token. Reviewer confirmed `RowIdGuardReason` runs before the first postings read on `ngram_search`, `ngram_candidates`, `NGRAM_INDEX_SCAN` (execution and plan time), `ngram_index_stats`, refresh, compact, and shared-guard create. |
-| Complete | Work | 17C: Registry row is the metadata row | Commits `4243564`, `a4e64ba`, `ef4d88c`. `__ngram.registry` carries the twelve metadata columns; postings and stats live in `__ngram.segments_<hex>` and `__ngram.stats_<hex>`; the meta table, per-index schema, `ReadMetaHeader`, the registry audit, and the schema cleanup are gone; refresh updates `hwm_rowid` in place (non-indexed column, verified against the host); drop is one `DELETE` and two `DROP TABLE`. Statuses are exactly `READY`, `SCAN_ONLY`, `ORPHAN`, `MALFORMED`. A use-after-free in the `ngram_indexes` classifier, caught by the sanitizer job and visible on macOS as a false `MALFORMED`, was fixed in `a4e64ba`. |
-| Complete | Work | 17D: One guard per table | Commits `4243564`, `a4e64ba`, `ef4d88c`. The first index runs the barrier and creates `__ngram_guard_<hex>` over every VARCHAR present; later indexes validate and record the same guard with no barrier; a column outside the guard's coverage is refused with one message; the guard drops with the last referencing row. Because the reference count reads the dropping transaction's snapshot, two concurrent drops can strand the guard, so a first-index create drops every unreferenced `__ngram_guard_*` on the table before its barrier (harness `TestConcurrentDropsStrandGuard`, fail-then-pass, reviewer reproduced the race independently). Protector paths deleted; the maintenance scalar takes 14 arguments instead of 27. |
-| Complete | Decision | 17D-2: Guard coverage at first creation | Decided 2026-09-01: keep covering every VARCHAR present at creation. Owner confirmed the recommendation; 17D documents the delete-plus-insert cost once. |
-| Complete | Work | 17E: Format 4 and drop-only path | Commits `4243564`, `a4e64ba`, `ef4d88c`. Format 4; a six-column registry-version-1 registry is recognized, listed `MALFORMED` with "format 3 ... predates format 4", and dropped by id through one branch; `test/fixtures/format3.duckdb` (258,048 bytes, built with the pre-change binary) is tested read-only in `ngram_lifecycle.test` and writable in harness `TestFormat3Fixture`, which the sanitizer job now runs too. Deferred to 21G: list an unreferenced `__ngram_guard_*` as `MALFORMED`; document the drop-versus-create window that yields a born-`SCAN_ONLY` index. |
-| Complete | Doc | 17F: Correct the vacuum sentence | Commit `4243564`. README and `docs/stale-updates.md` rewritten: any index blocks moving vacuum by default and the non-ART type matters under `vacuum_rebuild_indexes`; guard as identity; one guard per table; four states; the two concurrency windows and their remedies. |
-| Complete | Gate | Four states, one anchor, 600 fewer lines | `git diff --stat -- src/` over the phase: 752 insertions, 1888 deletions, net -1136 production lines. Status literals: 8 in `index_pragmas.cpp`, 0 elsewhere. Guard-verdict call sites listed under 17B. Reviewer approved after four rounds (one on the race, one on a sanitizer finding, one on the CI budget). Correctness green on `ef4d88c`: https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33596217147. Matrix green on all ten default targets: https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33596215795. |
-| Complete | Test | Lifecycle, shared-guard, and fixture suites | `make test_release`: 3046 assertions in 25 cases locally and in CI (harness includes `TestSharedGuardAndDrop`, `TestConcurrentDropsStrandGuard`, `TestFormat3Fixture`); sanitizer selectors 93/134/149/237 assertions and the ASAN harness (258 s locally, about 600 s on the runner, budget 1800 s) green; seeds 20261314 1764/0, 20261315 886/0, 20261316 320/0, 20261318 320/0; `release_evidence.py check` and `test --binary` PASS (the tool accepts the format-3 registry contract of the stored artifact until Phase 23 re-collects); format-check passed; `git diff --check` clean. Runs: https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33596217147, https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33596215795. |
+| Complete | Work | 17A: Delete legacy v2 | `4243564`, `a4e64ba`, `ef4d88c`; old read branches, naming helpers, and extra statuses deleted. |
+| Complete | Work | 17B: Guard as sole identity | Same commits; `RowIdGuardReason` validates name/token, physical column, host compatibility, observed mark, and reuse state. The fingerprint was deleted. |
+| Complete | Work | 17C: Registry row is metadata | Same commits; twelve-column `__ngram.registry`, UUID storage names, four lifecycle statuses. Format 5 subsequently removes the stats table. |
+| Complete | Work | 17D: One guard per table | `TestSharedGuardAndDrop`, `TestConcurrentDropsStrandGuard`; first-index create cleans unreferenced guards after the ownership/fence checks. |
+| Complete | Decision | 17D-2: Guard coverage at first creation | Historical choice: cover every existing VARCHAR. Retain for now; updates to otherwise unindexed covered columns also become delete+insert, and later-added VARCHARs need a rebuild. |
+| Complete | Work | 17E: Format 4 and drop-only path | `test/fixtures/format3.duckdb`, `TestFormat3Fixture`; historical format-3 cleanup works. This proves nothing about the format-4-to-5 cleanup newly broken in 19J. |
+| Complete | Doc | 17F: Vacuum and identity documentation | `4243564`; README and `docs/stale-updates.md`. Physical rowid-filter pruning claims still need correction under 19I/23A. |
+| Complete | Gate | Four states and one identity anchor | Historical net reduction 1136 production lines; [Correctness](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33596217147), [matrix](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33596215795) on `ef4d88c`. |
+| Complete | Test | Lifecycle and shared-guard evidence | Historical 3046 assertions/25 cases, sanitizer harness, four fixed seeds with zero failures. |
 
 ## Phase 18: Code Structure
 
 Goal:
-Each file owns one thing, each function fits on two screens, and validation has one entry
-point, with no behavior change.
+Keep ownership and invariant boundaries legible without treating function length as a design
+objective. Historical finding F12 was addressed by this restructuring.
 
 Scope:
-- `ValidateIndex(context, table, index_ref) -> {meta, hwm, reason}` replaces the seven inlined
-  validation triples and owns the read-path fallback policy.
-- Replace the 27-argument `__ngram_maintenance_guard` and the 10-argument
-  `__ngram_rowid_guard_validate` with one handle: prepared state in a `ClientContextState`
-  keyed by a UUID literal in the generated script.
-- Split `PlanIndexProbe`, `CreateNgramIndexQuery`, `ObserveCatalog`, `RefreshNgramIndexQuery`,
-  and `MaintenanceGuardFunction`; route `CheckedAdd` and `CheckedMultiply` failures to one
-  `InvalidInputException` and keep four real decline reasons.
-- Adopt the target module layout: `settings`, `gram`, `postings`, `catalog`, `index_state`,
-  `rowid_guard`, `fence`, `build_sql`, `pragmas`, `probe`, `search_core`, `search_functions`,
-  `rewrite`, plus `ngram_extension.cpp` for registration order.
-- Bind guards on the first query or maintenance call that touches them instead of the
-  load-time and connection-close callbacks, if a deadlock check against
-  `TableIndexList::Bind` passes.
-- Comment and naming hygiene: rewrite history-narrating comments as current behavior, reserve
-  "guard" for the rowid guard, reference DuckDB's `MAX_ROW_ID` instead of the literal, define
-  `ScratchName` and `FETCH_BATCHES_PER_SEGMENT` once, move `MetaInfo` to its own header, and
-  stop exporting partition internals from the pragma header.
-
-Out of scope:
-- Any change to generated SQL semantics, storage, or public behavior.
+- Preserve centralized validation, connection-owned maintenance handles, and module boundaries.
+- Carry correctness proofs through future simplification; avoid line-count-only refactors.
 
 Completion gate:
-No function over 150 lines and no file over 700 lines in `src/`; identical assertion counts and
-identical fixed-seed results before and after; production line count does not grow.
+Historical refactor complete; new scheduling and storage access require their own proof.
 
 Testing plan:
-- Run the full suite and the four seeds before and after; record both.
-- Harness case for lazy binding: open, query without any prior bind, `DETACH`, re-attach, query;
-  expect `READY` and no rebuild.
-- `make tidy-check` and `git diff --check`.
+Keep pragma expansion, multi-pragma handle, guard binding, shutdown seal, and suite parity tests.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | 18A: Single validation entry point | Commits `be7f6ce`, `aacfff7`. `ValidateIndex` and `LocateIndex` in `src/index_state.cpp` return an `IndexVerdict` (availability, reason, meta); the seven read paths call `ValidateIndex` and keep their own policy on a non-empty reason (scan, raise, refuse); `IndexLocationAvailable` and `ReadMeta` are deleted; `RowIdGuardReason` keeps two direct callers for the shared-guard create, which has no registry row yet. |
-| Complete | Work | 18B: Handle-based execution-time scalars | Commits `be7f6ce`, `aacfff7`. The pragma callback stores a `PreparedMaintenance` in the per-connection `MaintenanceState` under a random UUID and the script calls `__ngram_maintenance_guard('<uuid>')`; the scalar consumes the handle and runs the same drop, create, and maintenance checks as the former 14-argument and 5-argument scalars (reviewer compared them check by check). Handles are grouped per script builder so two pragmas in one query string cannot erase each other's handles (regression block `test/sql/ngram_maintenance.test:928-1018`, fail-then-pass); a handle is erased only by its own consumption, by the end of the transaction that consumed a same-group handle, or by a later expansion in another transaction. Remaining assumption: a client does not expand a second pragma string before running the first's statements; no public path does. |
-| Complete | Work | 18C: Split long functions and collapse overflow declines | Commits `be7f6ce`, `aacfff7`. No function over 150 lines (largest `SearchInitGlobal` 111, `CompactScript` 105); `PlanIndexProbe`, create, refresh, and the maintenance scalar are split into named helpers verified as line-for-line extractions; every `CheckedAdd`/`CheckedMultiply` failure throws one `InvalidInputException("ngram: probe arithmetic overflow")`; five decline strings remain, the plan's four plus `query grams exceed query memory budget`, which is reachable under a small memory limit and whose removal would turn a scan fallback into an out-of-memory error. |
-| Complete | Work | 18D: Module layout | Commits `be7f6ce`, `aacfff7`. Fifteen sources and eleven headers with one-line responsibility banners; largest file `rewrite.cpp` at 623 lines; refresh and compact scripts live in `maintenance_sql.cpp` so `build_sql.cpp` stays under 700, and `MetaInfo` lives in `catalog.hpp` beside `RegistryRow`, which embeds it; 116 unneeded DuckDB includes removed. |
-| Complete | Decision | 18E: Lazy guard binding | Rejected with analysis (Phase 18 implementer and reviewer, 2026-09-02). Locks: no cycle; a bind from a table-function init or pragma callback takes the vacuum and checkpoint locks before `index_entries_lock`, the same order as the host's checkpoint (`duckdb/src/storage/table_index_list.cpp:149-233`, `checkpoint_manager.cpp:591-603`). Seal: `AttachedDatabase::Close` checkpoints with no client context for both the destructor and `DETACH` (`duckdb/src/main/attached_database.cpp:186-191, 240-246, 328-350`); `WriteTable` binds only with an active transaction (`checkpoint_manager.cpp:597-600`) and copies an unbound index's stored info verbatim (`table_index_list.cpp:328-332`), so an untouched unbound guard would be written with its old seal while the header iteration advances, and the next open would latch `unsafe_reuse`. The load-time and connection-close callbacks prevent exactly that, as harness `TestCleanShutdownSeal` asserts. The callbacks and the README `DETACH` caveat stay. |
-| Complete | Work | 18F: Comment, naming, and header hygiene | Commits `be7f6ce`, `aacfff7`. DuckDB's `MAX_ROW_ID` replaces the literal; `ScratchName` and `FETCH_BATCHES_PER_SEGMENT` defined once; `SilentGuard`, `RethrowFatalObservation`, `PrepareCreationTransaction`, duplicate base resolvers removed; history-narrating comments rewritten; `EncodePostings` is file-local. `GuardTableName`, `ObservedIndex.format_version`, and `ProbePlan::stats_chunks_scanned` stay because they are used. The `VerifyBuffers` override stays: the `BoundIndex` default throws and DEBUG builds call it after appends, at commit, and during rollback, which the sanitizer job caught; every other pure or throwing `BoundIndex` virtual is overridden or unreachable for a constraint-free non-ART index (audit in the round-3 report). |
-| Complete | Gate | Behavior-neutral restructuring | `make test_release`: 3046 assertions in 25 cases before and after the restructuring, 3158 with the new two-pragma block; seeds identical (1764/0, 886/0, 320/0, 320/0); generated-SQL expansion parity over 13 pragma shapes differs only by the validate statement folded into the handle scalar. Gate deviation, accepted with the reviewer's breakdown: production lines grew from 6533 to 6733 (+200); `.cpp` files shrank by 39 while headers grew by 239 (declarations and shared structs +129, comments +49, blank +54, includes +7), the cost of module boundaries rather than padding. Correctness green on `aacfff7`: https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33608194857. Matrix green on all ten default targets: https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33608194556. |
-| Complete | Test | Suite parity and lazy-bind case | Suite parity above; no lazy-bind case because 18E was rejected with analysis. Sanitizer selectors and the ASAN harness green in CI after the `VerifyBuffers` restore; `make format-check` passed; `git diff --check` clean; `make tidy-check` covered by the matrix's Tidy Check. Runs: https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33608194857, https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33608194556. |
+| Complete | Work | 18A: Single validation entry point | `be7f6ce`, `aacfff7`; `ValidateIndex`/`LocateIndex` return `IndexVerdict`. Read and mutation policies remain distinct. |
+| Complete | Work | 18B: Handle-based execution-time scalars | Same commits; `MaintenanceState`, `PreparedMaintenance`, grouped one-use handles; multi-pragma regression in `ngram_maintenance.test`. Preserve execution-time validation, rather than blindly carrying mutable bind-time metadata. |
+| Complete | Work | 18C: Function extraction and overflow handling | Same commits; named helpers and one arithmetic-overflow error. Five reachable decline reasons retained. No new requirement to hit a line-count quota. |
+| Complete | Work | 18D: Module layout | Fifteen sources and eleven headers; build, maintenance, identity, and search concerns separated. Prefer a small storage adapter for 19I, not another general abstraction layer. |
+| Complete | Decision | 18E: Lazy guard binding | Rejected with host-source analysis: shutdown/DETACH can checkpoint an untouched unbound guard with an old seal. `TestCleanShutdownSeal`; keep callbacks until an alternative proves the same durability behavior. |
+| Complete | Work | 18F: Naming and header hygiene | Same commits; `MAX_ROW_ID`, shared helpers, and no-op `VerifyBuffers` override. The host calls this override in DEBUG builds; deleting it is not simplification. |
+| Complete | Gate | Behavior-neutral restructuring | Historical 3158 assertions including the new handle test; [Correctness](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33608194857), [matrix](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/33608194556) on `aacfff7`. |
+| Complete | Test | Suite parity and sanitizer evidence | Historical fixed seeds unchanged; focused sanitizers and harness green. Current local test results are recorded in Phase 19. |
 
-## Phase 19: Cut the Fixed Query Cost
+## Phase 19: Correct and Bound the New Query Path, Then Cut Its Cost
 
 Goal:
-A rare needle on the 10.9M-row enwik9 index answers in about 2 ms warm, a moderate needle in
-about 10 ms, with the same memory bounds and identical results.
+Finish the format-5 work without invalidating the database, exceeding the extension's resource
+allowance, or making a small indexed query scale with unrelated data. Then establish latency
+improvements on a comparable corpus and machine.
 
 Scope:
-- Store the gram as a fixed-width integer key: order-preserving byte-packed `UHUGEINT` when the
-  normalized gram fits 16 bytes, a 64-bit hash otherwise. Key collisions merge postings and
-  only widen candidates. The key is the leading sorted column so a `ConstantFilter` is evaluated
-  natively on bit-packed storage.
-- Drop the stats table. Select the rarest K grams from segment rows: one parallel scan of the
-  segments table with an `InFilter` hint over all needle keys collects descriptors and counts
-  for every gram, then the plan keeps K. Delete `ReadGramStats`, the refresh fold, the compact
-  stats rebuild, and the stats-versus-segments consistency checks. Bound the manifest as it
-  grows against the query budget.
-- Hand out candidates in fixed rowid batches through a shared cursor after each segment
-  intersection, so fetch parallelism follows candidate count rather than segment count.
-- Reuse per-thread decode buffers, resolve shadow column ids once per plan, intersect each
-  segment's grams smallest-first by per-segment count.
-- Carry `MetaInfo` from bind to init and revalidate with the registry row and guard verdict
-  instead of re-resolving and re-reading twice.
-- Re-derive the candidate-fraction default from the measured per-candidate fetch cost and the
-  new parallelism, and record the model.
+- Keep fixed-width gram keys and segment-only storage as the working design; test actual
+  collision widening. Compare per-key filtered scans and a combined scan using measured
+  visited rows, fragmentation, gram size, and query length; do not mandate `InFilter` by name.
+- Repair candidate scheduling. Start with ordered segment production and parallel batch fetch;
+  retain parallel decoding only if a bounded ordered publication scheme pays for its complexity.
+  Merely sorting the ready queue is insufficient when an earlier segment is still decoding.
+- Account and limit query preparation, manifest growth, retained decode capacities, candidate
+  publication, and recheck scratch. Poll for cancellation within long-running loops.
+- Make candidate ranges and the committed tail physically bounded through a narrow host adapter,
+  preserving transaction-local visibility. If no safe API is available, disable the dense-range
+  optimization until one is proved; a private DataTable method is not a supported shortcut.
+- Filter query shapes before registry discovery; resolve only relevant owners/IDs and preserve
+  statement-snapshot validation. Avoid a process-global metadata cache as the first remedy.
+- Retain cumulative decode-work admission, add actual visited-row/byte counters, and derive
+  profitability from fixed planning cost, locality, projected bytes, compression, tail size,
+  and native recheck cost. Avoid evaluating transparent scan filters twice on fallback/tail rows.
+- Close every format-5 integration path: old-format cleanup, crash checks, docs, and fixtures.
 
 Out of scope:
-- Postings encoding changes (measured as not the bottleneck).
-- Any change to recheck semantics or the tail scan.
+A native postings backend, a new codec, API renames, or claiming release performance from the
+small diagnostic cases below.
 
 Completion gate:
-On enwik9 at 24 threads warm: rare p50 at most 3 ms, moderate p50 at most 12 ms, dense
-unchanged within 10%; a 1,000-row table costs under 0.3 ms per query; the 51k-candidate
-single-segment case scales with threads; `ngram_query_bounds.test` passes with its budgets
-re-derived; all differential suites identical.
+Both exact paths pass admitted multi-segment CTAS/INSERT/streaming tests at 1/2/8/24 threads,
+including unequal decode workloads, cancellations, and local tails. No decreasing or duplicate
+batch ownership and no database invalidation. Extension allocation peaks fit the declared
+reservation including retained capacity. Bounded scans visit only intersecting row groups or
+vectors plus a separately measured local tail. Unrelated numeric filters perform no registry
+scan. Crash and real format-4 cleanup tests pass.
+
+After those gates, target enwik9 warm p50 <=3 ms rare, <=12 ms moderate, and dense/fallback
+within 10% of the native baseline; tiny-table p50 <0.3 ms. Treat these as targets pending a
+fresh comparable baseline, not proof inherited from the prior agent. Record full query latency,
+CPU, work counters, RSS, projection, compression, and threads; investigate regressions before
+changing a target. A 51k-candidate single-segment case must benefit from parallel fetch.
 
 Testing plan:
-- Extend `ngram_query_bounds.test` for the integer key, hash-collision widening (two grams
-  forced to one key in a unit test of the key function), and manifest budget declines without
-  stats.
-- `build_scale.test` gains cross-segment `EXCEPT` identity queries on the partitioned fixture.
-- Parity at threads 1, 2, 8, 24 across refresh generations and partial segments.
-- Benchmark before and after with `release_evidence.py collect` and the ad hoc `.timer` loops
-  recorded in the ledger.
+- Regressions from `docs/review/2026-09-04/reproduce.py`, converted to deterministic suite tests.
+- Actual same-size gram collision injection at an internal test seam; key packing for ASCII,
+  Unicode, NUL, and >16-byte grams, including two colliding grams in one row and across refresh.
+- Long needles at 8/16/32/64/128 KiB, long haystacks, low budgets, many refresh generations,
+  alternating segment densities, concurrent queries, and cancellation before the manifest.
+- Fixed candidate count with a 10x larger unrelated prefix/suffix; empty and small tails;
+  persistent FSST/uncompressed data; selectivity and projection sweeps.
+- An unaccelerated oracle and explicit mode assertions; do not use a count aggregate as the
+  only scheduler test. Add Phase 22 regressions as this phase is implemented.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 19A: Integer gram key | Missing: key function with tests for ASCII, 2-, 3-, and 4-byte codepoints, gram sizes 1 to 6, and the hash fallback; segments written sorted by key; probe filters use `ConstantFilter` on the key; `trigrams()` unchanged for users; internal pair emitter for build. |
-| Incomplete | Work | 19B: Drop the stats table | Missing: single-scan descriptor collection over all needle keys; rarest-K from collected counts; deletions of `ReadGramStats`, the fold (`ngram_maintenance.cpp:781-804`), stats rebuild (`:1019-1023`), and the six malformed-stats throws; `ngram_index_stats.distinct_grams` computed lazily; measured rare and moderate p50 recorded against 19A alone. Gate for keeping this row: no regression over 10% on rare or moderate p50. |
-| Incomplete | Work | 19C: Parallel manifest collection | Missing: `ParallelForEachUnit` over key row groups, or moot after 19B; recorded either way. |
-| Incomplete | Work | 19D: Candidate-batch fetch parallelism | Missing: shared cursor over 4,096-rowid batches per intersected segment; batch index scheme preserved; 51k-candidate case time at 1 and 24 threads recorded. |
-| Incomplete | Work | 19E: Decode-path allocation and order | Missing: reusable buffers in `SearchCoreLocal`; column ids resolved in `PlanIndexProbe`; per-segment smallest-first order; dense-needle CPU before and after. |
-| Incomplete | Work | 19F: Bind-to-init metadata carry | Missing: one `ValidateIndex` per query; the registry table is currently full-scanned three times per query init (`ExistingIndexes` at bind, `IndexLocationAvailable`, `ReadMeta`), which this row reduces to one read; tiny-table loop time before and after (baseline 0.11 s per 200 statements). |
-| Incomplete | Work | 19G: Candidate gate model | Missing: measured per-candidate fetch cost and per-row scan cost after 19D; default `ngram_max_candidate_fraction` re-derived and justified in the README settings row. |
-| Incomplete | Gate | Latency targets with identical results | Missing: the enwik9 numbers with commands; parity suite results at four thread counts; `ngram_query_bounds.test` green. |
-| Incomplete | Test | Key, budget, cross-segment, and parity suites | Missing: test names, seed results, run URL. |
+| In Progress | Work | 19A: Integer gram key | `src/gram.cpp` implements byte-packed UHUGEINT/FNV fallback, `ngram_gram_keys`, and key-based build/probe; `gram_key.test` passes locally. Missing: actual same-gram-size collision coverage. Its current `ab` versus `ab`+NUL example compares different gram sizes; the gram-2 index only exercises ordinary shared `ab` postings. |
+| In Progress | Work | 19B: Drop the stats table | Build/refresh/compact and `ngram_index_stats` use segments; `ReadGramStats` and the fold are gone. Missing: comparable format-4/5 query/build/refresh/storage measurements, fragmented-generation cases, and 19J closure. Reconsider a compact synopsis only if measurements justify both its query benefit and maintenance cost. |
+| In Progress | Work | 19C: Parallel manifest collection | `CollectGramRows` uses one native `ConstantFilter` scan per key via `ParallelForEachUnit`; this differs from the original single-scan prescription. Missing: reserve descriptor growth before allocation, adapt worker count to budget, and compare scan strategies using physical work rather than returned rows alone. |
+| In Progress | Work | 19D: Candidate-batch fetch parallelism — P1 correctness | **Reproduced:** `batch_order` at 24 threads fails in both explicit and transparent CTAS with `Pipeline batch index - gotten lower batch index`; a later ordinary SELECT reports database invalidation. One thread returns all 1,065,717 matches. `ClaimCandidateBatch` publishes decode completion order while assigning segment-derived indexes; host `PipelineExecutor::NextBatch` requires monotonicity per worker. Missing: bounded ordered publication or simpler ordered production, deterministic regression, sink/streaming parity, cancellation, and scaling evidence. Current batches are 2,048 rows, not the plan's former 4,096. |
+| In Progress | Work | 19E: Decode reuse, order, and resource ownership — P1 invariant gap | `ProbeDecodeScratch` and per-segment smallest-first order exist. **Source-confirmed accounting gap:** `CollectGramRows` fills ordinary vectors before `Grow` reserves only selected descriptors; `per_key` retains unselected rows until planning returns. `SegmentWorkerBytes` counts logical current rows, but `scratch.postings`/`intersection` retain capacities across segments. For counts (300k,300k) then (1,1M), a 300k intersection capacity can coexist with a 1M posting buffer although the modeled row peak is 1M+2. Missing: allocation instrumentation, reserve-before-grow, capacity-aware ownership through queue publication and vector swaps, and concurrent low-memory tests. No process-OOM reproduction is claimed. |
+| In Progress | Work | 19F: Bind/init metadata and cheap discovery — P2 performance | `OwnedIndexes` reduces duplicate reads, but `TryRewriteGet` reads the entire registry before checking for a probeable VARCHAR filter. **Measured:** unrelated numeric query with 10,000 registry rows (9,999 synthetic absent owners) costs p50 0.092 ms CPU with acceleration off versus 9.562 ms on. Missing: shape-first eligibility, owner/ID-targeted snapshot reads, no discovery on ineligible scans, and tiny-table/large-registry benchmarks. Do not delete execution-time revalidation to save a read. |
+| In Progress | Work | 19G: Candidate/work cost model — P2 design | README/settings describe a 1% threshold, but those prose timings lack a reproducible Phase 19 release artifact. `AdmitSegments` bounds cumulative decoded rowids separately from `SegmentWorkerBytes`; candidate fraction and peak memory do not replace that bound. Missing: retain a work ceiling, account manifest/base visits, compare locality and projected bytes, eliminate duplicate native rechecks where safe, publish counters for both exact APIs, and record a measured default. |
+| Incomplete | Work | 19H: Bounded, interruptible needle preparation — P2 performance/resource gap | **Measured:** `long_needle` on one row, gram=6, 16MB memory: 16/32/64/128 KiB needles take about 0.062/0.239/0.965/3.872 s. `DecomposeNeedle`/`MergeKeys` linearly search the accumulated vector for every key, before admission; normalization/decomposition have no interruption checks. Rewrite decomposes needles repeatedly. Missing: bounded deduplication with stable order, admission while emitting keys, reuse of decompositions, periodic interruption checks, and bounded normalization scratch for recheck. |
+| Incomplete | Work | 19I: Physical range and tail access — P2 performance | **Measured:** fixed 50k candidates at one thread cost p50 4.524 ms CPU on 1.1M rows versus 36.286 ms on 11M. Native `rowid BETWEEN 1000 AND 2999` profiles 11M visited rows; the equivalent stored `id` filter visits 122,880. `StartRangeScan` initializes an exhaustive scan per batch; rowid segment checks cannot jump because `RowIdColumnData` has no current segment. The comment claiming all other groups are pruned is false. Missing: safe bounded access, empty-tail coverage, physical-work counters, MVCC/delete/checkpoint tests, and correction of inherited pruning claims. These scans still beat native full contains in this fixture; the defect is repeated unrelated work, not a demonstrated overall slowdown versus full scan. |
+| Incomplete | Work | 19J: Complete format-5 lifecycle and tooling — P2 correctness/validation | **Reproduced:** `crash_maintenance.py --rows 100 --tail 20 --kills 1 --seed 20261317` exits before any kill because `index_state` still queries `stats_<id>`. `format4_drop` shows the current generic drop leaves the known format-4 stats table and a permanent MALFORMED listing. The latter uses a synthetic cleanup shape, not a real persisted format-4 fixture. Missing: token/ownership-checked cleanup of known old objects, real format-4 and format-5 read-only/reopen fixtures, working crash/digest checks, and README storage-count fixes. |
+| Complete | Test | Audit baseline, not phase acceptance | Audited tree: build targets report no pending work; `make test_release` passes the C++ harness and 3188 assertions in 26 cases. `differential_search.py --trials 2 --rows 5000 --seed 20261314`: 1764/0; `--transparent --seed 20261315`: 886/0. `release_evidence.py test --binary build/release/duckdb`, `check`, `scripts/verify_pins.sh`, and `git diff --check` pass. Existing evidence check accepts historical artifacts; this is not a current-source performance claim. The new reproductions fail despite these green checks. |
+| Incomplete | Gate | Correctness and bounded-resource targets | Missing: 19D/19E/19H regressions, actual memory/work evidence, format-5 crash and cleanup coverage, and current-head sanitizer/Correctness results. |
+| Incomplete | Gate | Latency targets with identical results | Missing: comparable enwik9 before/after artifact and commands, physical-work/projection/locality sweeps, and four-thread-count multiset/sink parity. |
 
 ## Phase 20: Maintenance and Build Cost
 
 Goal:
-A no-op refresh or compact costs milliseconds, a real refresh costs its tail, and build holds
-half the memory per pair at the same wall time.
+Make maintenance cost its changed data, and reduce build memory where measurements identify
+avoidable state. Preserve the meaning of a caller's bound.
 
 Scope:
-- Refresh writes only its delta; compact exits early when no key is fragmented; the bounded
-  loop's final no-op call is a guard check plus a progress row.
-- Store 32-bit in-segment offsets in the packing aggregate state; recalibrate the per-pair
-  byte estimate from measurement; write the segments table directly from the aggregate
-  instead of through the `packed` temp table.
-- Simplify the bounded-refresh bound: round the bound up to the next segment boundary at or
-  beyond `hwm + max_rows` so the loop never issues near-empty increments, and shrink the README
-  passage to one paragraph.
-
-Out of scope:
-- Postings codec or container changes.
-- A background scheduler.
+- Exit no-op refresh/merge without a pointless pack/rewrite, after execution-time validation.
+  Exact status counts must not force a whole-table scan on every bounded increment.
+- Use 19I's storage-work measurements to separate scans, normalization, pair emission,
+  aggregation, sorting, and temporary copies before choosing a build optimization.
+- Evaluate 32-bit in-segment offsets and smaller aggregate blocks, with explicit validation of
+  the aggregate's accepted rowid range; alternatively keep BIGINT at the public boundary.
+  Test fewer packed-temp copies without losing partitioning, spill, or atomicity.
+- Preserve `max_rows` as a maximum rowid span. Do not silently round it upward by as much as
+  a 2^20-row segment merely to reduce generations. Consider a differently named target only
+  if a measured use case warrants an additional API.
+- Size partitions from actual emitted distinct keys and aggregate costs. State the one-segment
+  lower bound: adding partitions cannot rescue a single oversized segment/row. Evaluate
+  spillable partial packing or a clear bounded failure instead of promising arbitrary fit.
 
 Completion gate:
-No-op refresh and no-op compact under 20 ms on the enwik9 index; peak build RSS at most 7 GB
-at the same partition count and wall time within 5% of 8.6 s; postings byte-identical to the
-previous build of the same corpus.
+No-op refresh and merge target <20 ms on enwik9 after 19I, with visited work reported. The
+bounded loop never exceeds `max_rows`, advances through deleted gaps, and stops correctly.
+For build, establish a current baseline first; target substantially lower accounted memory
+and RSS with wall time within 5% at identical partitions/settings, exact postings and crash
+atomicity. The prior 7GB/8.6s target is not comparable evidence for this dirty implementation.
 
 Testing plan:
-- Compare `segments` blobs and counts before and after via `EXCEPT` in both directions.
-- Crash harness seed `20261317` across refresh, merge, purge, and bounded catch-up offsets.
-- Record build wall, RSS, and spill with `/usr/bin/time` and the sampled temp poll.
+Byte/posting identity in both directions; long/skewed rows, Unicode, gram>4, small memory,
+partial segments, no-op and populated tails; fixed crash seed 20261317 for every maintenance
+shape; wall, CPU, RSS, spill, emitted pairs, and physical visits at fixed settings.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 20A: Delta-only refresh and early-exit compact | Missing: no-op refresh and compact timings; early exit when `keys` is empty; bounded loop's final call measured. |
-| Incomplete | Work | 20B: Build memory | Missing: 32-bit offsets in state; `PAIR_STATE_BYTES` recalibrated with the measurement; direct `CREATE TABLE ... AS` from the aggregate; RSS and wall recorded at auto partitions. |
-| Complete | Decision | 20C: Round the bound up to a segment boundary | Decided 2026-09-01: round up to the next segment boundary. Owner confirmed the recommendation; implemented under 20A. |
-| Incomplete | Gate | Cheap no-ops, lighter build, identical postings | Missing: timings, RSS, `EXCEPT` identity result, crash seed result. |
-| Incomplete | Test | Identity and crash suites | Missing: command outputs, run URL. |
+| In Progress | Work | 20A: Delta-only refresh and cheap no-ops | Stats rewrite is gone in the dirty code; refresh still packs an empty delta, computes generation/HWM, and updates the registry; compact materializes all key groups. Missing: execution-time early exits, cheap authoritative progress, no-op work/timings, and tests that the fence/atomic transaction survives the shortcut. Depends on 19I/19J. |
+| Incomplete | Work | 20B: Build memory and amplification | `RowidBlock` uses int64 payloads and starts each per-thread group at 16 entries; finalization copies into a vector and blob. `PAIR_STATE_BYTES=32` samples byte-length windows, whereas `GramKeysFunction` now emits distinct keys; ranges cannot be finer than one segment. Missing: current pair/cardinality/peak breakdown, calibrated estimator, measured offset/block/temp alternatives, oversized-segment behavior, and spill/identity proof. |
+| Incomplete | Decision | 20C: Bound semantics | Reopened by this audit: the former upward-rounding recommendation conflicts with the useful `max_rows` ceiling and current `BoundedRefreshEnd`. Recommended: retain the hard span ceiling; no new tuning parameter without measured benefit. Missing: implemented/documented contract and boundary tests. |
+| Incomplete | Gate | Cheap no-ops and lower build cost | Missing: comparable measurements and work counters; exact identity and fixed-seed crash outcomes. |
+| Incomplete | Test | Maintenance and build edge cases | Missing: evidence for small bounds, large deleted gaps, single oversized rows/segments, transaction-local rows, and cancellation/rollback after early exits. |
 
-## Phase 21: Public Surface
+## Phase 21: Public Surface and Stable Query Semantics
 
 Goal:
-The API a community-extension reader meets is small, consistent, and defaults to being
-useful.
+Keep search semantics independent of an optional optimization, and make metadata and maintenance
+APIs useful without creating a second implementation of exact filtering.
 
 Scope:
-- `ngram_auto_accelerate` defaults to true.
-- Reading operations become table functions: `ngram_indexes()` (replacing the pragma and
-  `ngram_index_status`) and `ngram_index_stats(table)`; mutating operations stay pragmas.
-- `drop_ngram_index(index_ref)` overload replaces `drop_ngram_index_by_id`; a named `catalog`
-  parameter covers attached databases.
-- `ngram_refresh` always returns the progress row.
-- Remove `ngram_candidates` from the public surface (delete, or rename to `__ngram_candidates`
-  for tests and benchmarks).
-- Remove `ngram_max_probe_rowids`; the memory budget and candidate fraction bound work.
-- Update `description.yml`, README API and settings tables, tests, and benchmark scripts.
+- Keep automatic acceleration opt-in until 19D/19E/19F/19H/19I and representative fallback
+  performance gates pass. Reassess a default change using eligible and ineligible queries.
+- Reading operations become composable table functions, evaluated in the executing statement's
+  snapshot: `ngram_indexes()` and `ngram_index_stats(table)`. Provide cheap lifecycle status
+  separately from expensive full storage statistics, and expose stranded guards as promised.
+- Use `drop_ngram_index(index_ref, catalog=...)` for by-ID cleanup, with unambiguous catalog
+  rules for copied attached databases. Retain the table/column form if it remains useful.
+- Always return progress from refresh. Prefer an authoritative `has_more` plus rows advanced
+  if exact `remaining_tail` requires repeated full counts; define snapshot and local-row meaning.
+- Keep raw candidates and storage/codec helpers internal or explicitly diagnostic. A prefix
+  does not remove the need for validation, accounting, and documentation of unsafe composition.
+- Retain independent decode-work admission; deciding whether the knob is public is separate
+  from deleting the protection.
+- Give explicit search its own case semantics and an explicit-column form that works without
+  an index. A rebuild, different index normalization, or dropping an index must not change
+  the selected result set. Prefer one native predicate construction and execution path.
+  Prototype bind replacement/shared logical scan before retaining separate custom scan/recheck
+  machinery; preserve the distinction between explicit search and the automatic rewrite switch.
 
 Out of scope:
-- `CREATE INDEX ... USING NGRAM` as the front door: the postings build is a multi-statement
-  script and `IndexType` has no drop hook, so pragmas remain the only mechanism that runs DDL
-  scripts. Rejected.
+`CREATE INDEX USING NGRAM` as the only front door unless the pinned host can also provide safe
+multi-statement build, drop, and transaction lifecycle. Renaming alone does not justify it.
 
 Completion gate:
-A test asserts the exact public surface from `duckdb_functions()` and `duckdb_settings()`; README
-and `description.yml` list the same surface; all harnesses green with the new names.
+No-index, CI-index, CS-index, dropped/rebuilt-index, and prepared-query runs of the same explicit
+semantic request have identical multisets. Metadata reflects its execution snapshot. Surface
+docs, function/setting registrations, examples, and harnesses agree. Default changes meet the
+unrelated-query and native fallback performance gates before being enabled.
 
 Testing plan:
-- Surface test comparing catalog output to a checked list.
-- Differential harnesses re-pointed at the renamed or removed functions.
-- Plan-shape tests confirm the default rewrite fires and the two kill switches work.
+Compare native contains/ILIKE semantics, escaped wildcard literals, NULL/empty strings, Unicode
+folds, no/multiple indexes, joins, nested projections, prepared plans, and both kill switches.
+Test metadata around concurrent refresh/drop and copied attached catalogs. Verify progress
+termination and cost; audit all renamed helper callers.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Decision | 21A: `ngram_auto_accelerate` defaults to true | Decided 2026-09-01: default true. Owner confirmed the recommendation; implemented under 21G. |
-| Complete | Decision | 21B: Reading operations as table functions | Decided 2026-09-01: yes. Owner confirmed the recommendation; implemented under 21G. |
-| Complete | Decision | 21C: Drop by `index_ref` overload; delete `drop_ngram_index_by_id` and `ngram_index_status` | Decided 2026-09-01: yes. Owner confirmed the recommendation; implemented under 21G. |
-| Complete | Decision | 21D: `ngram_refresh` always returns progress | Decided 2026-09-01: yes. Owner confirmed the recommendation; implemented under 21G. |
-| Complete | Decision | 21E: Remove `ngram_candidates` from the public surface | Decided 2026-09-01: rename to `__ngram_candidates`. Owner confirmed the recommendation; implemented under 21G. |
-| Complete | Decision | 21F: Remove `ngram_max_probe_rowids` | Decided 2026-09-01: yes. Owner confirmed the recommendation; implemented under 21G. |
-| Incomplete | Work | 21G: Implement confirmed decisions and update surface docs | Missing: code, `description.yml`, README tables, test and benchmark updates, surface test. |
-| Incomplete | Gate | Surface test matches docs | Missing: test name, README diff, run URL. |
-| Incomplete | Test | Surface, plan-shape, and harness suites | Missing: results. |
+| Incomplete | Decision | 21A: Automatic acceleration default | Reopened: 19D can invalidate a database and 19F charges an unrelated query ~9.6 ms. Recommended: remain opt-in until those gates and the native fallback baseline pass. Missing: post-fix workload evidence before a default-true decision. |
+| Incomplete | Decision | 21B: Reading operations as table functions | Retain the earlier direction. `NgramIndexesQuery` returns VALUES captured in preprocessing; `NgramIndexStatsQuery` embeds guard/table-size facts while later SQL reads other facts. Missing: one executing snapshot, cheap status versus explicit expensive statistics, and a concurrent metadata test. |
+| Incomplete | Decision | 21C: Drop by index_ref overload | Retain the earlier direction, including deleting redundant `ngram_index_status`/`drop_ngram_index_by_id` after replacements exist. Missing: catalog disambiguation, all call-site updates, and safe cleanup from 19J. |
+| Incomplete | Decision | 21D: Refresh always returns progress | Retain the direction; settle `has_more` versus exact remaining count on measured cost under 20A. Missing: documented fields, snapshot/local-row behavior, and caller loop updates. |
+| Incomplete | Decision | 21E: Raw candidates and low-level helpers | Recommended: internal diagnostic surface (`__ngram_candidates` or equivalent), with exact search as the supported composition path. Missing: minimal helper inventory, tests/benchmarks moved, and public docs made consistent. |
+| Incomplete | Decision | 21F: Decode-work limit | Supersedes the earlier removal recommendation: **keep a cumulative work ceiling**. Peak segment memory is bounded while total decoded work grows with segment count; a sparse intersection can also pass candidate fraction despite large posting lists. Missing: measured replacement if the setting itself is removed, with a hard-work regression. |
+| Incomplete | Work | 21G: Implement API decisions and update callers | Missing: registrations, metadata implementation, surface docs/test, CLI/Python examples, benchmarks and harness updates. Do semantics first, renames second. Earlier decision rows marked Complete were approvals of intent, not implemented behavior. |
+| Incomplete | Work | 21H: Index-independent explicit search — P2 architecture | `BindQueryTarget` currently refuses an absent index and `ngram_search` inherits its case behavior; `RecheckState` separately normalizes strings and uses `std::search`, while rewrite uses the native expression executor. Recommended: explicit semantic options and optional index use, with shared native predicates and one scan design. Missing: prototype, parity of escaped/Unicode literals, projection/dependency/prepared-plan behavior, and measured simplification without disabling explicitly requested acceleration. |
+| Incomplete | Gate | Stable semantics and coherent surface | Missing: no-index/index-replacement multiset parity, executing-snapshot metadata evidence, default-policy performance evidence, and matching API docs. |
+| Incomplete | Test | API and query-shape matrix | Missing: actual tests and current-head CI evidence, including literal `%`, `_`, and escape characters. |
 
-## Phase 22: Test Infrastructure
+## Phase 22: Tests That Exercise the Claims
 
 Goal:
-The suite covers the races and shapes the review found missing, the C++ harness is
-selectable and deterministic, the Python harnesses share one core, and the nightly lane runs
-what pull requests cannot afford.
+Make the suite detect scheduler, multiplicity, resource, persistence, and race defects before
+release. Pull the relevant tests forward into each implementation phase.
 
 Scope:
-- Add refresh and compact racing search in `concurrentloop`, strings over 4 KiB and 64 KiB in
-  the differential test and Python corpus, Unicode ILIKE parity cases with byte-length-changing
-  folds, and a committed format fixture opened read-only.
-- Split the C++ harness per mechanism, move SQL-only cases to sqllogictest, add `--only`, make
-  cancellation deterministic, and make the registry-scale timing report-only.
-- Extract `scripts/ngramharness/` shared by the three Python drivers.
-- Nightly workflow: full `make test_debug`, `crash_maintenance.py`, ThreadSanitizer build of the
-  three concurrency files; add those files to the pull-request sanitizer selector.
-- `-Wall -Wextra -Werror` behind an option CI enables; `make tidy-check` in Correctness; raise
-  `cmake_minimum_required`.
-
-Out of scope:
-- New benchmark tooling (Phase 23).
+- Race refresh/compact with search, using deterministic barriers where possible and explicit
+  allowed conflict errors; compare successful statements against their valid snapshot oracle.
+- Replace set-only differential checks with multiset checks, isolate the oracle from rewriting,
+  and prove the intended runtime mode. Include ordered sinks and deliberately unequal segments.
+- Add long needles/haystacks, Unicode folds, real same-size-key collisions, and persistent
+  current/previous-format fixtures opened read-only as well as through WAL/checkpoint paths.
+- Split the C++ harness by mechanism and support selection; keep timing report-only and make
+  cancellation deterministic. Keep useful semantic checks when deleting obsolete stats checks.
+- Share Python process/corpus/oracle infrastructure where semantics truly match. Keep format
+  lookup/digest logic in one place; do not force arbitrary file-length targets.
+- Run focused query/concurrency/resource tests under ASAN/UBSAN on pull requests; nightly full
+  debug/crash coverage and a supported TSan configuration. Add warnings on extension code only,
+  maintain host pin checks, and run formatting/tidy checks without treating style as architecture.
 
 Completion gate:
-Nightly job green once; no wall-clock assertion remains in the harness; the three concurrency
-files run under ASAN on pull requests; Python harness line count drops by at least a third.
+Every 19D/19H/19J reproduction has a regression and relevant mode assertion; multiplicity and
+ordered sinks are tested; no correctness assertion depends on machine speed; crash coverage
+runs successfully under format 5. Nightly passes once with its exact source/run recorded.
 
 Testing plan:
-- The new tests themselves, plus a deliberate revert of 16A to prove `ngram_refresh_noop.test`
-  fails on the old script shape.
+Demonstrate fail-before/pass-after for targeted defects. Deliberately duplicate an accelerated
+result to prove the multiset oracle detects it; force fallback to prove a probe-mode assertion
+fails. Use internal barriers for publication/cancellation races, not probabilistic sleeps.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Test | 22A: Maintenance versus search races | Missing: `concurrentloop` blocks in `ngram_refresh_concurrent.test` and `ngram_search_concurrent.test` with `statement maybe` on conflicts. |
-| Incomplete | Test | 22B: Long strings and Unicode ILIKE parity | Missing: rows over 4 KiB and 64 KiB with needles straddling 4 KiB in `ngram_search_differential.test` and `scripts` corpus; Kelvin sign, dotted I, capital sharp s, Cherokee, Deseret needles in `ngram_rewrite.test`. |
-| Incomplete | Test | 22C: Committed format fixture | Missing: a small format-4 database under `test/fixtures/` opened read-only and queried (the format-3 fixture from Phase 17 stays for the drop-only path). |
-| Incomplete | Work | 22D: Harness split and determinism | Missing: per-mechanism files; SQL-only cases moved; `--only`; latch-based cancellation; timing report-only; the harness's POSIX-only child-process code (`<sys/wait.h>`, `WIFEXITED`) either gains a Windows path or the target is documented as Linux-only, since the distribution matrix never compiles it today. |
-| Incomplete | Work | 22E: Shared Python harness core | Missing: `scripts/ngramharness/{cli,corpus,oracle}.py`; three drivers under about 120 lines each. |
-| Incomplete | Work | 22F: Nightly lane and warnings | Missing: `.github/workflows/Nightly.yml`; ASAN selector adds the concurrency files; `NGRAM_WERROR` option; `tidy-check` step; `cmake_minimum_required` at 3.10 or later. |
-| Incomplete | Gate | Nightly green, deterministic harness | Missing: nightly run URL; grep proving no `_ms >` assertions remain; line counts. |
+| Incomplete | Test | 22A: Maintenance/search races and scheduler contracts | The existing `ngram_parallel.test` has useful EXCEPT ALL and ordering cases but its initial fixture fits one posting segment; the dirty queue fails the new two-segment CTAS. Missing: deterministic out-of-order decoder completion, CTAS/INSERT/streaming, local tails, cancellation, and refresh/compact snapshot races. Implement with 19D, not afterward. |
+| Incomplete | Test | 22B: Long inputs, Unicode, and honest oracles | `DecomposeNeedle`'s quadratic behavior is untested. `scripts/differential_search.py` uses EXCEPT; `ngram_search_differential.test` incorrectly says unique IDs make that an exact multiset comparison. `build_scale.test` compares sets of strings and can hide duplicates/fallback. Missing: EXCEPT ALL, independent native oracle, runtime-mode assertions, 4/64 KiB+ haystacks and 128 KiB needles, folds, and real collision injection. |
+| Incomplete | Test | 22C: Real format fixtures | Only committed format-3 fixture coverage is recorded. Missing: actual format-4 file for safe drop plus a format-5 file for query/reopen/read-only, fixture source/host identities, and format-5 crash checks. Synthetic audit cleanup is insufficient for this gate. |
+| Incomplete | Work | 22D: Selectable, deterministic C++ harness | `ngram_maintenance_checkpoint_gap.cpp` is 2418 lines; registry-scale tests assert elapsed time and cancellation uses sleeps. Missing: mechanism-based selection, barriers, report-only timings, and explicit POSIX/Windows coverage policy. Keep native harnesses for invariants SQL cannot control. |
+| Incomplete | Work | 22E: Shared Python harness core | Three drivers duplicate CLI/registry/oracle logic; the crash driver now queries a removed table while differential tests pass. Missing: shared format-aware lookup/digests and multiset oracle, with actual existing seed behavior preserved. |
+| Incomplete | Work | 22F: Nightly and focused CI | Current ASAN selector runs lifecycle/search/rewrite/maintenance plus the C++ harness, omitting the new key and SQL concurrency files. Missing: nightly debug/crash/TSan results, focused resource/order tests, extension-only warnings, and appropriate CMake minimum/tidy checks. No unverified claim of current remote CI. |
+| Incomplete | Gate | Tests cover the changed mechanisms | Missing: fail-before/pass-after and oracle-sensitivity evidence, working crash lane, deterministic harness, and current-head nightly/Correctness URLs. |
 
-## Phase 23: Documentation, Benchmarks, and Release
+## Phase 23: Documentation, Evidence, and Release
 
 Goal:
-A reader can install, understand the contract, and find the API in a 250-line README; every
-claim traces to a command or artifact; the release is tagged on a green matrix.
+Provide a concise, accurate entry point whose guarantees, APIs, installation instructions,
+performance claims, and release provenance are all verifiable.
 
 Scope:
-- README to about 250 lines: install, quick start, contract in five lines, API and settings
-  tables, limitations, links. Move staleness and guard mechanics, bounded refresh, lifecycle
-  states, and stats columns to `docs/`.
-- Move `ngram_index_plan.md` and this file to `docs/plan/`; distill the research facts and
-  principles into `docs/design.md`; remove the README reference to plan ledgers.
-- Rewrite `docs/UPDATING.md` for this repo (gitlinks, the two workflow SHAs, the source-id pin)
-  and `test/README.md` (how to run one file, the harness, seeds, runtimes).
-- Delete `scripts/extension-upload.sh`; trim `vcpkg.json`.
-- `benchmarks/RESULTS.md` becomes the single owner of the evidence block with README linking to
-  it; fix the three documents that call it the scale results, or restore a `SCALE.md` from
-  committed JSON; add a `prepare` subcommand to `clickhouse_compare.py` that downloads and
-  verifies inputs; trim the render golden hash from `release_evidence.py tests()`.
-- Fix `SUBMISSION.md` (public repo, five settings) and `description.yml` (`ref`, `ngram_refresh`
-  signature, extended description).
-- Re-collect release evidence after Phases 19 and 20; run the distribution matrix; tag
-  `v0.1.0`.
-
-Out of scope:
-- Community-extensions PR submission itself.
+- Lead README with supported installation, quick start, semantic/resource contract, and concise
+  API/limitations. Link deeper ownership, maintenance, rowid, and recovery explanations in docs;
+  do not delete necessary qualifications to meet an arbitrary line quota.
+- Treat prior plans as historical evidence. Distill a current design note with explicit
+  ownership, snapshot, batch-order, memory/work, and host-dependency invariants; correct the
+  old physical-pruning claims rather than copying them into the new design note.
+- Rewrite template update/test guidance for this repository; remove unused upload/configuration
+  remnants after checking callers. Keep the host source/version definition consistent.
+- Give benchmark results one owner and reproducible corpus preparation. Preserve immutable
+  old artifact validation by the artifact's recorded format; regenerate current release
+  evidence, not old measurements relabeled as the new format.
+- Align packaging metadata and docs with the final API and verified release availability.
+  Community installation must not be the only apparent working first step before submission.
 
 Completion gate:
-`release_evidence.py check` passes on the regenerated artifact; README under 300 lines; matrix
-green on the tag commit; no document names a CI result older than the tag.
+Current-source release evidence validates and matches the tagged source and tool identity;
+all final API examples run on that build; links and supported installation work; Correctness
+and distribution matrix are green on the release candidate/tag source. No unsupported
+physical-pruning, unconditional-corruption-recovery, or stale performance claim remains.
 
 Testing plan:
-- `release_evidence.py validate` and `check`; link check over `docs/` and README; matrix run.
+`release_evidence.py validate`, `check --current-source`, executable examples/link checks,
+release matrix and current-format reopen/CLI smoke. Full benchmarks are required after the
+query/build changes; the audit's synthetic measurements are not a release substitute.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Doc | 23A: README diet and `docs/` split | Missing: README line count; new `docs/*.md` files; every moved section linked. |
-| Incomplete | Doc | 23B: Plans and design note relocated | Missing: `docs/plan/`, `docs/design.md`, README reference removed. |
-| Incomplete | Doc | 23C: Template boilerplate rewritten or deleted | Missing: `docs/UPDATING.md`, `test/README.md`, `scripts/extension-upload.sh` deleted, `vcpkg.json` trimmed. |
-| Incomplete | Doc | 23D: Benchmark documents and packaging | Missing: single-owner evidence block; three stale references fixed; `prepare` subcommand; golden trimmed; `SUBMISSION.md` and `description.yml` corrected (including `description.yml:65`, which still lists the two literal source-id forms the guard no longer requires); `release_evidence.py` `runtime_identity` adopts the guard's commit-prefix rule instead of the exact `d8cdaa33` compare so the repo carries one definition of the host pin. |
-| Incomplete | Work | 23E: Re-collected evidence and release tag | Missing: new `enwik9-current-v1.json` after Phase 20; matrix run URL on the tag commit; tag `v0.1.0`. |
-| Incomplete | Gate | Traceable docs on a green matrix | Missing: check output, README line count, run URL, tag. |
+| Incomplete | Doc | 23A: README and contract | README still says READY requires both storage tables and asserts physical rowid pruning; top-level exhaustiveness needs its supported-state boundary close by. Missing: accurate format-5 storage, semantics from 21H, work/memory distinction, installation status, and linked detailed docs. |
+| Incomplete | Doc | 23B: Plans and current design note | Missing: `docs/design.md` with actual host adapter, guard/fence, snapshot, publication, and accounting proofs. Move plans to `docs/plan/` only with all references fixed; do not duplicate active ledgers. |
+| Incomplete | Doc | 23C: Repository-specific maintenance/test docs | Missing: useful `docs/UPDATING.md`, `test/README.md`, verified removal of unused upload tooling/configuration, and commands to select the harness/regressions. |
+| Incomplete | Doc | 23D: Benchmark and packaging coherence | Existing `release_evidence.py check` passes historical artifact/pins/ancestry/rendering, not current implementation performance. Missing: single-owner result block, reproducible corpus preparation, stale packaging/source-ID text fixed, format-aware historical validation, and final API metadata. |
+| Incomplete | Work | 23E: Fresh evidence and release | Missing: current-format benchmark artifact after 19/20/21, fixed-seed and sanitizer/crash results on the final source, green distribution matrix, and release tag. Tag/publish is not part of this audit's completed work. |
+| Incomplete | Gate | Traceable release claims | Missing: strict current-source check, runnable examples, link/install verification, and recorded final-source workflow results. |

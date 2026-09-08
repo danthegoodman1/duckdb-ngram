@@ -173,15 +173,19 @@ static void CollectFilterNeedles(const TableFilter &filter, vector<RewriteNeedle
 
 //! The needles that may probe this index: ILIKE needles require a
 //! case-insensitive index, and a needle must decompose into at least one gram
-//! under the index's options to contribute to the probe.
-static vector<RewriteNeedle> UsableNeedles(const vector<RewriteNeedle> &needles, const GramOptions &options) {
+//! within the query memory budget under the index's options to contribute to
+//! the probe.
+static vector<RewriteNeedle> UsableNeedles(ClientContext &context, const vector<RewriteNeedle> &needles,
+                                           const GramOptions &options) {
 	vector<RewriteNeedle> usable;
+	auto max_keys = MaxProbeKeys(context);
 	for (auto &needle : needles) {
 		if (needle.requires_ci && !options.case_insensitive) {
 			continue;
 		}
-		auto decomposition = DecomposeNeedle(needle.text.data(), needle.text.size(), options);
-		if (!decomposition.too_short && !decomposition.keys.empty()) {
+		NeedleKeys keys;
+		if (DecomposeNeedle(context, needle.text.data(), needle.text.size(), options, max_keys, keys) ==
+		    NeedleShape::PROBEABLE) {
 			usable.push_back(needle);
 		}
 	}
@@ -285,19 +289,35 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 		return false;
 	}
 	auto &info = verdict.meta;
-	auto usable = UsableNeedles(bind.needles, info.options);
-	if (usable.empty()) {
+	// a matching row must contain every needle, hence every gram of every
+	// needle: one intersection over the union of gram sets is exactly the
+	// per-needle candidate-set intersection, and any subset of that union
+	// still yields a superset of the matches, so needles or grams past the
+	// key budget are left out rather than declining the probe
+	NeedleKeys keys;
+	auto max_keys = MaxProbeKeys(context);
+	idx_t usable = 0;
+	for (auto &needle : bind.needles) {
+		if (needle.requires_ci && !info.options.case_insensitive) {
+			continue;
+		}
+		NeedleKeys own;
+		if (DecomposeNeedle(context, needle.text.data(), needle.text.size(), info.options, max_keys, own) !=
+		    NeedleShape::PROBEABLE) {
+			continue;
+		}
+		usable++;
+		for (auto &key : own.keys) {
+			if (!keys.Add(key, max_keys)) {
+				break;
+			}
+		}
+	}
+	if (usable == 0) {
 		// only possible when the index was rebuilt with different options
 		// after planning; the rewrite never fires without a usable needle
 		state.fallback_reason = "no probeable needle";
 		return false;
-	}
-	// a matching row must contain every needle, hence every gram of every
-	// needle: one intersection over the union of gram sets is exactly the
-	// per-needle candidate-set intersection
-	vector<uhugeint_t> keys;
-	for (auto &needle : usable) {
-		MergeKeys(keys, DecomposeNeedle(needle.text.data(), needle.text.size(), info.options).keys);
 	}
 	auto segments = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
 	                                        "ngram index segments table");
@@ -306,7 +326,7 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 		return false;
 	}
 	auto probe =
-	    PlanIndexProbe(context, *state.core.tx, *segments, keys, MaxGramsPerQuery(context), info.hwm_rowid,
+	    PlanIndexProbe(context, *state.core.tx, *segments, keys.keys, MaxGramsPerQuery(context), info.hwm_rowid,
 	                   state.core.storage->GetTotalRows(), MaxCandidateFraction(context), DConstants::INVALID_INDEX);
 	state.candidate_count = probe->candidate_upper_bound;
 	if (!probe->admitted) {
@@ -456,9 +476,16 @@ static InsertionOrderPreservingMap<string> NgramScanDynamicToString(TableFunctio
 	if (state.mode == NgramScanMode::INDEX) {
 		result["Ngram Mode"] = StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
 		                                          state.candidate_count, state.core.probe->decoded_rowids.load());
+		result["Ngram Probe Workers"] = to_string(state.core.probe->max_threads);
+		result["Ngram Decode Workspace Bytes"] = to_string(state.core.probe->workspace_bytes);
+		result["Ngram Decode Peak Bytes"] = to_string(state.core.probe->tracker->peak.load());
 	} else {
 		result["Ngram Mode"] = "full scan fallback: " + state.fallback_reason;
 	}
+	result["Ngram Fetched Rows"] = to_string(state.core.fetched_rows.load());
+	result["Ngram Range Rows"] = to_string(state.core.range_rows.load());
+	result["Ngram Tail Rows"] = to_string(state.core.tail_rows.load());
+	result["Ngram Local Rows"] = to_string(state.core.local_rows.load());
 	return result;
 }
 
@@ -515,11 +542,9 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		}
 	}
 	auto &columns = table->GetColumns();
-	auto catalog_name = table->ParentCatalog().GetName();
-	auto schema_name = table->ParentSchema().name;
-	ResolvedTarget resolved {catalog_name, schema_name, table->name, string(), table};
-	auto owned = OwnedIndexes(context, resolved, true);
-
+	// filter shapes first: a scan without a substring filter on a VARCHAR
+	// column never reads the registry
+	vector<std::pair<const ColumnDefinition *, vector<RewriteNeedle>>> probeable;
 	for (auto &entry : get.table_filters.filters) {
 		if (entry.first >= columns.LogicalColumnCount()) {
 			continue;
@@ -530,27 +555,34 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		}
 		vector<RewriteNeedle> needles;
 		CollectFilterNeedles(*entry.second, needles);
-		if (needles.empty()) {
+		if (!needles.empty()) {
+			probeable.emplace_back(&column, std::move(needles));
+		}
+	}
+	if (probeable.empty()) {
+		return;
+	}
+	auto catalog_name = table->ParentCatalog().GetName();
+	auto schema_name = table->ParentSchema().name;
+	for (auto &candidate : probeable) {
+		auto &column = *candidate.first;
+		auto &needles = candidate.second;
+		// one owner-keyed registry read per filtered column
+		ResolvedTarget resolved {catalog_name, schema_name, table->name, column.Name(), table};
+		auto owned = OwnedIndexes(context, resolved, true);
+		if (owned.size() > 1) {
+			return;
+		}
+		if (owned.empty()) {
 			continue;
 		}
-		optional_ptr<const OwnedIndex> index;
-		for (auto &candidate : owned) {
-			if (StringUtil::CIEquals(candidate.location.column_name, column.Name())) {
-				if (index) {
-					return;
-				}
-				index = &candidate;
-			}
-		}
-		if (!index) {
-			continue;
-		}
+		auto index = &owned[0];
 		// the row was read in this statement's snapshot, so the plan-time
 		// verdict is the guard's alone; execution revalidates row and guard
 		if (!RowIdGuardReason(context, table->Cast<DuckTableEntry>(), index->meta).empty()) {
 			continue;
 		}
-		auto usable = UsableNeedles(needles, index->meta.options);
+		auto usable = UsableNeedles(context, needles, index->meta.options);
 		if (usable.empty()) {
 			// short needles, or ILIKE against a case-sensitive index
 			continue;

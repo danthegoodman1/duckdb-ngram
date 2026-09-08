@@ -93,9 +93,25 @@ struct RegistrySnapshot {
 	vector<RegistryRow> rows;
 };
 
-//! Every registry row of `catalog_name`, in this transaction's snapshot. Raises
-//! when the registry table exists but is not one this extension wrote.
-RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name);
+//! Which registry rows a read materializes. An owner key or index ID is
+//! pushed into the scan as a native equality filter; a schema and table pair
+//! selects that table's rows by case-insensitive name. Empty selects every
+//! row.
+struct RegistrySelector {
+	string owner_key;
+	string index_ref;
+	string schema_name;
+	string table_name;
+};
+
+//! The selected registry rows of `catalog_name`, in this transaction's
+//! snapshot. The identity columns of every row the scan returns are
+//! validated and only selected rows are materialized; a native filter hides
+//! the rows it rejects, NULLs included, so only an unselected read validates
+//! the whole registry. Raises when the registry table exists but is not one
+//! this extension wrote.
+RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name,
+                              const RegistrySelector &selector = RegistrySelector());
 
 //! The registry as create_ngram_index needs it: absent (bootstrap) or in the
 //! current shape. A registry version 1 database must be emptied by id first.
@@ -148,6 +164,10 @@ string LegacyGuardToken(ClientContext &context, const string &catalog_name, cons
 
 //! The index id named by a segments table (segments_<hex>).
 bool ParseStorageName(const string &name, string &index_ref);
+//! ParseStorageName for the per-gram statistics table format 4 kept beside
+//! the segments: `stats_<id>`. Known only so a format-4 index lists and drops
+//! as one object.
+bool ParseFormat4StatsName(const string &name, string &index_ref);
 bool IsCanonicalUUID(const string &value);
 
 //! The length-framed, case-folded (schema, table, column) key of a registry

@@ -1,0 +1,144 @@
+# name: test/sql/ngram_batch_order.test
+# description: ordered sinks over admitted multi-segment probes at several thread counts: increasing batch indexes per thread, exact multisets, rowid order
+# group: [sql]
+
+require ngram
+
+# Segment 0 (rowids below 2^20) matches in every row and takes long to decode;
+# segment 1 matches one row in three and decodes first. Workers publish
+# segments in ordinal order, so every batch index a worker emits exceeds its
+# previous one. Publishing in decode-completion order instead trips the host's
+# per-thread batch-index check inside ordered sinks (CTAS, INSERT, the
+# materialized result collector), which invalidates the database.
+statement ok
+CREATE TABLE t AS SELECT i AS id,
+	CASE WHEN i < 1048576 OR i % 3 = 0 THEN 'abcdefgh' ELSE 'zzzzzzzz' END AS s
+	FROM range(1100000) r(i);
+
+statement ok
+PRAGMA create_ngram_index('t', 's', case_insensitive=false);
+
+statement ok
+SET ngram_max_candidate_fraction=1;
+
+statement ok
+SET ngram_auto_accelerate=false;
+
+# the unaccelerated oracle, in rowid order
+statement ok
+CREATE TABLE oracle AS SELECT id, row_number() OVER (ORDER BY id) - 1 AS pos FROM t WHERE contains(s, 'abcdefgh');
+
+query I
+SELECT count(*) FROM oracle;
+----
+1065717
+
+statement ok
+CREATE TABLE got_insert (id BIGINT);
+
+foreach threads 1 2 8 24
+
+statement ok
+SET threads=${threads};
+
+statement ok
+SET ngram_auto_accelerate=false;
+
+# both paths run the admitted probe over both segments at this thread count
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('t', 'abcdefgh');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index .*
+
+# CTAS is an ordered batch sink
+statement ok
+CREATE TABLE got AS SELECT id FROM ngram_search('t', 'abcdefgh');
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM got EXCEPT ALL SELECT id FROM oracle)
+	UNION ALL
+	(SELECT id FROM oracle EXCEPT ALL SELECT id FROM got));
+----
+0
+
+# the sink restored candidate order: row k of the result is the k-th match
+query I
+SELECT count(*) FROM (SELECT id, rowid AS pos FROM got) g JOIN oracle USING (pos) WHERE g.id <> oracle.id;
+----
+0
+
+statement ok
+DROP TABLE got;
+
+# INSERT into an existing table is the other ordered batch sink
+statement ok
+INSERT INTO got_insert SELECT id FROM ngram_search('t', 'abcdefgh');
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM got_insert EXCEPT ALL SELECT id FROM oracle)
+	UNION ALL
+	(SELECT id FROM oracle EXCEPT ALL SELECT id FROM got_insert));
+----
+0
+
+statement ok
+DELETE FROM got_insert;
+
+# the materialized result collector orders by batch index too: the digest is
+# order-sensitive, so it pins every id in rowid order
+query I
+SELECT id FROM ngram_search('t', 'abcdefgh');
+----
+1065717 values hashing to f7cc3b5a58f225071e3e60ad3bc6b50d
+
+# transparent path through the same sinks
+statement ok
+SET ngram_auto_accelerate=true;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM t WHERE contains(s, 'abcdefgh');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index .*
+
+statement ok
+CREATE TABLE got AS SELECT id FROM t WHERE contains(s, 'abcdefgh');
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM got EXCEPT ALL SELECT id FROM oracle)
+	UNION ALL
+	(SELECT id FROM oracle EXCEPT ALL SELECT id FROM got));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, rowid AS pos FROM got) g JOIN oracle USING (pos) WHERE g.id <> oracle.id;
+----
+0
+
+statement ok
+DROP TABLE got;
+
+statement ok
+INSERT INTO got_insert SELECT id FROM t WHERE contains(s, 'abcdefgh');
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM got_insert EXCEPT ALL SELECT id FROM oracle)
+	UNION ALL
+	(SELECT id FROM oracle EXCEPT ALL SELECT id FROM got_insert));
+----
+0
+
+statement ok
+DELETE FROM got_insert;
+
+endloop
+
+statement ok
+SET ngram_auto_accelerate=false;
+
+statement ok
+RESET threads;

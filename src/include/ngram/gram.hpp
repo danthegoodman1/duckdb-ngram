@@ -5,6 +5,8 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/types/hash.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
 namespace duckdb {
 namespace ngram {
@@ -59,18 +61,41 @@ void ExtractGrams(const char *data, idx_t len, const GramOptions &options, strin
 //! rows the build wrote for it.
 uhugeint_t GramKey(const char *data, idx_t len);
 
-struct NeedleDecomposition {
-	//! Keys of the needle's distinct grams in first-occurrence order.
-	vector<uhugeint_t> keys;
-	//! Needle has fewer than gram_size codepoints: the index cannot be probed and the
-	//! caller must fall back to a full scan (which is still exhaustive).
-	bool too_short = false;
+struct GramKeyHash {
+	size_t operator()(const uhugeint_t &key) const {
+		return Hash(key);
+	}
 };
 
-NeedleDecomposition DecomposeNeedle(const char *data, idx_t len, const GramOptions &options);
+//! The keys of a query's distinct grams in first-occurrence order. Order
+//! breaks ties when the rarest grams are selected, so it is deterministic.
+class NeedleKeys {
+public:
+	//! Adds a key unless it is present; false when adding would exceed
+	//! `max_keys` distinct keys.
+	bool Add(uhugeint_t key, idx_t max_keys);
 
-//! Append the keys of `keys` that are not yet in `target`, keeping order.
-void MergeKeys(vector<uhugeint_t> &target, const vector<uhugeint_t> &keys);
+	vector<uhugeint_t> keys;
+
+private:
+	unordered_set<uhugeint_t, GramKeyHash> seen;
+};
+
+enum class NeedleShape : uint8_t {
+	//! At least one gram; its keys were added.
+	PROBEABLE,
+	//! Fewer than gram_size codepoints: the index cannot be probed and the
+	//! caller falls back to a full scan, which is still exhaustive.
+	TOO_SHORT,
+	//! The needle's bytes or distinct grams exceed `max_keys`, the count the
+	//! query memory budget admits; the caller declines the probe.
+	OVER_BUDGET
+};
+
+//! Add the keys of the needle's distinct grams to `keys`, in one pass with a
+//! cancellation check every few thousand grams.
+NeedleShape DecomposeNeedle(ClientContext &context, const char *data, idx_t len, const GramOptions &options,
+                            idx_t max_keys, NeedleKeys &keys);
 
 void RegisterGram(ExtensionLoader &loader);
 

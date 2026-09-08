@@ -238,8 +238,10 @@ static IndexVerdict Changed(string reason) {
 static IndexVerdict Verdict(ClientContext &context, const ResolvedTarget &target, const IndexLocation &location,
                             bool guard) {
 	RegistrySnapshot registry;
+	RegistrySelector selector;
+	selector.index_ref = location.index_ref;
 	try {
-		registry = ReadRegistry(context, target.catalog_name);
+		registry = ReadRegistry(context, target.catalog_name, selector);
 	} catch (CatalogException &ex) {
 		return Changed(ex.what());
 	} catch (InvalidInputException &ex) {
@@ -360,8 +362,10 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 		observed.reason = std::move(reason);
 		return observed;
 	};
-	// Segments tables present in the schema, by index id.
+	// Segments tables present in the schema, by index id, and the statistics
+	// tables format 4 kept beside them.
 	unordered_set<string> storage;
+	unordered_set<string> format4_stats;
 	vector<ObservedIndex> foreign;
 	auto schema = Catalog::GetSchema(context, catalog_name, NGRAM_SCHEMA, OnEntryNotFound::RETURN_NULL);
 	if (schema) {
@@ -369,6 +373,10 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 			string index_ref;
 			bool table = entry.type == CatalogType::TABLE_ENTRY && entry.Cast<TableCatalogEntry>().IsDuckTable();
 			if (table && StringUtil::CIEquals(entry.name, REGISTRY_TABLE)) {
+				return;
+			}
+			if (table && ParseFormat4StatsName(entry.name, index_ref)) {
+				format4_stats.insert(index_ref);
 				return;
 			}
 			if (!table || !ParseStorageName(entry.name, index_ref)) {
@@ -388,9 +396,13 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 		observed.location = LocationOf(row, registry.oid);
 		observed.format_version = row.format_version;
 		observed.legacy = registry.legacy_shape;
-		// The row consumes its storage entry; whatever remains in storage
-		// afterwards has no registry row.
+		// The row consumes its storage entries; whatever remains in storage
+		// afterwards has no registry row. A format-4 row owns its statistics
+		// table too, so the pair lists and drops as one index.
 		bool storage_present = storage.erase(row.index_ref) > 0;
+		if (row.format_version == 4) {
+			format4_stats.erase(row.index_ref);
+		}
 		if (!row.error.empty()) {
 			observed.status = "MALFORMED";
 			observed.reason = row.error;
@@ -404,6 +416,11 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 	}
 	for (auto &orphaned : storage) {
 		result.push_back(malformed(orphaned, registry_error.empty() ? "storage has no registry row" : registry_error));
+	}
+	for (auto &orphaned : format4_stats) {
+		result.push_back(malformed(orphaned, registry_error.empty()
+		                                         ? "format-4 statistics table has no format-4 registry row"
+		                                         : registry_error));
 	}
 	result.insert(result.end(), std::make_move_iterator(foreign.begin()), std::make_move_iterator(foreign.end()));
 	return result;

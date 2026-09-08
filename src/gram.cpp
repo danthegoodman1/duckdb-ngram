@@ -66,28 +66,51 @@ void NormalizeString(const char *data, idx_t len, const GramOptions &options, st
 	offsets.push_back(normalized.size());
 }
 
-void MergeKeys(vector<uhugeint_t> &target, const vector<uhugeint_t> &keys) {
-	for (auto &key : keys) {
-		if (std::find(target.begin(), target.end(), key) == target.end()) {
-			target.push_back(key);
-		}
+bool NeedleKeys::Add(uhugeint_t key, idx_t max_keys) {
+	if (seen.find(key) != seen.end()) {
+		return true;
 	}
+	if (keys.size() >= max_keys) {
+		return false;
+	}
+	seen.insert(key);
+	keys.push_back(key);
+	return true;
 }
 
-NeedleDecomposition DecomposeNeedle(const char *data, idx_t len, const GramOptions &options) {
-	NeedleDecomposition result;
+static constexpr idx_t GRAMS_PER_INTERRUPT_CHECK = 4096;
+static constexpr idx_t NEEDLE_BYTES_PER_KEY = 16;
+
+NeedleShape DecomposeNeedle(ClientContext &context, const char *data, idx_t len, const GramOptions &options,
+                            idx_t max_keys, NeedleKeys &keys) {
+	// The normalized copy and its codepoint offsets take about nine bytes per
+	// needle byte, so a needle of sixteen bytes per admitted key stays inside
+	// the per-key allowance the budget was derived from, whatever its grams.
+	if (len > NEEDLE_BYTES_PER_KEY * max_keys) {
+		return NeedleShape::OVER_BUDGET;
+	}
 	string scratch;
 	vector<idx_t> offsets;
 	bool emitted = false;
+	bool over_budget = false;
+	idx_t grams_since_check = 0;
 	ExtractGrams(data, len, options, scratch, offsets, [&](const char *gram, idx_t gram_len) {
 		emitted = true;
-		auto key = GramKey(gram, gram_len);
-		if (std::find(result.keys.begin(), result.keys.end(), key) == result.keys.end()) {
-			result.keys.push_back(key);
+		if (over_budget) {
+			return;
 		}
+		if (++grams_since_check == GRAMS_PER_INTERRUPT_CHECK) {
+			grams_since_check = 0;
+			if (context.interrupted.load(std::memory_order_relaxed)) {
+				throw InterruptException();
+			}
+		}
+		over_budget = !keys.Add(GramKey(gram, gram_len), max_keys);
 	});
-	result.too_short = !emitted;
-	return result;
+	if (over_budget) {
+		return NeedleShape::OVER_BUDGET;
+	}
+	return emitted ? NeedleShape::PROBEABLE : NeedleShape::TOO_SHORT;
 }
 
 //! trigrams(text[, gram_size[, case_insensitive]]) -> LIST(VARCHAR)

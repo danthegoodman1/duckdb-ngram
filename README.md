@@ -391,7 +391,7 @@ Lifecycle status has four values:
 
 | Status | Meaning |
 | --- | --- |
-| `READY` | The registry row, both storage tables, and the rowid guard validate; indexed reads may accelerate. |
+| `READY` | The registry row, the segments table, and the rowid guard validate; indexed reads may accelerate. |
 | `SCAN_ONLY` | The table and column exist but the guard is missing, replaced, incompatible, or cannot exclude rowid reuse; exhaustive queries scan and maintenance refuses. |
 | `ORPHAN` | The recorded base table or column is absent. Drop by id remains available. |
 | `MALFORMED` | The row is unreadable (another storage format, corrupt values), the segments table is missing, or an object in `__ngram` has no row. The reason names the cause. A row is dropped by id; an object without a row is dropped by hand. |

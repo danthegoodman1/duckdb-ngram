@@ -42,7 +42,7 @@ set(NGRAM_CHECKPOINT_GAP_DB "${CMAKE_CURRENT_BINARY_DIR}/ngram_checkpoint_gap_te
 add_custom_target(
   run_ngram_checkpoint_gap_test
   COMMAND $<TARGET_FILE:ngram_checkpoint_gap_test> "${NGRAM_CHECKPOINT_GAP_DB}"
-          "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/format3.duckdb"
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures"
   DEPENDS ngram_checkpoint_gap_test
   VERBATIM)
 

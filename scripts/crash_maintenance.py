@@ -104,16 +104,17 @@ def append_tail(db, rng, start, rows):
 
 
 def index_state(db):
-    """The facts a half-applied maintenance operation would disagree on."""
+    """The facts a half-applied maintenance operation would disagree on: the
+    high-water mark and every segment row's identity and bounds."""
     ref = index_ref(db)
     _, out, _ = run(db, "SELECT (SELECT hwm_rowid FROM __ngram.registry WHERE index_id = '{ref}'::UUID), "
-                        "(SELECT count(*) FROM {segments}), "
-                        "(SELECT coalesce(sum(rowid_count), 0) FROM {segments}), "
-                        "s.n, s.hash_sum, s.hash_xor FROM (SELECT count(*) AS n, "
-                        "coalesce(sum(hash(gram_key, row_count, segment_count))::VARCHAR, '0') AS hash_sum, "
-                        "coalesce(bit_xor(hash(gram_key, row_count, segment_count))::VARCHAR, '0') AS hash_xor "
-                        "FROM {stats}) s;".format(ref=ref, segments=storage_table(ref, "segments"),
-                                                  stats=storage_table(ref, "stats")))
+                        "s.n, s.rows, s.hash_sum, s.hash_xor FROM (SELECT count(*) AS n, "
+                        "coalesce(sum(rowid_count), 0) AS rows, "
+                        "coalesce(sum(hash(gram_key, segment_no, generation, rowid_count, min_rowid, max_rowid))"
+                        "::VARCHAR, '0') AS hash_sum, "
+                        "coalesce(bit_xor(hash(gram_key, segment_no, generation, rowid_count, min_rowid, max_rowid))"
+                        "::VARCHAR, '0') AS hash_xor "
+                        "FROM {segments}) s;".format(ref=ref, segments=storage_table(ref, "segments")))
     line = [l for l in out.strip().splitlines() if l]
     return line[-1] if line else None
 

@@ -1739,6 +1739,102 @@ static void TestCatalogIdentity(const string &path, const string &clone_path) {
 	RemoveDatabase(clone_path);
 }
 
+//! The rows of the fixture tables that hold the needle, case-folded like the
+//! fixtures' case-insensitive indexes.
+static int64_t FixtureOracle(Connection &con, const string &catalog, const string &needle) {
+	return ScalarInt64(con, "SELECT count(*) FROM " + catalog + ".docs WHERE contains(lower(s), '" + needle + "')");
+}
+
+//! A database a format-4 build wrote: listed MALFORMED with its format, exact
+//! through the fallback paths, and removed whole by the token-checked drop,
+//! its statistics table included, after which a fresh index is READY.
+static void TestFormat4Fixture(const string &fixture, const string &path) {
+	RemoveDatabase(path);
+	CopyFile(fixture, path);
+	DuckDB db(nullptr);
+	LoadNgram(db);
+	Connection con(db);
+	Check(con, "ATTACH " + KeywordHelper::WriteQuoted(path) + " AS f4");
+	auto listed = Query(con, "PRAGMA ngram_indexes");
+	if (listed->RowCount() != 1 || listed->GetValue(0, 0).ToString() != "f4" ||
+	    listed->GetValue(5, 0).GetValue<int64_t>() != 4 || listed->GetValue(6, 0).ToString() != "MALFORMED" ||
+	    listed->GetValue(7, 0).ToString().find("index format 4") == string::npos) {
+		throw std::runtime_error("format-4 fixture was not listed MALFORMED with its format");
+	}
+	auto ref = listed->GetValue(1, 0).ToString();
+	if (ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name='f4' AND schema_name='__ngram' "
+	                     "AND table_name LIKE 'stats_%'") != 1) {
+		throw std::runtime_error("format-4 fixture lacks the statistics table this test removes");
+	}
+	Check(con, "SET ngram_auto_accelerate=true");
+	auto oracle = ScalarInt64(con, "SELECT count(*) FROM f4.docs WHERE s LIKE '%tent%'");
+	if (ScalarInt64(con, "SELECT count(*) FROM f4.docs WHERE s LIKE '%tent%'") != oracle || oracle != 3) {
+		throw std::runtime_error("format-4 transparent fallback returned the wrong rows");
+	}
+	Check(con, "SET ngram_auto_accelerate=false");
+	ExpectError(con, "SELECT count(*) FROM ngram_search('f4.main.docs', 'tent')", "drop_ngram_index_by_id");
+	ExpectError(con, "PRAGMA create_ngram_index('f4.main.docs', 's')", "index format 4");
+	DropByRef(con, "f4", ref);
+	if (Query(con, "PRAGMA ngram_indexes")->RowCount() != 0 ||
+	    ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name='f4' AND schema_name='__ngram' "
+	                     "AND table_name <> 'registry'") != 0 ||
+	    ScalarInt64(con, "SELECT count(*) FROM duckdb_indexes() WHERE database_name='f4'") != 0 ||
+	    ScalarInt64(con, "SELECT count(*) FROM f4.docs") != 7) {
+		throw std::runtime_error("format-4 drop left ngram objects or touched the table");
+	}
+	Check(con, "PRAGMA create_ngram_index('f4.main.docs', 's')");
+	if (StatusName(con, "f4", IndexRef(con, "docs", "s", "f4")) != "READY" ||
+	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('f4.main.docs', 'tent')") !=
+	        FixtureOracle(con, "f4", "tent")) {
+		throw std::runtime_error("rebuild after the format-4 drop was not READY and exact");
+	}
+	Check(con, "DETACH f4");
+	RemoveDatabase(path);
+}
+
+//! A database this format wrote, reopened: READY as persisted, exact on both
+//! paths across the persisted tail, maintainable, and droppable.
+static void TestFormat5Fixture(const string &fixture, const string &path) {
+	RemoveDatabase(path);
+	CopyFile(fixture, path);
+	DuckDB db(nullptr);
+	LoadNgram(db);
+	Connection con(db);
+	Check(con, "ATTACH " + KeywordHelper::WriteQuoted(path) + " AS f5");
+	auto listed = Query(con, "PRAGMA ngram_indexes");
+	if (listed->RowCount() != 1 || listed->GetValue(0, 0).ToString() != "f5" ||
+	    listed->GetValue(5, 0).GetValue<int64_t>() != 5 || listed->GetValue(6, 0).ToString() != "READY") {
+		throw std::runtime_error("format-5 fixture was not listed READY");
+	}
+	auto ref = listed->GetValue(1, 0).ToString();
+	auto oracle = FixtureOracle(con, "f5", "tent");
+	if (oracle != 4 || ScalarInt64(con, "SELECT count(*) FROM ngram_search('f5.main.docs', 'tent')") != oracle) {
+		throw std::runtime_error("format-5 explicit search disagreed with the oracle after reopen");
+	}
+	Check(con, "SET ngram_max_candidate_fraction=1");
+	Check(con, "SET ngram_auto_accelerate=true");
+	auto profiled = Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM f5.docs WHERE s ILIKE '%tent%'");
+	if (profiled->GetValue(1, 0).ToString().find("\"Ngram Mode\": \"index") == string::npos ||
+	    ScalarInt64(con, "SELECT count(*) FROM f5.docs WHERE s ILIKE '%tent%'") != oracle) {
+		throw std::runtime_error("format-5 transparent search did not probe exactly after reopen");
+	}
+	Check(con, "SET ngram_auto_accelerate=false");
+	Check(con, "PRAGMA ngram_refresh('f5.main.docs')");
+	if (ScalarInt64(con, "SELECT hwm_rowid FROM f5.__ngram.registry") != 6 ||
+	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('f5.main.docs', 'tent')") != oracle) {
+		throw std::runtime_error("format-5 refresh after reopen did not advance the index exactly");
+	}
+	DropByRef(con, "f5", ref);
+	if (Query(con, "PRAGMA ngram_indexes")->RowCount() != 0 ||
+	    ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name='f5' AND schema_name='__ngram' "
+	                     "AND table_name <> 'registry'") != 0 ||
+	    ScalarInt64(con, "SELECT count(*) FROM duckdb_indexes() WHERE database_name='f5'") != 0) {
+		throw std::runtime_error("format-5 drop left ngram objects");
+	}
+	Check(con, "DETACH f5");
+	RemoveDatabase(path);
+}
+
 static void TestFormat3Fixture(const string &fixture, const string &path) {
 	RemoveDatabase(path);
 	CopyFile(fixture, path);
@@ -2269,6 +2365,35 @@ static void TestRegistryScale() {
 		    "10k registry lookup/list exceeded bounded gate: rows=" + to_string(listed->RowCount()) +
 		    ", status_ms=" + to_string(status_ms) + ", list_ms=" + to_string(list_ms));
 	}
+	// Discovery must cost a query nothing when no VARCHAR filter can probe, and
+	// a probeable query reads only its owner's row: neither scales with the
+	// registry. Both are timed against the same statements with acceleration
+	// off; the bounds are loose multiples so sanitizer builds pass too.
+	Check(con, "CREATE TABLE scale_unrelated AS SELECT i AS id FROM range(1000) r(i)");
+	auto timed_ms = [&](const string &sql, idx_t repetitions) {
+		auto begin = std::chrono::steady_clock::now();
+		for (idx_t i = 0; i < repetitions; i++) {
+			Check(con, sql);
+		}
+		return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+	};
+	const string unrelated = "SELECT count(*) FROM scale_unrelated WHERE id = 1";
+	const string indexed = "SELECT count(*) FROM scale_live WHERE contains(s, 'needle')";
+	Check(con, "SET ngram_auto_accelerate=false");
+	auto unrelated_off_ms = timed_ms(unrelated, 200);
+	auto indexed_off_ms = timed_ms(indexed, 200);
+	Check(con, "SET ngram_auto_accelerate=true");
+	auto unrelated_on_ms = timed_ms(unrelated, 200);
+	auto indexed_on_ms = timed_ms(indexed, 200);
+	auto explicit_ms = timed_ms("SELECT count(*) FROM ngram_search('scale_live', 'needle')", 200);
+	Check(con, "SET ngram_auto_accelerate=false");
+	if (unrelated_on_ms > 2 * unrelated_off_ms + 100 || indexed_on_ms > 4 * indexed_off_ms + 400 ||
+	    explicit_ms > 4 * indexed_off_ms + 400) {
+		throw std::runtime_error(
+		    "10k registry discovery exceeded bounded gate: unrelated off/on ms=" + to_string(unrelated_off_ms) + "/" +
+		    to_string(unrelated_on_ms) + ", indexed off/on/explicit ms=" + to_string(indexed_off_ms) + "/" +
+		    to_string(indexed_on_ms) + "/" + to_string(explicit_ms));
+	}
 	start = std::chrono::steady_clock::now();
 	DropByRef(con, "memory", live_ref);
 	auto drop_ms =
@@ -2277,7 +2402,8 @@ static void TestRegistryScale() {
 		throw std::runtime_error("10k registry ID drop exceeded bounded gate: " + to_string(drop_ms) + " ms");
 	}
 	std::cerr << "registry-scale rows=10000 status_ms=" << status_ms << " list_ms=" << list_ms << " drop_ms=" << drop_ms
-	          << "\n";
+	          << " unrelated_off/on_ms=" << unrelated_off_ms << "/" << unrelated_on_ms
+	          << " indexed_off/on/explicit_ms=" << indexed_off_ms << "/" << indexed_on_ms << "/" << explicit_ms << "\n";
 }
 
 static void TestQueryCancellation() {
@@ -2355,6 +2481,141 @@ static void TestQueryCancellation() {
 	Check(con, "FORCE CHECKPOINT");
 }
 
+//! An admitted two-segment probe at 24 threads through a streaming result,
+//! then interrupted at several points. Segment 1 decodes before segment 0,
+//! so every worker must still emit increasing batch indexes; an interrupt
+//! must never strand a worker waiting for a segment that will not publish,
+//! and the connection must answer the same query exactly afterwards.
+static void TestParallelCandidateStreams() {
+	DuckDB db(nullptr);
+	LoadNgram(db);
+	Connection con(db);
+	Check(con, "SET threads=24");
+	Check(con, "SET ngram_max_candidate_fraction=1");
+	Check(con, "CREATE TABLE stream_rows AS SELECT i AS id, CASE WHEN i < 1048576 OR i % 3 = 0 THEN 'abcdefgh' "
+	           "ELSE 'zzzzzzzz' END AS s FROM range(1100000) r(i)");
+	Check(con, "PRAGMA create_ngram_index('stream_rows', 's', case_insensitive=false)");
+	const string search = "SELECT id FROM ngram_search('stream_rows', 'abcdefgh')";
+	auto expected = Query(con, "SELECT count(*), sum(id) FROM stream_rows WHERE contains(s, 'abcdefgh')");
+	auto expected_rows = expected->GetValue(0, 0).GetValue<int64_t>();
+	auto expected_sum = expected->GetValue(1, 0).GetValue<int64_t>();
+	if (expected_rows != 1065717) {
+		throw std::runtime_error("stream fixture produced " + to_string(expected_rows) + " matches");
+	}
+
+	auto stream = con.SendQuery(search);
+	if (stream->HasError()) {
+		throw std::runtime_error("streaming search failed: " + stream->GetError());
+	}
+	// the buffered batch collector orders the stream by batch index, so ids
+	// arrive ascending: candidates in rowid order, then the tail
+	int64_t rows = 0, sum = 0, previous = -1;
+	while (true) {
+		auto chunk = stream->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		chunk->Flatten();
+		auto ids = FlatVector::GetData<int64_t>(chunk->data[0]);
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			if (ids[r] <= previous) {
+				throw std::runtime_error("streaming search emitted " + to_string(ids[r]) + " after " +
+				                         to_string(previous));
+			}
+			previous = ids[r];
+			rows++;
+			sum += ids[r];
+		}
+	}
+	if (stream->HasError()) {
+		throw std::runtime_error("streaming search failed mid-stream: " + stream->GetError());
+	}
+	if (rows != expected_rows || sum != expected_sum) {
+		throw std::runtime_error("streaming search returned " + to_string(rows) + " rows summing to " + to_string(sum) +
+		                         ", expected " + to_string(expected_rows) + " summing to " + to_string(expected_sum));
+	}
+
+	for (auto delay_ms : vector<int> {1, 5, 20, 60}) {
+		unique_ptr<MaterializedQueryResult> result;
+		std::thread worker([&]() { result = con.Query("SELECT count(*), sum(id) FROM (" + search + ")"); });
+		std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+		con.Interrupt();
+		worker.join();
+		if (!result) {
+			throw std::runtime_error("interrupted parallel search returned no result");
+		}
+		if (result->HasError()) {
+			if (result->GetError().find("Interrupt") == string::npos) {
+				throw std::runtime_error("interrupted parallel search failed otherwise: " + result->GetError());
+			}
+		} else if (result->GetValue(0, 0).GetValue<int64_t>() != expected_rows ||
+		           result->GetValue(1, 0).GetValue<int64_t>() != expected_sum) {
+			throw std::runtime_error("parallel search that outran its interrupt returned wrong rows");
+		}
+		auto again = Query(con, "SELECT count(*), sum(id) FROM (" + search + ")");
+		if (again->GetValue(0, 0).GetValue<int64_t>() != expected_rows ||
+		    again->GetValue(1, 0).GetValue<int64_t>() != expected_sum) {
+			throw std::runtime_error("parallel search after an interrupt returned wrong rows");
+		}
+	}
+}
+
+//! Read one "Ngram ...": "<number>" field out of EXPLAIN ANALYZE JSON output.
+static int64_t ProfiledNumber(const string &profile, const string &key) {
+	auto needle = "\"" + key + "\": \"";
+	auto start = profile.find(needle);
+	if (start == string::npos) {
+		throw std::runtime_error("profile lacks " + key + ": " + profile.substr(0, 400));
+	}
+	start += needle.size();
+	auto end = profile.find('"', start);
+	return std::stoll(profile.substr(start, end - start));
+}
+
+//! The decode path's rowid buffers must peak inside the workspace the plan
+//! reserved, with many workers over unequal segments and with the budget
+//! squeezed down to one worker; both exact paths report the same peak field.
+static void TestProbeMemoryPeak() {
+	DuckDB db(nullptr);
+	LoadNgram(db);
+	Connection con(db);
+	Check(con, "SET threads=8");
+	Check(con, "SET ngram_max_candidate_fraction=1");
+	Check(con, "CREATE TABLE peak_rows AS SELECT i AS id, CASE WHEN i < 1048576 OR i % 3 = 0 THEN 'abcdefgh' "
+	           "ELSE 'zzzzzzzz' END AS s FROM range(1100000) r(i)");
+	Check(con, "PRAGMA create_ngram_index('peak_rows', 's', case_insensitive=false)");
+	auto expected = ScalarInt64(con, "SELECT count(*) FROM peak_rows WHERE contains(s, 'abcdefgh')");
+	for (auto &memory_limit : vector<string> {"8GB", "128MB"}) {
+		Check(con, "SET memory_limit='" + memory_limit + "'");
+		for (auto transparent : vector<bool> {false, true}) {
+			Check(con, string("SET ngram_auto_accelerate=") + (transparent ? "true" : "false"));
+			string query = transparent ? "SELECT count(*) FROM peak_rows WHERE contains(s, 'abcdefgh')"
+			                           : "SELECT count(*) FROM ngram_search('peak_rows', 'abcdefgh')";
+			auto profiled = Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) " + query);
+			auto profile = profiled->GetValue(1, 0).ToString();
+			if (profile.find("\"Ngram Mode\": \"index") == string::npos) {
+				throw std::runtime_error("probe was not admitted at memory_limit " + memory_limit + ": " + profile);
+			}
+			auto workers = ProfiledNumber(profile, "Ngram Probe Workers");
+			auto workspace = ProfiledNumber(profile, "Ngram Decode Workspace Bytes");
+			auto peak = ProfiledNumber(profile, "Ngram Decode Peak Bytes");
+			if (peak <= 0 || peak > workspace) {
+				throw std::runtime_error("decode peak " + to_string(peak) + " outside workspace " +
+				                         to_string(workspace) + " with " + to_string(workers) + " workers at " +
+				                         memory_limit);
+			}
+			if ((memory_limit == "8GB") != (workers > 1)) {
+				throw std::runtime_error("unexpected worker count " + to_string(workers) + " at " + memory_limit);
+			}
+			if (ScalarInt64(con, query) != expected) {
+				throw std::runtime_error("probe returned the wrong count at " + memory_limit);
+			}
+			std::cerr << "probe-peak limit=" << memory_limit << " transparent=" << transparent << " workers=" << workers
+			          << " peak=" << peak << " workspace=" << workspace << "\n";
+		}
+	}
+}
+
 int main(int argc, char **argv) {
 	try {
 		if (argc == 3 && string(argv[1]) == "--wal-child") {
@@ -2371,7 +2632,7 @@ int main(int argc, char **argv) {
 			return 0;
 		}
 		if (argc != 2 && argc != 3) {
-			std::cerr << "usage: ngram_maintenance_checkpoint_gap DATABASE [FORMAT3_FIXTURE]\n";
+			std::cerr << "usage: ngram_maintenance_checkpoint_gap DATABASE [FIXTURES_DIR]\n";
 			return 2;
 		}
 		auto unique =
@@ -2390,14 +2651,19 @@ int main(int argc, char **argv) {
 		TestRegistryBootstrapAndConflicts();
 		TestCatalogIdentity(unique + ".catalog", unique + ".clone");
 		if (argc == 3) {
-			TestFormat3Fixture(argv[2], unique + ".format3");
+			string fixtures = argv[2];
+			TestFormat3Fixture(fixtures + "/format3.duckdb", unique + ".format3");
+			TestFormat4Fixture(fixtures + "/format4.duckdb", unique + ".format4");
+			TestFormat5Fixture(fixtures + "/format5.duckdb", unique + ".format5");
 		} else {
-			std::cerr << "format3-fixture skipped: no fixture path given\n";
+			std::cerr << "format fixtures skipped: no fixtures directory given\n";
 		}
 		TestRegistryCorruption();
 		TestExecutionIdentityRaces();
 		TestRegistryScale();
 		TestQueryCancellation();
+		TestParallelCandidateStreams();
+		TestProbeMemoryPeak();
 		RemoveDatabase(unique + ".creation");
 		RemoveDatabase(unique + ".guards");
 		RemoveDatabase(unique + ".vacuum");

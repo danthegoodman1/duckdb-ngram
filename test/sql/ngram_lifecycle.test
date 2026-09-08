@@ -194,6 +194,102 @@ read-only
 statement ok
 DETACH f3;
 
+# A database a format-4 build wrote lists the same way; its queries stay exact
+# through the fallback paths and the drop needs a writable catalog (the C++
+# harness performs that drop and checks the statistics table goes with it).
+statement ok
+ATTACH 'test/fixtures/format4.duckdb' AS f4 (READ_ONLY);
+
+query TTTTTITT
+PRAGMA ngram_indexes;
+----
+f4	52986603-69de-433a-92bc-17b8347ea5c6	main	docs	s	4	MALFORMED	<REGEX>:index format 4 is not readable.*drop_ngram_index_by_id.*
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+query I
+SELECT count(*) FROM f4.docs WHERE s LIKE '%tent%';
+----
+3
+
+statement ok
+SET ngram_auto_accelerate = false;
+
+statement error
+SELECT count(*) FROM ngram_search('f4.main.docs', 'tent');
+----
+drop it with drop_ngram_index_by_id
+
+statement error
+PRAGMA create_ngram_index('f4.main.docs', 's');
+----
+index format 4
+
+statement error
+PRAGMA drop_ngram_index_by_id('f4', '52986603-69de-433a-92bc-17b8347ea5c6');
+----
+read-only
+
+statement ok
+DETACH f4;
+
+# A database this format wrote reopens READY: both paths probe it and agree
+# with the fallback over the persisted tail rows past the high-water mark.
+statement ok
+ATTACH 'test/fixtures/format5.duckdb' AS f5 (READ_ONLY);
+
+query TTTTTITT
+PRAGMA ngram_indexes;
+----
+f5	4e5f9ee4-ae63-40b0-b2e5-4fb40ba40865	main	docs	s	5	READY	NULL
+
+query I
+SELECT count(*) FROM ngram_search('f5.main.docs', 'tent');
+----
+4
+
+query I
+SELECT id FROM ngram_search('f5.main.docs', 'tent') ORDER BY id;
+----
+1
+2
+5
+6
+
+statement ok
+SET ngram_max_candidate_fraction = 1;
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM f5.docs WHERE s ILIKE '%tent%';
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index .*
+
+query I
+SELECT id FROM f5.docs WHERE s ILIKE '%tent%' ORDER BY id;
+----
+1
+2
+5
+6
+
+statement ok
+SET ngram_auto_accelerate = false;
+
+statement ok
+RESET ngram_max_candidate_fraction;
+
+statement error
+PRAGMA ngram_refresh('f5.main.docs');
+----
+read-only
+
+statement ok
+DETACH f5;
+
 # Strict textual refs reject noncanonical and injection-shaped inputs.
 statement error
 PRAGMA ngram_index_status('memory', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA');

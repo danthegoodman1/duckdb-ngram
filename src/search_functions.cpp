@@ -208,6 +208,13 @@ static bool BytesContain(const char *haystack, idx_t haystack_len, const string 
 	return std::search(haystack, end, needle.begin(), needle.end()) != end;
 }
 
+//! Fold scratch a thread keeps between rows; anything larger is released
+//! after the row that needed it.
+static constexpr idx_t RECHECK_SCRATCH_RETAIN_BYTES = 1024 * 1024;
+
+//! Decline reason shared by every path that gives up before the manifest.
+static constexpr const char *OVER_BUDGET_REASON = "query grams exceed query memory budget";
+
 struct RecheckState {
 	//! The needle in comparison form: normalized through the index's fold for
 	//! case-insensitive indexes, raw bytes otherwise.
@@ -233,6 +240,12 @@ struct RecheckState {
 			if (options.case_insensitive) {
 				NormalizeString(value.GetData(), value.GetSize(), options, scratch, scratch_offsets);
 				match = BytesContain(scratch.data(), scratch.size(), needle_cmp);
+				if (scratch.capacity() + scratch_offsets.capacity() * sizeof(idx_t) > RECHECK_SCRATCH_RETAIN_BYTES) {
+					// one oversized row must not pin its fold scratch for the
+					// rest of the query
+					string().swap(scratch);
+					vector<idx_t>().swap(scratch_offsets);
+				}
 			} else {
 				match = BytesContain(value.GetData(), value.GetSize(), needle_cmp);
 			}
@@ -356,13 +369,19 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 		state->needle_cmp = bind.needle;
 	}
 
-	auto decomposition = DecomposeNeedle(bind.needle.data(), bind.needle.size(), state->options);
+	NeedleKeys needle_keys;
+	auto shape = state->fallback_reason.empty() ? DecomposeNeedle(context, bind.needle.data(), bind.needle.size(),
+	                                                              state->options, MaxProbeKeys(context), needle_keys)
+	                                            : NeedleShape::TOO_SHORT;
 	if (!state->fallback_reason.empty()) {
 		state->core.hwm = -1;
-	} else if (decomposition.too_short) {
+	} else if (shape == NeedleShape::TOO_SHORT) {
 		// the index cannot be probed; the tail scan becomes a full scan, which
 		// is still exhaustive
 		state->fallback_reason = "needle shorter than gram size";
+		state->core.hwm = -1;
+	} else if (shape == NeedleShape::OVER_BUDGET) {
+		state->fallback_reason = OVER_BUDGET_REASON;
 		state->core.hwm = -1;
 	} else {
 		auto segments = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
@@ -371,7 +390,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 			state->fallback_reason = "index unavailable";
 			state->core.hwm = -1;
 		} else {
-			state->core.probe = PlanIndexProbe(context, *state->core.tx, *segments, decomposition.keys,
+			state->core.probe = PlanIndexProbe(context, *state->core.tx, *segments, needle_keys.keys,
 			                                   MaxGramsPerQuery(context), state->core.hwm, storage.GetTotalRows(),
 			                                   MaxCandidateFraction(context), DConstants::INVALID_INDEX);
 		}
@@ -441,9 +460,16 @@ static InsertionOrderPreservingMap<string> SearchDynamicToString(TableFunctionDy
 		    StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
 		                       state.core.probe->candidate_upper_bound, state.core.probe->decoded_rowids.load());
 		result["Ngram Manifest Rows Scanned"] = to_string(state.core.probe->manifest_rows_scanned);
+		result["Ngram Probe Workers"] = to_string(state.core.probe->max_threads);
+		result["Ngram Decode Workspace Bytes"] = to_string(state.core.probe->workspace_bytes);
+		result["Ngram Decode Peak Bytes"] = to_string(state.core.probe->tracker->peak.load());
 	} else {
 		result["Ngram Mode"] = "full scan fallback: " + state.fallback_reason;
 	}
+	result["Ngram Fetched Rows"] = to_string(state.core.fetched_rows.load());
+	result["Ngram Range Rows"] = to_string(state.core.range_rows.load());
+	result["Ngram Tail Rows"] = to_string(state.core.tail_rows.load());
+	result["Ngram Local Rows"] = to_string(state.core.local_rows.load());
 	return result;
 }
 
@@ -502,15 +528,19 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 	}
 	state->hwm = verdict.meta.hwm_rowid;
 
-	auto decomposition = DecomposeNeedle(bind.needle.data(), bind.needle.size(), verdict.meta.options);
-	if (!verdict.reason.empty()) {
-		state->all_rowids = true;
-	} else if (decomposition.too_short) {
+	NeedleKeys needle_keys;
+	auto shape = verdict.reason.empty() ? DecomposeNeedle(context, bind.needle.data(), bind.needle.size(),
+	                                                      verdict.meta.options, MaxProbeKeys(context), needle_keys)
+	                                    : NeedleShape::TOO_SHORT;
+	if (shape == NeedleShape::OVER_BUDGET) {
+		throw InvalidInputException("ngram_candidates: %s", OVER_BUDGET_REASON);
+	}
+	if (shape == NeedleShape::TOO_SHORT) {
 		state->all_rowids = true;
 	} else {
 		auto &segments = ResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
 		                                      "ngram index segments table");
-		state->probe = PlanIndexProbe(context, *state->tx, segments, decomposition.keys, MaxGramsPerQuery(context),
+		state->probe = PlanIndexProbe(context, *state->tx, segments, needle_keys.keys, MaxGramsPerQuery(context),
 		                              state->hwm, storage.GetTotalRows(), -1, 1);
 		if (!state->probe->admitted) {
 			throw InvalidInputException("ngram_candidates: %s", state->probe->decline_reason);
@@ -572,6 +602,8 @@ static InsertionOrderPreservingMap<string> CandidatesDynamicToString(TableFuncti
 		result["Ngram Probe Workers"] = to_string(state.probe->max_threads);
 		result["Ngram Manifest Rows Scanned"] = to_string(state.probe->manifest_rows_scanned);
 		result["Ngram Decoded Rowids"] = to_string(state.probe->decoded_rowids.load());
+		result["Ngram Decode Workspace Bytes"] = to_string(state.probe->workspace_bytes);
+		result["Ngram Decode Peak Bytes"] = to_string(state.probe->tracker->peak.load());
 	}
 	return result;
 }

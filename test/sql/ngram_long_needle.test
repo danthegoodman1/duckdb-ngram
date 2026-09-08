@@ -1,0 +1,119 @@
+# name: test/sql/ngram_long_needle.test
+# description: long needles decompose in one pass under the query memory budget; needles past it fall back and stay exact
+# group: [sql]
+
+require ngram
+
+# One thread: the manifest preflight then charges one worker, so the key
+# budget below is the only admission that depends on the needle.
+statement ok
+SET threads=1;
+
+statement ok
+SET ngram_max_candidate_fraction=1;
+
+# pseudo-random lowercase needles of 8 KiB and 16 KiB; nearly every 6-gram is
+# distinct, so the key count tracks the length
+statement ok
+SET VARIABLE short_needle = (SELECT string_agg(chr(97 + (hash(i * 7919) % 26)::INTEGER), '' ORDER BY i) FROM range(8192) r(i));
+
+statement ok
+SET VARIABLE long_needle = (SELECT string_agg(chr(97 + (hash(i * 104729) % 26)::INTEGER), '' ORDER BY i) FROM range(16384) r(i));
+
+statement ok
+CREATE TABLE t AS SELECT 'abcdef' AS s
+	UNION ALL SELECT 'x' || getvariable('short_needle') || 'y'
+	UNION ALL SELECT 'p' || getvariable('long_needle') || 'q';
+
+statement ok
+PRAGMA create_ngram_index('t', 's', gram=6, case_insensitive=false);
+
+# a 16 MB limit gives queries a 4 MB budget: about fifteen thousand keys, or
+# sixteen times as many needle bytes before a gram is extracted
+statement ok
+SET memory_limit='16MB';
+
+# the 8 KiB needle fits the budget and probes
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('t', getvariable('short_needle'));
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index .*
+
+query I
+SELECT count(*) FROM ngram_search('t', getvariable('short_needle'));
+----
+1
+
+query I
+SELECT count(*) FROM ngram_search('t', reverse(getvariable('short_needle')));
+----
+0
+
+query I
+SELECT count(*) FROM ngram_candidates('t', 's', getvariable('short_needle'));
+----
+1
+
+# the 16 KiB needle exceeds the budget before any manifest row is read: the
+# exact search falls back, the raw candidate API refuses
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('t', getvariable('long_needle'));
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: query grams exceed query memory budget".*
+
+query I
+SELECT count(*) FROM ngram_search('t', getvariable('long_needle'));
+----
+1
+
+query I
+SELECT count(*) FROM ngram_search('t', reverse(getvariable('long_needle')));
+----
+0
+
+statement error
+SELECT count(*) FROM ngram_candidates('t', 's', getvariable('long_needle'));
+----
+query grams exceed query memory budget
+
+# the transparent path declines the same way and stays exact
+statement ok
+SET ngram_auto_accelerate=true;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM t WHERE contains(s, getvariable('short_needle'));
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index .*
+
+query I
+SELECT count(*) FROM t WHERE contains(s, getvariable('short_needle'));
+----
+1
+
+query I
+SELECT count(*) FROM t WHERE contains(s, getvariable('long_needle'));
+----
+1
+
+query I
+SELECT count(*) FROM t WHERE contains(s, reverse(getvariable('long_needle')));
+----
+0
+
+statement ok
+SET ngram_auto_accelerate=false;
+
+# far longer needles stay linear: 128 KiB decomposes and declines promptly
+statement ok
+SET VARIABLE huge_needle = (SELECT string_agg(chr(97 + (hash(i * 15485863) % 26)::INTEGER), '' ORDER BY i) FROM range(131072) r(i));
+
+query I
+SELECT count(*) FROM ngram_search('t', getvariable('huge_needle'));
+----
+0
+
+statement ok
+RESET memory_limit;
+
+statement ok
+RESET threads;

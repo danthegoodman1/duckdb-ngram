@@ -7,6 +7,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/common/map.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -79,14 +80,25 @@ struct PublishedCandidates {
 
 //! The shared cursor over intersected segments. A fetch worker takes the next
 //! batch of a published segment when one is waiting and otherwise decodes the
-//! next admitted segment and publishes it, so every worker fetches whatever
-//! segment finished decoding rather than only its own.
+//! next admitted segment, so every worker fetches whatever segment is
+//! published rather than only its own. Segments publish in ordinal order: a
+//! decoded segment waits in `pending` until every lower ordinal has
+//! published. Every batch a worker claims therefore has a higher batch index
+//! than its previous one, which the host requires of each pipeline thread.
 struct CandidateQueue {
 	mutex lock;
 	std::condition_variable published;
+	//! Published segments, in ordinal order, with batches still to hand out.
 	std::deque<PublishedCandidates> ready;
-	//! Segments claimed for decoding and not yet published.
+	//! Decoded segments whose predecessors are still decoding, by ordinal.
+	map<idx_t, shared_ptr<vector<row_t>>> pending;
+	//! The ordinal that publishes next.
+	idx_t next_publish = 0;
+	//! Segments claimed for decoding whose result is not yet in `pending`.
 	idx_t decoding = 0;
+	//! A decode threw; the remaining workers finish with the tail scan while
+	//! the host propagates that error.
+	bool failed = false;
 };
 
 //! Projection-neutral execution state shared by ngram_search and the
@@ -100,10 +112,6 @@ struct SearchCoreGlobal {
 	atomic<idx_t> next_probe_thread {0};
 	CandidateQueue candidates;
 	idx_t fetch_batch_base = 0;
-	//! Position of the rowid column in the fetch projection while a probe is
-	//! admitted; dense candidate batches are read as rowid-range scans, whose
-	//! range filter references it.
-	idx_t fetch_rowid_position = 0;
 
 	vector<StorageIndex> fetch_column_ids;
 	vector<LogicalType> fetch_types;
@@ -111,11 +119,32 @@ struct SearchCoreGlobal {
 	//! BOOLEAN virtual column used only to carry cardinality for count(*).
 	vector<idx_t> output_ids;
 
-	vector<StorageIndex> scan_column_ids;
-	vector<LogicalType> scan_types;
+	//! Native filters the storage scans evaluate: the transparent scan's
+	//! pushed filters.
 	unique_ptr<TableFilterSet> scan_filters;
-	ParallelTableScanState parallel_scan;
+	//! Position of the rowid column in the fetch projection. Bounded scans
+	//! start at a vector boundary, so each carries a rowid filter that
+	//! excludes the rows of that vector before its bound.
+	idx_t fetch_rowid_position = 0;
+	//! The committed rows past the index, [tail_start, tail_end), scanned in
+	//! units of tail_unit_rows through the host's offset scan, so a scan
+	//! visits the row groups those rows occupy. Unit tail_units is the
+	//! transaction-local storage, whose rows all lie past the index.
+	idx_t tail_start = 0;
+	idx_t tail_end = 0;
+	idx_t tail_unit_rows = 1;
+	idx_t tail_units = 0;
+	atomic<idx_t> next_tail_unit {0};
 	idx_t max_threads = 1;
+
+	//! Physical work per access path, for profiling and bounded-work tests:
+	//! rows fetched by rowid, rows the range scans and tail scans can visit
+	//! (their vector-aligned spans, before zone-map pruning), and rows the
+	//! local storage scan returned.
+	atomic<idx_t> fetched_rows {0};
+	atomic<idx_t> range_rows {0};
+	atomic<idx_t> tail_rows {0};
+	atomic<idx_t> local_rows {0};
 };
 
 struct SearchCoreLocal {
@@ -129,22 +158,26 @@ struct SearchCoreLocal {
 	idx_t candidate_end = 0;
 	idx_t segment_ordinal = 0;
 	ProbeDecodeScratch decode;
-	//! A dense batch in progress as a rowid-range scan; the filters bound the
-	//! scan to the batch's first and last rowid. Both are rebuilt per batch:
-	//! a TableScanState keeps appending to its filter list when initialized
-	//! again.
+	//! A dense batch in progress as a committed scan bounded to the batch's
+	//! rowid span; the filter excludes the rows before its first rowid. Both
+	//! are fresh per batch: a TableScanState keeps appending filter info when
+	//! initialized again.
 	unique_ptr<TableScanState> range_state;
 	unique_ptr<TableFilterSet> range_filters;
 
-	TableScanState scan_state;
+	//! The tail unit in progress: a bounded committed scan with its own rowid
+	//! lower bound beside the pushed filters, or the local storage scan when
+	//! scan_local_storage is set. Fresh per unit.
+	unique_ptr<TableScanState> scan_state;
+	unique_ptr<TableFilterSet> scan_filters;
+	bool scan_local_storage = false;
 	DataChunk scan_chunk;
-	bool scan_unit_active = false;
 	SelectionVector sel;
 	idx_t batch_index = 0;
 };
 
-//! Add the tail/full-scan rowid filter, initialize the parallel cursor and set
-//! the bounded thread count after policy-specific init has populated `state`.
+//! Partition the tail, drop empty filter sets and set the bounded thread
+//! count after policy-specific init has populated `state`.
 void FinalizeSearchCore(ClientContext &context, SearchCoreGlobal &state);
 
 //! Initialize per-thread buffers and assign at most probe->max_threads locals

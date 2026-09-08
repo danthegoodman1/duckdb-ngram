@@ -352,6 +352,12 @@ string DropIndexScript(ClientContext &context, const ObservedIndex &index) {
 	} else {
 		storage.push_back("DROP TABLE IF EXISTS " + StorageTable(index.catalog_name, index.location.SegmentsTable()) +
 		                  ";\n");
+		if (index.format_version == 4) {
+			// Format 4 kept a per-gram statistics table beside the segments;
+			// this is the only place that layout is known.
+			auto hex = StringUtil::Replace(index_ref, "-", "");
+			storage.push_back("DROP TABLE IF EXISTS " + StorageTable(index.catalog_name, "stats_" + hex) + ";\n");
+		}
 	}
 	// The guard goes with the last index that records it, once the exact
 	// incarnation (name, type, table, token) is proven at execution time. An

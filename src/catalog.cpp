@@ -87,7 +87,7 @@ static const array<LogicalType, 12> REGISTRY_TYPES = {LogicalType::INTEGER, Logi
                                                       LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR};
 static constexpr idx_t IDENTITY_COLUMNS = 6;
 
-RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name) {
+RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name, const RegistrySelector &selector) {
 	RegistrySnapshot result;
 	// EntryLookupInfo stores the name by reference.
 	string registry_table = REGISTRY_TABLE;
@@ -120,10 +120,21 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 	}
 	result.oid = table.oid;
 	auto &transaction = DuckTransaction::Get(context, table.ParentCatalog());
+	TableFilterSet filters;
+	if (!selector.index_ref.empty()) {
+		filters.PushFilter(ColumnIndex(1),
+		                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::UUID(selector.index_ref)));
+	}
+	if (!selector.owner_key.empty()) {
+		filters.PushFilter(ColumnIndex(2), make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL,
+		                                                             Value::BLOB_RAW(selector.owner_key)));
+	}
 	TableScanState state;
-	InitializeExhaustiveScan(context, transaction, table.GetStorage(), state, column_ids, nullptr);
+	InitializeExhaustiveScan(context, transaction, table.GetStorage(), state, column_ids,
+	                         filters.filters.empty() ? nullptr : &filters);
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), types);
+	vector<UnifiedVectorFormat> identity(IDENTITY_COLUMNS);
 	while (true) {
 		ThrowIfInterrupted(context);
 		chunk.Reset();
@@ -131,8 +142,23 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 		if (chunk.size() == 0) {
 			break;
 		}
+		for (idx_t c = 0; c < IDENTITY_COLUMNS; c++) {
+			chunk.data[c].ToUnifiedFormat(chunk.size(), identity[c]);
+		}
+		auto names = [&](idx_t column, idx_t r) {
+			return UnifiedVectorFormat::GetData<string_t>(identity[column])[identity[column].sel->get_index(r)];
+		};
 		for (idx_t r = 0; r < chunk.size(); r++) {
-			for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+			for (idx_t c = 0; c < IDENTITY_COLUMNS; c++) {
+				if (!identity[c].validity.RowIsValid(identity[c].sel->get_index(r))) {
+					throw InvalidInputException("ngram: registry contains NULLs");
+				}
+			}
+			if (!selector.table_name.empty() && (!StringUtil::CIEquals(names(3, r).GetString(), selector.schema_name) ||
+			                                     !StringUtil::CIEquals(names(4, r).GetString(), selector.table_name))) {
+				continue;
+			}
+			for (idx_t c = IDENTITY_COLUMNS; c < chunk.ColumnCount(); c++) {
 				if (chunk.GetValue(c, r).IsNull()) {
 					throw InvalidInputException("ngram: registry contains NULLs");
 				}
@@ -140,10 +166,10 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 			auto version = chunk.GetValue(0, r).GetValue<int32_t>();
 			RegistryRow row;
 			row.index_ref = UUID::ToString(chunk.GetValue(1, r).GetValue<hugeint_t>());
-			row.owner_key = StringValue::Get(chunk.GetValue(2, r));
-			row.schema_name = StringValue::Get(chunk.GetValue(3, r));
-			row.table_name = StringValue::Get(chunk.GetValue(4, r));
-			row.column_name = StringValue::Get(chunk.GetValue(5, r));
+			row.owner_key = names(2, r).GetString();
+			row.schema_name = names(3, r).GetString();
+			row.table_name = names(4, r).GetString();
+			row.column_name = names(5, r).GetString();
 			row.meta.column_name = row.column_name;
 			if (!IsCanonicalUUID(row.index_ref)) {
 				throw InvalidInputException("ngram: registry row has a noncanonical ID");
@@ -235,8 +261,15 @@ vector<IndexLocation> Locations(const RegistrySnapshot &registry, const Resolved
 
 vector<OwnedIndex> OwnedIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient) {
 	RegistrySnapshot registry;
+	RegistrySelector selector;
+	if (!target.column_name.empty()) {
+		selector.owner_key = OwnerKey(target.schema_name, target.table_name, target.column_name);
+	} else {
+		selector.schema_name = target.schema_name;
+		selector.table_name = target.table_name;
+	}
 	try {
-		registry = ReadRegistry(context, target.catalog_name);
+		registry = ReadRegistry(context, target.catalog_name, selector);
 	} catch (CatalogException &) {
 		if (lenient) {
 			return {};
@@ -306,18 +339,26 @@ void ValidateRegistryForCreate(ClientContext &context, const string &catalog_nam
 	}
 }
 
-bool ParseStorageName(const string &name, string &index_ref) {
+static bool ParsePrefixedId(const string &name, const char *prefix, string &index_ref) {
 	auto lower = StringUtil::Lower(name);
-	if (!StringUtil::StartsWith(lower, "segments_")) {
+	if (!StringUtil::StartsWith(lower, prefix)) {
 		return false;
 	}
-	auto hex = lower.substr(strlen("segments_"));
+	auto hex = lower.substr(strlen(prefix));
 	if (hex.size() != 32) {
 		return false;
 	}
 	index_ref = hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) + "-" + hex.substr(16, 4) + "-" +
 	            hex.substr(20);
 	return IsCanonicalUUID(index_ref);
+}
+
+bool ParseStorageName(const string &name, string &index_ref) {
+	return ParsePrefixedId(name, "segments_", index_ref);
+}
+
+bool ParseFormat4StatsName(const string &name, string &index_ref) {
+	return ParsePrefixedId(name, "stats_", index_ref);
 }
 
 ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, const string &column_name,

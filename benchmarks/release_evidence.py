@@ -37,6 +37,17 @@ DUCKDB_GITLINK = "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa"
 CI_GITLINK = "72e76e99cd7fee45a99739cd118ec2db64e034ec"
 DUCKDB_VERSION = "v1.5.5"
 DUCKDB_SOURCE = "d8cdaa33"
+
+
+def source_id_matches(source_id):
+    """The CLI reports the host commit at whatever abbreviation its build's git
+    chose (eight characters in CI, ten on some developer machines); the pin is
+    a prefix of the same commit, so either may be the longer one."""
+    return (
+        isinstance(source_id, str)
+        and len(source_id) >= 7
+        and (source_id.startswith(DUCKDB_SOURCE) or DUCKDB_SOURCE.startswith(source_id))
+    )
 ENGINE_FILES = ("CMakeLists.txt", "Makefile", "extension_config.cmake", "vcpkg.json")
 SUBMODULES = ("duckdb", "extension-ci-tools")
 PINNED_LINKS = {"duckdb": DUCKDB_GITLINK, "extension-ci-tools": CI_GITLINK}
@@ -634,7 +645,7 @@ def runtime_identity(binary):
     valid = (
         len(version) == len(extension) == 1
         and version[0].get("library_version") == DUCKDB_VERSION
-        and version[0].get("source_id") == DUCKDB_SOURCE
+        and source_id_matches(version[0].get("source_id"))
         and type(extension[0].get("extension_version")) is str
     )
     if not valid or not re.fullmatch(r"[0-9a-f]{7,40}", extension[0].get("extension_version", "")):

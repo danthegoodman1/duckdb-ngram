@@ -18,12 +18,30 @@ ProbeMemoryReservation::ProbeMemoryReservation(BufferManager &manager_p, idx_t s
 }
 
 ProbeMemoryReservation::~ProbeMemoryReservation() {
-	manager.FreeReservedMemory(size);
+	manager.FreeReservedMemory(size.load());
 }
 
 void ProbeMemoryReservation::Grow(idx_t extra) {
 	manager.ReserveMemory(extra);
-	size += extra;
+	size.fetch_add(extra);
+}
+
+void ProbeMemoryReservation::Shrink(idx_t released) {
+	D_ASSERT(released <= size.load());
+	manager.FreeReservedMemory(released);
+	size.fetch_sub(released);
+}
+
+void ProbeDecodeTracker::Add(idx_t bytes) {
+	auto now = live.fetch_add(bytes) + bytes;
+	auto seen = peak.load();
+	while (now > seen && !peak.compare_exchange_weak(seen, now)) {
+	}
+}
+
+void ProbeDecodeTracker::Release(idx_t bytes) {
+	D_ASSERT(bytes <= live.load());
+	live.fetch_sub(bytes);
 }
 
 static idx_t ProbeThreads(ClientContext &context) {
@@ -53,20 +71,31 @@ static void ThrowProbeOverflow() {
 }
 
 //! Memory the planner needs before it reads a segments-table row: per-key
-//! scratch (descriptor vectors, totals, sort indexes, filter values) for the
-//! whole needle, without depending on STL layouts, plus 256 KiB for each
-//! manifest worker's scan chunk and state. Ordinary DuckDB allocator buffers
-//! are not charged to BufferManager reservations.
+//! scratch (the decomposition's key and set entry, descriptor vectors,
+//! totals, sort indexes, filter values) for the whole needle, without
+//! depending on STL layouts, plus 256 KiB for each manifest worker's scan
+//! chunk and state. Ordinary DuckDB allocator buffers are not charged to
+//! BufferManager reservations.
+static constexpr idx_t PREFLIGHT_FIXED_BYTES = 4096;
+static constexpr idx_t PREFLIGHT_BYTES_PER_KEY = 256;
+static constexpr idx_t PREFLIGHT_BYTES_PER_WORKER = 256 * 1024;
+
 static idx_t PreflightProbeBytes(idx_t key_count, idx_t workers) {
-	idx_t preflight_bytes = 4096;
+	idx_t preflight_bytes = PREFLIGHT_FIXED_BYTES;
 	idx_t per_key_bytes;
 	idx_t worker_bytes;
-	if (!CheckedMultiply(key_count, idx_t(256), per_key_bytes) ||
-	    !CheckedMultiply(workers, idx_t(256 * 1024), worker_bytes) || !CheckedAdd(preflight_bytes, per_key_bytes) ||
-	    !CheckedAdd(preflight_bytes, worker_bytes)) {
+	if (!CheckedMultiply(key_count, PREFLIGHT_BYTES_PER_KEY, per_key_bytes) ||
+	    !CheckedMultiply(workers, PREFLIGHT_BYTES_PER_WORKER, worker_bytes) ||
+	    !CheckedAdd(preflight_bytes, per_key_bytes) || !CheckedAdd(preflight_bytes, worker_bytes)) {
 		ThrowProbeOverflow();
 	}
 	return preflight_bytes;
+}
+
+idx_t MaxProbeKeys(ClientContext &context) {
+	auto budget = ProbeMemoryBudget(context);
+	auto fixed = PreflightProbeBytes(0, 1);
+	return budget > fixed ? (budget - fixed) / PREFLIGHT_BYTES_PER_KEY : 0;
 }
 
 //! Bytes the manifest occupies per descriptor row: the descriptor, the
@@ -84,12 +113,12 @@ struct GramRows {
 //! leading sorted column, so each `gram_key = ?` scan touches the row groups
 //! and column segments whose zone map admits the key and evaluates the filter
 //! natively on the fixed-width column. Rows are validated against the
-//! high-water mark and the segment capacity as they arrive, and their total
-//! is bounded by `max_rows`; past it the scans stop and the plan declines.
-//! Returns false on that decline.
+//! high-water mark and the segment capacity as they arrive, charged to the
+//! reservation chunk by chunk, and their total is bounded by `max_rows`; past
+//! it the scans stop and the plan declines. Returns false on that decline.
 static bool CollectGramRows(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
                             const vector<uhugeint_t> &keys, int64_t hwm, idx_t workers, idx_t max_rows,
-                            vector<GramRows> &per_key, idx_t &rows_scanned) {
+                            ProbeMemoryReservation &reservation, vector<GramRows> &per_key, idx_t &rows_scanned) {
 	vector<StorageIndex> column_ids;
 	vector<LogicalType> types;
 	AddShadowColumn(segments_entry, "gram_key", LogicalTypeId::UHUGEINT, column_ids, types);
@@ -122,6 +151,8 @@ static bool CollectGramRows(ClientContext &context, DuckTransaction &tx, DuckTab
 				declined.store(true);
 				return;
 			}
+			// charged before the descriptors that hold them are appended
+			reservation.Grow(chunk.size() * MANIFEST_BYTES_PER_ROW);
 			UnifiedVectorFormat key_format, segment_format, count_format, rowid_format;
 			chunk.data[0].ToUnifiedFormat(chunk.size(), key_format);
 			chunk.data[1].ToUnifiedFormat(chunk.size(), segment_format);
@@ -304,31 +335,35 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 	auto plan = make_uniq<ProbePlan>();
 	plan->segments_entry = &segments_entry;
 	plan->hwm = hwm;
+	plan->tracker = make_shared_ptr<ProbeDecodeTracker>();
 
 	// Both callers supply distinct keys. Account the whole needle before
 	// reading a row, collect every key's segment rows, then keep the rarest K.
+	// Manifest workers are as many as the budget leaves room for after the
+	// needle's keys, one at least.
 	auto memory_budget = ProbeMemoryBudget(context);
-	auto workers = MinValue<idx_t>(ProbeThreads(context), keys.size());
-	auto preflight_bytes = PreflightProbeBytes(keys.size(), workers);
-	if (preflight_bytes > memory_budget) {
+	auto key_bytes = PreflightProbeBytes(keys.size(), 0);
+	if (key_bytes + PREFLIGHT_BYTES_PER_WORKER > memory_budget) {
 		plan->decline_reason = "query grams exceed query memory budget";
 		return plan;
 	}
+	auto workers = MinValue<idx_t>(ProbeThreads(context), keys.size());
+	workers = MinValue<idx_t>(workers, (memory_budget - key_bytes) / PREFLIGHT_BYTES_PER_WORKER);
+	auto preflight_bytes = PreflightProbeBytes(keys.size(), workers);
 	plan->memory_reservation =
 	    make_uniq<ProbeMemoryReservation>(BufferManager::GetBufferManager(context), preflight_bytes);
 	auto max_manifest_rows = (memory_budget - preflight_bytes) / MANIFEST_BYTES_PER_ROW;
 	vector<GramRows> per_key(keys.size());
-	if (!CollectGramRows(context, tx, segments_entry, keys, hwm, workers, max_manifest_rows, per_key,
-	                     plan->manifest_rows_scanned)) {
+	if (!CollectGramRows(context, tx, segments_entry, keys, hwm, workers, max_manifest_rows, *plan->memory_reservation,
+	                     per_key, plan->manifest_rows_scanned)) {
 		plan->decline_reason = "segment manifest exceeds query memory budget";
 		return plan;
 	}
 	SelectRarestGrams(keys, per_key, max_grams, *plan);
-	idx_t manifest_bytes;
-	if (!CheckedMultiply(plan->descriptors.size(), MANIFEST_BYTES_PER_ROW, manifest_bytes)) {
-		ThrowProbeOverflow();
-	}
-	plan->memory_reservation->Grow(manifest_bytes);
+	// the unselected grams' rows are released with their charge
+	vector<GramRows>().swap(per_key);
+	auto manifest_bytes = plan->descriptors.size() * MANIFEST_BYTES_PER_ROW;
+	plan->memory_reservation->Shrink((plan->manifest_rows_scanned - plan->descriptors.size()) * MANIFEST_BYTES_PER_ROW);
 	auto reserved_bytes = preflight_bytes + manifest_bytes;
 
 	idx_t estimated_decoded_rowids = 0;
@@ -355,29 +390,70 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 		plan->decline_reason = "one posting segment exceeds query memory budget";
 		return plan;
 	}
-	// Every worker past the first may hold a published segment's candidates
-	// while it decodes the next segment, so it is charged both peaks. Workers
-	// are capped by the fetch batches the candidates fill, so a plan with few
-	// segments and many candidates still fetches in parallel.
-	auto extra_worker_bytes = peak_worker_bytes + peak_candidate_bytes;
-	auto possible_workers = 1 + (memory_budget - reserved_bytes - peak_worker_bytes) / extra_worker_bytes;
+	// With M fetch workers the candidate queue keeps at most M segments
+	// decoding, pending or published at once, and a worker fetching a popped
+	// segment holds one more; when the queue is full two workers are
+	// empty-handed, so at most 2M - 2 candidate vectors are alive beside M
+	// decode peaks. A decode peak already holds the candidates it produces,
+	// so a single worker is charged its peak alone, and M workers are charged
+	// M peaks plus M - 2 candidate vectors. Workers are capped by the fetch
+	// batches the candidates fill, so a plan with few segments and many
+	// candidates still fetches in parallel.
+	auto available_bytes = memory_budget - reserved_bytes;
+	auto per_worker_bytes = peak_worker_bytes;
+	if (!CheckedAdd(per_worker_bytes, peak_candidate_bytes)) {
+		ThrowProbeOverflow();
+	}
+	auto possible_workers = (available_bytes + 2 * peak_candidate_bytes) / per_worker_bytes;
 	auto fetch_units =
 	    MaxValue<idx_t>(plan->segments.size(), (plan->candidate_upper_bound + FETCH_BATCH_ROWS - 1) / FETCH_BATCH_ROWS);
 	plan->max_threads = MinValue<idx_t>(
 	    fetch_units, MinValue<idx_t>(worker_cap, MinValue<idx_t>(ProbeThreads(context), possible_workers)));
-	D_ASSERT(plan->max_threads > 0);
-	idx_t workspace_bytes;
-	if (!CheckedMultiply(extra_worker_bytes, plan->max_threads - 1, workspace_bytes) ||
-	    !CheckedAdd(workspace_bytes, peak_worker_bytes)) {
-		ThrowProbeOverflow();
+	if (plan->max_threads <= 1) {
+		plan->max_threads = 1;
+		plan->workspace_bytes = peak_worker_bytes;
+	} else {
+		idx_t alive_candidate_bytes;
+		if (!CheckedMultiply(peak_worker_bytes, plan->max_threads, plan->workspace_bytes) ||
+		    !CheckedMultiply(peak_candidate_bytes, plan->max_threads - 2, alive_candidate_bytes) ||
+		    !CheckedAdd(plan->workspace_bytes, alive_candidate_bytes)) {
+			ThrowProbeOverflow();
+		}
 	}
-	plan->memory_reservation->Grow(workspace_bytes);
+	D_ASSERT(plan->workspace_bytes <= available_bytes);
+	plan->memory_reservation->Grow(plan->workspace_bytes);
 	AddShadowColumn(segments_entry, "gram_key", LogicalTypeId::UHUGEINT, plan->decode_column_ids, plan->decode_types);
 	AddShadowColumn(segments_entry, "segment_no", LogicalTypeId::BIGINT, plan->decode_column_ids, plan->decode_types);
 	AddShadowColumn(segments_entry, "postings", LogicalTypeId::BLOB, plan->decode_column_ids, plan->decode_types);
 	AddShadowColumn(segments_entry, "rowid_count", LogicalTypeId::BIGINT, plan->decode_column_ids, plan->decode_types);
 	plan->admitted = true;
 	return plan;
+}
+
+//! Leave `buffer` empty with room for exactly `rows`, releasing a larger
+//! allocation a previous segment left behind, so a worker's buffers never
+//! exceed the peak the plan modeled for the segment it is decoding.
+static void ReserveExactly(vector<row_t> &buffer, idx_t rows) {
+	buffer.clear();
+	if (buffer.capacity() != rows) {
+		// release before reserving: a growing reserve would hold both
+		// allocations at once
+		vector<row_t>().swap(buffer);
+		buffer.reserve(rows);
+	}
+}
+
+//! Charge the difference between the worker's current rowid buffers and what
+//! it last charged.
+static void TrackDecodeBuffers(ProbePlan &plan, ProbeDecodeScratch &scratch, const vector<row_t> &candidates) {
+	auto bytes =
+	    (candidates.capacity() + scratch.postings.capacity() + scratch.intersection.capacity()) * sizeof(row_t);
+	if (bytes > scratch.tracked_bytes) {
+		plan.tracker->Add(bytes - scratch.tracked_bytes);
+	} else {
+		plan.tracker->Release(scratch.tracked_bytes - bytes);
+	}
+	scratch.tracked_bytes = bytes;
 }
 
 //! Decode the postings of one gram of `segment` into `postings`: every
@@ -403,8 +479,7 @@ static void DecodeDescriptorRange(ClientContext &context, DuckTransaction &tx, P
 	if (begin == end) {
 		throw InvalidInputException("ngram: admitted segment is missing a gram; the index is malformed");
 	}
-	postings.clear();
-	postings.reserve(expected);
+	ReserveExactly(postings, expected);
 
 	if (!scratch.initialized) {
 		scratch.chunk.Initialize(Allocator::Get(context), plan.decode_types);
@@ -482,15 +557,35 @@ void DecodeCandidateSegment(ClientContext &context, DuckTransaction &tx, ProbePl
 	auto &segment = plan.segments[segment_ordinal];
 	D_ASSERT(!segment.gram_order.empty());
 	DecodeDescriptorRange(context, tx, plan, segment, segment.gram_order[0], scratch, candidates);
+	TrackDecodeBuffers(plan, scratch, candidates);
 	for (idx_t position = 1; position < segment.gram_order.size() && !candidates.empty(); position++) {
 		DecodeDescriptorRange(context, tx, plan, segment, segment.gram_order[position], scratch, scratch.postings);
 		auto &intersection = scratch.intersection;
-		intersection.clear();
-		intersection.reserve(MinValue(candidates.size(), scratch.postings.size()));
+		ReserveExactly(intersection, MinValue(candidates.size(), scratch.postings.size()));
+		TrackDecodeBuffers(plan, scratch, candidates);
 		std::set_intersection(candidates.begin(), candidates.end(), scratch.postings.begin(), scratch.postings.end(),
 		                      std::back_inserter(intersection));
 		std::swap(candidates, intersection);
+		// the previous candidates leave as soon as they are superseded
+		ReserveExactly(intersection, 0);
+		TrackDecodeBuffers(plan, scratch, candidates);
 	}
+	// the buffers this segment no longer needs leave before the next one is
+	// modeled
+	ReserveExactly(scratch.postings, 0);
+	TrackDecodeBuffers(plan, scratch, candidates);
+}
+
+shared_ptr<vector<row_t>> TrackPublishedCandidates(ProbePlan &plan, ProbeDecodeScratch &scratch,
+                                                   vector<row_t> &&candidates) {
+	auto bytes = candidates.capacity() * sizeof(row_t);
+	auto tracker = plan.tracker;
+	// the worker's charge for this vector becomes the published charge
+	scratch.tracked_bytes -= bytes;
+	return shared_ptr<vector<row_t>>(new vector<row_t>(std::move(candidates)), [tracker, bytes](vector<row_t> *rowids) {
+		tracker->Release(bytes);
+		delete rowids;
+	});
 }
 
 bool NextCandidateSegment(ClientContext &context, DuckTransaction &tx, ProbePlan &plan, ProbeDecodeScratch &scratch,

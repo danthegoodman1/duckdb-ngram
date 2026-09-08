@@ -16,15 +16,29 @@ class DuckTransaction;
 
 namespace ngram {
 
+//! A hard reservation against the buffer manager for the query's probe
+//! scratch. Grow and Shrink are safe from the manifest workers' threads.
 class ProbeMemoryReservation {
 public:
 	ProbeMemoryReservation(BufferManager &manager, idx_t size);
 	~ProbeMemoryReservation();
 	void Grow(idx_t size);
+	void Shrink(idx_t size);
 
 private:
 	BufferManager &manager;
-	idx_t size;
+	atomic<idx_t> size;
+};
+
+//! Bytes the decode path holds in rowid buffers: every worker's scratch and
+//! every candidate vector alive between decode and the last fetch of its
+//! batches. `peak` is compared to the plan's workspace reservation.
+struct ProbeDecodeTracker {
+	atomic<idx_t> live {0};
+	atomic<idx_t> peak {0};
+
+	void Add(idx_t bytes);
+	void Release(idx_t bytes);
 };
 
 //! One visible segments-table row needed by the selected grams. The shared
@@ -41,10 +55,11 @@ struct ProbeDescriptor {
 	idx_t posting_count = 0;
 };
 
-//! Candidates are handed to fetch workers in batches of this many rowids, so
-//! fetch parallelism follows the candidate count rather than the segment
-//! count. A multiple of the vector size, so every fetch chunk has its own
-//! batch index.
+//! Candidates are handed to fetch workers in batches of at least this many
+//! rowids (fewer only at a segment's end), so fetch parallelism follows the
+//! candidate count rather than the segment count. A batch runs on to the
+//! next vector-aligned rowid boundary, so it holds fewer than twice this
+//! many.
 constexpr idx_t FETCH_BATCH_ROWS = STANDARD_VECTOR_SIZE;
 
 //! One rowid segment admitted for bounded probing. Its descriptors occupy the
@@ -82,6 +97,12 @@ struct ProbePlan {
 	idx_t manifest_rows_scanned = 0;
 	atomic<idx_t> decoded_rowids {0};
 	unique_ptr<ProbeMemoryReservation> memory_reservation;
+	//! The part of the reservation that pays for decode scratch and alive
+	//! candidate vectors across max_threads workers.
+	idx_t workspace_bytes = 0;
+	//! Shared with the deleters of published candidate vectors, which may
+	//! outlive the plan.
+	shared_ptr<ProbeDecodeTracker> tracker;
 	//! The segments-table projection every decode fetches, resolved once.
 	vector<StorageIndex> decode_column_ids;
 	vector<LogicalType> decode_types;
@@ -98,7 +119,13 @@ struct ProbeDecodeScratch {
 	DataChunk chunk;
 	Vector rowids;
 	bool initialized = false;
+	//! Rowid-buffer bytes this thread currently has charged to the tracker.
+	idx_t tracked_bytes = 0;
 };
+
+//! The most distinct needle keys the query memory budget admits, before any
+//! per-worker scan scratch: the ceiling needle decomposition stops at.
+idx_t MaxProbeKeys(ClientContext &context);
 
 //! Build a segment manifest and admit its decoded work before touching a
 //! postings blob. A negative candidate_fraction disables that gate (used by
@@ -109,9 +136,18 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
                                      double candidate_fraction, idx_t worker_cap);
 
 //! Decode, union and intersect the admitted segment at `segment_ordinal` into
-//! `candidates`: sorted rowids that all belong to that segment.
+//! `candidates`: sorted rowids that all belong to that segment. On return the
+//! scratch's retained buffers and `candidates` are charged to the tracker
+//! through `scratch.tracked_bytes`; a caller that hands `candidates` on must
+//! call TrackPublishedCandidates.
 void DecodeCandidateSegment(ClientContext &context, DuckTransaction &tx, ProbePlan &plan, idx_t segment_ordinal,
                             ProbeDecodeScratch &scratch, vector<row_t> &candidates);
+
+//! Move a decoded vector's bytes from the worker's charge to a published
+//! charge that its deleter releases: a shared vector that lives until the
+//! last fetch of its batches finishes.
+shared_ptr<vector<row_t>> TrackPublishedCandidates(ProbePlan &plan, ProbeDecodeScratch &scratch,
+                                                   vector<row_t> &&candidates);
 
 //! Claim the next admitted segment and decode it (the serial form used by
 //! ngram_candidates). Returns false when no segment remains; segment_ordinal

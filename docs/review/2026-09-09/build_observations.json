@@ -32,5 +32,39 @@
     "stats": "s,3,true,10920422,10920422,0,605513,1958417,0,1,711434908,855979002,NULL"
    }
   ]
+ },
+ "offsets32": {
+  "build_rss_median_bytes": 7383998464,
+  "build_s_median": 7.0,
+  "git_head": "464023e399ca37696d514b70f0803224d502ff3b",
+  "runs": [
+   {
+    "build_rss_bytes": 7380402176,
+    "build_s": 7.04,
+    "build_spill_bytes": 0,
+    "index_bytes": 997457920,
+    "load_rss_bytes": 3684921344,
+    "load_s": 0.82,
+    "stats": "s,3,true,10920422,10920422,0,605513,1958417,0,1,711434908,855979002,NULL"
+   },
+   {
+    "build_rss_bytes": 7383998464,
+    "build_s": 7.0,
+    "build_spill_bytes": 0,
+    "index_bytes": 998506496,
+    "load_rss_bytes": 3693219840,
+    "load_s": 0.79,
+    "stats": "s,3,true,10920422,10920422,0,605513,1958417,0,1,711434908,855979002,NULL"
+   },
+   {
+    "build_rss_bytes": 7441772544,
+    "build_s": 6.93,
+    "build_spill_bytes": 0,
+    "index_bytes": 997457920,
+    "load_rss_bytes": 3703848960,
+    "load_s": 0.77,
+    "stats": "s,3,true,10920422,10920422,0,605513,1958417,0,1,711434908,855979002,NULL"
+   }
+  ]
  }
 }

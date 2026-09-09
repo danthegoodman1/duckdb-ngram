@@ -561,7 +561,7 @@ void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchC
 					global.storage->Fetch(*global.tx, local.extra_chunk, global.extra_column_ids, local.hit_rowids,
 					                      hits, local.extra_state);
 					if (local.extra_chunk.size() != hits) {
-						throw InternalException("ngram: a kept candidate row vanished between two fetches");
+						throw InvalidInputException("ngram: a kept candidate row vanished between two fetches");
 					}
 				}
 				SearchCoreEmitFetched(global, local, hits, output);

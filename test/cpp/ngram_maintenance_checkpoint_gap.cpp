@@ -2407,30 +2407,65 @@ static void TestRegistryScale() {
 	          << " indexed_off/on/explicit_ms=" << indexed_off_ms << "/" << indexed_on_ms << "/" << explicit_ms << "\n";
 }
 
+//! Interrupt a query while it is provably running: stream it, hold its first
+//! chunk, interrupt, and require the rest of the stream to fail with the
+//! interrupt. No timing is involved, so a faster machine cannot let the
+//! query finish before the interrupt lands.
+static void ExpectStreamInterrupted(Connection &con, const string &sql) {
+	auto stream = con.SendQuery(sql);
+	if (stream->HasError()) {
+		throw std::runtime_error("streaming query failed before its interrupt: " + stream->GetError());
+	}
+	auto first = stream->Fetch();
+	if (!first || first->size() == 0) {
+		throw std::runtime_error("streaming query produced no first chunk: " + sql);
+	}
+	con.Interrupt();
+	bool interrupted = false;
+	while (true) {
+		auto chunk = stream->Fetch();
+		if (stream->HasError()) {
+			interrupted = stream->GetError().find("Interrupt") != string::npos;
+			if (!interrupted) {
+				throw std::runtime_error("interrupted query failed otherwise: " + stream->GetError());
+			}
+			break;
+		}
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+	}
+	if (!interrupted) {
+		throw std::runtime_error("query did not propagate cancellation: " + sql);
+	}
+}
+
 static void TestQueryCancellation() {
 	DuckDB db(nullptr);
 	LoadNgram(db);
 	Connection con(db);
 	Check(con, "SET threads=1");
 	Check(con, "SET ngram_max_candidate_fraction=1.0");
-	// every third row matches: sparse candidates take the per-row fetch path,
-	// which is slow enough for the interrupt below to land inside it
+	// every third row matches: dense enough for range scans; every seventh
+	// row of the second needle keeps the per-row fetch path
 	Check(con, "CREATE TABLE cancel_rows AS SELECT i::BIGINT id, CASE WHEN i % 3 = 0 THEN 'aaaaaaaa payload' "
-	           "ELSE 'zzzz' END::VARCHAR s FROM range(600000) t(i)");
+	           "WHEN i % 7 = 0 THEN 'bbbbbbbb sparse' ELSE 'zzzz' END::VARCHAR s FROM range(600000) t(i)");
 	Check(con, "PRAGMA create_ngram_index('cancel_rows', 's')");
 	Check(con, "SET memory_limit='64MB'");
-	unique_ptr<MaterializedQueryResult> result;
-	std::thread worker([&]() { result = con.Query("SELECT sum(id) FROM ngram_search('cancel_rows', 'aaaa')"); });
-	std::this_thread::sleep_for(std::chrono::milliseconds(10));
-	con.Interrupt();
-	worker.join();
-	if (!result || !result->HasError() || result->GetError().find("Interrupt") == string::npos) {
-		throw std::runtime_error("bounded query did not propagate cancellation");
-	}
-	// Cancellation must release both the hard memory reservation and shared
-	// vacuum fence; the same connection and an exclusive checkpoint remain usable.
-	if (ScalarInt64(con, "SELECT 42") != 42) {
-		throw std::runtime_error("connection unusable after query cancellation");
+	for (auto needle : vector<string> {"aaaa", "bbbb"}) {
+		auto profile = Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('cancel_rows', '" +
+		                              needle + "')")
+		                   ->GetValue(1, 0)
+		                   .ToString();
+		if (profile.find("\"Ngram Mode\": \"index") == string::npos) {
+			throw std::runtime_error("cancellation fixture was not admitted for " + needle);
+		}
+		ExpectStreamInterrupted(con, "SELECT id FROM ngram_search('cancel_rows', '" + needle + "')");
+		// Cancellation must release both the hard memory reservation and the
+		// shared vacuum fence; the same connection stays usable.
+		if (ScalarInt64(con, "SELECT 42") != 42) {
+			throw std::runtime_error("connection unusable after query cancellation");
+		}
 	}
 
 	// Both compaction plans are generated multi-statement transactions. Split a
@@ -2462,21 +2497,41 @@ static void TestQueryCancellation() {
 		                             cancel_segments + "), '|', (SELECT hwm_rowid FROM " +
 		                             OwnerRow("cancel_rows", "s") + "))");
 	};
+	// A pragma cannot be streamed, so its interrupt is timed; a machine fast
+	// enough to finish the merge first proves the committed outcome instead.
 	auto before = maintenance_digest();
+	auto expected_matches = ScalarInt64(con, "SELECT count(*) FROM cancel_rows WHERE contains(s, 'aaaa')");
 	for (auto &pragma :
 	     vector<string> {"PRAGMA ngram_compact('cancel_rows')", "PRAGMA ngram_compact('cancel_rows', purge=true)"}) {
-		result.reset();
+		unique_ptr<MaterializedQueryResult> result;
 		std::thread maintenance([&]() { result = con.Query(pragma); });
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		con.Interrupt();
 		maintenance.join();
-		if (!result || !result->HasError() || result->GetError().find("Interrupt") == string::npos) {
-			throw std::runtime_error(pragma + " did not propagate cancellation");
+		if (!result) {
+			throw std::runtime_error(pragma + " returned no result");
 		}
-		if (maintenance_digest() != before ||
-		    ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name='temp' AND "
+		if (ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name='temp' AND "
 		                     "table_name LIKE '__ngram_%'") != 0) {
-			throw std::runtime_error(pragma + " left partial storage state or scratch tables after cancellation");
+			throw std::runtime_error(pragma + " left scratch tables behind");
+		}
+		if (result->HasError()) {
+			if (result->GetError().find("Interrupt") == string::npos) {
+				throw std::runtime_error(pragma + " failed otherwise: " + result->GetError());
+			}
+			if (maintenance_digest() != before) {
+				throw std::runtime_error(pragma + " left partial storage state after cancellation");
+			}
+		} else {
+			// it outran the interrupt: the merge committed whole
+			if (ScalarInt64(con, "SELECT count(*) FROM (SELECT gram_key, segment_no FROM " + cancel_segments +
+			                         " GROUP BY gram_key, segment_no HAVING count(*) > 1)") != 0) {
+				throw std::runtime_error(pragma + " completed with fragmented keys left");
+			}
+			before = maintenance_digest();
+		}
+		if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('cancel_rows', 'aaaa')") != expected_matches) {
+			throw std::runtime_error(pragma + " changed the answer");
 		}
 	}
 	Check(con, "FORCE CHECKPOINT");

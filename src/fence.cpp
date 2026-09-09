@@ -2,6 +2,7 @@
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/index_state.hpp"
@@ -220,6 +221,14 @@ string PreparedMaintenanceCall(ClientContext &context, uint64_t group, PreparedM
 	       Lit(GetMaintenanceState(context)->Register(context, group, std::move(prepared))) + ")";
 }
 
+static constexpr const char *NGRAM_MAINTENANCE_APPEND = "__ngram_maintenance_append";
+
+string PreparedAppendCall(ClientContext &context, uint64_t group, PreparedMaintenance prepared, const string &source) {
+	prepared.target.entry = nullptr;
+	return SystemFunction(NGRAM_MAINTENANCE_APPEND) + "(" +
+	       Lit(GetMaintenanceState(context)->Register(context, group, std::move(prepared))) + ", " + Lit(source) + ")";
+}
+
 static void AcquireMaintenanceFence(ClientContext &context, Catalog &catalog) {
 	auto &transaction = DuckTransaction::Get(context, catalog);
 	transaction.SetModifications(DatabaseModificationType::INSERT_DATA);
@@ -374,6 +383,80 @@ static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Ve
 	}
 }
 
+//! Copy every row of the temporary table `source` into the index's segments
+//! table in the source's row order: the columns are matched by name and
+//! must have the segments table's types. The rows go through the host's
+//! transaction-local append, the path a plain INSERT takes, one chunk at a
+//! time, and an empty source appends nothing.
+static int64_t AppendSegmentRows(ClientContext &context, const PreparedMaintenance &prepared, const string &source) {
+	auto &target = ResolveExistingTable(context, prepared.target.catalog_name, NGRAM_SCHEMA,
+	                                    prepared.location.SegmentsTable(), "ngram index segments table");
+	auto &origin = ResolveExistingTable(context, TEMP_CATALOG, DEFAULT_SCHEMA, source, "maintenance scratch table");
+	vector<StorageIndex> column_ids;
+	vector<LogicalType> types;
+	for (auto &column : target.GetColumns().Logical()) {
+		if (!origin.ColumnExists(column.Name())) {
+			throw InvalidInputException("ngram: maintenance scratch table %s lacks column %s", source, column.Name());
+		}
+		auto &from = origin.GetColumn(column.Name());
+		if (from.Type() != column.Type()) {
+			throw InvalidInputException("ngram: maintenance scratch column %s has type %s, the index needs %s",
+			                            column.Name(), from.Type().ToString(), column.Type().ToString());
+		}
+		column_ids.push_back(origin.GetStorageIndex(ColumnIndex(from.Logical().index)));
+		types.push_back(column.Type());
+	}
+	auto &origin_storage = origin.GetStorage();
+	auto &origin_tx = DuckTransaction::Get(context, origin.ParentCatalog());
+	TableScanState scan;
+	InitializeExhaustiveScan(context, origin_tx, origin_storage, scan, column_ids, nullptr);
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(context), types);
+	auto &target_storage = target.GetStorage();
+	const vector<unique_ptr<BoundConstraint>> no_constraints;
+	LocalAppendState append;
+	int64_t appended = 0;
+	bool started = false;
+	while (true) {
+		ThrowIfInterrupted(context);
+		chunk.Reset();
+		origin_storage.Scan(origin_tx, chunk, scan);
+		if (chunk.size() == 0) {
+			break;
+		}
+		if (!started) {
+			target_storage.InitializeLocalAppend(append, target, context, no_constraints);
+			started = true;
+		}
+		chunk.Flatten();
+		target_storage.LocalAppend(append, context, chunk, false);
+		appended += NumericCast<int64_t>(chunk.size());
+	}
+	if (started) {
+		target_storage.FinalizeLocalAppend(append);
+	}
+	return appended;
+}
+
+//! The append half of a maintenance script: takes its handle, holds the
+//! vacuum fence (acquired once per transaction, so the script's guard call
+//! and this one share it), repeats the maintenance checks, and appends the
+//! scratch table's rows.
+static void MaintenanceAppendFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto output = FlatVector::GetData<int64_t>(result);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto prepared = GetMaintenanceState(context)->Take(context, args.GetValue(0, row).ToString());
+		if (prepared.kind != PreparedMaintenance::Kind::MAINTAIN) {
+			throw InvalidInputException("ngram: the append call belongs to refresh and compact scripts");
+		}
+		AcquireMaintenanceFence(context, Catalog::GetCatalog(context, prepared.target.catalog_name));
+		CheckPreparedMaintenance(context, prepared);
+		output[row] = AppendSegmentRows(context, prepared, args.GetValue(1, row).ToString());
+	}
+}
+
 //! Prove the scan-free physical guard was installed before releasing the
 //! creation EXCLUSIVE, and that ADD/DROP replaced the original DataTable.
 static void CreationFinishFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -401,6 +484,12 @@ void RegisterFence(ExtensionLoader &loader) {
 	check.stability = FunctionStability::VOLATILE;
 	check.SetFallible();
 	loader.RegisterFunction(check);
+
+	auto append = ScalarFunction(NGRAM_MAINTENANCE_APPEND, {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                             LogicalType::BIGINT, MaintenanceAppendFunction);
+	append.stability = FunctionStability::VOLATILE;
+	append.SetFallible();
+	loader.RegisterFunction(append);
 
 	auto finish = ScalarFunction(
 	    NGRAM_CREATION_FINISH,

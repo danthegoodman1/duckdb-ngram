@@ -14,9 +14,15 @@ The `ngram` extension hit this through `PRAGMA ngram_refresh` on an index whose
 tail was empty: the generated script appended an empty delta to a per-gram
 statistics table, deleted the table, and reinserted the folded rows. Every later
 query on that index in the process failed with "the index is malformed" until
-the file was reopened. That table no longer exists; refresh only appends to the
-segments table, and compaction deletes from it before it inserts, so no
-generated script takes this shape.
+the file was reopened. That table no longer exists. The shape can still be
+assembled across calls in one user transaction: a refresh over a deleted tail
+inserts an empty generation, and a purging compaction later in the same
+transaction deletes and reinserts every row. The extension therefore appends
+the rows that can be absent, a refresh generation and a merge, at execution
+time through the host's transaction-local append (the path a plain insert
+takes), which writes nothing when there is nothing, and keeps the parallel
+batch insert only for the build and the purge, which no empty batch insert
+into the same table can precede.
 
 ## Environment
 

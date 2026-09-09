@@ -4,8 +4,13 @@
 
 #include "ngram/build_sql.hpp"
 
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/local_storage.hpp"
 #include "ngram/fence.hpp"
 #include "ngram/index_state.hpp"
+#include "ngram/search_core.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -47,14 +52,41 @@ static vector<MaintenanceColumn> ResolveMaintenanceColumns(ClientContext &contex
 	return result;
 }
 
-static string MaintenanceCall(ClientContext &context, uint64_t group, const char *fn, const ResolvedTarget &target,
-                              const MaintenanceColumn &column) {
+static PreparedMaintenance PrepareMaintenance(const char *fn, const ResolvedTarget &target,
+                                              const MaintenanceColumn &column) {
 	PreparedMaintenance prepared;
 	prepared.fn = fn;
 	prepared.target = target;
 	prepared.location = column.location;
 	prepared.meta = column.meta;
-	return PreparedMaintenanceCall(context, group, std::move(prepared));
+	return prepared;
+}
+
+static string MaintenanceCall(ClientContext &context, uint64_t group, const char *fn, const ResolvedTarget &target,
+                              const MaintenanceColumn &column) {
+	return PreparedMaintenanceCall(context, group, PrepareMaintenance(fn, target, column));
+}
+
+//! The statements that move `packed`'s rows into the segments table as
+//! `generation`: sorted into a scratch table by key, so the run prunes by
+//! zone map, then appended at execution through the fence's append call,
+//! which inserts nothing when the packed delta is empty.
+static string AppendPackedStatements(ClientContext &context, uint64_t group, const char *fn,
+                                     const ResolvedTarget &target, const MaintenanceColumn &column,
+                                     const string &packed, const string &generation) {
+	auto sorted_name = ScratchTableName("sorted");
+	auto sorted = Ident(sorted_name);
+	auto applied = ScratchName("applied");
+	string script;
+	script += "CREATE TEMP TABLE " + sorted + " AS SELECT gram_key, segment_no, " + generation +
+	          " AS generation, postings, rowid_count, min_rowid, max_rowid FROM " + packed +
+	          " ORDER BY gram_key, segment_no;\n";
+	script += "CREATE TEMP TABLE " + applied + " AS SELECT " +
+	          PreparedAppendCall(context, group, PrepareMaintenance(fn, target, column), sorted_name) +
+	          " AS appended;\n";
+	script += "DROP TABLE " + applied + ";\n";
+	script += "DROP TABLE " + sorted + ";\n";
+	return script;
 }
 
 //! The registry row of one index, as a FROM/UPDATE target.
@@ -182,6 +214,20 @@ string RefreshScript(ClientContext &context, const ResolvedTarget &target, const
 		} else {
 			script += "INSERT INTO " + fence + " SELECT " + fence_call + ";\n";
 		}
+		// No rowid past the mark had been allocated when the pragma expanded
+		// (total_rows counts allocated rowids, deleted ones included), so no
+		// committed row can lie there: the call still validates the index
+		// through its fence, inside its transaction, and reports; it packs and
+		// writes nothing. A row committed after the expansion stays in the
+		// tail until the next refresh, as it would under any bound that
+		// stopped before it. A tail whose rows were all deleted keeps its
+		// allocated rowids and takes the packing path, which indexes nothing.
+		if (column.meta.hwm_rowid >= total_rows - 1) {
+			if (bounded) {
+				summary_rows.push_back(RefreshSummaryRow(target, column));
+			}
+			continue;
+		}
 		// One statement per rowid-range partition of the tail. Unbounded, the
 		// ranges cover exactly what tail_predicate covers, including rows
 		// committed between this script being generated and being run, so the
@@ -193,13 +239,15 @@ string RefreshScript(ClientContext &context, const ResolvedTarget &target, const
 		script +=
 		    PackRangesStatements(packed, target, column.column_name, column.meta.options,
 		                         SegmentAlignedRanges(column.meta.hwm_rowid + 1, range_end, partitions, !stops_short));
-		// a new generation of segment rows for keys the index already holds;
+		// A new generation of segment rows for keys the index already holds;
 		// readers union every row of a (gram_key, segment_no), compaction merges.
 		// Written in key order like every other generation, so the probe's
-		// `gram_key = ?` filter keeps pruning row groups by zone map.
-		script += "INSERT INTO " + segments + " SELECT gram_key, segment_no, (SELECT coalesce(" +
-		          SystemFunction("max") + "(generation), 0) + 1 FROM " + segments +
-		          "), postings, rowid_count, min_rowid, max_rowid FROM " + packed + " ORDER BY gram_key, segment_no;\n";
+		// `gram_key = ?` filter keeps pruning row groups by zone map. The delta
+		// is empty when every row past the mark was deleted; the append call
+		// then writes nothing.
+		script += AppendPackedStatements(context, group, "ngram_refresh", target, column, packed,
+		                                 "(SELECT coalesce(" + SystemFunction("max") + "(generation), 0) + 1 FROM " +
+		                                     segments + ")::INTEGER");
 		script += "UPDATE " + Registry(target.catalog_name) +
 		          " SET hwm_rowid = " + RefreshedHighWaterMark(base, tail_predicate, stops_short, bound_end) +
 		          " WHERE index_id = " + Lit(column.location.index_ref) + "::UUID;\n";
@@ -227,6 +275,31 @@ string RefreshScript(ClientContext &context, const ResolvedTarget &target, const
 // snapshot and drops every posting whose rowid is no longer live.
 //===----------------------------------------------------------------------===//
 
+//! Whether the segments table can hold two rows of one (gram_key, segment_no).
+//! Every generation writes a key of a segment at most once and compaction
+//! leaves every row at generation 0, so fragmentation needs rows of two
+//! generations. The table's column statistics answer that without a scan;
+//! rows this transaction appended are not in them and count as a second
+//! generation, as does any statistic the host cannot give.
+static bool MayHoldFragmentedKeys(ClientContext &context, const ResolvedTarget &target,
+                                  const MaintenanceColumn &column) {
+	auto &entry = ResolveExistingTable(context, target.catalog_name, NGRAM_SCHEMA, column.location.SegmentsTable(),
+	                                   "ngram index segments table");
+	auto &storage = entry.GetStorage();
+	if (LocalStorage::Get(DuckTransaction::Get(context, entry.ParentCatalog())).Find(storage)) {
+		return true;
+	}
+	if (!entry.ColumnExists("generation")) {
+		return true;
+	}
+	auto &generation = entry.GetColumn("generation");
+	auto stats = storage.GetStatistics(context, entry.GetStorageIndex(ColumnIndex(generation.Logical().index)));
+	if (!stats || !NumericStats::HasMinMax(*stats)) {
+		return true;
+	}
+	return NumericStats::Min(*stats) != NumericStats::Max(*stats);
+}
+
 string CompactScript(ClientContext &context, const ResolvedTarget &target, const string &only_column,
                      bool purge_everywhere) {
 	auto columns = ResolveMaintenanceColumns(context, "ngram_compact", target, only_column);
@@ -250,6 +323,10 @@ string CompactScript(ClientContext &context, const ResolvedTarget &target, const
 			first_fence = false;
 		} else {
 			script += "INSERT INTO " + fence + " SELECT " + fence_call + ";\n";
+		}
+		// a merge of one generation has nothing to merge: validate and stop
+		if (!purge_everywhere && !MayHoldFragmentedKeys(context, target, column)) {
+			continue;
 		}
 		script += "CREATE TEMP TABLE " + keys + " AS SELECT gram_key, segment_no FROM " + segments +
 		          " GROUP BY gram_key, segment_no" +
@@ -301,14 +378,23 @@ string CompactScript(ClientContext &context, const ResolvedTarget &target, const
 		}
 		script += "DELETE FROM " + segments + " WHERE EXISTS (SELECT 1 FROM " + keys +
 		          " k WHERE k.gram_key = " + segments + ".gram_key AND k.segment_no = " + segments + ".segment_no);\n";
-		// re-inserted in key order, so the merged rows prune by zone map for
-		// the probe exactly as the generations they replace did
-		script += "INSERT INTO " + segments +
-		          " SELECT gram_key, segment_no, 0, postings, rowid_count, min_rowid, max_rowid FROM " + packed +
-		          " ORDER BY gram_key, segment_no;\n";
-		// Nothing inserts into the segments table before the DELETE above, so it
-		// never takes the v1.5.5 empty-insert, delete, reinsert shape that
-		// empties a table in-process (docs/upstream/duckdb-empty-batch-insert.md).
+		// Re-inserted in key order, so the merged rows prune by zone map for
+		// the probe exactly as the generations they replace did. A merge with
+		// nothing fragmented has nothing to insert and goes through the append
+		// call, which writes nothing then; a purge rewrites every key and keeps
+		// the parallel batch insert, which no empty batch insert into this table
+		// can precede in a transaction (docs/upstream/duckdb-empty-batch-insert.md).
+		if (purge_everywhere) {
+			script += "INSERT INTO " + segments +
+			          " SELECT gram_key, segment_no, 0, postings, rowid_count, min_rowid, max_rowid FROM " + packed +
+			          " ORDER BY gram_key, segment_no;\n";
+		} else {
+			script += AppendPackedStatements(context, group, "ngram_compact", target, column, packed, "0::INTEGER");
+		}
+		// every surviving row joins generation 0: one generation is the state
+		// the next call recognizes as nothing to merge, and the next refresh
+		// numbers its rows from there
+		script += "UPDATE " + segments + " SET generation = 0 WHERE generation <> 0;\n";
 		script += "DROP TABLE " + keys + ";\n";
 		script += "DROP TABLE " + key_check + ";\n";
 		script += "DROP TABLE " + selected + ";\n";

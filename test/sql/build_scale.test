@@ -112,9 +112,9 @@ CREATE TABLE snapshot_three AS FROM query('SELECT * FROM __ngram.segments_' || g
 # the same bytes as one
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM snapshot_one EXCEPT SELECT * FROM snapshot_three)
+	(SELECT * FROM snapshot_one EXCEPT ALL SELECT * FROM snapshot_three)
 	UNION ALL
-	(SELECT * FROM snapshot_three EXCEPT SELECT * FROM snapshot_one));
+	(SELECT * FROM snapshot_three EXCEPT ALL SELECT * FROM snapshot_one));
 ----
 0
 
@@ -130,9 +130,9 @@ foreach needle 1048576 2097152 3145727 000000 999
 
 query I
 SELECT count(*) FROM (
-	(SELECT s FROM ngram_search('parts', '${needle}') EXCEPT SELECT s FROM parts WHERE contains(s, '${needle}'))
+	(SELECT s FROM ngram_search('parts', '${needle}') EXCEPT ALL SELECT s FROM parts WHERE contains(s, '${needle}'))
 	UNION ALL
-	(SELECT s FROM parts WHERE contains(s, '${needle}') EXCEPT SELECT s FROM ngram_search('parts', '${needle}'))
+	(SELECT s FROM parts WHERE contains(s, '${needle}') EXCEPT ALL SELECT s FROM ngram_search('parts', '${needle}'))
 );
 ----
 0

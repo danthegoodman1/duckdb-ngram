@@ -418,8 +418,12 @@ ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, 
 	return target;
 }
 
+string ScratchTableName(const char *purpose) {
+	return string("__ngram_") + purpose + "_" + UUID::ToString(UUID::GenerateRandomUUID());
+}
+
 string ScratchName(const char *purpose) {
-	return Ident(string("__ngram_") + purpose + "_" + UUID::ToString(UUID::GenerateRandomUUID()));
+	return Ident(ScratchTableName(purpose));
 }
 
 string LegacyGuardToken(ClientContext &context, const string &catalog_name, const string &schema_name) {

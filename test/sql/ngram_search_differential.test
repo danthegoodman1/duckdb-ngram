@@ -7,8 +7,10 @@
 require ngram
 
 # deterministic pseudo-random corpus: md5-derived noise with planted words,
-# traps, unicode, NULLs, and empty strings; id keeps every row distinct so the
-# EXCEPT-based comparison is exact for multisets
+# traps, unicode, NULLs, and empty strings. Every comparison below is EXCEPT
+# ALL in both directions: a distinct id does not make EXCEPT see a duplicated
+# output row, EXCEPT ALL does. The duplicate rows appended further down prove
+# the oracle notices a doubled row.
 statement ok
 CREATE TABLE corpus AS
 SELECT i AS id,
@@ -51,9 +53,9 @@ foreach needle tent ten ent TENT tEnT öft ÖFT cent city zzzz d41d8 3cf fff fff
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('corpus', '${needle}') EXCEPT SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')))
+	(SELECT * FROM ngram_search('corpus', '${needle}') EXCEPT ALL SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')))
 	UNION ALL
-	(SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')) EXCEPT SELECT * FROM ngram_search('corpus', '${needle}'))
+	(SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')) EXCEPT ALL SELECT * FROM ngram_search('corpus', '${needle}'))
 );
 ----
 0
@@ -66,10 +68,10 @@ foreach space_needle ten_tent TeNt_city ten_cent _ten _öft
 query I
 SELECT count(*) FROM (
 	(SELECT * FROM ngram_search('corpus', replace('${space_needle}', '_', ' '))
-	 EXCEPT SELECT * FROM corpus WHERE contains(lower(s), lower(replace('${space_needle}', '_', ' '))))
+	 EXCEPT ALL SELECT * FROM corpus WHERE contains(lower(s), lower(replace('${space_needle}', '_', ' '))))
 	UNION ALL
 	(SELECT * FROM corpus WHERE contains(lower(s), lower(replace('${space_needle}', '_', ' ')))
-	 EXCEPT SELECT * FROM ngram_search('corpus', replace('${space_needle}', '_', ' ')))
+	 EXCEPT ALL SELECT * FROM ngram_search('corpus', replace('${space_needle}', '_', ' ')))
 );
 ----
 0
@@ -84,7 +86,7 @@ SELECT count(*) FROM (
 	SELECT rowid FROM corpus
 	WHERE contains(lower(s), lower('${needle}')) AND rowid <=
 	      (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('corpus_id')))
-	EXCEPT SELECT rowid FROM ngram_candidates('corpus', 's', '${needle}'));
+	EXCEPT ALL SELECT rowid FROM ngram_candidates('corpus', 's', '${needle}'));
 ----
 0
 
@@ -99,9 +101,9 @@ foreach needle tent TeNt d41d8 ffff city
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('corpus', '${needle}') EXCEPT SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')))
+	(SELECT * FROM ngram_search('corpus', '${needle}') EXCEPT ALL SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')))
 	UNION ALL
-	(SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')) EXCEPT SELECT * FROM ngram_search('corpus', '${needle}'))
+	(SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')) EXCEPT ALL SELECT * FROM ngram_search('corpus', '${needle}'))
 );
 ----
 0
@@ -121,9 +123,9 @@ foreach needle tent ten öft cent d41d8 ffff a
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('corpus', '${needle}') EXCEPT SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')))
+	(SELECT * FROM ngram_search('corpus', '${needle}') EXCEPT ALL SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')))
 	UNION ALL
-	(SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')) EXCEPT SELECT * FROM ngram_search('corpus', '${needle}'))
+	(SELECT * FROM corpus WHERE contains(lower(s), lower('${needle}')) EXCEPT ALL SELECT * FROM ngram_search('corpus', '${needle}'))
 );
 ----
 0
@@ -141,9 +143,9 @@ foreach needle tent TeNt TEN öft ÖFT d41d8 D41D8
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('corpus_cs', '${needle}') EXCEPT SELECT * FROM corpus_cs WHERE contains(s, '${needle}'))
+	(SELECT * FROM ngram_search('corpus_cs', '${needle}') EXCEPT ALL SELECT * FROM corpus_cs WHERE contains(s, '${needle}'))
 	UNION ALL
-	(SELECT * FROM corpus_cs WHERE contains(s, '${needle}') EXCEPT SELECT * FROM ngram_search('corpus_cs', '${needle}'))
+	(SELECT * FROM corpus_cs WHERE contains(s, '${needle}') EXCEPT ALL SELECT * FROM ngram_search('corpus_cs', '${needle}'))
 );
 ----
 0

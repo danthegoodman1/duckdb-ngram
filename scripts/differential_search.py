@@ -132,9 +132,9 @@ def differential_sql(needle, case_insensitive):
         pred = "contains(s, %s)" % q
     return (
         "SELECT 'diff', %s, count(*) FROM ("
-        "(SELECT * FROM ngram_search('corpus', %s) EXCEPT SELECT * FROM corpus WHERE %s)"
+        "(SELECT * FROM ngram_search('corpus', %s) EXCEPT ALL SELECT * FROM corpus WHERE %s)"
         " UNION ALL "
-        "(SELECT * FROM corpus WHERE %s EXCEPT SELECT * FROM ngram_search('corpus', %s)));"
+        "(SELECT * FROM corpus WHERE %s EXCEPT ALL SELECT * FROM ngram_search('corpus', %s)));"
         % (q, q, pred, pred, q)
     )
 
@@ -195,8 +195,8 @@ def transparent_checks(patterns):
                 "CREATE OR REPLACE TEMP TABLE r_plain AS SELECT * FROM corpus WHERE %s;" % pred,
             ]
             statements.append(
-                "SELECT 'diff', %s, count(*) FROM ((TABLE r_acc EXCEPT TABLE r_plain)"
-                " UNION ALL (TABLE r_plain EXCEPT TABLE r_acc));" % sql_quote(tag))
+                "SELECT 'diff', %s, count(*) FROM ((TABLE r_acc EXCEPT ALL TABLE r_plain)"
+                " UNION ALL (TABLE r_plain EXCEPT ALL TABLE r_acc));" % sql_quote(tag))
     statements.append("SET disabled_optimizers='';")
     return statements
 

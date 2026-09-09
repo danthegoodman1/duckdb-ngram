@@ -257,10 +257,11 @@ while True:
 
 One row comes back per indexed column of the table — one row for the usual
 single-index table, and `col = 'message'` narrows it to one index as always.
-Calling it again on a caught-up index is a cheap no-op that reports
-`remaining_tail = 0`, so the loop is safe to run one extra time. A bound wider
-than the tail does exactly what the unbounded form does, in one call, and still
-reports progress — which is the way to get a summary out of a full catch-up.
+Calling it again on a caught-up index is a no-op that validates the index,
+writes nothing, and reports `remaining_tail = 0`, so the loop is safe to run
+one extra time. A bound wider than the tail does exactly what the unbounded
+form does, in one call, and still reports progress — which is the way to get a
+summary out of a full catch-up.
 
 The bound is approximate in one direction only: it is spent as a span of rowids,
 so deletes and gaps mean a call may index **fewer** rows than asked, never more.
@@ -283,7 +284,10 @@ A long run of deleted rowids costs one no-op call per bound: crossing a gap of
 1,000 deleted rowids at `max_rows = 100` takes ten calls that each report
 `rows_indexed = 0` before the loop reaches live rows again. They are cheap —
 there is nothing to index, so the call is a mark update — but if a catch-up
-crawls, a wider bound walks the gap in fewer steps.
+crawls, a wider bound walks the gap in fewer steps. A single row larger than
+the bound is one increment: the bound is a rowid span, never a byte budget.
+Rows this transaction appended and has not committed are neither indexed nor
+counted; their rowids are assigned at commit, and they join the tail then.
 
 Without a bound, `ngram_refresh` behaves exactly as it always has and returns no
 rows.

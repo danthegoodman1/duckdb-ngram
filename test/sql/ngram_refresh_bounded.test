@@ -135,6 +135,98 @@ SELECT getvariable('__ngram_guard') IS NULL;
 true
 
 #===----------------------------------------------------------------------===#
+# the bound is a maximum rowid span: it is never rounded up, a deleted gap is
+# crossed without indexing it twice, a single oversized row is one increment,
+# and this transaction's own rows stay out until they commit
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE gaps(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO gaps SELECT i, 'row ' || i || ' tent' FROM range(10) t(i);
+
+statement ok
+PRAGMA create_ngram_index('gaps', 's');
+
+statement ok
+INSERT INTO gaps SELECT i, 'row ' || i || ' tent gap' FROM range(10, 1010) t(i);
+
+statement ok
+DELETE FROM gaps WHERE id >= 20 AND id < 1000;
+
+# rowids 20..999 are deleted: a bound of 100 advances by rowid span, so the
+# gap costs increments of nothing before the surviving rows are reached
+query IIII
+PRAGMA ngram_refresh('gaps', 100);
+----
+s	10	109	10
+
+query IIII
+PRAGMA ngram_refresh('gaps', 500);
+----
+s	0	609	10
+
+query IIII
+PRAGMA ngram_refresh('gaps', 500);
+----
+s	10	1009	0
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM ngram_search('gaps', 'gap') EXCEPT ALL SELECT id FROM gaps WHERE contains(lower(s), 'gap'))
+	UNION ALL
+	(SELECT id FROM gaps WHERE contains(lower(s), 'gap') EXCEPT ALL SELECT id FROM ngram_search('gaps', 'gap'))
+);
+----
+0
+
+# one row larger than any sensible bound is still one increment
+statement ok
+INSERT INTO gaps SELECT 1010, repeat('big tent ', 500000);
+
+query IIII
+PRAGMA ngram_refresh('gaps', 1);
+----
+s	1	1010	0
+
+query I
+SELECT count(*) FROM ngram_search('gaps', 'big tent big');
+----
+1
+
+# rows appended in the same transaction are not committed rows: the bounded
+# call neither indexes nor counts them, and they join the tail at commit
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO gaps SELECT i, 'row ' || i || ' tent local' FROM range(1011, 1021) t(i);
+
+query IIII
+PRAGMA ngram_refresh('gaps', 100);
+----
+s	0	1010	0
+
+query I
+SELECT count(*) FROM ngram_search('gaps', 'local');
+----
+10
+
+statement ok
+COMMIT;
+
+query IIII
+PRAGMA ngram_refresh('gaps', 100);
+----
+s	10	1020	0
+
+query I
+SELECT count(*) FROM ngram_candidates('gaps', 's', 'local');
+----
+10
+
+#===----------------------------------------------------------------------===#
 # an increment is one transaction, whoever owns it
 #
 # The expansion is several statements plus the progress select, which the

@@ -192,5 +192,8 @@ string Registry(const string &catalog_name);
 //! A fresh, quoted temp-table name for one generated script.
 string ScratchName(const char *purpose);
 
+//! The bare name behind ScratchName, for lookups rather than SQL.
+string ScratchTableName(const char *purpose);
+
 } // namespace ngram
 } // namespace duckdb

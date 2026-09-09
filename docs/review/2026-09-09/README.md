@@ -218,3 +218,51 @@ accelerated paths cost about 100 µs of fixed work per statement on top of the
 host's own 0.2 ms per-statement floor, so the 0.3 ms target reads as 0.3 to
 0.4 ms per statement measured end to end, of which the extension's share is a
 third.
+
+## Build memory and no-op maintenance (Phase 20)
+
+`build_measure.py` loads the staged enwik9 lines into a fresh database and
+meters `PRAGMA create_ngram_index` in its own process with `/usr/bin/time -v`
+and a spill-directory sampler, three times per label; `noop_measure.py` times
+the maintenance calls on the benchmark database at 24 threads.
+
+| Build | Wall, median | Peak RSS, median | Spill | Index bytes |
+| --- | ---: | ---: | ---: | ---: |
+| baseline (464023e, 64-bit rowids in the pack aggregate) | 7.03 s | 8.82 GiB | none | 0.929 GiB |
+| 32-bit in-segment offsets | 7.00 s | 6.88 GiB | none | 0.929 GiB |
+
+The aggregate's payload is the build's largest allocation: 711 M postings at
+eight bytes each held until finalization. Storing each rowid as its offset
+within the group's segment halves that and leaves the postings byte-identical
+(`build_scale.test` compares them with brute force). Whole-process peak bytes
+per posting, the base table's buffers included, went from 13.3 to 10.4.
+`PAIR_STATE_BYTES` stays 32: a million single-posting groups measure about
+33 bytes per pair, where the group entry and the first block dominate.
+
+| Maintenance call | time |
+| --- | ---: |
+| `ngram_refresh('docs')`, nothing past the mark | 0 to 1 ms |
+| `ngram_refresh('docs', 1000000)`, nothing past the mark | 1 to 3 ms |
+| `ngram_compact('docs')`, one generation | 0 to 1 ms |
+| `ngram_refresh('docs')` after appending 100,000 rows | 529 ms |
+| `ngram_refresh('docs')` again in that process | 0 to 1 ms |
+| `ngram_refresh('docs')` in a fresh process | 0 to 1 ms |
+| `ngram_compact('docs')` merging that generation | 719 ms |
+| `ngram_compact('docs')` again in that process, before a checkpoint | 22 to 28 ms |
+| `ngram_compact('docs')` in a fresh process, after the shutdown checkpoint | 0 to 1 ms |
+
+A no-op refresh is decided at pragma expansion, where the mark and the table's
+allocated rowids are known, and still runs its fence call. A no-op merge is
+decided from the generation column's row-group statistics, and compaction
+leaves every row at generation 0, so the shortcut applies to a built index,
+after a purge, and after a checkpoint whose vacuum dropped the row groups that
+held the merged-away generation, which a 100,000-row generation on enwik9
+forms on its own. In the merge's own transaction and session, and for a small
+generation that shares a row group with older rows until a purge rewrites the
+table, the statistics keep the old maximum and the full check runs: about
+24 ms per two million segment rows here, over the 20 ms target. A refresh over
+a tail whose rows were all deleted still packs an empty delta; the delta is
+appended at execution by the fence's append call, which writes nothing when
+there is nothing, instead of an empty batch insert that the host's
+empty-insert hazard turns into an empty table when a purge follows in the same
+transaction.

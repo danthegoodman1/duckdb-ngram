@@ -17,9 +17,15 @@ namespace ngram {
 //===----------------------------------------------------------------------===//
 
 //! Aggregate-state bytes one pair costs while its partition is being grouped:
-//! eight for the rowid plus block slack and the copy each thread keeps of a
-//! group before the hash tables are combined. Measured at ~28 B/pair (26.4 GB
-//! peak RSS grouping 966 M pairs on 24 threads); rounded up for headroom.
+//! four for the in-segment offset plus block slack, the hash table's group
+//! entries, and the copy each thread keeps of a group before the tables are
+//! combined. Measured whole-process on enwik9 as 10.4 bytes per posting
+//! (6.88 GiB peak RSS packing 711 M postings on 24 threads in one partition,
+//! the base table's buffers included; 13.3 before the offsets shrank,
+//! docs/review/2026-09-09/build_observations.json) and about 33 bytes per
+//! pair for a million single-posting groups, where the group entry and the
+//! first block dominate. Thirty-two covers the small-group case; sizing from
+//! the emitted distinct keys rather than the pair count is still open.
 constexpr int64_t PAIR_STATE_BYTES = 32;
 
 //! Share of `memory_limit` the grouping pass may claim. The rest goes to the

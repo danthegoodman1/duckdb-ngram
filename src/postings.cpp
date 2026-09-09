@@ -332,19 +332,24 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 
 namespace {
 
-//! One block of a state's rowid buffer. Header and payload come from a single
-//! arena allocation, so appending a block is one bump.
+//! One block of a state's rowid buffer: offsets within the group's segment,
+//! four bytes each, since every rowid of a group shares segment_no =
+//! rowid >> SEGMENT_SHIFT by construction of the pack statement and an
+//! offset is below 2^20. Header and payload come from a single arena
+//! allocation, so appending a block is one bump.
 struct RowidBlock {
 	RowidBlock *next;
 	idx_t count;
 	idx_t capacity;
-	int64_t *data;
+	uint32_t *data;
 };
 
 struct EncodePostingsState {
 	RowidBlock *first;
 	RowidBlock *last;
 	idx_t total;
+	//! The group's segment start, taken from its first rowid.
+	int64_t base;
 };
 
 //! Block sizes grow geometrically so that the millions of tiny groups (a rare
@@ -360,23 +365,33 @@ struct EncodePostingsOp {
 		state.first = nullptr;
 		state.last = nullptr;
 		state.total = 0;
+		state.base = 0;
 	}
 };
 
 void AppendRowid(ArenaAllocator &allocator, EncodePostingsState &state, int64_t rowid) {
+	if (rowid < 0) {
+		throw InvalidInputException("ngram_pack_segment: rowids must not be negative");
+	}
+	auto base = (rowid >> SEGMENT_SHIFT) << SEGMENT_SHIFT;
+	if (!state.first) {
+		state.base = base;
+	} else if (base != state.base) {
+		throw InvalidInputException("ngram_pack_segment: the rowids of one group must lie in one segment");
+	}
 	if (!state.last || state.last->count == state.last->capacity) {
 		auto capacity =
 		    state.last ? MinValue<idx_t>(state.last->capacity * 2, MAX_BLOCK_ROWIDS) : idx_t(FIRST_BLOCK_ROWIDS);
-		auto memory = allocator.AllocateAligned(sizeof(RowidBlock) + capacity * sizeof(int64_t));
+		auto memory = allocator.AllocateAligned(sizeof(RowidBlock) + capacity * sizeof(uint32_t));
 		auto block = reinterpret_cast<RowidBlock *>(memory);
 		block->next = nullptr;
 		block->count = 0;
 		block->capacity = capacity;
-		block->data = reinterpret_cast<int64_t *>(memory + sizeof(RowidBlock));
+		block->data = reinterpret_cast<uint32_t *>(memory + sizeof(RowidBlock));
 		(state.last ? state.last->next : state.first) = block;
 		state.last = block;
 	}
-	state.last->data[state.last->count++] = rowid;
+	state.last->data[state.last->count++] = static_cast<uint32_t>(rowid - base);
 	state.total++;
 }
 
@@ -412,6 +427,9 @@ void EncodePostingsCombine(Vector &state_vector, Vector &combined, AggregateInpu
 		if (source.total == 0) {
 			continue;
 		}
+		if (target.first && target.base != source.base) {
+			throw InvalidInputException("ngram_pack_segment: the rowids of one group must lie in one segment");
+		}
 		if (aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE) {
 			// the source's blocks live in an arena the hash table keeps alive, so
 			// the target adopts them whole; the source is emptied so that a later
@@ -419,12 +437,13 @@ void EncodePostingsCombine(Vector &state_vector, Vector &combined, AggregateInpu
 			(target.last ? target.last->next : target.first) = source.first;
 			target.last = source.last;
 			target.total += source.total;
+			target.base = source.base;
 			EncodePostingsOp::Initialize(source);
 			continue;
 		}
 		for (auto block = source.first; block; block = block->next) {
 			for (idx_t r = 0; r < block->count; r++) {
-				AppendRowid(aggr_input_data.allocator, target, block->data[r]);
+				AppendRowid(aggr_input_data.allocator, target, source.base + block->data[r]);
 			}
 		}
 	}
@@ -460,7 +479,9 @@ void EncodePostingsFinalize(Vector &state_vector, AggregateInputData &aggr_input
 		rowids.clear();
 		rowids.reserve(state.total);
 		for (auto block = state.first; block; block = block->next) {
-			rowids.insert(rowids.end(), block->data, block->data + block->count);
+			for (idx_t r = 0; r < block->count; r++) {
+				rowids.push_back(state.base + block->data[r]);
+			}
 		}
 		// EncodePostings sorts and dedupes rowids in place, so count/min/max are
 		// read after encoding — the same order the streaming packer uses

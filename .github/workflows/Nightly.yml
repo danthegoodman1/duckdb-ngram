@@ -76,7 +76,7 @@ jobs:
   debug-sanitizers-full:
     name: Whole suite and harness under ASAN and UBSAN
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 420
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
       OVERRIDE_GIT_DESCRIBE: v1.5.5
@@ -136,9 +136,23 @@ jobs:
         run: |
           set -euo pipefail
           echo "source $(git rev-parse HEAD), duckdb ${{ steps.pins.outputs.duckdb }}" >> "$GITHUB_STEP_SUMMARY"
-          timeout 7200s build/ci-debug/test/unittest 'test/sql/*' | tail -n 3 | tee -a "$GITHUB_STEP_SUMMARY"
+          # The whole suite takes more than two hours under ASAN on a runner;
+          # the full output goes to a log whose tail is printed on failure.
+          suite_log="$RUNNER_TEMP/suite.log"
+          if ! timeout 14400s build/ci-debug/test/unittest 'test/sql/*' > "$suite_log" 2>&1; then
+            echo "suite failed; last 300 lines:"
+            tail -n 300 "$suite_log"
+            exit 1
+          fi
+          tail -n 3 "$suite_log" | tee -a "$GITHUB_STEP_SUMMARY"
           race_db="$RUNNER_TEMP/ngram-checkpoint-gap.db"
-          timeout 3600s build/ci-debug/extension/ngram/ngram_checkpoint_gap_test "$race_db" test/fixtures 2>&1 | tail -n 5 | tee -a "$GITHUB_STEP_SUMMARY"
+          harness_log="$RUNNER_TEMP/harness.log"
+          if ! timeout 3600s build/ci-debug/extension/ngram/ngram_checkpoint_gap_test "$race_db" test/fixtures > "$harness_log" 2>&1; then
+            echo "harness failed; last 100 lines:"
+            tail -n 100 "$harness_log"
+            exit 1
+          fi
+          tail -n 5 "$harness_log" | tee -a "$GITHUB_STEP_SUMMARY"
 
   thread-sanitizer:
     name: Concurrency tests and harness under ThreadSanitizer
@@ -205,14 +219,27 @@ jobs:
 
       - name: Run the concurrency tests and the harness
         shell: bash
-        env:
-          TSAN_OPTIONS: suppressions=${{ github.workspace }}/duckdb/.sanitizer-thread-suppressions.txt
         run: |
           set -euo pipefail
+          # the host's suppressions plus the extension's (test/tsan-suppressions.txt)
+          cat duckdb/.sanitizer-thread-suppressions.txt test/tsan-suppressions.txt > "$RUNNER_TEMP/tsan-suppressions.txt"
+          export TSAN_OPTIONS="suppressions=$RUNNER_TEMP/tsan-suppressions.txt"
           echo "source $(git rev-parse HEAD), duckdb ${{ steps.pins.outputs.duckdb }}" >> "$GITHUB_STEP_SUMMARY"
           for test in ngram_parallel ngram_batch_order ngram_refresh_concurrent ngram_search_concurrent ngram_query_bounds
           do
-            timeout 1800s build/ci-tsan/test/unittest "test/sql/$test.test" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
+            test_log="$RUNNER_TEMP/$test.log"
+            if ! timeout 1800s build/ci-tsan/test/unittest "test/sql/$test.test" > "$test_log" 2>&1; then
+              echo "$test failed; last 200 lines:"
+              tail -n 200 "$test_log"
+              exit 1
+            fi
+            tail -n 1 "$test_log" | tee -a "$GITHUB_STEP_SUMMARY"
           done
           race_db="$RUNNER_TEMP/ngram-checkpoint-gap.db"
-          timeout 3600s build/ci-tsan/extension/ngram/ngram_checkpoint_gap_test "$race_db" test/fixtures --only query 2>&1 | tail -n 5 | tee -a "$GITHUB_STEP_SUMMARY"
+          harness_log="$RUNNER_TEMP/harness.log"
+          if ! timeout 3600s build/ci-tsan/extension/ngram/ngram_checkpoint_gap_test "$race_db" test/fixtures --only query > "$harness_log" 2>&1; then
+            echo "harness failed; last 200 lines:"
+            tail -n 200 "$harness_log"
+            exit 1
+          fi
+          tail -n 5 "$harness_log" | tee -a "$GITHUB_STEP_SUMMARY"

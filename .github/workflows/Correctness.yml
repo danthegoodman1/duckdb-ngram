@@ -228,9 +228,11 @@ jobs:
         run: |
           set -euo pipefail
           # the query, concurrency and resource files; the whole suite and the
-          # drivers run nightly (Nightly.yml)
+          # drivers run nightly (Nightly.yml). ngram_parallel's 600,000-row
+          # fixture takes more than fifteen minutes under ASAN on a runner and
+          # runs in the nightly lanes instead.
           for test in ngram_lifecycle ngram_search ngram_rewrite ngram_maintenance ngram_api gram_key \
-                      ngram_query_bounds ngram_parallel ngram_batch_order ngram_refresh_concurrent \
+                      ngram_query_bounds ngram_batch_order ngram_refresh_concurrent \
                       ngram_search_concurrent ngram_long_inputs
           do
             timeout 900s build/ci-debug/test/unittest "test/sql/$test.test"

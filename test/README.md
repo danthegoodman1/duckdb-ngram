@@ -75,5 +75,6 @@ ASAN/UBSAN debug build (warnings are errors for the extension's sources) of
 the query, concurrency and resource files plus the harness. `Nightly.yml`
 runs the drivers at full size, the whole suite and the harness under
 ASAN/UBSAN, and the concurrency tests and the query harness under
-ThreadSanitizer. `MainDistributionPipeline.yml` builds the distributed
-binaries and runs the suite on each platform.
+ThreadSanitizer with the host's suppressions plus `test/tsan-suppressions.txt`
+(one entry, explained in the file). `MainDistributionPipeline.yml` builds the
+distributed binaries and runs the suite on each platform.

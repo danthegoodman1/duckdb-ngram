@@ -367,11 +367,12 @@ SELECT (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation
 ----
 true
 
-# the same stats the build reported, after the checkpointed round
+# the same stats the build reported, after the checkpointed round; the mark
+# stays at the last allocated rowid while the highest live rowid is 149999
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('t');
 ----
-s	3	true	150019	150019	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
+s	3	true	150019	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
 
 #===----------------------------------------------------------------------===#
 # the host's empty-batch-insert shape, assembled across calls in one user

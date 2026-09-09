@@ -68,9 +68,8 @@ docs:
 
     * `PRAGMA create_ngram_index(table, column[, gram, case_insensitive])`,
       `PRAGMA drop_ngram_index(table, column)`
-    * `PRAGMA ngram_indexes`,
-      `PRAGMA ngram_index_status(database_name, index_ref)`, and
-      `PRAGMA drop_ngram_index_by_id(database_name, index_ref)` — discover and
+    * `ngram_indexes()` — the lifecycle listing, one row per index or stray
+      storage object, and `PRAGMA drop_ngram_index(index_ref[, catalog])` —
       remove UUID-backed or legacy allocations even after the base is absent
     * `ngram_search(table, needle[, col])` — rows, exact and complete
     * `ngram_candidates(table, column, needle)` — the raw superset, for

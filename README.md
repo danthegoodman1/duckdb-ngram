@@ -289,8 +289,9 @@ the bound is one increment: the bound is a rowid span, never a byte budget.
 Rows this transaction appended and has not committed are neither indexed nor
 counted; their rowids are assigned at commit, and they join the tail then.
 
-Without a bound, `ngram_refresh` behaves exactly as it always has and returns no
-rows.
+Without a bound, `ngram_refresh` indexes the whole tail in one transaction and
+returns the same progress row; `remaining_tail` is 0 unless another connection
+committed rows between the call's expansion and its transaction.
 
 ### When to compact
 
@@ -342,14 +343,19 @@ PRAGMA create_ngram_index('logs', 'message');
 ### Reading `ngram_index_stats`
 
 ```sql
-PRAGMA ngram_index_stats('logs');
+SELECT * FROM ngram_index_stats('logs');
+PRAGMA ngram_index_stats('logs');   -- the same rows
 ```
+
+Every column is read by the statement that runs the function, so one call
+describes one snapshot; `ngram_indexes()` is the cheap listing to poll, this
+is the storage aggregation to read before deciding on maintenance.
 
 | Column | Meaning |
 | --- | --- |
 | `column_name`, `gram_size`, `case_insensitive` | the options the index was built with |
 | `hwm_rowid` | the highest rowid the index covers |
-| `table_max_rowid` | the table's current highest rowid — the gap is what the tail scan reads on every query |
+| `table_max_rowid` | the highest committed live rowid of the table; below `hwm_rowid` once deletes have emptied the end of the indexed range |
 | `remaining_tail` | committed rows past `hwm_rowid`: what the tail scan actually reads, and what a refresh would index (the rowid gap counts deleted rows, this does not) |
 | `distinct_grams` | size of the index's gram dictionary |
 | `segments` | posting-list rows |
@@ -368,11 +374,19 @@ PRAGMA ngram_index_stats('logs');
 PRAGMA create_ngram_index('table', 'column');
 PRAGMA create_ngram_index('table', 'column', gram = 3, case_insensitive = true);
 PRAGMA drop_ngram_index('table', 'column');
+PRAGMA drop_ngram_index('index_ref');                          -- in the current database
+PRAGMA drop_ngram_index('index_ref', catalog = 'database_name');
 
-PRAGMA ngram_indexes;
-PRAGMA ngram_index_status('database_name', 'index_ref');
-PRAGMA drop_ngram_index_by_id('database_name', 'index_ref');
+SELECT * FROM ngram_indexes();          -- every index of every attached DuckDB catalog
+PRAGMA ngram_indexes;                   -- the same rows, ordered
 ```
+
+`ngram_indexes()` is the cheap lifecycle listing: one row per registry row or
+stray storage object, with `database_name`, `index_ref`, `schema_name`,
+`table_name`, `column_name`, `format_version`, `status` and `reason`, observed
+when the statement executes. It composes like any table function, so
+`SELECT * FROM ngram_indexes() WHERE index_ref = ...` is the status of one
+index and `... WHERE status <> 'READY'` the list of what needs attention.
 
 `gram` is the number of characters per gram (default 3). Larger grams are more
 selective but cannot answer needles shorter than themselves; smaller grams
@@ -401,17 +415,20 @@ Lifecycle status has four values:
 | `MALFORMED` | The row is unreadable (another storage format, corrupt values), the segments table is missing, or an object in `__ngram` has no row. The reason names the cause. A row is dropped by id; an object without a row is dropped by hand. |
 
 A database written by an earlier storage format lists each of its indexes as
-`MALFORMED` with the format in the reason. `drop_ngram_index_by_id` removes
-such an index, guard included, once its recorded guard token still matches;
-`create_ngram_index` then builds a current one.
+`MALFORMED` with the format in the reason. `drop_ngram_index` by reference
+removes such an index, guard included, once its recorded guard token still
+matches; `create_ngram_index` then builds a current one. The reference form
+drops in the current database unless `catalog` names another attached one:
+copied attached databases may hold the same reference, so the catalog is part
+of the identity.
 
 DuckDB v1.5.5 refuses table and indexed-column rename while the physical guard
 exists, including case-only rename. Moving a table between schemas and renaming
 a schema are host-not-implemented. The supported workflow is therefore:
 
 ```sql
-PRAGMA ngram_indexes;  -- save database_name + index_ref
-PRAGMA drop_ngram_index_by_id('database_name', 'index_ref');
+SELECT database_name, index_ref FROM ngram_indexes();  -- save both
+PRAGMA drop_ngram_index('index_ref', catalog = 'database_name');
 ALTER TABLE old_name RENAME TO new_name;
 PRAGMA create_ngram_index('new_name', 'column');
 ```
@@ -425,26 +442,27 @@ live guard.
 ### Maintenance
 
 ```sql
-PRAGMA ngram_refresh('table');                        -- index the whole tail, returns nothing
-PRAGMA ngram_refresh('table', 1000000);               -- at most ~1e6 rows, returns a progress row
+PRAGMA ngram_refresh('table');                        -- index the whole tail
+PRAGMA ngram_refresh('table', 1000000);               -- at most ~1e6 rows of rowid span
 PRAGMA ngram_refresh('table', max_rows = 1000000);    -- same, named
 PRAGMA ngram_refresh('table', 1000000, col = 'c');    -- one index of a multi-index table
 PRAGMA ngram_compact('table');
 PRAGMA ngram_compact('table', col = 'c', purge = true);
-PRAGMA ngram_index_stats('table');
+SELECT * FROM ngram_index_stats('table');             -- the full storage statistics
+PRAGMA ngram_index_stats('table');                    -- the same rows
 ```
 
 Pragma named parameters take `=`, not `:=`. Each call is one transaction,
 whether or not it is bounded; `max_rows` must be at least 1.
 
-The bounded form returns one row per index it advanced:
+Every refresh returns one progress row per index it covers, bounded or not:
 
 | Column | Meaning |
 | --- | --- |
 | `column_name` | the indexed column this row is about |
 | `rows_indexed` | committed rows this call brought under the mark (rows whose value is `NULL` included: they are covered, they just hold no grams) |
 | `hwm_rowid` | the high-water mark the call committed |
-| `remaining_tail` | committed rows still past it — loop until this is 0 |
+| `remaining_tail` | committed rows still past it in this statement's snapshot — loop until this is 0; rows this transaction has not committed are not counted |
 
 ### Querying
 
@@ -503,15 +521,22 @@ EXPLAIN ANALYZE SELECT * FROM logs WHERE message LIKE '%reset%';
 Two kill switches: `SET ngram_auto_accelerate = false`, and DuckDB's own
 `SET disabled_optimizers = 'extension'`.
 
-### Helper functions
+### Diagnostic helpers
+
+These expose the pieces the index is built from. `trigrams` is a general text
+helper; the rest are for inspecting an index, reproducing its build steps, and
+tests. `ngram_candidates` above belongs to the same family.
 
 ```sql
 SELECT trigrams('hello');                     -- ['hel', 'ell', 'llo']
 SELECT trigrams('Hello', 4, false);           -- gram size 4, case-sensitive
-SELECT ngram_encode_postings([1, 2, 5]);      -- posting blob codec
-SELECT ngram_decode_postings(blob);
 SELECT ngram_gram_key('hel');                 -- the storage key of one normalized gram
 SELECT ngram_gram_keys('Hello', 3, true);     -- keys of a text's distinct grams, ascending
+SELECT ngram_encode_postings([1, 2, 5]);      -- posting blob codec
+SELECT ngram_decode_postings(blob);
+SELECT ngram_pack_segment(rowid) FROM t;      -- the build's aggregate: one segment's postings row
+SELECT * FROM ngram_unpack_postings(           -- every (gram_key, segment_no, rowid) of a segments table
+    (SELECT gram_key, segment_no, postings FROM __ngram.segments_<hex>));
 ```
 
 ---

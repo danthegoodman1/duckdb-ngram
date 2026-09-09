@@ -123,10 +123,11 @@ PRAGMA ngram_refresh('docs', 9223372036854775807);
 ----
 s	5	44	0
 
-# the unbounded form is unchanged: it returns no rows at all
-query I
+# the unbounded form reports the same progress row
+query IIII
 PRAGMA ngram_refresh('docs');
 ----
+s	0	44	0
 
 # and the invocation-scoped guard table leaves no session-variable value
 query I

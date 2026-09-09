@@ -168,9 +168,12 @@ static string RefreshedHighWaterMark(const string &base, const string &tail_pred
 //! Progress, read back from what this transaction just committed: rows_indexed
 //! counts the committed rows the mark newly covers (NULL values included; they
 //! are covered but contribute no grams) and remaining_tail what a query still
-//! answers with a tail scan. Both are counted in the packing pass's snapshot,
-//! so they reconcile with what was indexed exactly. The old mark is a literal:
-//! the execution-time check already refused the script if the row lost it.
+//! answers with a tail scan, the committed rows past the mark in this
+//! statement's snapshot; rows this transaction appended have no committed
+//! rowid yet and are in neither. Both are counted in the packing pass's
+//! snapshot, so they reconcile with what was indexed exactly. The old mark is
+//! a literal: the execution-time check already refused the script if the row
+//! lost it.
 static string RefreshSummaryRow(const ResolvedTarget &target, const MaintenanceColumn &column) {
 	auto base = target.Qualified();
 	auto recorded = "(SELECT hwm_rowid FROM " + RegistryRow(target, column) + ")";
@@ -223,9 +226,7 @@ string RefreshScript(ClientContext &context, const ResolvedTarget &target, const
 		// stopped before it. A tail whose rows were all deleted keeps its
 		// allocated rowids and takes the packing path, which indexes nothing.
 		if (column.meta.hwm_rowid >= total_rows - 1) {
-			if (bounded) {
-				summary_rows.push_back(RefreshSummaryRow(target, column));
-			}
+			summary_rows.push_back(RefreshSummaryRow(target, column));
 			continue;
 		}
 		// One statement per rowid-range partition of the tail. Unbounded, the
@@ -252,17 +253,13 @@ string RefreshScript(ClientContext &context, const ResolvedTarget &target, const
 		          " SET hwm_rowid = " + RefreshedHighWaterMark(base, tail_predicate, stops_short, bound_end) +
 		          " WHERE index_id = " + Lit(column.location.index_ref) + "::UUID;\n";
 		script += "DROP TABLE " + packed + ";\n";
-		if (bounded) {
-			summary_rows.push_back(RefreshSummaryRow(target, column));
-		}
+		summary_rows.push_back(RefreshSummaryRow(target, column));
 	}
 	script += "DROP TABLE " + fence + ";\n";
-	if (!summary_rows.empty()) {
-		// The pragma's only output row, placed last so that the preprocessor's
-		// BEGIN/COMMIT around the still multi-statement expansion, the crash
-		// atomicity this pragma rests on, stays in place.
-		script += StringUtil::Join(summary_rows, " UNION ALL ") + " ORDER BY column_name;\n";
-	}
+	// The pragma's only output, one progress row per index, placed last so
+	// that the preprocessor's BEGIN/COMMIT around the still multi-statement
+	// expansion, the crash atomicity this pragma rests on, stays in place.
+	script += StringUtil::Join(summary_rows, " UNION ALL ") + " ORDER BY column_name;\n";
 	return script;
 }
 

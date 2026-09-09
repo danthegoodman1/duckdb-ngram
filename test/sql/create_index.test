@@ -472,9 +472,10 @@ PRAGMA create_ngram_index('guard_output', 's');
 statement ok
 INSERT INTO guard_output VALUES (1000, 'row tail');
 
-query I
+query IIII
 PRAGMA ngram_refresh('guard_output');
 ----
+s	1	100	0
 
 query I
 PRAGMA ngram_compact('guard_output');

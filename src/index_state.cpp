@@ -428,7 +428,10 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 
 ObservedIndex FindObserved(ClientContext &context, const string &catalog_name, const string &index_ref) {
 	if (!IsCanonicalUUID(index_ref)) {
-		throw InvalidInputException("ngram: index reference must be a canonical lowercase UUID");
+		throw InvalidInputException("ngram: index reference %s must be a canonical lowercase UUID as listed by "
+		                            "ngram_indexes(); to drop by table, name the column: drop_ngram_index(table, "
+		                            "column)",
+		                            index_ref);
 	}
 	auto database = DatabaseManager::Get(context).GetDatabase(context, catalog_name);
 	if (!database || !database->GetCatalog().IsDuckCatalog() || !database->HasStorageManager()) {

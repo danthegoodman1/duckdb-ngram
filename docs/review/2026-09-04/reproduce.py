@@ -167,7 +167,7 @@ def format4_drop(binary, work):
     checked(binary, f"CREATE TABLE __ngram.{stats}(gram VARCHAR,row_count BIGINT,segment_count BIGINT);"
             " UPDATE __ngram.registry SET format_version=4;", database)
     before = checked(binary, "PRAGMA ngram_indexes;", database)
-    checked(binary, f"PRAGMA drop_ngram_index_by_id('format4',{quote(ref)});", database)
+    checked(binary, f"PRAGMA drop_ngram_index({quote(ref)}, catalog = 'format4');", database)
     return {
         "fixture_kind": "synthetic format-4 cleanup shape", "before": before,
         "after": checked(binary, "PRAGMA ngram_indexes;", database),

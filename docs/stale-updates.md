@@ -154,7 +154,7 @@ Public drop validates the registry row at execution time and drops the guard
 only when no other index records it and its name, type, table, and token prove
 the incarnation; a genuinely missing guard is recoverable. An index written by
 an earlier storage format is listed `MALFORMED` and is removed by
-`drop_ngram_index_by_id` under the same token check.
+`drop_ngram_index` by reference under the same token check.
 
 ## WAL, checkpoints, and reopen
 

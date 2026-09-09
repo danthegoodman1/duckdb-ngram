@@ -196,6 +196,42 @@ analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: decoded-rowid work bu
 statement ok
 RESET ngram_max_probe_rowids;
 
+# A sparse intersection passes the candidate fraction on its rarest gram and
+# still meets the work ceiling on the dense gram it decodes beside it: the
+# ceiling is cumulative decoded work, which the candidate bound does not cap.
+statement ok
+CREATE TABLE sparse AS
+SELECT i::BIGINT AS id,
+       (CASE WHEN i % 50000 = 0 THEN 'aaaab rare' ELSE 'aaaaaaaa common payload' END)::VARCHAR AS s
+FROM range(250000) t(i);
+
+statement ok
+PRAGMA create_ngram_index('sparse', 's');
+
+statement ok
+SET ngram_max_probe_rowids = 1000;
+
+query I
+SELECT count(*) FROM ngram_search('sparse', 'aaaab');
+----
+5
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('sparse', 'aaaab');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: decoded-rowid work budget exceeded".*
+
+statement ok
+RESET ngram_max_probe_rowids;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('sparse', 'aaaab');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index \(<= 5 candidates, 250005 decoded rowids\)".*
+
+statement ok
+DROP TABLE sparse;
+
 # Three equally dense grams exercise the K>1 peak: current candidates, the
 # next posting list, and intersection output coexist. It fits an 8 MiB query
 # budget but is rejected before decode when that budget falls to 6 MiB.

@@ -166,7 +166,7 @@ ATTACH 'test/fixtures/format3.duckdb' AS f3 (READ_ONLY);
 query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-f3	a03b02be-5f8a-4c43-92c9-5969ea3e178f	main	docs	s	3	MALFORMED	<REGEX>:index format 3 .*predates format 5.*drop_ngram_index_by_id.*
+f3	a03b02be-5f8a-4c43-92c9-5969ea3e178f	main	docs	s	3	MALFORMED	<REGEX>:index format 3 .*predates format 5.*drop_ngram_index.*
 
 statement ok
 SET ngram_auto_accelerate = true;
@@ -179,7 +179,7 @@ SELECT count(*) FROM f3.docs WHERE s LIKE '%tent%';
 statement error
 SELECT count(*) FROM ngram_search('f3.main.docs', 'tent');
 ----
-drop it with drop_ngram_index_by_id
+drop it with drop_ngram_index
 
 statement error
 PRAGMA create_ngram_index('f3.main.docs', 't');
@@ -187,7 +187,7 @@ PRAGMA create_ngram_index('f3.main.docs', 't');
 predates format 5
 
 statement error
-PRAGMA drop_ngram_index_by_id('f3', 'a03b02be-5f8a-4c43-92c9-5969ea3e178f');
+PRAGMA drop_ngram_index('a03b02be-5f8a-4c43-92c9-5969ea3e178f', catalog = 'f3');
 ----
 read-only
 
@@ -203,7 +203,7 @@ ATTACH 'test/fixtures/format4.duckdb' AS f4 (READ_ONLY);
 query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-f4	52986603-69de-433a-92bc-17b8347ea5c6	main	docs	s	4	MALFORMED	<REGEX>:index format 4 is not readable.*drop_ngram_index_by_id.*
+f4	52986603-69de-433a-92bc-17b8347ea5c6	main	docs	s	4	MALFORMED	<REGEX>:index format 4 is not readable.*drop_ngram_index.*
 
 statement ok
 SET ngram_auto_accelerate = true;
@@ -219,7 +219,7 @@ SET ngram_auto_accelerate = false;
 statement error
 SELECT count(*) FROM ngram_search('f4.main.docs', 'tent');
 ----
-drop it with drop_ngram_index_by_id
+drop it with drop_ngram_index
 
 statement error
 PRAGMA create_ngram_index('f4.main.docs', 's');
@@ -227,7 +227,7 @@ PRAGMA create_ngram_index('f4.main.docs', 's');
 index format 4
 
 statement error
-PRAGMA drop_ngram_index_by_id('f4', '52986603-69de-433a-92bc-17b8347ea5c6');
+PRAGMA drop_ngram_index('52986603-69de-433a-92bc-17b8347ea5c6', catalog = 'f4');
 ----
 read-only
 
@@ -292,11 +292,11 @@ DETACH f5;
 
 # Strict textual refs reject noncanonical and injection-shaped inputs.
 statement error
-PRAGMA ngram_index_status('memory', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA');
+PRAGMA drop_ngram_index('AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA', catalog = 'memory');
 ----
 canonical lowercase UUID
 
 statement error
-PRAGMA drop_ngram_index_by_id('memory', '''; DROP TABLE __ngram.registry; --');
+PRAGMA drop_ngram_index('''; DROP TABLE __ngram.registry; --', catalog = 'memory');
 ----
 canonical lowercase UUID

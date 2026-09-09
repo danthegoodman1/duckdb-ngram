@@ -73,17 +73,23 @@ static string GuardName(Connection &con, const string &table_name, const string 
 	return ScalarString(con, "SELECT guard_name FROM " + OwnerRow(table_name, column_name));
 }
 
-static string IndexStatus(Connection &con, const string &table_name, const string &column_name) {
-	auto catalog = ScalarString(con, "SELECT current_database()");
-	auto result = Query(con, "PRAGMA ngram_index_status(" + KeywordHelper::WriteQuoted(catalog) + ", " +
-	                             KeywordHelper::WriteQuoted(IndexRef(con, table_name, column_name)) + ")");
-	return result->GetValue(6, 0).ToString();
-}
-
+//! The ngram_indexes() row of one index; an index the listing lacks is an
+//! error, as the status pragma it replaces made it.
 static unique_ptr<MaterializedQueryResult> StatusByRef(Connection &con, const string &catalog,
                                                        const string &index_ref) {
-	return Query(con, "PRAGMA ngram_index_status(" + KeywordHelper::WriteQuoted(catalog) + "," +
-	                      KeywordHelper::WriteQuoted(index_ref) + ")");
+	auto result =
+	    Query(con, "SELECT * FROM ngram_indexes() WHERE database_name = " + KeywordHelper::WriteQuoted(catalog) +
+	                   " AND index_ref = " + KeywordHelper::WriteQuoted(index_ref));
+	if (result->RowCount() != 1) {
+		throw std::runtime_error("ngram_indexes() lists " + to_string(result->RowCount()) + " rows for " + index_ref +
+		                         " in " + catalog);
+	}
+	return result;
+}
+
+static string IndexStatus(Connection &con, const string &table_name, const string &column_name) {
+	auto catalog = ScalarString(con, "SELECT current_database()");
+	return StatusByRef(con, catalog, IndexRef(con, table_name, column_name))->GetValue(6, 0).ToString();
 }
 
 static string StatusName(Connection &con, const string &catalog, const string &index_ref) {
@@ -96,8 +102,8 @@ static string StatusReason(Connection &con, const string &catalog, const string 
 }
 
 static void DropByRef(Connection &con, const string &catalog, const string &index_ref) {
-	Check(con, "PRAGMA drop_ngram_index_by_id(" + KeywordHelper::WriteQuoted(catalog) + "," +
-	               KeywordHelper::WriteQuoted(index_ref) + ")");
+	Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(index_ref) +
+	               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
 }
 
 static void ExpectStatus(Connection &con, const string &catalog, const string &index_ref, const string &expected) {
@@ -1263,7 +1269,7 @@ static void TestStorageCorruption() {
 		throw std::runtime_error("storage without a row was not listed as such");
 	}
 	ExpectError(con, "PRAGMA drop_ngram_index('guarded', 's')", "No ngram index");
-	ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(guarded_ref) + ")",
+	ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(guarded_ref) + ", catalog = 'memory')",
 	            "manually");
 	ExpectError(con, "SELECT * FROM ngram_search('guarded', 'tent')", "no ngram index");
 	if (ScalarInt64(con, "SELECT count(*) FROM guarded WHERE s LIKE '%tent%'") != 1) {
@@ -1483,16 +1489,15 @@ static void TestRegistryLifecycle(const string &path) {
 			throw std::runtime_error("registry shape, nullability, or constraints changed");
 		}
 		auto listed = Query(con, "PRAGMA ngram_indexes");
-		auto status = Query(con, "PRAGMA ngram_index_status(" + KeywordHelper::WriteQuoted(catalog) + "," +
-		                             KeywordHelper::WriteQuoted(ref) + ")");
+		auto status = StatusByRef(con, catalog, ref);
 		if (IndexStatus(con, "lifecycle", "s") != "READY" || listed->types[5].id() != LogicalTypeId::BIGINT ||
 		    status->types[5].id() != LogicalTypeId::BIGINT) {
 			throw std::runtime_error("list/status schema or READY state changed");
 		}
 		ExpectError(con, "ALTER TABLE lifecycle RENAME TO LIFECYCLE", "Dependency");
 		ExpectError(con, "ALTER TABLE lifecycle RENAME COLUMN s TO S", "Dependency");
-		Check(con, "PRAGMA drop_ngram_index_by_id(" + KeywordHelper::WriteQuoted(catalog) + "," +
-		               KeywordHelper::WriteQuoted(ref) + ")");
+		Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) +
+		               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
 		Check(con, "ALTER TABLE lifecycle RENAME TO renamed_lifecycle");
 		Check(con, "PRAGMA create_ngram_index('renamed_lifecycle','s')");
 		if (IndexStatus(con, "renamed_lifecycle", "s") != "READY") {
@@ -1516,8 +1521,8 @@ static void TestRegistryLifecycle(const string &path) {
 		if (IndexStatus(con, "orphaned", "s") != "ORPHAN") {
 			throw std::runtime_error("base drop was not listed ORPHAN");
 		}
-		Check(con, "PRAGMA drop_ngram_index_by_id(" + KeywordHelper::WriteQuoted(catalog) + "," +
-		               KeywordHelper::WriteQuoted(orphan_ref) + ")");
+		Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(orphan_ref) +
+		               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
 
 		// A replacement table under the recorded name has no guard: scan-only,
 		// and an ID drop must not touch the replacement or its foreign ART.
@@ -1532,8 +1537,8 @@ static void TestRegistryLifecycle(const string &path) {
 		    ScalarInt64(con, "SELECT count(*) FROM ngram_search('replaced','survives')") != 1) {
 			throw std::runtime_error("CREATE OR REPLACE was not SCAN_ONLY with an exact scan");
 		}
-		Check(con, "PRAGMA drop_ngram_index_by_id(" + KeywordHelper::WriteQuoted(catalog) + "," +
-		               KeywordHelper::WriteQuoted(replaced_ref) + ")");
+		Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(replaced_ref) +
+		               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
 		if (ScalarString(con, "SELECT s FROM replaced") != "replacement survives" ||
 		    ScalarInt64(con, "SELECT count(*) FROM duckdb_indexes() WHERE index_name='replacement_art'") != 1) {
 			throw std::runtime_error("orphan cleanup touched a replacement table or foreign ART");
@@ -1570,8 +1575,8 @@ static void TestRegistryLifecycle(const string &path) {
 		if (IndexStatus(con, "reopen_ready", "s") != "SCAN_ONLY") {
 			throw std::runtime_error("missing guard after reopen was not SCAN_ONLY");
 		}
-		Check(con, "PRAGMA drop_ngram_index_by_id(" + KeywordHelper::WriteQuoted(catalog) + "," +
-		               KeywordHelper::WriteQuoted(reopen_ref) + ")");
+		Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(reopen_ref) +
+		               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
 		if (StorageTableCount(con) != 0) {
 			throw std::runtime_error("scan-only ID drop left storage");
 		}
@@ -1732,7 +1737,7 @@ static void TestCatalogIdentity(const string &path, const string &clone_path) {
 		    ScalarInt64(con, "SELECT count(*) FROM ngram_search('ro.main.docs','needle')") != 1) {
 			throw std::runtime_error("read-only catalog did not list/search a healthy index");
 		}
-		ExpectError(con, "PRAGMA drop_ngram_index_by_id('ro'," + KeywordHelper::WriteQuoted(index_ref) + ")",
+		ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(index_ref) + ", catalog = 'ro')",
 		            "read-only");
 		ExpectError(con, "PRAGMA create_ngram_index('ro.main.unindexed','s')", "read-only");
 	}
@@ -1773,7 +1778,7 @@ static void TestFormat4Fixture(const string &fixture, const string &path) {
 		throw std::runtime_error("format-4 transparent fallback returned the wrong rows");
 	}
 	Check(con, "SET ngram_auto_accelerate=false");
-	ExpectError(con, "SELECT count(*) FROM ngram_search('f4.main.docs', 'tent')", "drop_ngram_index_by_id");
+	ExpectError(con, "SELECT count(*) FROM ngram_search('f4.main.docs', 'tent')", "drop_ngram_index");
 	ExpectError(con, "PRAGMA create_ngram_index('f4.main.docs', 's')", "index format 4");
 	DropByRef(con, "f4", ref);
 	if (Query(con, "PRAGMA ngram_indexes")->RowCount() != 0 ||
@@ -1891,7 +1896,8 @@ static void TestRegistryCorruption() {
 			Check(con, "DELETE FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
 		}
 		ExpectStatus(con, catalog, ref, "MALFORMED");
-		ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")", "manually");
+		ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
+		            "manually");
 		Check(con, "CREATE TABLE unblocked(s VARCHAR)");
 		Check(con, "PRAGMA create_ngram_index('unblocked','s')");
 		Check(con, "PRAGMA drop_ngram_index('unblocked','s')");
@@ -1941,7 +1947,8 @@ static void TestRegistryCorruption() {
 			throw std::runtime_error("malformed global registry poisoned LIKE");
 		}
 		ExpectError(con, "PRAGMA create_ngram_index('unrelated','s')", "ordinary DuckDB table");
-		ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")", "manually");
+		ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
+		            "manually");
 	}
 
 	// Row edits are caught against the binary owner key; the row stays
@@ -1994,7 +2001,7 @@ static void TestRegistryCorruption() {
 			}
 		} else {
 			ExpectError(con, "PRAGMA create_ngram_index('create_blocked','s')", "noncanonical ID");
-			ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")",
+			ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
 			            "manually");
 			if (!HasRowIdGuard(con, "registry_value_bad")) {
 				throw std::runtime_error("noncanonical ID refusal changed the guard");
@@ -2021,7 +2028,8 @@ static void TestRegistryCorruption() {
 		}
 		Check(con, "CREATE VIEW " + table + " AS SELECT 1 AS wrong_kind");
 		ExpectError(con, "SELECT count(*) FROM partial WHERE contains(s,'needle')", "wrong catalog type");
-		ExpectError(con, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")", "View");
+		ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
+		            "View");
 		Check(con, "DROP VIEW " + table);
 		DropByRef(con, catalog, ref);
 		if (HasRowIdGuard(con, "partial") || StorageTableCount(con) != 0) {
@@ -2203,7 +2211,7 @@ static void TestExecutionIdentityRaces() {
 			Check(ddl, "DROP TABLE base_race");
 		}
 		auto script =
-		    Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
+		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
 		if (orphan_first) {
 			Check(ddl, "CREATE TABLE base_race(s VARCHAR)");
 		} else {
@@ -2233,18 +2241,18 @@ static void TestExecutionIdentityRaces() {
 		Check(ddl, "CREATE TABLE row_backup AS SELECT * FROM __ngram.registry WHERE index_id=" +
 		               KeywordHelper::WriteQuoted(ref) + "::UUID");
 		auto removed =
-		    Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
+		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
 		Check(ddl, "DELETE FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
 		auto error = ExecuteRemainingForError(planned, removed);
 		if (error.find("removed after") == string::npos) {
 			throw std::runtime_error("registry-row deletion race did not fail closed: " + error);
 		}
 		Rollback(planned);
-		ExpectError(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")",
+		ExpectError(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
 		            "manually");
 		Check(ddl, "INSERT INTO __ngram.registry SELECT * FROM row_backup");
 		auto changed =
-		    Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
+		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
 		Check(ddl, "UPDATE __ngram.registry SET table_name='changed' WHERE index_id=" +
 		               KeywordHelper::WriteQuoted(ref) + "::UUID");
 		error = ExecuteRemainingForError(planned, changed);
@@ -2269,7 +2277,8 @@ static void TestExecutionIdentityRaces() {
 		auto exact = planned.Prepare("SELECT count(*) FROM ngram_search('registry_swap','needle')");
 		auto transparent = planned.Prepare("SELECT count(*) FROM registry_swap WHERE contains(s,'needle')");
 		auto candidate = planned.Prepare("SELECT count(*) FROM ngram_candidates('registry_swap','s','needle')");
-		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
+		auto drop =
+		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
 		Check(ddl, "CREATE TABLE registry_backup AS SELECT * FROM __ngram.registry");
 		Check(ddl, "DROP TABLE __ngram.registry");
 		Check(ddl, "CREATE TABLE __ngram.registry(registry_version INTEGER NOT NULL, index_id UUID PRIMARY KEY, "
@@ -2304,7 +2313,8 @@ static void TestExecutionIdentityRaces() {
 		auto ref = IndexRef(planned, "guard_race", "s");
 		auto guard = GuardName(planned, "guard_race", "s");
 		Check(ddl, "DROP INDEX " + guard);
-		auto drop = Expand(planned, "PRAGMA drop_ngram_index_by_id('memory'," + KeywordHelper::WriteQuoted(ref) + ")");
+		auto drop =
+		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
 		Check(ddl, "CREATE TABLE other_guard(s VARCHAR)");
 		Check(ddl, "CREATE INDEX " + guard + " ON other_guard USING NGRAM_ROWID_GUARD(s)");
 		auto error = ExecuteRemainingForError(planned, drop);

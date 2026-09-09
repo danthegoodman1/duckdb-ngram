@@ -375,7 +375,7 @@ string DropIndexScript(ClientContext &context, const ObservedIndex &index) {
 	auto fence = ScratchName("fence");
 	PreparedMaintenance prepared;
 	prepared.kind = PreparedMaintenance::Kind::DROP;
-	prepared.fn = "drop_ngram_index_by_id";
+	prepared.fn = "drop_ngram_index";
 	prepared.target = owner;
 	prepared.location = index.location;
 	prepared.location.guard_name = guard_name;

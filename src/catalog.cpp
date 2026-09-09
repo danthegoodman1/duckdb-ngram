@@ -178,7 +178,7 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 				row.format_version = 3;
 				row.error =
 				    StringUtil::Format("index format 3 (registry version %d) predates format %lld; drop it with "
-				                       "drop_ngram_index_by_id and rebuild it",
+				                       "drop_ngram_index(index_ref, catalog = ...) and rebuild it",
 				                       version, NGRAM_FORMAT_VERSION);
 				result.rows.push_back(std::move(row));
 				continue;
@@ -194,9 +194,10 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 			} else if (row.owner_key != OwnerKey(row.schema_name, row.table_name, row.column_name)) {
 				row.error = "registry row owner key does not match its owner";
 			} else if (row.format_version != NGRAM_FORMAT_VERSION) {
-				row.error = StringUtil::Format("index format %lld is not readable by this extension, which uses format "
-				                               "%lld; drop it with drop_ngram_index_by_id and rebuild it",
-				                               row.format_version, NGRAM_FORMAT_VERSION);
+				row.error =
+				    StringUtil::Format("index format %lld is not readable by this extension, which uses format "
+				                       "%lld; drop it with drop_ngram_index(index_ref, catalog = ...) and rebuild it",
+				                       row.format_version, NGRAM_FORMAT_VERSION);
 			} else if (gram_size < 1) {
 				row.error = StringUtil::Format("registry row records gram_size %lld", gram_size);
 			} else if (row.meta.hwm_rowid < -1 || row.meta.hwm_rowid >= MAX_ROW_ID) {
@@ -325,7 +326,7 @@ RegistrySnapshot ReadRegistryForCreate(ClientContext &context, const string &cat
 	auto registry = ReadRegistry(context, catalog_name);
 	if (registry.legacy_shape) {
 		throw InvalidInputException("create_ngram_index: the ngram registry in %s predates format %lld; drop each "
-		                            "listed index with drop_ngram_index_by_id and rebuild it",
+		                            "listed index with drop_ngram_index(index_ref, catalog = ...) and rebuild it",
 		                            catalog_name, NGRAM_FORMAT_VERSION);
 	}
 	return registry;

@@ -13,3 +13,11 @@
 # suppresses the same report from its own index initialization
 # (deadlock:InitializeIndexes).
 deadlock:GuardBuildGlobalInit
+
+# The host's progress bar reads a hash join's partition mask
+# (JoinHashTable::FinishedPartitionCount, src/execution/join_hashtable.cpp)
+# from the client thread while a worker finalizes the join and sets bits in
+# that mask. The report carries no extension frame; it appears under the
+# EXCEPT ALL comparisons the tests run. DuckDB v1.5.5 behavior, recorded here
+# so the lane keeps reporting races in the extension's own code.
+race:FinishedPartitionCount

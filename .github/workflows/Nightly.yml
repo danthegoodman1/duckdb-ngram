@@ -5,8 +5,8 @@ name: Nightly
 # sizes on a release build, and the concurrency tests and the query harness
 # under ThreadSanitizer in the host's own configuration (clang, RelWithDebInfo,
 # the host's suppressions). It runs on the schedule, on dispatch, and on a push
-# that changes this file, so a change to the lanes is exercised at once. Each
-# job records the exact source it ran in its summary.
+# that changes this file or the suppressions, so a change to the lanes is
+# exercised at once. Each job records the exact source it ran in its summary.
 
 on:
   schedule:
@@ -15,13 +15,16 @@ on:
   push:
     paths:
       - '.github/workflows/Nightly.yml'
+      - 'test/tsan-suppressions.txt'
 
 permissions:
   contents: read
 
+# A nightly in progress is left to finish; a later trigger on the same ref
+# queues behind it, since the lanes take hours and their results are the point.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   release-drivers:

@@ -168,7 +168,7 @@ SET disabled_optimizers = '';
 
 query I
 SELECT count(*) FROM (
-	(TABLE accelerated EXCEPT TABLE plain) UNION ALL (TABLE plain EXCEPT TABLE accelerated));
+	(TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
 ----
 0
 

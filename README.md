@@ -703,13 +703,16 @@ DuckDB v1.5.5 with:
 duckdb -unsigned -c "LOAD '/path/to/ngram.duckdb_extension';"
 ```
 
-Property-based and long-running harnesses live in `scripts/`:
+Property-based and long-running harnesses live in `scripts/`, and the C++
+harness for invariants SQL cannot control in `test/cpp`; `test/README.md`
+describes each kind and how to select the harness's tests by mechanism:
 
 ```sh
 python3 scripts/differential_search.py --trials 8 --seed 12345
 python3 scripts/differential_search.py --transparent --trials 8 --seed 12345
 python3 scripts/churn_maintenance.py --rounds 40 --seed 12345
 python3 scripts/crash_maintenance.py --seed 12345
+build/release/extension/ngram/ngram_checkpoint_gap_test /tmp/harness.db test/fixtures --only query
 ```
 
 Benchmarks and corpus generation live in `benchmarks/`; see

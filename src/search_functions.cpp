@@ -174,7 +174,7 @@ static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunction
 	}
 	return_types = result->types;
 	names = result->names;
-	return std::move(result);
+	return result;
 }
 
 //! ngram_candidates(table, column, needle) emits candidate rowids for the
@@ -195,7 +195,7 @@ static unique_ptr<FunctionData> CandidatesBind(ClientContext &context, TableFunc
 	BindQueryTarget(context, "ngram_candidates", table_input, column, *result);
 	return_types = {LogicalType::BIGINT};
 	names = {"rowid"};
-	return std::move(result);
+	return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -391,7 +391,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 		state->vacuum_lock.reset();
 	}
 	FinalizeSearchCore(context, state->core);
-	return std::move(state);
+	return state;
 }
 
 static unique_ptr<LocalTableFunctionState> SearchInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
@@ -400,7 +400,7 @@ static unique_ptr<LocalTableFunctionState> SearchInitLocal(ExecutionContext &con
 	auto state = make_uniq<SearchLocalState>();
 	state->recheck_executor = make_uniq<ExpressionExecutor>(context.client, *gstate.recheck_expr);
 	InitializeSearchCoreLocal(context, gstate.core, state->core);
-	return std::move(state);
+	return state;
 }
 
 static void SearchFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -536,7 +536,7 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 			throw InvalidInputException("ngram_candidates: %s", state->probe->decline_reason);
 		}
 	}
-	return std::move(state);
+	return state;
 }
 
 static void CandidatesFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {

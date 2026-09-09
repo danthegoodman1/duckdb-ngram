@@ -407,7 +407,7 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 	}
 	FinalizeSearchCore(context, state->core);
 
-	return std::move(state);
+	return state;
 }
 
 static unique_ptr<LocalTableFunctionState> NgramScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
@@ -418,7 +418,7 @@ static unique_ptr<LocalTableFunctionState> NgramScanInitLocal(ExecutionContext &
 		state->recheck_executor = make_uniq<ExpressionExecutor>(context.client, *gstate.recheck_expr);
 	}
 	InitializeSearchCoreLocal(context, gstate.core, state->core);
-	return std::move(state);
+	return state;
 }
 
 //===----------------------------------------------------------------------===//

@@ -56,6 +56,13 @@ jobs:
           python3 scripts/gen_trigram_fixtures.py
           git diff --exit-code -- test/sql/trigrams_fixtures.test
 
+      - name: Check formatting of the extension sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'clang-format==11.0.1' 'black==24.4.0' cmake-format
+          make format-check
+
       - name: Restore compiler cache
         uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
         with:
@@ -123,7 +130,7 @@ jobs:
   debug-sanitizers:
     name: Focused ASAN, UBSAN, and race checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
       OVERRIDE_GIT_DESCRIBE: v1.5.5
@@ -170,6 +177,7 @@ jobs:
             -DREDUCE_SYMBOLS=ON \
             -DENABLE_SANITIZER=ON \
             -DENABLE_UBSAN=ON \
+            -DNGRAM_STRICT_WARNINGS=ON \
             -DDUCKDB_DEBUG_LINK_JOBS=1 \
             -DCMAKE_BUILD_TYPE=Debug \
             -S duckdb -B build/ci-debug
@@ -185,6 +193,7 @@ jobs:
             OVERRIDE_GIT_DESCRIBE:UNINITIALIZED=v1.5.5 \
             ENABLE_SANITIZER:BOOL=ON \
             ENABLE_UBSAN:BOOL=ON \
+            NGRAM_STRICT_WARNINGS:BOOL=ON \
             EXTENSION_STATIC_BUILD:BOOL=1 \
             BUILD_SHELL:BOOL=OFF \
             REDUCE_SYMBOLS:UNINITIALIZED=ON \
@@ -218,10 +227,14 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           set -euo pipefail
-          timeout 600s build/ci-debug/test/unittest 'test/sql/ngram_lifecycle.test'
-          timeout 600s build/ci-debug/test/unittest 'test/sql/ngram_search.test'
-          timeout 600s build/ci-debug/test/unittest 'test/sql/ngram_rewrite.test'
-          timeout 600s build/ci-debug/test/unittest 'test/sql/ngram_maintenance.test'
+          # the query, concurrency and resource files; the whole suite and the
+          # drivers run nightly (Nightly.yml)
+          for test in ngram_lifecycle ngram_search ngram_rewrite ngram_maintenance ngram_api gram_key \
+                      ngram_query_bounds ngram_parallel ngram_batch_order ngram_refresh_concurrent \
+                      ngram_search_concurrent ngram_long_inputs
+          do
+            timeout 900s build/ci-debug/test/unittest "test/sql/$test.test"
+          done
           race_db="$RUNNER_TEMP/ngram-checkpoint-gap.db"
           test ! -e "$race_db"
-          timeout 1800s build/ci-debug/extension/ngram/ngram_checkpoint_gap_test "$race_db" test/fixtures
+          timeout 2400s build/ci-debug/extension/ngram/ngram_checkpoint_gap_test "$race_db" test/fixtures

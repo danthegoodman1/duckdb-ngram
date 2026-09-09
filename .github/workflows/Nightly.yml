@@ -1,0 +1,214 @@
+name: Nightly
+
+# The runs too long for a pull request: the whole SQL suite and the C++
+# harness under ASAN/UBSAN, the crash and churn drivers at their default
+# sizes on a release build, and the concurrency tests and the query harness
+# under ThreadSanitizer in the host's own configuration (clang, RelWithDebInfo,
+# the host's suppressions). Each job records the exact source it ran in its
+# summary.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-drivers:
+    name: Crash, churn and differential drivers at full size
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
+      OVERRIDE_GIT_DESCRIBE: v1.5.5
+      PYTHONHASHSEED: 0
+    steps:
+      - name: Check out pinned sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify submodule pins
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/verify_pins.sh
+          echo "duckdb=$(git ls-tree HEAD duckdb | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler cache
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ccache-release-${{ steps.pins.outputs.duckdb }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}
+          restore-keys: |
+            ccache-release-${{ steps.pins.outputs.duckdb }}-
+          max-size: 1G
+
+      - name: Build release
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 3600s make release GEN=ninja
+
+      - name: Run the drivers
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "source $(git rev-parse HEAD), duckdb ${{ steps.pins.outputs.duckdb }}" >> "$GITHUB_STEP_SUMMARY"
+          timeout 3600s python3 scripts/crash_maintenance.py --duckdb build/release/duckdb --seed 20261318 | tee -a "$GITHUB_STEP_SUMMARY"
+          timeout 1800s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 60 --rows 6000 --seed 20261316 | tail -n 5 | tee -a "$GITHUB_STEP_SUMMARY"
+          timeout 1800s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 60 --rows 6000 --seed 20261318 --no-stale-expected | tail -n 5 | tee -a "$GITHUB_STEP_SUMMARY"
+          timeout 1800s python3 scripts/differential_search.py --duckdb build/release/duckdb --trials 8 --rows 8000 --seed 20261314 | tail -n 3 | tee -a "$GITHUB_STEP_SUMMARY"
+          timeout 1800s python3 scripts/differential_search.py --duckdb build/release/duckdb --transparent --trials 8 --rows 8000 --seed 20261315 | tail -n 3 | tee -a "$GITHUB_STEP_SUMMARY"
+
+  debug-sanitizers-full:
+    name: Whole suite and harness under ASAN and UBSAN
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      OVERRIDE_GIT_DESCRIBE: v1.5.5
+      PYTHONHASHSEED: 0
+    steps:
+      - name: Check out pinned sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify submodule pins
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/verify_pins.sh
+          echo "duckdb=$(git ls-tree HEAD duckdb | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler cache
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ccache-debug-asan-${{ steps.pins.outputs.duckdb }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}
+          restore-keys: |
+            ccache-debug-asan-${{ steps.pins.outputs.duckdb }}-
+          max-size: 2G
+
+      - name: Build sanitizer targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 600s cmake -G Ninja \
+            -DEXTENSION_STATIC_BUILD=1 \
+            -DOVERRIDE_GIT_DESCRIBE="$OVERRIDE_GIT_DESCRIBE" \
+            -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
+            -DUNITTEST_ROOT_DIRECTORY="$GITHUB_WORKSPACE" \
+            -DENABLE_UNITTEST_CPP_TESTS=FALSE \
+            -DENABLE_EXTENSION_AUTOLOADING=OFF \
+            -DENABLE_EXTENSION_AUTOINSTALL=OFF \
+            -DBUILD_SHELL=OFF \
+            -DSKIP_EXTENSIONS=parquet \
+            -DREDUCE_SYMBOLS=ON \
+            -DENABLE_SANITIZER=ON \
+            -DENABLE_UBSAN=ON \
+            -DNGRAM_STRICT_WARNINGS=ON \
+            -DDUCKDB_DEBUG_LINK_JOBS=1 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -S duckdb -B build/ci-debug
+          timeout 7200s cmake --build build/ci-debug --target unittest ngram_checkpoint_gap_test
+
+      - name: Run the whole suite and the harness
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          echo "source $(git rev-parse HEAD), duckdb ${{ steps.pins.outputs.duckdb }}" >> "$GITHUB_STEP_SUMMARY"
+          timeout 7200s build/ci-debug/test/unittest 'test/sql/*' | tail -n 3 | tee -a "$GITHUB_STEP_SUMMARY"
+          race_db="$RUNNER_TEMP/ngram-checkpoint-gap.db"
+          timeout 3600s build/ci-debug/extension/ngram/ngram_checkpoint_gap_test "$race_db" test/fixtures 2>&1 | tail -n 5 | tee -a "$GITHUB_STEP_SUMMARY"
+
+  thread-sanitizer:
+    name: Concurrency tests and harness under ThreadSanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      OVERRIDE_GIT_DESCRIBE: v1.5.5
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Check out pinned sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify submodule pins
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/verify_pins.sh
+          echo "duckdb=$(git ls-tree HEAD duckdb | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler cache
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ccache-debug-tsan-${{ steps.pins.outputs.duckdb }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}
+          restore-keys: |
+            ccache-debug-tsan-${{ steps.pins.outputs.duckdb }}-
+          max-size: 2G
+
+      - name: Install clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq clang
+
+      - name: Build ThreadSanitizer targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 600s cmake -G Ninja \
+            -DEXTENSION_STATIC_BUILD=1 \
+            -DOVERRIDE_GIT_DESCRIBE="$OVERRIDE_GIT_DESCRIBE" \
+            -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
+            -DUNITTEST_ROOT_DIRECTORY="$GITHUB_WORKSPACE" \
+            -DENABLE_UNITTEST_CPP_TESTS=FALSE \
+            -DENABLE_EXTENSION_AUTOLOADING=OFF \
+            -DENABLE_EXTENSION_AUTOINSTALL=OFF \
+            -DBUILD_SHELL=OFF \
+            -DSKIP_EXTENSIONS=parquet \
+            -DREDUCE_SYMBOLS=ON \
+            -DENABLE_SANITIZER=OFF \
+            -DENABLE_UBSAN=OFF \
+            -DENABLE_THREAD_SANITIZER=ON \
+            -DDUCKDB_DEBUG_LINK_JOBS=1 \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -S duckdb -B build/ci-tsan
+          timeout 7200s cmake --build build/ci-tsan --target unittest ngram_checkpoint_gap_test
+
+      - name: Run the concurrency tests and the harness
+        shell: bash
+        env:
+          TSAN_OPTIONS: suppressions=${{ github.workspace }}/duckdb/.sanitizer-thread-suppressions.txt
+        run: |
+          set -euo pipefail
+          echo "source $(git rev-parse HEAD), duckdb ${{ steps.pins.outputs.duckdb }}" >> "$GITHUB_STEP_SUMMARY"
+          for test in ngram_parallel ngram_batch_order ngram_refresh_concurrent ngram_search_concurrent ngram_query_bounds
+          do
+            timeout 1800s build/ci-tsan/test/unittest "test/sql/$test.test" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          race_db="$RUNNER_TEMP/ngram-checkpoint-gap.db"
+          timeout 3600s build/ci-tsan/extension/ngram/ngram_checkpoint_gap_test "$race_db" test/fixtures --only query 2>&1 | tail -n 5 | tee -a "$GITHUB_STEP_SUMMARY"

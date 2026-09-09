@@ -70,9 +70,9 @@ foreach needle tent ten often Hello world contentment zzz öft ÖFT Öft ll o x 
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('docs', '${needle}') EXCEPT SELECT * FROM docs WHERE contains(lower(s), lower('${needle}')))
+	(SELECT * FROM ngram_search('docs', '${needle}') EXCEPT ALL SELECT * FROM docs WHERE contains(lower(s), lower('${needle}')))
 	UNION ALL
-	(SELECT * FROM docs WHERE contains(lower(s), lower('${needle}')) EXCEPT SELECT * FROM ngram_search('docs', '${needle}'))
+	(SELECT * FROM docs WHERE contains(lower(s), lower('${needle}')) EXCEPT ALL SELECT * FROM ngram_search('docs', '${needle}'))
 );
 ----
 0
@@ -82,9 +82,9 @@ endloop
 # needles containing spaces (foreach cannot carry them)
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('docs', 'ten c') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'ten c'))
+	(SELECT * FROM ngram_search('docs', 'ten c') EXCEPT ALL SELECT * FROM docs WHERE contains(lower(s), 'ten c'))
 	UNION ALL
-	(SELECT * FROM docs WHERE contains(lower(s), 'ten c') EXCEPT SELECT * FROM ngram_search('docs', 'ten c'))
+	(SELECT * FROM docs WHERE contains(lower(s), 'ten c') EXCEPT ALL SELECT * FROM ngram_search('docs', 'ten c'))
 );
 ----
 0
@@ -97,9 +97,9 @@ SELECT id, s FROM ngram_search('docs', 'connection reset') ORDER BY id;
 # empty needle: contains(s, '') is true for every non-NULL value
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('docs', '') EXCEPT SELECT * FROM docs WHERE contains(s, ''))
+	(SELECT * FROM ngram_search('docs', '') EXCEPT ALL SELECT * FROM docs WHERE contains(s, ''))
 	UNION ALL
-	(SELECT * FROM docs WHERE contains(s, '') EXCEPT SELECT * FROM ngram_search('docs', ''))
+	(SELECT * FROM docs WHERE contains(s, '') EXCEPT ALL SELECT * FROM ngram_search('docs', ''))
 );
 ----
 0

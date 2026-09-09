@@ -261,7 +261,7 @@ static unique_ptr<GlobalTableFunctionState> IndexesInitGlobal(ClientContext &con
 		}
 		return left.location.index_ref < right.location.index_ref;
 	});
-	return std::move(state);
+	return state;
 }
 
 static void IndexesFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {

@@ -7,6 +7,7 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/index_state.hpp"
 #include "ngram/search_core.hpp"
+#include "ngram/test_hooks.hpp"
 
 #include <functional>
 #include <mutex>
@@ -418,6 +419,10 @@ static int64_t AppendSegmentRows(ClientContext &context, const PreparedMaintenan
 	int64_t appended = 0;
 	bool started = false;
 	while (true) {
+		auto &hooks = GetNgramTestHooks();
+		if (hooks.before_maintenance_append_chunk) {
+			hooks.before_maintenance_append_chunk();
+		}
 		ThrowIfInterrupted(context);
 		chunk.Reset();
 		origin_storage.Scan(origin_tx, chunk, scan);

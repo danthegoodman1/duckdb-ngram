@@ -258,9 +258,9 @@ SELECT (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'old')),
 # a full differential check over the compacted index
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('docs', 'ten') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'ten'))
+	(SELECT * FROM ngram_search('docs', 'ten') EXCEPT ALL SELECT * FROM docs WHERE contains(lower(s), 'ten'))
 	UNION ALL
-	(SELECT * FROM docs WHERE contains(lower(s), 'ten') EXCEPT SELECT * FROM ngram_search('docs', 'ten'))
+	(SELECT * FROM docs WHERE contains(lower(s), 'ten') EXCEPT ALL SELECT * FROM ngram_search('docs', 'ten'))
 );
 ----
 0

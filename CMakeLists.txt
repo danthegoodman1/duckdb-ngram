@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.5...3.29)
 
 # Set extension name here
 set(TARGET_NAME ngram)
@@ -32,6 +32,16 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+# Warnings are errors for the extension's own sources only: the host's tree
+# and the third-party code it vendors are built with the host's flags. CI
+# turns this on; a distribution build keeps the compiler's defaults.
+option(NGRAM_STRICT_WARNINGS "Compile the extension sources with -Wall -Wextra -Werror" OFF)
+if(NGRAM_STRICT_WARNINGS AND NOT MSVC)
+  foreach(ngram_target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
+    target_compile_options(${ngram_target} PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+  endforeach()
+endif()
 
 # A small C++ harness is needed to pause between pragma preprocessing and the
 # generated transaction, which SQLLogicTest cannot do deterministically.

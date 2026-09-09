@@ -39,9 +39,9 @@ FROM range(150) r(j);
 # snapshot-atomic differential identity while other threads write
 query I
 SELECT count(*) FROM (
-	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT SELECT id FROM churn WHERE contains(lower(s), 'tent'))
+	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT ALL SELECT id FROM churn WHERE contains(lower(s), 'tent'))
 	UNION ALL
-	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT SELECT id FROM ngram_search('churn', 'tent'))
+	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT ALL SELECT id FROM ngram_search('churn', 'tent'))
 );
 ----
 0
@@ -63,9 +63,9 @@ CHECKPOINT;
 
 query I
 SELECT count(*) FROM (
-	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT SELECT id FROM churn WHERE contains(lower(s), 'tent'))
+	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT ALL SELECT id FROM churn WHERE contains(lower(s), 'tent'))
 	UNION ALL
-	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT SELECT id FROM ngram_search('churn', 'tent'))
+	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT ALL SELECT id FROM ngram_search('churn', 'tent'))
 );
 ----
 0
@@ -79,9 +79,9 @@ INSERT INTO churn VALUES (900000 + ${t} * 100 + ${i}, 'uncommitted tent ' || ${t
 
 query I
 SELECT count(*) FROM (
-	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT SELECT id FROM churn WHERE contains(lower(s), 'tent'))
+	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT ALL SELECT id FROM churn WHERE contains(lower(s), 'tent'))
 	UNION ALL
-	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT SELECT id FROM ngram_search('churn', 'tent'))
+	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT ALL SELECT id FROM ngram_search('churn', 'tent'))
 );
 ----
 0
@@ -104,9 +104,9 @@ CHECKPOINT;
 
 query I
 SELECT count(*) FROM (
-	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT SELECT id FROM churn WHERE contains(lower(s), 'tent'))
+	(SELECT id FROM ngram_search('churn', 'tent') EXCEPT ALL SELECT id FROM churn WHERE contains(lower(s), 'tent'))
 	UNION ALL
-	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT SELECT id FROM ngram_search('churn', 'tent'))
+	(SELECT id FROM churn WHERE contains(lower(s), 'tent') EXCEPT ALL SELECT id FROM ngram_search('churn', 'tent'))
 );
 ----
 0

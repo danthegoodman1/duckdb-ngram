@@ -362,7 +362,7 @@ static unique_ptr<IndexBuildGlobalState> GuardBuildGlobalInit(IndexBuildInitGlob
 	    make_uniq<RowIdGuard>(input.info.index_name, input.storage_ids, TableIOManager::Get(storage), input.expressions,
 	                          storage.db, UUID::ToString(UUID::GenerateRandomUUID()), max_seen, false, true,
 	                          optional_idx(), ObservableCheckpointIteration(storage.db));
-	return std::move(state);
+	return state;
 }
 
 static unique_ptr<IndexBuildLocalState> GuardBuildLocalInit(IndexBuildInitLocalStateInput &) {

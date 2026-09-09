@@ -1,4 +1,5 @@
 #include "ngram/search_core.hpp"
+#include "ngram/test_hooks.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -253,6 +254,11 @@ static bool SearchCoreYieldEmpty(TableFunctionInput &data) {
 
 enum class BatchClaim : uint8_t { CLAIMED, EXHAUSTED, WAITING };
 
+NgramTestHooks &GetNgramTestHooks() {
+	static NgramTestHooks hooks;
+	return hooks;
+}
+
 //! Move every decoded segment that is next in ordinal order from `pending`
 //! to `ready`. Caller holds the queue lock.
 static void PublishInOrder(CandidateQueue &queue) {
@@ -331,6 +337,10 @@ static BatchClaim ClaimCandidateBatch(ClientContext &context, TableFunctionInput
 			vector<row_t> decoded;
 			DecodeCandidateSegment(context, *global.tx, plan, ordinal, local.decode, decoded);
 			rowids = TrackPublishedCandidates(plan, local.decode, std::move(decoded));
+			auto &hooks = GetNgramTestHooks();
+			if (hooks.before_segment_publish) {
+				hooks.before_segment_publish(ordinal);
+			}
 		} catch (...) {
 			std::lock_guard<mutex> guard(queue.lock);
 			queue.decoding--;

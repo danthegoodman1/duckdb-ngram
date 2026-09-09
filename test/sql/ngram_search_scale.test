@@ -30,9 +30,9 @@ foreach needle 999999 048576 114999 000 123456
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('big', '${needle}') EXCEPT SELECT * FROM big WHERE contains(s, '${needle}'))
+	(SELECT * FROM ngram_search('big', '${needle}') EXCEPT ALL SELECT * FROM big WHERE contains(s, '${needle}'))
 	UNION ALL
-	(SELECT * FROM big WHERE contains(s, '${needle}') EXCEPT SELECT * FROM ngram_search('big', '${needle}'))
+	(SELECT * FROM big WHERE contains(s, '${needle}') EXCEPT ALL SELECT * FROM ngram_search('big', '${needle}'))
 );
 ----
 0
@@ -95,9 +95,9 @@ CHECKPOINT;
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('big', '999999') EXCEPT SELECT * FROM big WHERE contains(s, '999999'))
+	(SELECT * FROM ngram_search('big', '999999') EXCEPT ALL SELECT * FROM big WHERE contains(s, '999999'))
 	UNION ALL
-	(SELECT * FROM big WHERE contains(s, '999999') EXCEPT SELECT * FROM ngram_search('big', '999999'))
+	(SELECT * FROM big WHERE contains(s, '999999') EXCEPT ALL SELECT * FROM ngram_search('big', '999999'))
 );
 ----
 0
@@ -112,9 +112,9 @@ foreach needle 999999 048576 000 123456
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('big', '${needle}') EXCEPT SELECT * FROM big WHERE contains(s, '${needle}'))
+	(SELECT * FROM ngram_search('big', '${needle}') EXCEPT ALL SELECT * FROM big WHERE contains(s, '${needle}'))
 	UNION ALL
-	(SELECT * FROM big WHERE contains(s, '${needle}') EXCEPT SELECT * FROM ngram_search('big', '${needle}'))
+	(SELECT * FROM big WHERE contains(s, '${needle}') EXCEPT ALL SELECT * FROM ngram_search('big', '${needle}'))
 );
 ----
 0

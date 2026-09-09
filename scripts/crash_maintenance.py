@@ -36,10 +36,8 @@ Exit code 0 iff every reopened database passed.
 """
 
 import argparse
-import csv
 import os
 import random
-import re
 import shutil
 import signal
 import subprocess
@@ -47,43 +45,20 @@ import sys
 import tempfile
 import time
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DUCKDB = os.path.join(REPO, "build", "release", "duckdb")
+from ngram_harness import Cli, DEFAULT_DUCKDB, multiset_mismatch, sql_quote
+
 WORDS = ["tent", "ten", "cent", "often", "entered", "content", "connection",
          "reset", "peer", "needle", "haystack", "gram", "index", "duck", "row"]
 NEEDLES = ["tent", "ten", "connection", "gram", "xyzzy"]
-
-
-def sql_quote(s):
-    return "'" + s.replace("'", "''") + "'"
+CLI = Cli()
 
 
 def run(db, script, allow_error=False, timeout=900):
-    proc = subprocess.run([DUCKDB, db], input=".headers off\n.mode csv\n" + script,
-                          capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0 and not allow_error:
-        raise RuntimeError("duckdb failed on %s:\n%s" % (db, proc.stderr[-3000:]))
-    return proc.returncode, proc.stdout, proc.stderr
+    return CLI.run(db, script, allow_error=allow_error, timeout=timeout)
 
 
 def index_ref(db):
-    _, catalog_out, _ = run(db, "SELECT current_database();")
-    catalog = next(csv.reader(catalog_out.splitlines()))[0]
-    _, out, _ = run(db, "PRAGMA ngram_indexes;")
-    rows = [row for row in csv.reader(out.splitlines())
-            if len(row) == 8 and row[0] == catalog
-            and row[2:5] == ["main", "corpus", "s"] and row[5] == "5"
-            and row[6] in ("READY", "SCAN_ONLY")]
-    if len(rows) != 1:
-        raise RuntimeError("expected one format-5 corpus.s index")
-    ref = rows[0][1]
-    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", ref):
-        raise RuntimeError("public corpus.s index id is not a canonical UUIDv4")
-    return ref
-
-
-def storage_table(ref, part):
-    return "__ngram.%s_%s" % (part, ref.replace("-", ""))
+    return CLI.index_ref(db, statuses=("READY", "SCAN_ONLY"))
 
 
 def build_corpus(db, rng, rows):
@@ -104,42 +79,21 @@ def append_tail(db, rng, start, rows):
 
 
 def index_state(db):
-    """The facts a half-applied maintenance operation would disagree on: the
-    high-water mark and every segment row's identity and bounds."""
-    ref = index_ref(db)
-    _, out, _ = run(db, "SELECT (SELECT hwm_rowid FROM __ngram.registry WHERE index_id = '{ref}'::UUID), "
-                        "s.n, s.rows, s.hash_sum, s.hash_xor FROM (SELECT count(*) AS n, "
-                        "coalesce(sum(rowid_count), 0) AS rows, "
-                        "coalesce(sum(hash(gram_key, segment_no, generation, rowid_count, min_rowid, max_rowid))"
-                        "::VARCHAR, '0') AS hash_sum, "
-                        "coalesce(bit_xor(hash(gram_key, segment_no, generation, rowid_count, min_rowid, max_rowid))"
-                        "::VARCHAR, '0') AS hash_xor "
-                        "FROM {segments}) s;".format(ref=ref, segments=storage_table(ref, "segments")))
-    line = [l for l in out.strip().splitlines() if l]
-    return line[-1] if line else None
+    return CLI.index_state(db, index_ref(db))
 
 
 def postings_digest(db):
-    """The decoded index itself: every (gram_key, rowid) posting, summarised so two
-    databases can be compared without materialising both."""
-    ref = index_ref(db)
-    _, out, _ = run(db, "SELECT count(*), coalesce(sum(hash(gram_key || ':' || r))::VARCHAR, '0') "
-                        "FROM ngram_unpack_postings("
-                        "(SELECT gram_key, segment_no, postings FROM {0}));".format(storage_table(ref, "segments")))
-    line = [l for l in out.strip().splitlines() if l]
-    return line[-1] if line else None
+    return CLI.postings_digest(db, index_ref(db))
 
 
 def differential(db):
-    """Rows the index path and brute force disagree on, both directions."""
+    """Rows the index path and brute force disagree on as multisets, both directions."""
     script = []
     for needle in NEEDLES:
         q = sql_quote(needle)
         pred = "contains(lower(s), lower(%s))" % q
-        script.append("SELECT count(*) FROM ("
-                      "(SELECT * FROM ngram_search('corpus', %s) EXCEPT SELECT * FROM corpus WHERE %s) UNION ALL "
-                      "(SELECT * FROM corpus WHERE %s EXCEPT SELECT * FROM ngram_search('corpus', %s)));"
-                      % (q, pred, pred, q))
+        script.append(multiset_mismatch("SELECT * FROM ngram_search('corpus', %s)" % q,
+                                        "SELECT * FROM corpus WHERE %s" % pred) + ";")
     code, out, err = run(db, "\n".join(script), allow_error=True)
     if code != 0:
         return None, err.strip()[-300:]
@@ -154,7 +108,7 @@ def timed_pragma(db, pragma):
 
 def kill_during(db, pragma, delay):
     """Start the pragma in a child process and SIGKILL it after `delay`."""
-    proc = subprocess.Popen([DUCKDB, db], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+    proc = subprocess.Popen([CLI.binary, db], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, text=True)
     proc.stdin.write(pragma + "\n")
     proc.stdin.flush()
@@ -248,7 +202,7 @@ def bounded_scenario(tmp, rng, args, failures):
 
 
 def main():
-    global DUCKDB
+    global CLI
     ap = argparse.ArgumentParser()
     ap.add_argument("--kills", type=int, default=12)
     ap.add_argument("--rows", type=int, default=60000)
@@ -256,10 +210,10 @@ def main():
     ap.add_argument("--bound", type=int, default=2000,
                     help="max_rows for the bounded catch-up loop scenario")
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--duckdb", default=DUCKDB)
+    ap.add_argument("--duckdb", default=DEFAULT_DUCKDB)
     ap.add_argument("--keep", action="store_true", help="keep the working directory")
     args = ap.parse_args()
-    DUCKDB = args.duckdb
+    CLI = Cli(args.duckdb)
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(0, 2**31)
     print("master seed: %d" % seed, flush=True)

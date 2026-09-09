@@ -14,11 +14,14 @@
 #include "ngram/fence.hpp"
 #include "ngram/gram.hpp"
 #include "ngram/rowid_guard.hpp"
+#include "ngram/test_hooks.hpp"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <thread>
 #if defined(__linux__)
@@ -2365,21 +2368,15 @@ static void TestRegistryScale() {
 		ready += status == "READY";
 		malformed += status == "MALFORMED";
 	}
-#ifdef DEBUG
-	constexpr int64_t STATUS_LIMIT_MS = 30000, LIST_LIMIT_MS = 120000;
-#else
-	constexpr int64_t STATUS_LIMIT_MS = 5000, LIST_LIMIT_MS = 20000;
-#endif
-	if (listed->RowCount() != 10000 || ready != 1 || malformed != 9999 || status_ms > STATUS_LIMIT_MS ||
-	    list_ms > LIST_LIMIT_MS) {
-		throw std::runtime_error(
-		    "10k registry lookup/list exceeded bounded gate: rows=" + to_string(listed->RowCount()) +
-		    ", status_ms=" + to_string(status_ms) + ", list_ms=" + to_string(list_ms));
+	if (listed->RowCount() != 10000 || ready != 1 || malformed != 9999) {
+		throw std::runtime_error("10k registry listing miscounted: rows=" + to_string(listed->RowCount()) +
+		                         " ready=" + to_string(ready) + " malformed=" + to_string(malformed));
 	}
-	// Discovery must cost a query nothing when no VARCHAR filter can probe, and
-	// a probeable query reads only its owner's row: neither scales with the
-	// registry. Both are timed against the same statements with acceleration
-	// off; the bounds are loose multiples so sanitizer builds pass too.
+	// Discovery costs a query nothing when no VARCHAR filter can probe, and a
+	// probeable query reads only its owner's row: neither scales with the
+	// registry. The timings below are reported, never asserted: a correctness
+	// run must not depend on the machine's speed. The 19B measurement records
+	// the costs on a fixed machine.
 	Check(con, "CREATE TABLE scale_unrelated AS SELECT i AS id FROM range(1000) r(i)");
 	auto timed_ms = [&](const string &sql, idx_t repetitions) {
 		auto begin = std::chrono::steady_clock::now();
@@ -2398,37 +2395,32 @@ static void TestRegistryScale() {
 	auto indexed_on_ms = timed_ms(indexed, 200);
 	auto explicit_ms = timed_ms("SELECT count(*) FROM ngram_search('scale_live', 'needle')", 200);
 	Check(con, "SET ngram_auto_accelerate=false");
-	if (unrelated_on_ms > 2 * unrelated_off_ms + 100 || indexed_on_ms > 4 * indexed_off_ms + 400 ||
-	    explicit_ms > 4 * indexed_off_ms + 400) {
-		throw std::runtime_error(
-		    "10k registry discovery exceeded bounded gate: unrelated off/on ms=" + to_string(unrelated_off_ms) + "/" +
-		    to_string(unrelated_on_ms) + ", indexed off/on/explicit ms=" + to_string(indexed_off_ms) + "/" +
-		    to_string(indexed_on_ms) + "/" + to_string(explicit_ms));
-	}
 	start = std::chrono::steady_clock::now();
 	DropByRef(con, "memory", live_ref);
 	auto drop_ms =
 	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-	if (drop_ms > STATUS_LIMIT_MS || HasRowIdGuard(con, "scale_live")) {
-		throw std::runtime_error("10k registry ID drop exceeded bounded gate: " + to_string(drop_ms) + " ms");
+	if (HasRowIdGuard(con, "scale_live")) {
+		throw std::runtime_error("10k registry drop by reference left the guard behind");
 	}
 	std::cerr << "registry-scale rows=10000 status_ms=" << status_ms << " list_ms=" << list_ms << " drop_ms=" << drop_ms
 	          << " unrelated_off/on_ms=" << unrelated_off_ms << "/" << unrelated_on_ms
 	          << " indexed_off/on/explicit_ms=" << indexed_off_ms << "/" << indexed_on_ms << "/" << explicit_ms << "\n";
 }
 
-//! Interrupt a query while it is provably running: stream it, hold its first
-//! chunk, interrupt, and require the rest of the stream to fail with the
-//! interrupt. No timing is involved, so a faster machine cannot let the
-//! query finish before the interrupt lands.
-static void ExpectStreamInterrupted(Connection &con, const string &sql) {
+//! Interrupt a query while it is provably running: stream it, hold its
+//! `chunks_before` first chunks, interrupt, and require the rest of the
+//! stream to fail with the interrupt. No timing is involved, so a faster
+//! machine cannot let the query finish before the interrupt lands.
+static void ExpectStreamInterrupted(Connection &con, const string &sql, idx_t chunks_before = 1) {
 	auto stream = con.SendQuery(sql);
 	if (stream->HasError()) {
 		throw std::runtime_error("streaming query failed before its interrupt: " + stream->GetError());
 	}
-	auto first = stream->Fetch();
-	if (!first || first->size() == 0) {
-		throw std::runtime_error("streaming query produced no first chunk: " + sql);
+	for (idx_t i = 0; i < chunks_before; i++) {
+		auto chunk = stream->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			throw std::runtime_error("streaming query ended before chunk " + to_string(i + 1) + ": " + sql);
+		}
 	}
 	con.Interrupt();
 	bool interrupted = false;
@@ -2507,19 +2499,36 @@ static void TestQueryCancellation() {
 		                             cancel_segments + "), '|', (SELECT hwm_rowid FROM " +
 		                             OwnerRow("cancel_rows", "s") + "))");
 	};
-	// A pragma cannot be streamed, so its interrupt is timed; a machine fast
-	// enough to finish the merge first proves the committed outcome instead.
+	// The merge appends its packed rows through the fence's append call, whose
+	// per-chunk hook interrupts the query once rows are provably in flight; the
+	// purge reinserts through the host's batch insert, which no hook reaches, so
+	// its interrupt is timed and a machine fast enough to finish first proves
+	// the committed outcome instead.
 	auto before = maintenance_digest();
 	auto expected_matches = ScalarInt64(con, "SELECT count(*) FROM cancel_rows WHERE contains(s, 'aaaa')");
 	for (auto &pragma :
 	     vector<string> {"PRAGMA ngram_compact('cancel_rows')", "PRAGMA ngram_compact('cancel_rows', purge=true)"}) {
 		unique_ptr<MaterializedQueryResult> result;
+		bool purge = pragma.find("purge") != string::npos;
+		idx_t chunks_seen = 0;
+		ngram::GetNgramTestHooks().before_maintenance_append_chunk = [&]() {
+			if (++chunks_seen == 2) {
+				con.Interrupt();
+			}
+		};
 		std::thread maintenance([&]() { result = con.Query(pragma); });
-		std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		con.Interrupt();
+		if (purge) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			con.Interrupt();
+		}
 		maintenance.join();
+		ngram::GetNgramTestHooks().before_maintenance_append_chunk = nullptr;
 		if (!result) {
 			throw std::runtime_error(pragma + " returned no result");
+		}
+		if (!purge && (chunks_seen < 2 || !result->HasError())) {
+			throw std::runtime_error(pragma + " was not interrupted at its second appended chunk (chunks seen " +
+			                         to_string(chunks_seen) + ")");
 		}
 		if (ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name='temp' AND "
 		                     "table_name LIKE '__ngram_%'") != 0) {
@@ -2548,10 +2557,12 @@ static void TestQueryCancellation() {
 }
 
 //! An admitted two-segment probe at 24 threads through a streaming result,
-//! then interrupted at several points. Segment 1 decodes before segment 0,
-//! so every worker must still emit increasing batch indexes; an interrupt
-//! must never strand a worker waiting for a segment that will not publish,
-//! and the connection must answer the same query exactly afterwards.
+//! then interrupted after its first chunk, after eight and after sixty-four.
+//! Segment 1 is far smaller than segment 0, so it decodes first and every
+//! worker must still emit increasing batch indexes; an interrupt must never
+//! strand a worker waiting for a segment that will not publish, and the
+//! connection must answer the same query exactly afterwards. The publication
+//! order itself is forced in TestPublicationBarrier.
 static void TestParallelCandidateStreams() {
 	DuckDB db(nullptr);
 	LoadNgram(db);
@@ -2601,28 +2612,152 @@ static void TestParallelCandidateStreams() {
 		                         ", expected " + to_string(expected_rows) + " summing to " + to_string(expected_sum));
 	}
 
-	for (auto delay_ms : vector<int> {1, 5, 20, 60}) {
-		unique_ptr<MaterializedQueryResult> result;
-		std::thread worker([&]() { result = con.Query("SELECT count(*), sum(id) FROM (" + search + ")"); });
-		std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-		con.Interrupt();
-		worker.join();
-		if (!result) {
-			throw std::runtime_error("interrupted parallel search returned no result");
-		}
-		if (result->HasError()) {
-			if (result->GetError().find("Interrupt") == string::npos) {
-				throw std::runtime_error("interrupted parallel search failed otherwise: " + result->GetError());
-			}
-		} else if (result->GetValue(0, 0).GetValue<int64_t>() != expected_rows ||
-		           result->GetValue(1, 0).GetValue<int64_t>() != expected_sum) {
-			throw std::runtime_error("parallel search that outran its interrupt returned wrong rows");
-		}
+	for (idx_t chunks_before : vector<idx_t> {1, 8, 64}) {
+		ExpectStreamInterrupted(con, search, chunks_before);
 		auto again = Query(con, "SELECT count(*), sum(id) FROM (" + search + ")");
 		if (again->GetValue(0, 0).GetValue<int64_t>() != expected_rows ||
 		    again->GetValue(1, 0).GetValue<int64_t>() != expected_sum) {
-			throw std::runtime_error("parallel search after an interrupt returned wrong rows");
+			throw std::runtime_error("parallel search after an interrupt at chunk " + to_string(chunks_before) +
+			                         " returned wrong rows");
 		}
+	}
+}
+
+//! Hold the hooks for one test and clear them however it ends.
+struct ScopedPublishHook {
+	explicit ScopedPublishHook(std::function<void(idx_t)> hook) {
+		ngram::GetNgramTestHooks().before_segment_publish = std::move(hook);
+	}
+	~ScopedPublishHook() {
+		ngram::GetNgramTestHooks().before_segment_publish = nullptr;
+	}
+};
+
+//! The publication order forced rather than left to segment sizes: the
+//! worker that decoded segment 0 waits at the publication hook until segment
+//! 1 has reached its own, so segment 1 is pending first. The queue must still
+//! hand out segment 0 before segment 1, which the ascending ids of the stream
+//! prove. Then the hook interrupts the query the moment segment 1 is decoded:
+//! no worker may strand waiting for segment 0, the interrupt must surface,
+//! and the connection must answer the query exactly afterwards.
+static void TestPublicationBarrier() {
+	DuckDB db(nullptr);
+	LoadNgram(db);
+	Connection con(db);
+	Check(con, "SET threads=8");
+	Check(con, "SET ngram_max_candidate_fraction=1");
+	// two segments of similar size, so nothing but the barrier decides the order
+	Check(con, "CREATE TABLE barrier_rows AS SELECT i AS id, CASE WHEN i % 5 = 0 THEN 'abcdefgh' ELSE 'zzzzzzzz' "
+	           "END AS s FROM range(2097152) r(i)");
+	Check(con, "PRAGMA create_ngram_index('barrier_rows', 's', case_insensitive=false)");
+	const string search = "SELECT id FROM ngram_search('barrier_rows', 'abcdefgh')";
+	auto expected = Query(con, "SELECT count(*), sum(id) FROM barrier_rows WHERE contains(s, 'abcdefgh')");
+	auto expected_rows = expected->GetValue(0, 0).GetValue<int64_t>();
+	auto expected_sum = expected->GetValue(1, 0).GetValue<int64_t>();
+
+	std::mutex lock;
+	std::condition_variable reached;
+	bool segment_one_reached = false;
+	bool segment_zero_waited = false;
+	bool barrier_timed_out = false;
+	{
+		ScopedPublishHook hook([&](idx_t ordinal) {
+			std::unique_lock<std::mutex> guard(lock);
+			if (ordinal == 1) {
+				segment_one_reached = true;
+				reached.notify_all();
+				return;
+			}
+			if (ordinal == 0) {
+				segment_zero_waited = true;
+				if (!reached.wait_for(guard, std::chrono::seconds(30), [&]() { return segment_one_reached; })) {
+					barrier_timed_out = true;
+				}
+			}
+		});
+		auto stream = con.SendQuery(search);
+		if (stream->HasError()) {
+			throw std::runtime_error("barrier search failed: " + stream->GetError());
+		}
+		int64_t rows = 0, sum = 0, previous = -1;
+		while (true) {
+			auto chunk = stream->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			chunk->Flatten();
+			auto ids = FlatVector::GetData<int64_t>(chunk->data[0]);
+			for (idx_t r = 0; r < chunk->size(); r++) {
+				if (ids[r] <= previous) {
+					throw std::runtime_error("barrier search emitted " + to_string(ids[r]) + " after " +
+					                         to_string(previous));
+				}
+				previous = ids[r];
+				rows++;
+				sum += ids[r];
+			}
+		}
+		if (stream->HasError()) {
+			throw std::runtime_error("barrier search failed mid-stream: " + stream->GetError());
+		}
+		if (rows != expected_rows || sum != expected_sum) {
+			throw std::runtime_error("barrier search returned " + to_string(rows) + " rows summing to " +
+			                         to_string(sum));
+		}
+	}
+	if (!segment_zero_waited || !segment_one_reached) {
+		throw std::runtime_error("the publication barrier was not exercised: both segments must reach the hook");
+	}
+	if (barrier_timed_out) {
+		throw std::runtime_error("segment 1 did not reach its publication while segment 0 waited: the probe did not "
+		                         "decode the two segments concurrently");
+	}
+
+	// The interrupt lands when both segments are decoded and neither has
+	// published: segment 0 waits at its hook, segment 1 waits at its own until
+	// segment 0 is there, interrupts, and releases it. No batch has been
+	// handed out when the flag is set. A stranded worker would show as a
+	// query that never returns; the CI timeout is the deadline.
+	bool interrupted_at_decode = false;
+	bool held_zero = false;
+	bool interrupt_timed_out = false;
+	{
+		ScopedPublishHook hook([&](idx_t ordinal) {
+			std::unique_lock<std::mutex> guard(lock);
+			if (ordinal == 0) {
+				held_zero = true;
+				reached.notify_all();
+				if (!reached.wait_for(guard, std::chrono::seconds(30), [&]() { return interrupted_at_decode; })) {
+					interrupt_timed_out = true;
+				}
+				return;
+			}
+			if (ordinal == 1) {
+				if (!reached.wait_for(guard, std::chrono::seconds(30), [&]() { return held_zero; })) {
+					interrupt_timed_out = true;
+				}
+				interrupted_at_decode = true;
+				con.Interrupt();
+				reached.notify_all();
+			}
+		});
+		auto result = con.Query("SELECT count(*), sum(id) FROM (" + search + ")");
+		if (!result->HasError() || result->GetError().find("Interrupt") == string::npos) {
+			throw std::runtime_error("the interrupt at segment 1's publication did not surface: " +
+			                         (result->HasError() ? result->GetError() : string("query succeeded")));
+		}
+	}
+	if (!interrupted_at_decode || !held_zero || interrupt_timed_out) {
+		throw std::runtime_error("the decode-time interrupt was not forced: both segments must wait at the hook "
+		                         "before the interrupt (reached 0: " +
+		                         string(held_zero ? "yes" : "no") +
+		                         ", interrupted at 1: " + string(interrupted_at_decode ? "yes" : "no") +
+		                         ", timed out: " + string(interrupt_timed_out ? "yes" : "no") + ")");
+	}
+	auto again = Query(con, "SELECT count(*), sum(id) FROM (" + search + ")");
+	if (again->GetValue(0, 0).GetValue<int64_t>() != expected_rows ||
+	    again->GetValue(1, 0).GetValue<int64_t>() != expected_sum) {
+		throw std::runtime_error("barrier search after the decode-time interrupt returned wrong rows");
 	}
 }
 
@@ -2859,6 +2994,31 @@ static void TestGramKeyCollisions() {
 	}
 }
 
+//! One harness test: its mechanism, its name, and the run.
+struct HarnessTest {
+	string mechanism;
+	string name;
+	std::function<void()> run;
+};
+
+//! `--only PATTERN` keeps the tests whose "mechanism/name" contains PATTERN;
+//! several patterns keep their union. Mechanisms: lifecycle (guards, fences,
+//! WAL and checkpoint seals), registry (rows, identity, corruption, scale),
+//! fixtures (persisted formats, when a fixtures directory is given), query
+//! (cancellation, publication order, memory peak, key collisions).
+static bool Selected(const HarnessTest &test, const vector<string> &patterns) {
+	if (patterns.empty()) {
+		return true;
+	}
+	auto label = test.mechanism + "/" + test.name;
+	for (auto &pattern : patterns) {
+		if (label.find(pattern) != string::npos) {
+			return true;
+		}
+	}
+	return false;
+}
+
 int main(int argc, char **argv) {
 	try {
 		if (argc == 3 && string(argv[1]) == "--wal-child") {
@@ -2874,52 +3034,151 @@ int main(int argc, char **argv) {
 			TestIncompatibleGuardQuarantine(argv[2]);
 			return 0;
 		}
-		if (argc != 2 && argc != 3) {
-			std::cerr << "usage: ngram_maintenance_checkpoint_gap DATABASE [FIXTURES_DIR]\n";
+		string database, fixtures;
+		vector<string> patterns;
+		for (int i = 1; i < argc; i++) {
+			string arg = argv[i];
+			if (arg == "--only" && i + 1 < argc) {
+				patterns.emplace_back(argv[++i]);
+			} else if (database.empty()) {
+				database = arg;
+			} else if (fixtures.empty()) {
+				fixtures = arg;
+			} else {
+				database.clear();
+				break;
+			}
+		}
+		if (database.empty()) {
+			std::cerr << "usage: ngram_maintenance_checkpoint_gap DATABASE [FIXTURES_DIR] [--only PATTERN]...\n";
 			return 2;
 		}
-		auto unique =
-		    string(argv[1]) + "." + to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-		TestCreationSchedules(unique + ".creation");
-		TestSharedGuardAndDrop(unique + ".guards");
-		TestVacuumAndConflict(unique + ".vacuum");
-		TestRejectedCommitKeepsGuard(unique + ".retried");
-		TestConcurrentDropsStrandGuard(unique + ".stranded");
-		TestWALAndStock(argv[0], unique + ".wal");
-		TestUnboundCheckpointSeal(argv[0], unique + ".seal");
-		TestCleanShutdownSeal(unique + ".clean");
-		TestIncompatibleGuardQuarantine(unique + ".quarantine");
-		TestStorageCorruption();
-		TestRegistryLifecycle(unique + ".lifecycle");
-		TestRegistryBootstrapAndConflicts();
-		TestCatalogIdentity(unique + ".catalog", unique + ".clone");
-		if (argc == 3) {
-			string fixtures = argv[2];
-			TestFormat3Fixture(fixtures + "/format3.duckdb", unique + ".format3");
-			TestFormat4Fixture(fixtures + "/format4.duckdb", unique + ".format4");
-			TestFormat5Fixture(fixtures + "/format5.duckdb", unique + ".format5");
-		} else {
-			std::cerr << "format fixtures skipped: no fixtures directory given\n";
+		auto unique = database + "." + to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+		string executable = argv[0];
+		vector<string> scratch;
+		auto path = [&](const string &suffix) {
+			scratch.push_back(unique + "." + suffix);
+			return scratch.back();
+		};
+		vector<HarnessTest> tests = {
+		    {"lifecycle", "creation-schedules",
+		     [&]() {
+			     TestCreationSchedules(path("creation"));
+		     }},
+		    {"lifecycle", "shared-guard-and-drop",
+		     [&]() {
+			     TestSharedGuardAndDrop(path("guards"));
+		     }},
+		    {"lifecycle", "vacuum-and-conflict",
+		     [&]() {
+			     TestVacuumAndConflict(path("vacuum"));
+		     }},
+		    {"lifecycle", "rejected-commit-keeps-guard",
+		     [&]() {
+			     TestRejectedCommitKeepsGuard(path("retried"));
+		     }},
+		    {"lifecycle", "concurrent-drops-strand-guard",
+		     [&]() {
+			     TestConcurrentDropsStrandGuard(path("stranded"));
+		     }},
+		    {"lifecycle", "wal-and-stock",
+		     [&]() {
+			     TestWALAndStock(executable, path("wal"));
+		     }},
+		    {"lifecycle", "unbound-checkpoint-seal",
+		     [&]() {
+			     TestUnboundCheckpointSeal(executable, path("seal"));
+		     }},
+		    {"lifecycle", "clean-shutdown-seal",
+		     [&]() {
+			     TestCleanShutdownSeal(path("clean"));
+		     }},
+		    {"lifecycle", "incompatible-guard-quarantine",
+		     [&]() {
+			     TestIncompatibleGuardQuarantine(path("quarantine"));
+		     }},
+		    {"lifecycle", "storage-corruption",
+		     []() {
+			     TestStorageCorruption();
+		     }},
+		    {"registry", "lifecycle",
+		     [&]() {
+			     TestRegistryLifecycle(path("lifecycle"));
+		     }},
+		    {"registry", "bootstrap-and-conflicts",
+		     []() {
+			     TestRegistryBootstrapAndConflicts();
+		     }},
+		    {"registry", "catalog-identity",
+		     [&]() {
+			     TestCatalogIdentity(path("catalog"), path("clone"));
+		     }},
+		    {"fixtures", "format3",
+		     [&]() {
+			     TestFormat3Fixture(fixtures + "/format3.duckdb", path("format3"));
+		     }},
+		    {"fixtures", "format4",
+		     [&]() {
+			     TestFormat4Fixture(fixtures + "/format4.duckdb", path("format4"));
+		     }},
+		    {"fixtures", "format5",
+		     [&]() {
+			     TestFormat5Fixture(fixtures + "/format5.duckdb", path("format5"));
+		     }},
+		    {"registry", "corruption",
+		     []() {
+			     TestRegistryCorruption();
+		     }},
+		    {"registry", "execution-identity-races",
+		     []() {
+			     TestExecutionIdentityRaces();
+		     }},
+		    {"registry", "scale",
+		     []() {
+			     TestRegistryScale();
+		     }},
+		    {"query", "cancellation",
+		     []() {
+			     TestQueryCancellation();
+		     }},
+		    {"query", "parallel-candidate-streams",
+		     []() {
+			     TestParallelCandidateStreams();
+		     }},
+		    {"query", "publication-barrier",
+		     []() {
+			     TestPublicationBarrier();
+		     }},
+		    {"query", "probe-memory-peak",
+		     []() {
+			     TestProbeMemoryPeak();
+		     }},
+		    {"query", "gram-key-collisions",
+		     []() {
+			     TestGramKeyCollisions();
+		     }},
+		};
+		idx_t ran = 0;
+		for (auto &test : tests) {
+			if (!Selected(test, patterns)) {
+				continue;
+			}
+			if (test.mechanism == "fixtures" && fixtures.empty()) {
+				std::cerr << "fixtures/" << test.name << " skipped: no fixtures directory given\n";
+				continue;
+			}
+			std::cerr << "== " << test.mechanism << "/" << test.name << "\n";
+			test.run();
+			ran++;
 		}
-		TestRegistryCorruption();
-		TestExecutionIdentityRaces();
-		TestRegistryScale();
-		TestQueryCancellation();
-		TestParallelCandidateStreams();
-		TestProbeMemoryPeak();
-		TestGramKeyCollisions();
-		RemoveDatabase(unique + ".creation");
-		RemoveDatabase(unique + ".guards");
-		RemoveDatabase(unique + ".vacuum");
-		RemoveDatabase(unique + ".retried");
-		RemoveDatabase(unique + ".stranded");
-		RemoveDatabase(unique + ".wal");
-		RemoveDatabase(unique + ".seal");
-		RemoveDatabase(unique + ".clean");
-		RemoveDatabase(unique + ".quarantine");
-		RemoveDatabase(unique + ".lifecycle");
-		RemoveDatabase(unique + ".catalog");
-		RemoveDatabase(unique + ".clone");
+		if (ran == 0) {
+			std::cerr << "no harness test matched the selection\n";
+			return 2;
+		}
+		for (auto &file : scratch) {
+			RemoveDatabase(file);
+		}
+		std::cerr << "harness: " << ran << " tests passed\n";
 		return 0;
 	} catch (std::exception &ex) {
 		std::cerr << ex.what() << "\n";

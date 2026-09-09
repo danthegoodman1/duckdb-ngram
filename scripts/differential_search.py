@@ -38,20 +38,19 @@ import argparse
 import csv
 import os
 import random
-import re
-import subprocess
 import sys
 import tempfile
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DUCKDB = os.path.join(REPO, "build", "release", "duckdb")
+from ngram_harness import Cli, DEFAULT_DUCKDB, multiset_mismatch, sql_quote
+
 NULL_SENTINEL = "__NGRAM_NULL__"
 UPDATE_MARKER = "QzPhaseElevenMarker917"
+CLI = Cli()
 
 
 def set_duckdb_binary(path):
-    global DUCKDB
-    DUCKDB = path
+    global CLI
+    CLI = Cli(path)
 
 ALPHABETS = {
     "hex": "0123456789abcdef",
@@ -66,10 +65,6 @@ WORDS = [
     "connection", "reset", "peer", "Tent", "TENT", "öft", "ÖFT", "sträße",
     "needle", "haystack", "gram", "index", "duck", "db", "row", "tail",
 ]
-
-
-def sql_quote(s):
-    return "'" + s.replace("'", "''") + "'"
 
 
 def make_row(rng, alphabet_name, rows):
@@ -130,13 +125,8 @@ def differential_sql(needle, case_insensitive):
         pred = "contains(lower(s), lower(%s))" % q
     else:
         pred = "contains(s, %s)" % q
-    return (
-        "SELECT 'diff', %s, count(*) FROM ("
-        "(SELECT * FROM ngram_search('corpus', %s) EXCEPT ALL SELECT * FROM corpus WHERE %s)"
-        " UNION ALL "
-        "(SELECT * FROM corpus WHERE %s EXCEPT ALL SELECT * FROM ngram_search('corpus', %s)));"
-        % (q, q, pred, pred, q)
-    )
+    return "SELECT 'diff', %s, (%s);" % (
+        q, multiset_mismatch("SELECT * FROM ngram_search('corpus', %s)" % q, "SELECT * FROM corpus WHERE %s" % pred))
 
 
 def candidates_sql(needle, case_insensitive, index_ref):
@@ -194,35 +184,18 @@ def transparent_checks(patterns):
                 "SET disabled_optimizers='extension';",
                 "CREATE OR REPLACE TEMP TABLE r_plain AS SELECT * FROM corpus WHERE %s;" % pred,
             ]
-            statements.append(
-                "SELECT 'diff', %s, count(*) FROM ((TABLE r_acc EXCEPT ALL TABLE r_plain)"
-                " UNION ALL (TABLE r_plain EXCEPT ALL TABLE r_acc));" % sql_quote(tag))
+            statements.append("SELECT 'diff', %s, (%s);"
+                              % (sql_quote(tag), multiset_mismatch("TABLE r_acc", "TABLE r_plain")))
     statements.append("SET disabled_optimizers='';")
     return statements
 
 
 def run_duckdb(db_path, script):
-    proc = subprocess.run(
-        [DUCKDB, db_path],
-        input=".headers off\n.mode csv\n" + script,
-        capture_output=True, text=True, timeout=600,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError("duckdb failed:\n%s" % proc.stderr[-4000:])
-    return proc.stdout
+    return CLI.run(db_path, script, timeout=600)[1]
 
 
 def index_ref(db_path):
-    catalog = next(csv.reader(run_duckdb(db_path, "SELECT current_database();").splitlines()))[0]
-    rows = [row for row in csv.reader(run_duckdb(db_path, "PRAGMA ngram_indexes;").splitlines())
-            if len(row) == 8 and row[0] == catalog
-            and row[2:5] == ["main", "corpus", "s"] and row[5] == "5" and row[6] == "READY"]
-    if len(rows) != 1:
-        raise RuntimeError("expected one READY format-5 corpus.s index")
-    ref = rows[0][1]
-    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", ref):
-        raise RuntimeError("public corpus.s index id is not a canonical UUIDv4")
-    return ref
+    return CLI.index_ref(db_path)
 
 
 def check_output(out, label, failures):
@@ -358,7 +331,7 @@ def main():
     ap.add_argument("--transparent", action="store_true",
                     help="exercise the Phase 4 optimizer rewrite (plain LIKE/contains/ILIKE queries, "
                          "accelerated vs disabled_optimizers='extension') instead of the explicit functions")
-    ap.add_argument("--duckdb", default=DUCKDB, help="duckdb binary to run (e.g. a DEBUG build)")
+    ap.add_argument("--duckdb", default=DEFAULT_DUCKDB, help="duckdb binary to run (e.g. a DEBUG build)")
     args = ap.parse_args()
     set_duckdb_binary(args.duckdb)
 

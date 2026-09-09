@@ -54,9 +54,9 @@ SELECT (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(inde
 # still tail, and every query scans it
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('docs', 'tail') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'tail'))
+	(SELECT * FROM ngram_search('docs', 'tail') EXCEPT ALL SELECT * FROM docs WHERE contains(lower(s), 'tail'))
 	UNION ALL
-	(SELECT * FROM docs WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('docs', 'tail'))
+	(SELECT * FROM docs WHERE contains(lower(s), 'tail') EXCEPT ALL SELECT * FROM ngram_search('docs', 'tail'))
 );
 ----
 0
@@ -95,9 +95,9 @@ s	0	29	0
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('docs', 'tail') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'tail'))
+	(SELECT * FROM ngram_search('docs', 'tail') EXCEPT ALL SELECT * FROM docs WHERE contains(lower(s), 'tail'))
 	UNION ALL
-	(SELECT * FROM docs WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('docs', 'tail'))
+	(SELECT * FROM docs WHERE contains(lower(s), 'tail') EXCEPT ALL SELECT * FROM ngram_search('docs', 'tail'))
 );
 ----
 0
@@ -350,9 +350,9 @@ s	10	59	0
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('gappy', 'tail') EXCEPT SELECT * FROM gappy WHERE contains(lower(s), 'tail'))
+	(SELECT * FROM ngram_search('gappy', 'tail') EXCEPT ALL SELECT * FROM gappy WHERE contains(lower(s), 'tail'))
 	UNION ALL
-	(SELECT * FROM gappy WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('gappy', 'tail'))
+	(SELECT * FROM gappy WHERE contains(lower(s), 'tail') EXCEPT ALL SELECT * FROM ngram_search('gappy', 'tail'))
 );
 ----
 0
@@ -436,13 +436,13 @@ query I
 SELECT count(*) FROM (
 	(SELECT gram_key, r FROM ngram_unpack_postings((SELECT gram_key, segment_no, postings FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id'))))
-	 EXCEPT
+	 EXCEPT ALL
 	 SELECT gram_key, r FROM ngram_unpack_postings((SELECT gram_key, segment_no, postings FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id')))))
 	UNION ALL
 	(SELECT gram_key, r FROM ngram_unpack_postings((SELECT gram_key, segment_no, postings FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_b_id'))))
-	 EXCEPT
+	 EXCEPT ALL
 	 SELECT gram_key, r FROM ngram_unpack_postings((SELECT gram_key, segment_no, postings FROM
 	 query('SELECT * FROM __ngram.segments_' || getvariable('twin_a_id')))))
 );
@@ -539,9 +539,9 @@ SELECT
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('crossing', 'tail') EXCEPT SELECT * FROM crossing WHERE contains(lower(s), 'tail'))
+	(SELECT * FROM ngram_search('crossing', 'tail') EXCEPT ALL SELECT * FROM crossing WHERE contains(lower(s), 'tail'))
 	UNION ALL
-	(SELECT * FROM crossing WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('crossing', 'tail'))
+	(SELECT * FROM crossing WHERE contains(lower(s), 'tail') EXCEPT ALL SELECT * FROM ngram_search('crossing', 'tail'))
 );
 ----
 0
@@ -792,9 +792,9 @@ s	5000	29999	20000
 
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('vac.main.t', 'tail') EXCEPT SELECT * FROM vac.t WHERE contains(lower(s), 'tail'))
+	(SELECT * FROM ngram_search('vac.main.t', 'tail') EXCEPT ALL SELECT * FROM vac.t WHERE contains(lower(s), 'tail'))
 	UNION ALL
-	(SELECT * FROM vac.t WHERE contains(lower(s), 'tail') EXCEPT SELECT * FROM ngram_search('vac.main.t', 'tail'))
+	(SELECT * FROM vac.t WHERE contains(lower(s), 'tail') EXCEPT ALL SELECT * FROM ngram_search('vac.main.t', 'tail'))
 );
 ----
 0

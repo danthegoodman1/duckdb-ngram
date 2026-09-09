@@ -140,9 +140,11 @@ partitions sized from `memory_limit` (`ngram_build_partitions` overrides the
 count) so that the aggregate's hash table fits; compaction packs at the
 finest partition count. The packed rows are copied once into the segments
 table in key order so that each generation is one sorted run. On
-the enwik9 corpus (10.9M rows, 0.92 GiB of text) a build reaches a peak of
-6.9 GiB of process memory at 24 threads (`docs/review/2026-09-09/`
-`build_observations.json`); an index is about the size of its text.
+the enwik9 corpus (10.9M rows, 0.92 GiB of text) a case-insensitive build
+peaks at 6.9 GiB of process memory at 24 threads
+(`docs/review/2026-09-09/build_observations.json`), and the release block in
+the README reports the case-sensitive index it measures; an index is about
+the size of its text.
 
 A query's memory is reserved up front and released with the query, including
 on interrupt: the manifest, the per-worker segment workspace, and the

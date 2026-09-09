@@ -584,25 +584,25 @@ Same-machine observations; queries are warm-cache for a **non-default case-sensi
 index** over nonempty line-per-row `enwik9`. These are not cold-cache, large-scale, or
 shipped-default claims. Raw evidence: [`benchmarks/artifacts/enwik9-current-v1.json`](benchmarks/artifacts/enwik9-current-v1.json).
 
-- Engine commit: `b6a388c8c39f`; build commit: `b6a388c8c39f`; DuckDB v1.5.5 / source d8cdaa33;
+- Engine commit: `6fb01c606165`; build commit: `6fb01c606165`; DuckDB v1.5.5 / source d8cdaa33;
   static-extension release CLI. The numbers describe the engine commit's `src/**` and are
   re-collected on release; later commits keep this block until the next collection.
 - Corpus: 10,920,423 rows, 0.919 GiB of UTF-8 text; three fresh load/build pairs.
 - Timed load—fresh CLI and absent DB through create, hex decode, insert, CHECKPOINT—was
-  2.299 s median (2.170–2.401 s). Timed index build—fresh CLI through create-index and
-  CHECKPOINT—was 7.834 s median (7.781–7.941 s), 120.14 MiB/s of source text.
-- Paired whole-database size increase: 0.996 GiB apparent, 0.996 GiB allocated
-  (median); 1.083× source bytes. This whole-DB effect includes allocator/checkpoint effects.
-- Build-process max RSS: 11.752 GiB median. Sampled peak temp apparent file bytes: 0.000 GiB
+  2.066 s median (1.981–2.138 s). Timed index build—fresh CLI through create-index and
+  CHECKPOINT—was 7.554 s median (7.477–8.880 s), 124.59 MiB/s of source text.
+- Paired whole-database size increase: 0.992 GiB apparent, 0.992 GiB allocated
+  (median); 1.080× source bytes. This whole-DB effect includes allocator/checkpoint effects.
+- Build-process max RSS: 7.920 GiB median. Sampled peak temp apparent file bytes: 0.000 GiB
   median, polled every 100 ms; zero means none observed, not proof that no brief spill occurred.
   Acquisition, normalization, relation/stat checks, EXPLAIN, and parity are untimed. Loads may
   read cached transport pages; builds follow relation identity and may read cached source pages.
 
 | needle class | ngram_search mode | exact matches | candidates | ngram_search p50 / p95 / range | scan p50 / p95 / range | scan ÷ search p50 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| rare | index | 1 | 12 | 7 / 7 ms / 6–7 ms | 43 / 45 ms / 42–47 ms | 6.14× |
-| moderate | index | 26,068 | 26,381 | 15 / 16 ms / 14–17 ms | 29 / 30 ms / 27–31 ms | 1.93× |
-| dense | full-scan-fallback | 1,963,067 | 1,963,067 | 44 / 45 ms / 43–46 ms | 39 / 40 ms / 37–40 ms | 0.89× |
+| rare | index | 1 | 12 | 1 / 2 ms / 0–4 ms | 42 / 43 ms / 40–45 ms | 42.00× |
+| moderate | index | 26,068 | 26,381 | 6 / 7 ms / 5–8 ms | 28 / 30 ms / 26–31 ms | 4.67× |
+| dense | full-scan-fallback | 1,963,067 | 1,963,067 | 37 / 40 ms / 36–43 ms | 37 / 39 ms / 36–45 ms | 1.00× |
 
 The timed campaign adds one warmup per variant after untimed parity/EXPLAIN executions, then
 twenty-one measured observations per variant using a fixed-seed interleaving on one connection.

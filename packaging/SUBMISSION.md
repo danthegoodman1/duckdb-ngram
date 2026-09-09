@@ -213,6 +213,23 @@ SELECT count(*) FROM ngram_search('logs','reset by peer #4242');   -- 1
 SELECT count(*) FROM ngram_search('logs','after the extension');   -- 1
 ```
 
+### Current-format revalidation
+
+Run on the release-evidence build of engine commit `6fb01c606165` with the
+official v1.5.5 (Variegata) d8cdaa33fd CLI, SHA-256
+`3d33b1df037cb049155c393778df7853fafb23e9d49d7c9cacdde4dd67155788`,
+against the loadable artifact, SHA-256
+`846d5408fec67f9b041062c2593333ae65151b7eb928a7aa7d322edb4b3fc17b`,
+through `INSTALL ngram` from a repository in DuckDB's layout
+with a fresh `extension_directory`: install mode `REPOSITORY`; a 50,000-row
+table indexed and searched exactly on both paths; a second process reopened
+the file with the index `READY`, ran a covered update and a tail insert,
+searched exactly before and after `ngram_refresh` (mark advanced, no tail
+left, no staleness), dropped the index by reference and found no ngram table
+or index left with all rows intact; a third, extension-free process read the
+table. The script is `docs/review/2026-09-09/install_check.sh` and the
+transcript `docs/review/2026-09-09/install_check.log`.
+
 ## Draft PR
 
 **Title**

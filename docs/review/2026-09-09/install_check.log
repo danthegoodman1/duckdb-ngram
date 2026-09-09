@@ -1,0 +1,35 @@
+artifact sha256: 846d5408fec67f9b041062c2593333ae65151b7eb928a7aa7d322edb4b3fc17b
+stock cli: v1.5.5 (Variegata) d8cdaa33fd sha256 3d33b1df037cb049155c393778df7853fafb23e9d49d7c9cacdde4dd67155788
+== process 1: install, load, build, search
+extension_name,loaded,installed,install_mode
+ngram,true,true,REPOSITORY
+count_star()
+7143
+count_star()
+7143
+Success
+== process 2: reopen, status, covered update, tail insert, refresh, drop
+table_name,column_name,format_version,status
+docs,s,5,READY
+count_star()
+7145
+count_star()
+7145
+column_name,rows_indexed,hwm_rowid,remaining_tail
+s,2,50001,0
+count_star()
+7145
+hwm_rowid,remaining_tail,stale_reason
+50001,0,NULL
+count_star()
+0
+count_star()
+0
+count_star()
+0
+count_star()
+50001
+== process 3: extension-free read of the same file
+count_star()
+7145
+INSTALL_CHECK_DONE

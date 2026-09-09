@@ -19,20 +19,19 @@ namespace ngram {
 //! candidate set, never drop a match (benchmarks/RESULTS.md).
 static constexpr idx_t DEFAULT_MAX_GRAMS_PER_QUERY = 3;
 
-//! The gate compares fetching every candidate against scanning every row.
-//! Measured on enwik9 (10.9M rows, warm, Phase 19): a per-row fetch plus
-//! recheck costs 3.8 us of CPU when the string column segment is FSST
-//! compressed (188 ms for 50,000 consecutive rows on one thread) and 0.13 us
-//! when it is uncompressed (6.4 ms); 68% of the corpus rows are FSST. Sparse
-//! candidates fetch in parallel at 0.22 us of wall time each (32k candidates
-//! over 11 segments: 7.1 ms at 24 threads); dense batches are read as rowid
-//! range scans instead of per-row fetches. A scanned row costs about 50 ns of
-//! CPU (536 ms single-threaded) and 3.6 ns of wall time (39 ms at 24 threads).
-//! The break-even is 1.3% of rows by CPU on FSST segments and 1.6% by wall
-//! time for sparse candidates; one percent sits below both, rounded toward
-//! scanning. Earlier measurements at 1, 10 and 100 GB put the crossover at
-//! 1.6%, 1.3% and 1.1% (benchmarks/RESULTS.md).
-static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.01;
+//! The gate compares fetching the candidates against scanning the indexed
+//! rows, in fetch-equivalent rows: a candidate of a scattered segment counts
+//! one, a segment whose candidates could be read as range scans counts its
+//! span over the range-to-fetch ratio, and every projected column beyond the
+//! recheck's multiplies the charge. Measured on enwik9 (10.9M rows, warm,
+//! docs/review/2026-09-09/cost_observations.json): a scattered fetch costs
+//! 0.8-1.5 us of CPU at one thread and 0.22-0.29 us of wall time at 24, a
+//! scanned row 92 ns and 6.3 ns. With the gate open, a needle whose candidate
+//! bound is 3.2% of the rows ran 8x faster than the scan at one thread and
+//! 2.5x at 24, one at 3.6% ran 2.5x faster at one thread and 1.15x slower at
+//! 24, and one at 20% ran 2.3x and 7.8x slower. Two percent sits below the
+//! 24-thread crossover, rounded toward scanning.
+static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.02;
 static constexpr int64_t DEFAULT_MAX_PROBE_ROWIDS = 100000000;
 static constexpr idx_t MAX_PROBE_MEMORY_BYTES = 256ULL * 1024ULL * 1024ULL;
 
@@ -110,7 +109,8 @@ void RegisterSettings(ExtensionLoader &loader) {
 	                          "ngram index queries probe at most this many of the needle's rarest grams",
 	                          LogicalType::BIGINT, Value::BIGINT(DEFAULT_MAX_GRAMS_PER_QUERY));
 	config.AddExtensionOption("ngram_max_candidate_fraction",
-	                          "full-result ngram queries scan when the candidate upper bound exceeds this fraction",
+	                          "full-result ngram queries scan when the fetch-equivalent candidate bound (dense spans "
+	                          "discounted, extra projected columns charged) exceeds this fraction of the indexed rows",
 	                          LogicalType::DOUBLE, Value::DOUBLE(DEFAULT_MAX_CANDIDATE_FRACTION));
 	config.AddExtensionOption("ngram_max_probe_rowids",
 	                          "hard limit on posting rowids an ngram query may decode before scanning or erroring",

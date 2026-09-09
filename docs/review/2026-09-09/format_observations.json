@@ -1,0 +1,3322 @@
+{
+ "format4": {
+  "base_bytes": 72888320,
+  "binary": "/home/dangoodman/.claude/jobs/9ac4ba05/tmp/main-d3ecccf/build/release/duckdb",
+  "build_s": 1.233,
+  "compact_s": 2.814,
+  "compacted_bytes": 349188096,
+  "fragmented_bytes": 273690624,
+  "index_bytes": 108789760,
+  "indexed_bytes": 181678080,
+  "load_s": 0.231,
+  "noop_compact_s": 0.216,
+  "noop_refresh_s": [
+   0.106,
+   0.109,
+   0.106,
+   0.094,
+   0.093,
+   0.098,
+   0.095,
+   0.102,
+   0.093,
+   0.097,
+   0.094,
+   0.089,
+   0.098,
+   0.096,
+   0.089,
+   0.094,
+   0.098,
+   0.097,
+   0.096,
+   0.099
+  ],
+  "queries_compacted": {
+   "Schwarzschild": {
+    "matches": 24,
+    "mode": "index (<= 28 candidates, 1078 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 28 candidates, 1078 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 41.0,
+     "min_ms": 34.0,
+     "n": 7,
+     "p50_ms": 36.0
+    },
+    "search": {
+     "max_ms": 17.0,
+     "min_ms": 13.0,
+     "n": 7,
+     "p50_ms": 15.0
+    }
+   },
+   "chemistry": {
+    "matches": 1486,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 39.0,
+     "min_ms": 33.0,
+     "n": 7,
+     "p50_ms": 34.0
+    },
+    "search": {
+     "max_ms": 62.0,
+     "min_ms": 59.0,
+     "n": 7,
+     "p50_ms": 60.0
+    }
+   },
+   "history": {
+    "matches": 14481,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 39.0,
+     "min_ms": 32.0,
+     "n": 7,
+     "p50_ms": 37.0
+    },
+    "search": {
+     "max_ms": 65.0,
+     "min_ms": 60.0,
+     "n": 7,
+     "p50_ms": 63.0
+    }
+   },
+   "parliamentary": {
+    "matches": 694,
+    "mode": "index (<= 9270 candidates, 46793 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 9270 candidates, 46793 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 37.0,
+     "min_ms": 31.0,
+     "n": 7,
+     "p50_ms": 36.0
+    },
+    "search": {
+     "max_ms": 20.0,
+     "min_ms": 18.0,
+     "n": 7,
+     "p50_ms": 19.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 67,
+    "mode": "index (<= 801 candidates, 6140 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 801 candidates, 6140 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 39.0,
+     "min_ms": 30.0,
+     "n": 7,
+     "p50_ms": 31.0
+    },
+    "search": {
+     "max_ms": 20.0,
+     "min_ms": 15.0,
+     "n": 7,
+     "p50_ms": 16.0
+    }
+   },
+   "which": {
+    "matches": 42950,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 37.0,
+     "min_ms": 29.0,
+     "n": 7,
+     "p50_ms": 34.0
+    },
+    "search": {
+     "max_ms": 58.0,
+     "min_ms": 56.0,
+     "n": 7,
+     "p50_ms": 57.0
+    }
+   }
+  },
+  "queries_generation_1": {
+   "Schwarzschild": {
+    "matches": 23,
+    "mode": "index (<= 26 candidates, 901 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 26 candidates, 901 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Stats Chunks Scanned": "117",
+     "Ngram Stats Rows Scanned": "238546",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 27.0,
+     "min_ms": 21.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "search": {
+     "max_ms": 13.0,
+     "min_ms": 7.0,
+     "n": 7,
+     "p50_ms": 8.0
+    }
+   },
+   "chemistry": {
+    "matches": 1285,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 23.0,
+     "min_ms": 20.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "search": {
+     "max_ms": 41.0,
+     "min_ms": 34.0,
+     "n": 7,
+     "p50_ms": 37.0
+    }
+   },
+   "history": {
+    "matches": 12413,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 24.0,
+     "min_ms": 20.0,
+     "n": 7,
+     "p50_ms": 22.0
+    },
+    "search": {
+     "max_ms": 41.0,
+     "min_ms": 36.0,
+     "n": 7,
+     "p50_ms": 37.0
+    }
+   },
+   "parliamentary": {
+    "matches": 577,
+    "mode": "index (<= 7881 candidates, 39525 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 7881 candidates, 39525 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Stats Chunks Scanned": "117",
+     "Ngram Stats Rows Scanned": "238546",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 24.0,
+     "min_ms": 18.0,
+     "n": 7,
+     "p50_ms": 22.0
+    },
+    "search": {
+     "max_ms": 16.0,
+     "min_ms": 12.0,
+     "n": 7,
+     "p50_ms": 13.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 63,
+    "mode": "index (<= 702 candidates, 5179 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 702 candidates, 5179 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Stats Chunks Scanned": "117",
+     "Ngram Stats Rows Scanned": "238546",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 23.0,
+     "min_ms": 19.0,
+     "n": 7,
+     "p50_ms": 21.0
+    },
+    "search": {
+     "max_ms": 13.0,
+     "min_ms": 8.0,
+     "n": 7,
+     "p50_ms": 8.0
+    }
+   },
+   "which": {
+    "matches": 36415,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 22.0,
+     "min_ms": 18.0,
+     "n": 7,
+     "p50_ms": 20.0
+    },
+    "search": {
+     "max_ms": 37.0,
+     "min_ms": 32.0,
+     "n": 7,
+     "p50_ms": 33.0
+    }
+   }
+  },
+  "queries_generation_10": {
+   "Schwarzschild": {
+    "matches": 23,
+    "mode": "index (<= 26 candidates, 923 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 26 candidates, 923 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 34.0,
+     "min_ms": 33.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 19.0,
+     "min_ms": 15.0,
+     "n": 7,
+     "p50_ms": 16.0
+    }
+   },
+   "chemistry": {
+    "matches": 1357,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 36.0,
+     "min_ms": 30.0,
+     "n": 7,
+     "p50_ms": 32.0
+    },
+    "search": {
+     "max_ms": 65.0,
+     "min_ms": 61.0,
+     "n": 7,
+     "p50_ms": 62.0
+    }
+   },
+   "history": {
+    "matches": 13402,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 35.0,
+     "min_ms": 30.0,
+     "n": 7,
+     "p50_ms": 32.0
+    },
+    "search": {
+     "max_ms": 65.0,
+     "min_ms": 61.0,
+     "n": 7,
+     "p50_ms": 62.0
+    }
+   },
+   "parliamentary": {
+    "matches": 638,
+    "mode": "index (<= 8482 candidates, 42663 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 8482 candidates, 42663 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 33.0,
+     "min_ms": 28.0,
+     "n": 7,
+     "p50_ms": 29.0
+    },
+    "search": {
+     "max_ms": 28.0,
+     "min_ms": 20.0,
+     "n": 7,
+     "p50_ms": 21.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 64,
+    "mode": "index (<= 746 candidates, 5501 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 746 candidates, 5501 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 35.0,
+     "min_ms": 28.0,
+     "n": 7,
+     "p50_ms": 30.0
+    },
+    "search": {
+     "max_ms": 21.0,
+     "min_ms": 17.0,
+     "n": 7,
+     "p50_ms": 18.0
+    }
+   },
+   "which": {
+    "matches": 39517,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 32.0,
+     "min_ms": 26.0,
+     "n": 7,
+     "p50_ms": 31.0
+    },
+    "search": {
+     "max_ms": 61.0,
+     "min_ms": 55.0,
+     "n": 7,
+     "p50_ms": 58.0
+    }
+   }
+  },
+  "queries_generation_20": {
+   "Schwarzschild": {
+    "matches": 24,
+    "mode": "index (<= 28 candidates, 1060 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 28 candidates, 1060 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 39.0,
+     "min_ms": 34.0,
+     "n": 7,
+     "p50_ms": 36.0
+    },
+    "search": {
+     "max_ms": 26.0,
+     "min_ms": 22.0,
+     "n": 7,
+     "p50_ms": 25.0
+    }
+   },
+   "chemistry": {
+    "matches": 1468,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 38.0,
+     "min_ms": 32.0,
+     "n": 7,
+     "p50_ms": 34.0
+    },
+    "search": {
+     "max_ms": 76.0,
+     "min_ms": 69.0,
+     "n": 7,
+     "p50_ms": 71.0
+    }
+   },
+   "history": {
+    "matches": 14396,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 39.0,
+     "min_ms": 32.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 79.0,
+     "min_ms": 69.0,
+     "n": 7,
+     "p50_ms": 73.0
+    }
+   },
+   "parliamentary": {
+    "matches": 691,
+    "mode": "index (<= 9189 candidates, 46436 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 9189 candidates, 46436 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 36.0,
+     "min_ms": 31.0,
+     "n": 7,
+     "p50_ms": 35.0
+    },
+    "search": {
+     "max_ms": 32.0,
+     "min_ms": 28.0,
+     "n": 7,
+     "p50_ms": 31.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 67,
+    "mode": "index (<= 798 candidates, 6083 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 798 candidates, 6083 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 38.0,
+     "min_ms": 31.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 27.0,
+     "min_ms": 22.0,
+     "n": 7,
+     "p50_ms": 25.0
+    }
+   },
+   "which": {
+    "matches": 42547,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 36.0,
+     "min_ms": 28.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 71.0,
+     "min_ms": 65.0,
+     "n": 7,
+     "p50_ms": 68.0
+    }
+   }
+  },
+  "queries_generation_5": {
+   "Schwarzschild": {
+    "matches": 23,
+    "mode": "index (<= 26 candidates, 917 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 26 candidates, 917 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 29.0,
+     "min_ms": 25.0,
+     "n": 7,
+     "p50_ms": 25.0
+    },
+    "search": {
+     "max_ms": 13.0,
+     "min_ms": 11.0,
+     "n": 7,
+     "p50_ms": 12.0
+    }
+   },
+   "chemistry": {
+    "matches": 1315,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 28.0,
+     "min_ms": 23.0,
+     "n": 7,
+     "p50_ms": 26.0
+    },
+    "search": {
+     "max_ms": 51.0,
+     "min_ms": 44.0,
+     "n": 7,
+     "p50_ms": 46.0
+    }
+   },
+   "history": {
+    "matches": 12911,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 28.0,
+     "min_ms": 24.0,
+     "n": 7,
+     "p50_ms": 27.0
+    },
+    "search": {
+     "max_ms": 48.0,
+     "min_ms": 45.0,
+     "n": 7,
+     "p50_ms": 45.0
+    }
+   },
+   "parliamentary": {
+    "matches": 588,
+    "mode": "index (<= 8124 candidates, 40829 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 8124 candidates, 40829 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 27.0,
+     "min_ms": 23.0,
+     "n": 7,
+     "p50_ms": 24.0
+    },
+    "search": {
+     "max_ms": 18.0,
+     "min_ms": 16.0,
+     "n": 7,
+     "p50_ms": 17.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 64,
+    "mode": "index (<= 719 candidates, 5390 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "index (<= 719 candidates, 5390 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Stats Chunks Scanned": "120",
+     "Ngram Stats Rows Scanned": "245760",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 27.0,
+     "min_ms": 21.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "search": {
+     "max_ms": 14.0,
+     "min_ms": 12.0,
+     "n": 7,
+     "p50_ms": 13.0
+    }
+   },
+   "which": {
+    "matches": 37756,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Storage Columns": "s"
+    },
+    "scan": {
+     "max_ms": 25.0,
+     "min_ms": 20.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "search": {
+     "max_ms": 44.0,
+     "min_ms": 41.0,
+     "n": 7,
+     "p50_ms": 43.0
+    }
+   }
+  },
+  "refresh_s": [
+   0.195,
+   0.175,
+   0.177,
+   0.177,
+   0.181,
+   0.182,
+   0.178,
+   0.163,
+   0.165,
+   0.152,
+   0.142,
+   0.153,
+   0.18,
+   0.171,
+   0.167,
+   0.166,
+   0.183,
+   0.164,
+   0.168,
+   0.187
+  ],
+  "stats_compacted": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 16.0,
+    "min_ms": 12.0,
+    "n": 5,
+    "p50_ms": 12.0
+   },
+   "stats_row": "s,3,true,1199999,1199999,0,261105,334477,0,21,90776384,109191028,NULL"
+  },
+  "stats_generation_1": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 16.0,
+    "min_ms": 10.0,
+    "n": 5,
+    "p50_ms": 13.0
+   },
+   "stats_row": "s,3,true,999999,999999,0,238546,238546,0,1,76417949,91710768,NULL"
+  },
+  "stats_generation_10": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 16.0,
+    "min_ms": 12.0,
+    "n": 5,
+    "p50_ms": 12.0
+   },
+   "stats_row": "s,3,true,1089999,1089999,0,251053,493514,76766,10,83031562,100356388,NULL"
+  },
+  "stats_generation_20": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 18.0,
+    "min_ms": 15.0,
+    "n": 5,
+    "p50_ms": 16.0
+   },
+   "stats_row": "s,3,true,1189999,1189999,0,260088,748030,96163,20,89969191,109416915,NULL"
+  },
+  "stats_generation_5": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 14.0,
+    "min_ms": 12.0,
+    "n": 5,
+    "p50_ms": 13.0
+   },
+   "stats_row": "s,3,true,1039999,1039999,0,245939,354159,47536,5,79477315,95715080,NULL"
+  },
+  "storage_tables": "registry,segments_b074b15fb0914263ba8fb6b078ae473a,stats_b074b15fb0914263ba8fb6b078ae473a",
+  "version": "v1.5.5"
+ },
+ "format5": {
+  "base_bytes": 72101888,
+  "binary": "build/release/duckdb",
+  "build_s": 1.31,
+  "compact_s": 1.746,
+  "compacted_bytes": 361508864,
+  "fragmented_bytes": 277098496,
+  "index_bytes": 110100480,
+  "indexed_bytes": 182202368,
+  "load_s": 0.202,
+  "noop_compact_s": 0.023,
+  "noop_refresh_s": [
+   0.003,
+   0.003,
+   0.004,
+   0.004,
+   0.004,
+   0.004,
+   0.003,
+   0.004,
+   0.004,
+   0.004,
+   0.003,
+   0.004,
+   0.004,
+   0.003,
+   0.004,
+   0.004,
+   0.004,
+   0.006,
+   0.004,
+   0.004
+  ],
+  "queries_compacted": {
+   "Schwarzschild": {
+    "matches": 24,
+    "mode": "index (<= 28 candidates, 1078 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "5160",
+     "Ngram Decode Workspace Bytes": "534640",
+     "Ngram Fetched Rows": "24",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "20",
+     "Ngram Mode": "index (<= 28 candidates, 1078 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Probe Workers": "2",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 40.0,
+     "min_ms": 34.0,
+     "n": 7,
+     "p50_ms": 39.0
+    },
+    "search": {
+     "max_ms": 9.0,
+     "min_ms": 8.0,
+     "n": 7,
+     "p50_ms": 8.0
+    }
+   },
+   "chemistry": {
+    "matches": 1486,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1200000"
+    },
+    "scan": {
+     "max_ms": 40.0,
+     "min_ms": 32.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 56.0,
+     "min_ms": 52.0,
+     "n": 7,
+     "p50_ms": 53.0
+    }
+   },
+   "history": {
+    "matches": 14481,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1200000"
+    },
+    "scan": {
+     "max_ms": 39.0,
+     "min_ms": 34.0,
+     "n": 7,
+     "p50_ms": 37.0
+    },
+    "search": {
+     "max_ms": 56.0,
+     "min_ms": 53.0,
+     "n": 7,
+     "p50_ms": 53.0
+    }
+   },
+   "parliamentary": {
+    "matches": 694,
+    "mode": "index (<= 9270 candidates, 46793 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "273184",
+     "Ngram Decode Workspace Bytes": "3086200",
+     "Ngram Fetched Rows": "2845",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "22",
+     "Ngram Mode": "index (<= 9270 candidates, 46793 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Probe Workers": "5",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 36.0,
+     "min_ms": 30.0,
+     "n": 7,
+     "p50_ms": 35.0
+    },
+    "search": {
+     "max_ms": 13.0,
+     "min_ms": 12.0,
+     "n": 7,
+     "p50_ms": 13.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 67,
+    "mode": "index (<= 801 candidates, 6140 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "30456",
+     "Ngram Decode Workspace Bytes": "593872",
+     "Ngram Fetched Rows": "87",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "24",
+     "Ngram Mode": "index (<= 801 candidates, 6140 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Probe Workers": "2",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 36.0,
+     "min_ms": 30.0,
+     "n": 7,
+     "p50_ms": 35.0
+    },
+    "search": {
+     "max_ms": 10.0,
+     "min_ms": 8.0,
+     "n": 7,
+     "p50_ms": 9.0
+    }
+   },
+   "which": {
+    "matches": 42950,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1200000"
+    },
+    "scan": {
+     "max_ms": 34.0,
+     "min_ms": 28.0,
+     "n": 7,
+     "p50_ms": 28.0
+    },
+    "search": {
+     "max_ms": 55.0,
+     "min_ms": 49.0,
+     "n": 7,
+     "p50_ms": 51.0
+    }
+   }
+  },
+  "queries_generation_1": {
+   "Schwarzschild": {
+    "matches": 23,
+    "mode": "index (<= 26 candidates, 901 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "4984",
+     "Ngram Decode Workspace Bytes": "267152",
+     "Ngram Fetched Rows": "23",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "10",
+     "Ngram Mode": "index (<= 26 candidates, 901 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Probe Workers": "1",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 25.0,
+     "min_ms": 21.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "search": {
+     "max_ms": 4.0,
+     "min_ms": 4.0,
+     "n": 7,
+     "p50_ms": 4.0
+    }
+   },
+   "chemistry": {
+    "matches": 1285,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1000000"
+    },
+    "scan": {
+     "max_ms": 24.0,
+     "min_ms": 20.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "search": {
+     "max_ms": 43.0,
+     "min_ms": 31.0,
+     "n": 7,
+     "p50_ms": 32.0
+    }
+   },
+   "history": {
+    "matches": 12413,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1000000"
+    },
+    "scan": {
+     "max_ms": 26.0,
+     "min_ms": 20.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "search": {
+     "max_ms": 42.0,
+     "min_ms": 33.0,
+     "n": 7,
+     "p50_ms": 33.0
+    }
+   },
+   "parliamentary": {
+    "matches": 577,
+    "mode": "index (<= 7881 candidates, 39525 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "259632",
+     "Ngram Decode Workspace Bytes": "2386512",
+     "Ngram Fetched Rows": "2413",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "11",
+     "Ngram Mode": "index (<= 7881 candidates, 39525 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Probe Workers": "4",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 23.0,
+     "min_ms": 19.0,
+     "n": 7,
+     "p50_ms": 20.0
+    },
+    "search": {
+     "max_ms": 11.0,
+     "min_ms": 8.0,
+     "n": 7,
+     "p50_ms": 8.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 63,
+    "mode": "index (<= 702 candidates, 5179 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "28984",
+     "Ngram Decode Workspace Bytes": "295464",
+     "Ngram Fetched Rows": "81",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "12",
+     "Ngram Mode": "index (<= 702 candidates, 5179 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Probe Workers": "1",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 24.0,
+     "min_ms": 19.0,
+     "n": 7,
+     "p50_ms": 21.0
+    },
+    "search": {
+     "max_ms": 5.0,
+     "min_ms": 4.0,
+     "n": 7,
+     "p50_ms": 4.0
+    }
+   },
+   "which": {
+    "matches": 36415,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1000000"
+    },
+    "scan": {
+     "max_ms": 22.0,
+     "min_ms": 17.0,
+     "n": 7,
+     "p50_ms": 20.0
+    },
+    "search": {
+     "max_ms": 35.0,
+     "min_ms": 29.0,
+     "n": 7,
+     "p50_ms": 30.0
+    }
+   }
+  },
+  "queries_generation_10": {
+   "Schwarzschild": {
+    "matches": 23,
+    "mode": "index (<= 26 candidates, 923 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "5152",
+     "Ngram Decode Workspace Bytes": "267320",
+     "Ngram Fetched Rows": "23",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "91",
+     "Ngram Mode": "index (<= 26 candidates, 923 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Probe Workers": "1",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 37.0,
+     "min_ms": 32.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 8.0,
+     "min_ms": 7.0,
+     "n": 7,
+     "p50_ms": 7.0
+    }
+   },
+   "chemistry": {
+    "matches": 1357,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1090000"
+    },
+    "scan": {
+     "max_ms": 36.0,
+     "min_ms": 30.0,
+     "n": 7,
+     "p50_ms": 31.0
+    },
+    "search": {
+     "max_ms": 56.0,
+     "min_ms": 49.0,
+     "n": 7,
+     "p50_ms": 53.0
+    }
+   },
+   "history": {
+    "matches": 13402,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1090000"
+    },
+    "scan": {
+     "max_ms": 36.0,
+     "min_ms": 30.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 55.0,
+     "min_ms": 49.0,
+     "n": 7,
+     "p50_ms": 50.0
+    }
+   },
+   "parliamentary": {
+    "matches": 638,
+    "mode": "index (<= 8482 candidates, 42663 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "271504",
+     "Ngram Decode Workspace Bytes": "3086200",
+     "Ngram Fetched Rows": "2638",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "121",
+     "Ngram Mode": "index (<= 8482 candidates, 42663 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Probe Workers": "5",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 37.0,
+     "min_ms": 30.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 15.0,
+     "min_ms": 13.0,
+     "n": 7,
+     "p50_ms": 14.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 64,
+    "mode": "index (<= 746 candidates, 5501 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "30496",
+     "Ngram Decode Workspace Bytes": "593872",
+     "Ngram Fetched Rows": "83",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "129",
+     "Ngram Mode": "index (<= 746 candidates, 5501 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Probe Workers": "2",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 35.0,
+     "min_ms": 29.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 10.0,
+     "min_ms": 7.0,
+     "n": 7,
+     "p50_ms": 8.0
+    }
+   },
+   "which": {
+    "matches": 39517,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1090000"
+    },
+    "scan": {
+     "max_ms": 32.0,
+     "min_ms": 26.0,
+     "n": 7,
+     "p50_ms": 27.0
+    },
+    "search": {
+     "max_ms": 52.0,
+     "min_ms": 46.0,
+     "n": 7,
+     "p50_ms": 49.0
+    }
+   }
+  },
+  "queries_generation_20": {
+   "Schwarzschild": {
+    "matches": 24,
+    "mode": "index (<= 28 candidates, 1060 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "5168",
+     "Ngram Decode Workspace Bytes": "534640",
+     "Ngram Fetched Rows": "24",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "177",
+     "Ngram Mode": "index (<= 28 candidates, 1060 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Probe Workers": "2",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 40.0,
+     "min_ms": 34.0,
+     "n": 7,
+     "p50_ms": 36.0
+    },
+    "search": {
+     "max_ms": 9.0,
+     "min_ms": 8.0,
+     "n": 7,
+     "p50_ms": 8.0
+    }
+   },
+   "chemistry": {
+    "matches": 1468,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1190000"
+    },
+    "scan": {
+     "max_ms": 39.0,
+     "min_ms": 32.0,
+     "n": 7,
+     "p50_ms": 34.0
+    },
+    "search": {
+     "max_ms": 58.0,
+     "min_ms": 54.0,
+     "n": 7,
+     "p50_ms": 55.0
+    }
+   },
+   "history": {
+    "matches": 14396,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1190000"
+    },
+    "scan": {
+     "max_ms": 39.0,
+     "min_ms": 32.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 58.0,
+     "min_ms": 53.0,
+     "n": 7,
+     "p50_ms": 56.0
+    }
+   },
+   "parliamentary": {
+    "matches": 691,
+    "mode": "index (<= 9189 candidates, 46436 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "278440",
+     "Ngram Decode Workspace Bytes": "3086200",
+     "Ngram Fetched Rows": "2827",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "231",
+     "Ngram Mode": "index (<= 9189 candidates, 46436 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Probe Workers": "5",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 38.0,
+     "min_ms": 31.0,
+     "n": 7,
+     "p50_ms": 35.0
+    },
+    "search": {
+     "max_ms": 15.0,
+     "min_ms": 14.0,
+     "n": 7,
+     "p50_ms": 15.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 67,
+    "mode": "index (<= 798 candidates, 6083 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "30312",
+     "Ngram Decode Workspace Bytes": "593872",
+     "Ngram Fetched Rows": "86",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "249",
+     "Ngram Mode": "index (<= 798 candidates, 6083 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Probe Workers": "2",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 39.0,
+     "min_ms": 31.0,
+     "n": 7,
+     "p50_ms": 35.0
+    },
+    "search": {
+     "max_ms": 9.0,
+     "min_ms": 8.0,
+     "n": 7,
+     "p50_ms": 8.0
+    }
+   },
+   "which": {
+    "matches": 42547,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1190000"
+    },
+    "scan": {
+     "max_ms": 34.0,
+     "min_ms": 28.0,
+     "n": 7,
+     "p50_ms": 33.0
+    },
+    "search": {
+     "max_ms": 52.0,
+     "min_ms": 49.0,
+     "n": 7,
+     "p50_ms": 50.0
+    }
+   }
+  },
+  "queries_generation_5": {
+   "Schwarzschild": {
+    "matches": 23,
+    "mode": "index (<= 26 candidates, 917 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "5104",
+     "Ngram Decode Workspace Bytes": "267272",
+     "Ngram Fetched Rows": "23",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "43",
+     "Ngram Mode": "index (<= 26 candidates, 917 decoded rowids)",
+     "Ngram Needle": "Schwarzschild",
+     "Ngram Probe Workers": "1",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 26.0,
+     "min_ms": 25.0,
+     "n": 7,
+     "p50_ms": 25.0
+    },
+    "search": {
+     "max_ms": 5.0,
+     "min_ms": 4.0,
+     "n": 7,
+     "p50_ms": 5.0
+    }
+   },
+   "chemistry": {
+    "matches": 1315,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "chemistry",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1040000"
+    },
+    "scan": {
+     "max_ms": 28.0,
+     "min_ms": 23.0,
+     "n": 7,
+     "p50_ms": 24.0
+    },
+    "search": {
+     "max_ms": 41.0,
+     "min_ms": 38.0,
+     "n": 7,
+     "p50_ms": 38.0
+    }
+   },
+   "history": {
+    "matches": 12911,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "history",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1040000"
+    },
+    "scan": {
+     "max_ms": 27.0,
+     "min_ms": 24.0,
+     "n": 7,
+     "p50_ms": 26.0
+    },
+    "search": {
+     "max_ms": 42.0,
+     "min_ms": 39.0,
+     "n": 7,
+     "p50_ms": 40.0
+    }
+   },
+   "parliamentary": {
+    "matches": 588,
+    "mode": "index (<= 8124 candidates, 40829 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "267824",
+     "Ngram Decode Workspace Bytes": "2428832",
+     "Ngram Fetched Rows": "2476",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "55",
+     "Ngram Mode": "index (<= 8124 candidates, 40829 decoded rowids)",
+     "Ngram Needle": "parliamentary",
+     "Ngram Probe Workers": "4",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 26.0,
+     "min_ms": 22.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "search": {
+     "max_ms": 10.0,
+     "min_ms": 8.0,
+     "n": 7,
+     "p50_ms": 9.0
+    }
+   },
+   "photosynthesis": {
+    "matches": 64,
+    "mode": "index (<= 719 candidates, 5390 decoded rowids)",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Decode Peak Bytes": "30216",
+     "Ngram Decode Workspace Bytes": "296808",
+     "Ngram Fetched Rows": "83",
+     "Ngram Local Rows": "0",
+     "Ngram Manifest Rows Scanned": "60",
+     "Ngram Mode": "index (<= 719 candidates, 5390 decoded rowids)",
+     "Ngram Needle": "photosynthesis",
+     "Ngram Probe Workers": "1",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "0"
+    },
+    "scan": {
+     "max_ms": 26.0,
+     "min_ms": 22.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "search": {
+     "max_ms": 5.0,
+     "min_ms": 5.0,
+     "n": 7,
+     "p50_ms": 5.0
+    }
+   },
+   "which": {
+    "matches": 37756,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "profile": {
+     "Ngram Column": "s",
+     "Ngram Fetched Rows": "0",
+     "Ngram Local Rows": "0",
+     "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+     "Ngram Needle": "which",
+     "Ngram Range Rows": "0",
+     "Ngram Storage Columns": "s",
+     "Ngram Tail Rows": "1040000"
+    },
+    "scan": {
+     "max_ms": 26.0,
+     "min_ms": 20.0,
+     "n": 7,
+     "p50_ms": 24.0
+    },
+    "search": {
+     "max_ms": 35.0,
+     "min_ms": 34.0,
+     "n": 7,
+     "p50_ms": 35.0
+    }
+   }
+  },
+  "refresh_s": [
+   0.118,
+   0.113,
+   0.102,
+   0.101,
+   0.123,
+   0.119,
+   0.11,
+   0.082,
+   0.097,
+   0.096,
+   0.072,
+   0.083,
+   0.112,
+   0.108,
+   0.093,
+   0.105,
+   0.118,
+   0.105,
+   0.102,
+   0.117
+  ],
+  "stats_compacted": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 15.0,
+    "min_ms": 11.0,
+    "n": 5,
+    "p50_ms": 13.0
+   },
+   "stats_row": "s,3,true,1199999,1199999,0,261105,334477,0,21,90776384,109191028,NULL"
+  },
+  "stats_generation_1": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 12.0,
+    "min_ms": 9.0,
+    "n": 5,
+    "p50_ms": 11.0
+   },
+   "stats_row": "s,3,true,999999,999999,0,238546,238546,0,1,76417949,91710768,NULL"
+  },
+  "stats_generation_10": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 13.0,
+    "min_ms": 12.0,
+    "n": 5,
+    "p50_ms": 12.0
+   },
+   "stats_row": "s,3,true,1089999,1089999,0,251053,493514,76766,10,83031562,100356388,NULL"
+  },
+  "stats_generation_20": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 17.0,
+    "min_ms": 15.0,
+    "n": 5,
+    "p50_ms": 16.0
+   },
+   "stats_row": "s,3,true,1189999,1189999,0,260088,748030,96163,20,89969191,109416915,NULL"
+  },
+  "stats_generation_5": {
+   "indexes": {
+    "max_ms": 1.0,
+    "min_ms": 0.0,
+    "n": 5,
+    "p50_ms": 0.0
+   },
+   "stats": {
+    "max_ms": 12.0,
+    "min_ms": 10.0,
+    "n": 5,
+    "p50_ms": 11.0
+   },
+   "stats_row": "s,3,true,1039999,1039999,0,245939,354159,47536,5,79477315,95715080,NULL"
+  },
+  "storage_tables": "registry,segments_08c3283d66604028898d67e21d1e3a7e",
+  "version": "v1.5.5"
+ },
+ "generations": 20,
+ "git_head": "48407e6b2bf0bac5a477d572818b227f28848b6a",
+ "manifest_compacted": {
+  "needles": [
+   {
+    "combined_returned": 334477,
+    "combined_row_groups": 3,
+    "combined_rows_scanned": 334477,
+    "combined_sql": {
+     "max_ms": 3.0,
+     "min_ms": 3.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 10,
+    "manifest_rows_scanned": "20",
+    "manifest_rows_visited": "938224",
+    "needle": "Schwarzschild",
+    "per_key": [
+     {
+      "key": "129529511886981455525113482993381408768",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.010063557
+     },
+     {
+      "key": "132135700109002676916238585047378034688",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.009193863
+     },
+     {
+      "key": "132135984062737128039624520308896038912",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.009117960000000001
+     },
+     {
+      "key": "138787093232014602063397422686862835712",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.005889701000000001
+     },
+     {
+      "key": "138859562281528449481822186215707770880",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.008664454
+     },
+     {
+      "key": "140131735859098293205823429658120552448",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006956571
+     },
+     {
+      "key": "152167784213326078423813479358022025216",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.008857336
+     },
+     {
+      "key": "153377366274859053092886421582966161408",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.007008948
+     },
+     {
+      "key": "158684096488377683445948828303941959680",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.010464745000000001
+     },
+     {
+      "key": "162764937583042003186917439209939664896",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.005892332
+     }
+    ],
+    "per_key_row_groups": 60,
+    "per_key_rows_scanned": 2832770,
+    "per_key_sql": {
+     "max_ms": 24.0,
+     "min_ms": 20.0,
+     "n": 7,
+     "p50_ms": 22.0
+    },
+    "probe": {
+     "max_ms": 3.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    }
+   },
+   {
+    "combined_returned": 334477,
+    "combined_row_groups": 3,
+    "combined_rows_scanned": 334477,
+    "combined_sql": {
+     "max_ms": 3.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 12,
+    "manifest_rows_scanned": "24",
+    "manifest_rows_visited": "1130784",
+    "needle": "photosynthesis",
+    "per_key": [
+     {
+      "key": "134851271366016391765960034627560144896",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.007011187
+     },
+     {
+      "key": "138766466021447688314576268332304957440",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.0058864880000000005
+     },
+     {
+      "key": "138818409272442640242531997242848444416",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.010654098
+     },
+     {
+      "key": "146819495342529565798052404719161180160",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.0067246979999999994
+     },
+     {
+      "key": "148143875842419208921724888386384166912",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.009207601999999999
+     },
+     {
+      "key": "148148865315181707232649179410200526848",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.009798361
+     },
+     {
+      "key": "149415785748664205174010620514530230272",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.009945452
+     },
+     {
+      "key": "153408743162515902227032267980705628160",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.008906319999999999
+     },
+     {
+      "key": "153491718500204441210736636185716719616",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.007153052
+     },
+     {
+      "key": "154732494907707832148921609283138748416",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006915744
+     },
+     {
+      "key": "154769124939452027065707258018961293312",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.009596986
+     },
+     {
+      "key": "161410092903927675254268186771285082112",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.007964182
+     }
+    ],
+    "per_key_row_groups": 72,
+    "per_key_rows_scanned": 3399324,
+    "per_key_sql": {
+     "max_ms": 29.0,
+     "min_ms": 23.0,
+     "n": 7,
+     "p50_ms": 26.0
+    },
+    "probe": {
+     "max_ms": 3.0,
+     "min_ms": 3.0,
+     "n": 7,
+     "p50_ms": 3.0
+    }
+   },
+   {
+    "combined_returned": 334477,
+    "combined_row_groups": 3,
+    "combined_rows_scanned": 334477,
+    "combined_sql": {
+     "max_ms": 4.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 11,
+    "manifest_rows_scanned": "22",
+    "manifest_rows_visited": "1035528",
+    "needle": "parliamentary",
+    "per_key": [
+     {
+      "key": "129503124472087104701891927619458301952",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.012400396000000001
+     },
+     {
+      "key": "129529227933247004401727547731863404544",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.010151954
+     },
+     {
+      "key": "129529491604571851873443059046130122752",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.011970609
+     },
+     {
+      "key": "134825532988229357796192045565678190592",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.009059838
+     },
+     {
+      "key": "140074803135340842966943409723760705536",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.007192718000000001
+     },
+     {
+      "key": "144103782108648625386637987508220067840",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.008588430000000001
+     },
+     {
+      "key": "145412504588324249420743183897450250240",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006630480000000001
+     },
+     {
+      "key": "146819353365662340236359437088402178048",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.0067759790000000006
+     },
+     {
+      "key": "149379500517883272335622178881979547648",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006652978
+     },
+     {
+      "key": "152094889233210554320309812936900083712",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006240739
+     },
+     {
+      "key": "154696412501022935827237407123100925952",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.008644545
+     }
+    ],
+    "per_key_row_groups": 66,
+    "per_key_rows_scanned": 3116047,
+    "per_key_sql": {
+     "max_ms": 24.0,
+     "min_ms": 22.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "probe": {
+     "max_ms": 4.0,
+     "min_ms": 3.0,
+     "n": 7,
+     "p50_ms": 3.0
+    }
+   },
+   {
+    "combined_returned": 334477,
+    "combined_row_groups": 3,
+    "combined_rows_scanned": 334477,
+    "combined_sql": {
+     "max_ms": 4.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 7,
+    "manifest_rows_scanned": "14",
+    "manifest_rows_visited": "658600",
+    "needle": "chemistry",
+    "per_key": [
+     {
+      "key": "132135618979364262309556889258372890624",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006905817
+     },
+     {
+      "key": "134820117584865182800188851649584824320",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.008974673999999998
+     },
+     {
+      "key": "138766344326990066404553724648797241344",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.011047312
+     },
+     {
+      "key": "140168406455661695425949926288445669376",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.008798437
+     },
+     {
+      "key": "145433375187806406989609425619023560704",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.011483293
+     },
+     {
+      "key": "153465838145550181679275679493075763200",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006700406
+     },
+     {
+      "key": "154784823524485253458615393191456669696",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.009477696
+     }
+    ],
+    "per_key_row_groups": 42,
+    "per_key_rows_scanned": 1982939,
+    "per_key_sql": {
+     "max_ms": 19.0,
+     "min_ms": 14.0,
+     "n": 7,
+     "p50_ms": 15.0
+    },
+    "probe": {
+     "max_ms": 5.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 2.0
+    }
+   },
+   {
+    "combined_returned": 334477,
+    "combined_row_groups": 3,
+    "combined_rows_scanned": 334477,
+    "combined_sql": {
+     "max_ms": 6.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 5,
+    "manifest_rows_scanned": "10",
+    "manifest_rows_visited": "472184",
+    "needle": "history",
+    "per_key": [
+     {
+      "key": "138787235208881827625090390317621837824",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.009605849
+     },
+     {
+      "key": "140168406455661695425949926288445669376",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006663154
+     },
+     {
+      "key": "148138683545560674094096357890054946816",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.008520278
+     },
+     {
+      "key": "153465777298321370724264407651321905152",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.007073154
+     },
+     {
+      "key": "154769104657042423414036834071710007296",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.010306017
+     }
+    ],
+    "per_key_row_groups": 30,
+    "per_key_rows_scanned": 1416385,
+    "per_key_sql": {
+     "max_ms": 14.0,
+     "min_ms": 10.0,
+     "n": 7,
+     "p50_ms": 12.0
+    },
+    "probe": {
+     "max_ms": 3.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    }
+   },
+   {
+    "combined_returned": 334477,
+    "combined_row_groups": 3,
+    "combined_rows_scanned": 334477,
+    "combined_sql": {
+     "max_ms": 5.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 3,
+    "manifest_rows_scanned": "6",
+    "manifest_rows_visited": "283720",
+    "needle": "which",
+    "per_key": [
+     {
+      "key": "138786910690328169198363607161601261568",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.007293547000000001
+     },
+     {
+      "key": "140085086317009894363848350980162715648",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006498443
+     },
+     {
+      "key": "158720260024700994374314726252984926208",
+      "returned": 2,
+      "row_groups": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       2
+      ],
+      "rows_scanned": 283277,
+      "seconds": 0.006590249000000001
+     }
+    ],
+    "per_key_row_groups": 18,
+    "per_key_rows_scanned": 849831,
+    "per_key_sql": {
+     "max_ms": 8.0,
+     "min_ms": 6.0,
+     "n": 7,
+     "p50_ms": 6.0
+    },
+    "probe": {
+     "max_ms": 4.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    }
+   }
+  ],
+  "row_groups": 22,
+  "rows": 334477,
+  "segments_table": "__ngram.segments_08c3283d66604028898d67e21d1e3a7e"
+ },
+ "manifest_one_generation": {
+  "needles": [
+   {
+    "combined_returned": 238546,
+    "combined_row_groups": 2,
+    "combined_rows_scanned": 238546,
+    "combined_sql": {
+     "max_ms": 6.0,
+     "min_ms": 3.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 10,
+    "manifest_rows_scanned": "10",
+    "manifest_rows_visited": "143360",
+    "needle": "Schwarzschild",
+    "per_key": [
+     {
+      "key": "129529511886981455525113482993381408768",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.005427834000000001
+     },
+     {
+      "key": "132135700109002676916238585047378034688",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.0027563519999999997
+     },
+     {
+      "key": "132135984062737128039624520308896038912",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.005356126000000001
+     },
+     {
+      "key": "138787093232014602063397422686862835712",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.0027234610000000004
+     },
+     {
+      "key": "138859562281528449481822186215707770880",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002793529
+     },
+     {
+      "key": "140131735859098293205823429658120552448",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002789412
+     },
+     {
+      "key": "152167784213326078423813479358022025216",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.002847152
+     },
+     {
+      "key": "153377366274859053092886421582966161408",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.002849974
+     },
+     {
+      "key": "158684096488377683445948828303941959680",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 101330,
+      "seconds": 0.002577418
+     },
+     {
+      "key": "162764937583042003186917439209939664896",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 101330,
+      "seconds": 0.002735678
+     }
+    ],
+    "per_key_row_groups": 10,
+    "per_key_rows_scanned": 1085256,
+    "per_key_sql": {
+     "max_ms": 25.0,
+     "min_ms": 20.0,
+     "n": 7,
+     "p50_ms": 21.0
+    },
+    "probe": {
+     "max_ms": 1.0,
+     "min_ms": 0.0,
+     "n": 7,
+     "p50_ms": 1.0
+    }
+   },
+   {
+    "combined_returned": 238546,
+    "combined_row_groups": 2,
+    "combined_rows_scanned": 238546,
+    "combined_sql": {
+     "max_ms": 6.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 12,
+    "manifest_rows_scanned": "12",
+    "manifest_rows_visited": "147456",
+    "needle": "photosynthesis",
+    "per_key": [
+     {
+      "key": "134851271366016391765960034627560144896",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002766919
+     },
+     {
+      "key": "138766466021447688314576268332304957440",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.004398681000000001
+     },
+     {
+      "key": "138818409272442640242531997242848444416",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002780412
+     },
+     {
+      "key": "146819495342529565798052404719161180160",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.0056668510000000005
+     },
+     {
+      "key": "148143875842419208921724888386384166912",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.004821953
+     },
+     {
+      "key": "148148865315181707232649179410200526848",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.005213445000000001
+     },
+     {
+      "key": "149415785748664205174010620514530230272",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.0044657690000000005
+     },
+     {
+      "key": "153408743162515902227032267980705628160",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.005174083
+     },
+     {
+      "key": "153491718500204441210736636185716719616",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.005545136
+     },
+     {
+      "key": "154732494907707832148921609283138748416",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.002920042
+     },
+     {
+      "key": "154769124939452027065707258018961293312",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.002906368
+     },
+     {
+      "key": "161410092903927675254268186771285082112",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 101330,
+      "seconds": 0.005031155
+     }
+    ],
+    "per_key_row_groups": 12,
+    "per_key_rows_scanned": 1323802,
+    "per_key_sql": {
+     "max_ms": 30.0,
+     "min_ms": 25.0,
+     "n": 7,
+     "p50_ms": 26.0
+    },
+    "probe": {
+     "max_ms": 1.0,
+     "min_ms": 0.0,
+     "n": 7,
+     "p50_ms": 1.0
+    }
+   },
+   {
+    "combined_returned": 238546,
+    "combined_row_groups": 2,
+    "combined_rows_scanned": 238546,
+    "combined_sql": {
+     "max_ms": 6.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 4.0
+    },
+    "keys": 11,
+    "manifest_rows_scanned": "11",
+    "manifest_rows_visited": "149504",
+    "needle": "parliamentary",
+    "per_key": [
+     {
+      "key": "129503124472087104701891927619458301952",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002755717
+     },
+     {
+      "key": "129529227933247004401727547731863404544",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.0046662610000000005
+     },
+     {
+      "key": "129529491604571851873443059046130122752",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002799286
+     },
+     {
+      "key": "134825532988229357796192045565678190592",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002791066
+     },
+     {
+      "key": "140074803135340842966943409723760705536",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002779821
+     },
+     {
+      "key": "144103782108648625386637987508220067840",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.0027721399999999998
+     },
+     {
+      "key": "145412504588324249420743183897450250240",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.005332855
+     },
+     {
+      "key": "146819353365662340236359437088402178048",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002800781
+     },
+     {
+      "key": "149379500517883272335622178881979547648",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.00281327
+     },
+     {
+      "key": "152094889233210554320309812936900083712",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.002882462
+     },
+     {
+      "key": "154696412501022935827237407123100925952",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.002853006
+     }
+    ],
+    "per_key_row_groups": 11,
+    "per_key_rows_scanned": 1208228,
+    "per_key_sql": {
+     "max_ms": 27.0,
+     "min_ms": 22.0,
+     "n": 7,
+     "p50_ms": 23.0
+    },
+    "probe": {
+     "max_ms": 2.0,
+     "min_ms": 1.0,
+     "n": 7,
+     "p50_ms": 1.0
+    }
+   },
+   {
+    "combined_returned": 238546,
+    "combined_row_groups": 2,
+    "combined_rows_scanned": 238546,
+    "combined_sql": {
+     "max_ms": 6.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 7,
+    "manifest_rows_scanned": "7",
+    "manifest_rows_visited": "100352",
+    "needle": "chemistry",
+    "per_key": [
+     {
+      "key": "132135618979364262309556889258372890624",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002747539
+     },
+     {
+      "key": "134820117584865182800188851649584824320",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002726648
+     },
+     {
+      "key": "138766344326990066404553724648797241344",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.0027915939999999997
+     },
+     {
+      "key": "140168406455661695425949926288445669376",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.00280357
+     },
+     {
+      "key": "145433375187806406989609425619023560704",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.005052465999999999
+     },
+     {
+      "key": "153465838145550181679275679493075763200",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.005838977
+     },
+     {
+      "key": "154784823524485253458615393191456669696",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.002895509
+     }
+    ],
+    "per_key_row_groups": 7,
+    "per_key_rows_scanned": 774052,
+    "per_key_sql": {
+     "max_ms": 20.0,
+     "min_ms": 15.0,
+     "n": 7,
+     "p50_ms": 17.0
+    },
+    "probe": {
+     "max_ms": 2.0,
+     "min_ms": 0.0,
+     "n": 7,
+     "p50_ms": 1.0
+    }
+   },
+   {
+    "combined_returned": 238546,
+    "combined_row_groups": 2,
+    "combined_rows_scanned": 238546,
+    "combined_sql": {
+     "max_ms": 6.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 5,
+    "manifest_rows_scanned": "5",
+    "manifest_rows_visited": "63488",
+    "needle": "history",
+    "per_key": [
+     {
+      "key": "138787235208881827625090390317621837824",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002719321
+     },
+     {
+      "key": "140168406455661695425949926288445669376",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.0027424599999999995
+     },
+     {
+      "key": "148138683545560674094096357890054946816",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.005352246
+     },
+     {
+      "key": "153465777298321370724264407651321905152",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.002861459
+     },
+     {
+      "key": "154769104657042423414036834071710007296",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 115666,
+      "seconds": 0.004491996
+     }
+    ],
+    "per_key_row_groups": 5,
+    "per_key_rows_scanned": 556964,
+    "per_key_sql": {
+     "max_ms": 16.0,
+     "min_ms": 10.0,
+     "n": 7,
+     "p50_ms": 13.0
+    },
+    "probe": {
+     "max_ms": 2.0,
+     "min_ms": 1.0,
+     "n": 7,
+     "p50_ms": 2.0
+    }
+   },
+   {
+    "combined_returned": 238546,
+    "combined_row_groups": 2,
+    "combined_rows_scanned": 238546,
+    "combined_sql": {
+     "max_ms": 5.0,
+     "min_ms": 2.0,
+     "n": 7,
+     "p50_ms": 3.0
+    },
+    "keys": 3,
+    "manifest_rows_scanned": "3",
+    "manifest_rows_visited": "43008",
+    "needle": "which",
+    "per_key": [
+     {
+      "key": "138786910690328169198363607161601261568",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.0027327379999999997
+     },
+     {
+      "key": "140085086317009894363848350980162715648",
+      "returned": 1,
+      "row_groups": [
+       0
+      ],
+      "rows_scanned": 108544,
+      "seconds": 0.002731009
+     },
+     {
+      "key": "158720260024700994374314726252984926208",
+      "returned": 1,
+      "row_groups": [
+       1
+      ],
+      "rows_scanned": 101330,
+      "seconds": 0.004920656999999999
+     }
+    ],
+    "per_key_row_groups": 3,
+    "per_key_rows_scanned": 318418,
+    "per_key_sql": {
+     "max_ms": 10.0,
+     "min_ms": 6.0,
+     "n": 7,
+     "p50_ms": 6.0
+    },
+    "probe": {
+     "max_ms": 2.0,
+     "min_ms": 1.0,
+     "n": 7,
+     "p50_ms": 2.0
+    }
+   }
+  ],
+  "row_groups": 17,
+  "rows": 238546,
+  "segments_table": "__ngram.segments_09a7ae66e522400d9a3944c362874737"
+ },
+ "memory_limit": "16GB",
+ "needles": [
+  "Schwarzschild",
+  "photosynthesis",
+  "parliamentary",
+  "chemistry",
+  "history",
+  "which"
+ ],
+ "refresh_rows": 10000,
+ "rows": 1000000,
+ "threads": 8
+}

@@ -45,15 +45,29 @@ struct ProbeDecodeTracker {
 //! vacuum fence keeps posting_rowid stable between manifest scan and fetch.
 struct ProbeDescriptor {
 	ProbeDescriptor() = default;
-	ProbeDescriptor(int64_t segment_no_p, idx_t gram_index_p, row_t posting_rowid_p, idx_t posting_count_p)
+	ProbeDescriptor(int64_t segment_no_p, idx_t gram_index_p, row_t posting_rowid_p, idx_t posting_count_p,
+	                row_t min_rowid_p, row_t max_rowid_p)
 	    : segment_no(segment_no_p), gram_index(gram_index_p), posting_rowid(posting_rowid_p),
-	      posting_count(posting_count_p) {
+	      posting_count(posting_count_p), min_rowid(min_rowid_p), max_rowid(max_rowid_p) {
 	}
 	int64_t segment_no = 0;
 	idx_t gram_index = 0;
 	row_t posting_rowid = 0;
 	idx_t posting_count = 0;
+	//! The postings' first and last rowid: the row's own zone map, which
+	//! bounds where the segment's candidates can lie.
+	row_t min_rowid = 0;
+	row_t max_rowid = 0;
 };
+
+//! Rows a bounded range scan reads for the cost of one fetch by rowid. A
+//! batch whose candidates fill their span this densely is read as a range
+//! scan, and the admission gate prices a segment at its span over this ratio
+//! when that is below its candidate bound. Measured on enwik9 at one thread
+//! (docs/review/2026-09-09/cost_observations.json, range_threads_1.history
+//! against fetch_threads_1.history): a scattered fetch costs 1.35 us and a
+//! span row 0.29 us, about 4.6 to one; four rounds toward scanning.
+constexpr idx_t RANGE_ROWS_PER_FETCH = 4;
 
 //! Candidates are handed to fetch workers in batches of at least this many
 //! rowids (fewer only at a segment's end), so fetch parallelism follows the
@@ -93,8 +107,15 @@ struct ProbePlan {
 	bool admitted = false;
 	string decline_reason;
 	//! Segments-table rows read while collecting the manifest for every gram
-	//! of the needle, before the rarest K were kept.
+	//! of the needle, before the rarest K were kept, and the rows the
+	//! positioned manifest scans could visit: the vector-aligned spans of the
+	//! key-column segments whose zone maps admitted a key.
 	idx_t manifest_rows_scanned = 0;
+	idx_t manifest_rows_visited = 0;
+	//! Fetch-equivalent rows the admission gate compared with the candidate
+	//! fraction: each segment's candidate bound, or its rowid span at
+	//! range-scan cost when that is cheaper.
+	idx_t admission_rows = 0;
 	atomic<idx_t> decoded_rowids {0};
 	unique_ptr<ProbeMemoryReservation> memory_reservation;
 	//! The part of the reservation that pays for decode scratch and alive
@@ -128,12 +149,15 @@ struct ProbeDecodeScratch {
 idx_t MaxProbeKeys(ClientContext &context);
 
 //! Build a segment manifest and admit its decoded work before touching a
-//! postings blob. A negative candidate_fraction disables that gate (used by
-//! ngram_candidates, which has no full-result scan substitute). worker_cap is
-//! one for that serial API and unlimited for parallel exact scans.
+//! postings blob. The candidate fraction compares the plan's fetch-equivalent
+//! rows, each fetched column beyond the recheck's counted as one more fetch
+//! per candidate, with the rows the index covers, hwm + 1; a negative
+//! fraction disables that gate (used by ngram_candidates, which has no
+//! full-result scan substitute). worker_cap is one for that serial API and
+//! unlimited for parallel exact scans.
 unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
-                                     const vector<uhugeint_t> &keys, idx_t max_grams, int64_t hwm, idx_t table_rows,
-                                     double candidate_fraction, idx_t worker_cap);
+                                     const vector<uhugeint_t> &keys, idx_t max_grams, int64_t hwm,
+                                     double candidate_fraction, idx_t worker_cap, idx_t extra_columns);
 
 //! Decode, union and intersect the admitted segment at `segment_ordinal` into
 //! `candidates`: sorted rowids that all belong to that segment. On return the

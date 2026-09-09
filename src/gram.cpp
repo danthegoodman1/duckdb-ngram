@@ -3,6 +3,7 @@
 #include "utf8proc_wrapper.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 
 namespace duckdb {
@@ -11,7 +12,22 @@ namespace ngram {
 //! Grams up to this many bytes are byte-packed; longer ones are hashed.
 constexpr idx_t PACKED_KEY_BYTES = 16;
 
-uhugeint_t GramKey(const char *data, idx_t len) {
+static std::atomic<uint64_t> key_mask_upper {~uint64_t(0)};
+static std::atomic<uint64_t> key_mask_lower {~uint64_t(0)};
+
+GramKeyMask CurrentGramKeyMask() {
+	GramKeyMask mask;
+	mask.upper = key_mask_upper.load(std::memory_order_relaxed);
+	mask.lower = key_mask_lower.load(std::memory_order_relaxed);
+	return mask;
+}
+
+void SetGramKeyMask(GramKeyMask mask) {
+	key_mask_upper.store(mask.upper, std::memory_order_relaxed);
+	key_mask_lower.store(mask.lower, std::memory_order_relaxed);
+}
+
+uhugeint_t GramKey(const char *data, idx_t len, const GramKeyMask &mask) {
 	if (len <= PACKED_KEY_BYTES) {
 		uint64_t upper = 0;
 		uint64_t lower = 0;
@@ -23,7 +39,7 @@ uhugeint_t GramKey(const char *data, idx_t len) {
 				lower |= byte << ((15 - i) * 8);
 			}
 		}
-		return uhugeint_t(upper, lower);
+		return uhugeint_t(upper & mask.upper, lower & mask.lower);
 	}
 	// FNV-1a; any fixed function works, since collisions only widen and the
 	// key never leaves this extension's storage
@@ -32,7 +48,7 @@ uhugeint_t GramKey(const char *data, idx_t len) {
 		hash ^= static_cast<uint64_t>(static_cast<uint8_t>(data[i]));
 		hash *= 1099511628211ULL;
 	}
-	return uhugeint_t(std::numeric_limits<uint64_t>::max(), hash);
+	return uhugeint_t(std::numeric_limits<uint64_t>::max() & mask.upper, hash & mask.lower);
 }
 
 void NormalizeString(const char *data, idx_t len, const GramOptions &options, string &normalized,
@@ -94,6 +110,7 @@ NeedleShape DecomposeNeedle(ClientContext &context, const char *data, idx_t len,
 	bool emitted = false;
 	bool over_budget = false;
 	idx_t grams_since_check = 0;
+	auto mask = CurrentGramKeyMask();
 	ExtractGrams(data, len, options, scratch, offsets, [&](const char *gram, idx_t gram_len) {
 		emitted = true;
 		if (over_budget) {
@@ -105,7 +122,7 @@ NeedleShape DecomposeNeedle(ClientContext &context, const char *data, idx_t len,
 				throw InterruptException();
 			}
 		}
-		over_budget = !keys.Add(GramKey(gram, gram_len), max_keys);
+		over_budget = !keys.Add(GramKey(gram, gram_len, mask), max_keys);
 	});
 	if (over_budget) {
 		return NeedleShape::OVER_BUDGET;
@@ -202,8 +219,10 @@ static void TrigramsFunction(DataChunk &args, ExpressionState &state, Vector &re
 //! ngram_gram_key(gram) -> UHUGEINT: the storage key of one already
 //! normalized gram, for tests and inspection of the segments table.
 static void GramKeyFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	UnaryExecutor::Execute<string_t, uhugeint_t>(args.data[0], result, args.size(),
-	                                             [](string_t gram) { return GramKey(gram.GetData(), gram.GetSize()); });
+	auto mask = CurrentGramKeyMask();
+	UnaryExecutor::Execute<string_t, uhugeint_t>(args.data[0], result, args.size(), [&](string_t gram) {
+		return GramKey(gram.GetData(), gram.GetSize(), mask);
+	});
 }
 
 //! ngram_gram_keys(text, gram_size, case_insensitive) -> LIST(UHUGEINT): the
@@ -229,6 +248,7 @@ static void GramKeysFunction(DataChunk &args, ExpressionState &state, Vector &re
 	string scratch;
 	vector<idx_t> offsets;
 	vector<uhugeint_t> keys;
+	auto mask = CurrentGramKeyMask();
 	for (idx_t row = 0; row < count; row++) {
 		auto input_idx = input_format.sel->get_index(row);
 		auto gram_idx = gram_format.sel->get_index(row);
@@ -248,7 +268,7 @@ static void GramKeysFunction(DataChunk &args, ExpressionState &state, Vector &re
 		auto &input = input_strings[input_idx];
 		keys.clear();
 		ExtractGrams(input.GetData(), input.GetSize(), options, scratch, offsets,
-		             [&](const char *gram, idx_t gram_len) { keys.push_back(GramKey(gram, gram_len)); });
+		             [&](const char *gram, idx_t gram_len) { keys.push_back(GramKey(gram, gram_len, mask)); });
 		std::sort(keys.begin(), keys.end());
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		if (total + keys.size() > ListVector::GetListCapacity(result)) {

@@ -1,6 +1,12 @@
 #include "ngram/probe.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/storage/table/column_data.hpp"
+#include "duckdb/storage/table/column_segment.hpp"
+#include "duckdb/storage/table/row_group.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/transaction/local_storage.hpp"
 #include "ngram/catalog.hpp"
 #include "ngram/postings.hpp"
 #include "ngram/search_core.hpp"
@@ -108,86 +114,196 @@ struct GramRows {
 	idx_t row_count = 0;
 };
 
-//! Read every visible segments-table row of every needle key, one filtered
-//! scan per key across the scheduler's threads. The key is the table's
-//! leading sorted column, so each `gram_key = ?` scan touches the row groups
-//! and column segments whose zone map admits the key and evaluates the filter
-//! natively on the fixed-width column. Rows are validated against the
-//! high-water mark and the segment capacity as they arrive, charged to the
-//! reservation chunk by chunk, and their total is bounded by `max_rows`; past
-//! it the scans stop and the plan declines. Returns false on that decline.
+//! The vector-aligned, disjoint row spans of one row group whose key-column
+//! segments may hold the filter's key, appended to `spans` as [start, end).
+//! A column segment's zone map is exact for the fixed-width key, and the rows
+//! of one key are contiguous within each generation's key-ordered run, so a
+//! key admits about one segment per run. Alignment keeps two spans from
+//! sharing a vector, so no row is scanned twice; the key filter drops the
+//! rows of other keys inside a span. v1.5.5's own filtered scan skips only
+//! the first excluded segment of a row group (RowGroup::CheckZonemapSegments
+//! takes a segment's relative start for its vector index), so positioned by
+//! the host it reads the whole row group: measured 108,000 rows per key on a
+//! two-row-group table (docs/review/2026-09-09/format_observations.json).
+static void AdmittedKeySpans(SegmentNode<RowGroup> &row_group, const StorageIndex &key_column, TableFilter &filter,
+                             vector<std::pair<idx_t, idx_t>> &spans) {
+	auto &column = row_group.GetNode().GetRawColumnData(key_column);
+	if (column.CheckZonemap(key_column, filter) == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+		return;
+	}
+	auto row_group_start = row_group.GetRowStart();
+	auto row_group_end = row_group.GetRowEnd();
+	auto &tree = column.GetSegmentTree();
+	for (auto segment = tree.GetRootSegment(); segment; segment = tree.GetNextSegment(*segment)) {
+		if (segment->GetCount() == 0) {
+			continue;
+		}
+		// the host's check reads the segment's statistics under their lock
+		// and declines to prune a column with updates
+		ColumnScanState segment_state(nullptr);
+		segment_state.current = segment;
+		segment_state.segment_tree = &tree;
+		if (column.CheckZonemap(segment_state, filter) == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+			continue;
+		}
+		auto offset = segment->GetRowStart();
+		auto start = row_group_start + offset - offset % STANDARD_VECTOR_SIZE;
+		auto last = offset + segment->GetCount();
+		auto end = MinValue<idx_t>(row_group_start +
+		                               (last + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE,
+		                           row_group_end);
+		if (end <= start) {
+			continue;
+		}
+		if (!spans.empty() && spans.back().second >= start) {
+			spans.back().second = MaxValue(spans.back().second, end);
+		} else {
+			spans.emplace_back(start, end);
+		}
+	}
+}
+
+//! Read every visible segments-table row of every needle key, one key per
+//! unit across the scheduler's threads. The key is the table's leading
+//! sorted column, so a key's rows are read by bounded scans over the column
+//! segments whose zone maps admit it, with the equality filter evaluated
+//! natively on the fixed-width column, followed by this transaction's local
+//! rows. Rows are validated against the high-water mark and the segment
+//! capacity as they arrive, charged to the reservation chunk by chunk, and
+//! their total is bounded by `max_rows`; past it the scans stop and the plan
+//! declines. Returns false on that decline.
 static bool CollectGramRows(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
                             const vector<uhugeint_t> &keys, int64_t hwm, idx_t workers, idx_t max_rows,
-                            ProbeMemoryReservation &reservation, vector<GramRows> &per_key, idx_t &rows_scanned) {
+                            ProbeMemoryReservation &reservation, vector<GramRows> &per_key, idx_t &rows_scanned,
+                            idx_t &rows_visited) {
 	vector<StorageIndex> column_ids;
 	vector<LogicalType> types;
 	AddShadowColumn(segments_entry, "gram_key", LogicalTypeId::UHUGEINT, column_ids, types);
 	AddShadowColumn(segments_entry, "segment_no", LogicalTypeId::BIGINT, column_ids, types);
 	AddShadowColumn(segments_entry, "rowid_count", LogicalTypeId::BIGINT, column_ids, types);
+	AddShadowColumn(segments_entry, "min_rowid", LogicalTypeId::BIGINT, column_ids, types);
+	AddShadowColumn(segments_entry, "max_rowid", LogicalTypeId::BIGINT, column_ids, types);
 	column_ids.emplace_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
 	types.emplace_back(LogicalType::ROW_TYPE);
 	auto &storage = segments_entry.GetStorage();
 	auto max_segment = hwm < 0 ? int64_t(-1) : hwm >> SEGMENT_SHIFT;
 
 	atomic<idx_t> total_rows {0};
+	atomic<idx_t> total_visited {0};
 	atomic<bool> declined {false};
 	ParallelForEachUnit(context, keys.size(), workers, [&](idx_t key_index) {
 		auto &rows = per_key[key_index];
 		TableFilterSet filters;
 		filters.PushFilter(ColumnIndex(0),
 		                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::UHUGEINT(keys[key_index])));
-		TableScanState state;
-		InitializeExhaustiveScan(context, tx, storage, state, column_ids, &filters);
+		auto &filter = *filters.filters.at(0);
 		DataChunk chunk;
 		chunk.Initialize(Allocator::Get(context), types);
-		while (!declined.load()) {
-			ThrowIfInterrupted(context);
-			chunk.Reset();
-			storage.Scan(tx, chunk, state);
-			if (chunk.size() == 0) {
-				return;
-			}
+		// validates and appends the chunk's rows; false once the plan declines
+		auto consume = [&]() {
 			if (total_rows.fetch_add(chunk.size()) + chunk.size() > max_rows) {
 				declined.store(true);
-				return;
+				return false;
 			}
 			// charged before the descriptors that hold them are appended
 			reservation.Grow(chunk.size() * MANIFEST_BYTES_PER_ROW);
-			UnifiedVectorFormat key_format, segment_format, count_format, rowid_format;
-			chunk.data[0].ToUnifiedFormat(chunk.size(), key_format);
-			chunk.data[1].ToUnifiedFormat(chunk.size(), segment_format);
-			chunk.data[2].ToUnifiedFormat(chunk.size(), count_format);
-			chunk.data[3].ToUnifiedFormat(chunk.size(), rowid_format);
-			auto key_data = UnifiedVectorFormat::GetData<uhugeint_t>(key_format);
-			auto segment_data = UnifiedVectorFormat::GetData<int64_t>(segment_format);
-			auto count_data = UnifiedVectorFormat::GetData<int64_t>(count_format);
-			auto rowid_data = UnifiedVectorFormat::GetData<row_t>(rowid_format);
+			UnifiedVectorFormat formats[6];
+			for (idx_t c = 0; c < 6; c++) {
+				chunk.data[c].ToUnifiedFormat(chunk.size(), formats[c]);
+			}
+			auto key_data = UnifiedVectorFormat::GetData<uhugeint_t>(formats[0]);
+			auto segment_data = UnifiedVectorFormat::GetData<int64_t>(formats[1]);
+			auto count_data = UnifiedVectorFormat::GetData<int64_t>(formats[2]);
+			auto min_data = UnifiedVectorFormat::GetData<int64_t>(formats[3]);
+			auto max_data = UnifiedVectorFormat::GetData<int64_t>(formats[4]);
+			auto rowid_data = UnifiedVectorFormat::GetData<row_t>(formats[5]);
 			for (idx_t r = 0; r < chunk.size(); r++) {
-				auto key_idx = key_format.sel->get_index(r);
-				auto segment_idx = segment_format.sel->get_index(r);
-				auto count_idx = count_format.sel->get_index(r);
-				auto rowid_idx = rowid_format.sel->get_index(r);
-				if (!key_format.validity.RowIsValid(key_idx) || !segment_format.validity.RowIsValid(segment_idx) ||
-				    !count_format.validity.RowIsValid(count_idx) || !rowid_format.validity.RowIsValid(rowid_idx)) {
-					throw InvalidInputException("ngram: segments table contains NULLs; the index is malformed");
+				idx_t idx[6];
+				for (idx_t c = 0; c < 6; c++) {
+					idx[c] = formats[c].sel->get_index(r);
+					if (!formats[c].validity.RowIsValid(idx[c])) {
+						throw InvalidInputException("ngram: segments table contains NULLs; the index is malformed");
+					}
 				}
-				if (key_data[key_idx] != keys[key_index] || segment_data[segment_idx] < 0 ||
-				    segment_data[segment_idx] > max_segment || count_data[count_idx] <= 0) {
+				auto segment_no = segment_data[idx[1]];
+				if (key_data[idx[0]] != keys[key_index] || segment_no < 0 || segment_no > max_segment ||
+				    count_data[idx[2]] <= 0) {
 					throw InvalidInputException("ngram: invalid segments-table descriptor; the index is malformed");
 				}
-				auto count = NumericCast<idx_t>(count_data[count_idx]);
+				auto count = NumericCast<idx_t>(count_data[idx[2]]);
 				if (count > (idx_t(1) << SEGMENT_SHIFT)) {
 					throw InvalidInputException(
 					    "ngram: segment row_count exceeds its rowid range; the index is malformed");
 				}
+				auto segment_start = segment_no << SEGMENT_SHIFT;
+				auto min_rowid = min_data[idx[3]];
+				auto max_rowid = max_data[idx[4]];
+				if (min_rowid < segment_start || max_rowid < min_rowid ||
+				    max_rowid >= segment_start + (int64_t(1) << SEGMENT_SHIFT) || max_rowid > hwm) {
+					throw InvalidInputException(
+					    "ngram: segment rowid span lies outside its segment or past the high-water mark; the index "
+					    "is malformed");
+				}
+				if (count_data[idx[2]] > max_rowid - min_rowid + 1) {
+					// the same class as the per-segment check below, met before a
+					// corrupt span can leave the segment out
+					throw InvalidInputException(
+					    "ngram: gram posting count exceeds its segment rowid range; the index is malformed");
+				}
 				if (!CheckedAdd(rows.row_count, count)) {
 					ThrowProbeOverflow();
 				}
-				rows.descriptors.emplace_back(segment_data[segment_idx], key_index, rowid_data[rowid_idx], count);
+				rows.descriptors.emplace_back(segment_no, key_index, rowid_data[idx[5]], count, min_rowid, max_rowid);
+			}
+			return true;
+		};
+		if (storage.GetTotalRows() > 0) {
+			auto &collection = *storage.GetRowGroupCollection();
+			auto row_groups = collection.GetRowGroups();
+			vector<std::pair<idx_t, idx_t>> spans;
+			for (auto row_group = row_groups->GetRootSegment(); row_group;
+			     row_group = row_groups->GetNextSegment(*row_group)) {
+				AdmittedKeySpans(*row_group, column_ids[0], filter, spans);
+			}
+			for (auto &span : spans) {
+				ThrowIfInterrupted(context);
+				if (declined.load()) {
+					return;
+				}
+				TableScanState state;
+				total_visited.fetch_add(
+				    InitializeBoundedScan(context, storage, state, column_ids, &filters, span.first, span.second));
+				while (true) {
+					chunk.Reset();
+					state.table_state.Scan(tx, chunk);
+					if (chunk.size() == 0) {
+						break;
+					}
+					if (!consume()) {
+						return;
+					}
+				}
+			}
+		}
+		// rows this transaction appended, a refresh in progress, are local
+		TableScanState local;
+		local.Initialize(column_ids, &context, &filters);
+		auto &local_storage = LocalStorage::Get(tx);
+		local_storage.InitializeScan(storage, local.local_state, &filters);
+		while (!declined.load()) {
+			ThrowIfInterrupted(context);
+			chunk.Reset();
+			local_storage.Scan(local.local_state, column_ids, chunk);
+			if (chunk.size() == 0) {
+				break;
+			}
+			if (!consume()) {
+				return;
 			}
 		}
 	});
 	rows_scanned = total_rows.load();
+	rows_visited = total_visited.load();
 	return !declined.load();
 }
 
@@ -258,11 +374,18 @@ static idx_t SegmentWorkerBytes(const vector<idx_t> &counts, idx_t segment_capac
 //! decode bytes and the peak candidate bytes a published segment holds, until
 //! the work budget is exceeded, which declines the plan. The structural
 //! checks continue past that point, so a decline in one segment cannot hide
-//! corruption in a later one.
+//! corruption in a later one. A segment whose grams' rowid spans share no
+//! row can hold no candidate and is left out; otherwise the candidates lie
+//! within the spans' intersection, which bounds them beside the smallest
+//! posting count and prices them for the admission gate. The published
+//! candidate vector keeps the capacity of the first intersection, the
+//! smallest posting count, so the memory model charges that bound.
 static void AdmitSegments(ProbePlan &plan, int64_t hwm, idx_t hard_work_limit, idx_t &estimated_decoded_rowids,
                           idx_t &peak_worker_bytes, idx_t &peak_candidate_bytes) {
 	auto &descriptors = plan.descriptors;
 	vector<idx_t> counts;
+	vector<row_t> lows;
+	vector<row_t> highs;
 	counts.reserve(plan.keys.size());
 	for (idx_t begin = 0; begin < descriptors.size();) {
 		idx_t end = begin + 1;
@@ -270,15 +393,21 @@ static void AdmitSegments(ProbePlan &plan, int64_t hwm, idx_t hard_work_limit, i
 			end++;
 		}
 		counts.clear();
+		lows.clear();
+		highs.clear();
 		idx_t current_gram = DConstants::INVALID_INDEX;
 		for (idx_t i = begin; i < end; i++) {
 			if (descriptors[i].gram_index != current_gram) {
 				current_gram = descriptors[i].gram_index;
 				counts.push_back(0);
+				lows.push_back(descriptors[i].min_rowid);
+				highs.push_back(descriptors[i].max_rowid);
 			}
 			if (!CheckedAdd(counts.back(), descriptors[i].posting_count)) {
 				ThrowProbeOverflow();
 			}
+			lows.back() = MinValue(lows.back(), descriptors[i].min_rowid);
+			highs.back() = MaxValue(highs.back(), descriptors[i].max_rowid);
 		}
 		auto segment_start = NumericCast<idx_t>(descriptors[begin].segment_no) << SEGMENT_SHIFT;
 		auto segment_capacity =
@@ -294,10 +423,21 @@ static void AdmitSegments(ProbePlan &plan, int64_t hwm, idx_t hard_work_limit, i
 		if (counts.size() != plan.keys.size()) {
 			continue;
 		}
-		idx_t candidate_bound = segment_capacity;
-		for (auto count : counts) {
-			candidate_bound = MinValue(candidate_bound, count);
+		row_t span_low = lows[0];
+		row_t span_high = highs[0];
+		for (idx_t gram = 1; gram < counts.size(); gram++) {
+			span_low = MaxValue(span_low, lows[gram]);
+			span_high = MinValue(span_high, highs[gram]);
 		}
+		if (span_low > span_high) {
+			continue;
+		}
+		auto span_rows = NumericCast<idx_t>(span_high - span_low) + 1;
+		idx_t vector_bound = segment_capacity;
+		for (auto count : counts) {
+			vector_bound = MinValue(vector_bound, count);
+		}
+		auto candidate_bound = MinValue(vector_bound, span_rows);
 		plan.segments.push_back(ProbeSegment {descriptors[segment_begin].segment_no, segment_begin, end});
 		// smallest posting list first: every later intersection is bounded by
 		// the smallest list decoded so far
@@ -322,14 +462,18 @@ static void AdmitSegments(ProbePlan &plan, int64_t hwm, idx_t hard_work_limit, i
 		if (!CheckedAdd(plan.candidate_upper_bound, candidate_bound)) {
 			ThrowProbeOverflow();
 		}
+		auto range_equivalent = (span_rows + RANGE_ROWS_PER_FETCH - 1) / RANGE_ROWS_PER_FETCH;
+		if (!CheckedAdd(plan.admission_rows, MinValue(candidate_bound, range_equivalent))) {
+			ThrowProbeOverflow();
+		}
 		peak_worker_bytes = MaxValue(peak_worker_bytes, SegmentWorkerBytes(counts, segment_capacity));
-		peak_candidate_bytes = MaxValue(peak_candidate_bytes, candidate_bound * sizeof(row_t));
+		peak_candidate_bytes = MaxValue(peak_candidate_bytes, vector_bound * sizeof(row_t));
 	}
 }
 
 unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx, DuckTableEntry &segments_entry,
-                                     const vector<uhugeint_t> &keys, idx_t max_grams, int64_t hwm, idx_t table_rows,
-                                     double candidate_fraction, idx_t worker_cap) {
+                                     const vector<uhugeint_t> &keys, idx_t max_grams, int64_t hwm,
+                                     double candidate_fraction, idx_t worker_cap, idx_t extra_columns) {
 	D_ASSERT(!keys.empty());
 	D_ASSERT(worker_cap > 0);
 	auto plan = make_uniq<ProbePlan>();
@@ -355,7 +499,7 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 	auto max_manifest_rows = (memory_budget - preflight_bytes) / MANIFEST_BYTES_PER_ROW;
 	vector<GramRows> per_key(keys.size());
 	if (!CollectGramRows(context, tx, segments_entry, keys, hwm, workers, max_manifest_rows, *plan->memory_reservation,
-	                     per_key, plan->manifest_rows_scanned)) {
+	                     per_key, plan->manifest_rows_scanned, plan->manifest_rows_visited)) {
 		plan->decline_reason = "segment manifest exceeds query memory budget";
 		return plan;
 	}
@@ -377,8 +521,20 @@ unique_ptr<ProbePlan> PlanIndexProbe(ClientContext &context, DuckTransaction &tx
 	if (estimated_decoded_rowids > std::numeric_limits<idx_t>::max() / sizeof(row_t)) {
 		ThrowProbeOverflow();
 	}
+	// Every projected column beyond the recheck's is one more fetch per kept
+	// row, charged per candidate: measured against the searched column's
+	// fetch, a bit-packed integer costs a tenth, a DOUBLE about one, a short
+	// FSST string nine (docs/review/2026-09-09). The probe stands in for a
+	// scan of the rows the index covers; both paths scan the rows past the
+	// mark.
+	idx_t projection_weight = 1;
+	if (!CheckedAdd(projection_weight, extra_columns) ||
+	    !CheckedMultiply(plan->admission_rows, projection_weight, plan->admission_rows)) {
+		ThrowProbeOverflow();
+	}
+	auto indexed_rows = hwm < 0 ? idx_t(0) : NumericCast<idx_t>(hwm) + 1;
 	if (candidate_fraction >= 0 &&
-	    static_cast<double>(plan->candidate_upper_bound) > candidate_fraction * static_cast<double>(table_rows)) {
+	    static_cast<double>(plan->admission_rows) > candidate_fraction * static_cast<double>(indexed_rows)) {
 		plan->decline_reason = "candidate fraction exceeded";
 		return plan;
 	}
@@ -530,6 +686,13 @@ static void DecodeDescriptorRange(ClientContext &context, DuckTransaction &tx, P
 			}
 			DecodePostings(blob.GetData(), blob.GetSize(), postings);
 			plan.decoded_rowids.fetch_add(encoded_count);
+			// the row's span bounded this segment's candidates before any
+			// blob was read; the blob must lie exactly within it
+			if (postings[postings.size() - encoded_count] != descriptor.min_rowid ||
+			    postings.back() != descriptor.max_rowid) {
+				throw InvalidInputException(
+				    "ngram: posting rowids disagree with the row's rowid span; the index is malformed");
+			}
 		}
 	}
 	if (postings.size() != expected) {

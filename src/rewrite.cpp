@@ -220,10 +220,10 @@ struct NgramScanGlobalState final : public GlobalTableFunctionState {
 	idx_t candidate_count = 0;
 	vector<string> fetched_columns;
 
-	//! The conjunction of every non-optional pushed filter, evaluated on
-	//! fetched candidate chunks (DataTable::Fetch applies no filters). Shared
-	//! read-only; each thread builds its own executor over it, because an
-	//! ExpressionExecutor carries per-evaluation state.
+	//! The conjunction of every non-optional pushed filter over the probe
+	//! layout, evaluated on fetched candidate chunks (DataTable::Fetch applies
+	//! no filters). Shared read-only; each thread builds its own executor over
+	//! it, because an ExpressionExecutor carries per-evaluation state.
 	unique_ptr<Expression> recheck_expr;
 
 	idx_t MaxThreads() const override {
@@ -243,12 +243,14 @@ struct NgramScanLocalState final : public LocalTableFunctionState {
 // Execution: init
 //===----------------------------------------------------------------------===//
 
-//! The conjunction of every non-optional pushed filter over the scanned
-//! chunk. Optional filters (zone-map hints, dynamic TopN/join filters) are
-//! skipped: their contract says executing them is not required for
-//! correctness, and their state can change between init and evaluation.
+//! The conjunction of every non-optional pushed filter over the probe
+//! layout, whose columns `recheck_positions` lists in the expression's
+//! reference order. Optional filters (zone-map hints, dynamic TopN/join
+//! filters) are skipped: their contract says executing them is not required
+//! for correctness, and their state can change between init and evaluation.
 static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet> filters,
-                                                     const vector<LogicalType> &scanned_types) {
+                                                     const vector<LogicalType> &scanned_types,
+                                                     vector<idx_t> &recheck_positions) {
 	unique_ptr<Expression> result;
 	if (!filters) {
 		return result;
@@ -261,7 +263,12 @@ static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet
 			throw InvalidInputException("ngram accelerated scan: table filter references column %llu of %llu scanned",
 			                            entry.first, scanned_types.size());
 		}
-		BoundReferenceExpression column(scanned_types[entry.first], entry.first);
+		auto position = std::find(recheck_positions.begin(), recheck_positions.end(), entry.first);
+		idx_t reference = NumericCast<idx_t>(position - recheck_positions.begin());
+		if (position == recheck_positions.end()) {
+			recheck_positions.push_back(entry.first);
+		}
+		BoundReferenceExpression column(scanned_types[entry.first], reference);
 		auto expr = entry.second->ToExpression(column);
 		if (result) {
 			result = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
@@ -327,7 +334,7 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 	}
 	auto probe =
 	    PlanIndexProbe(context, *state.core.tx, *segments, keys.keys, MaxGramsPerQuery(context), info.hwm_rowid,
-	                   state.core.storage->GetTotalRows(), MaxCandidateFraction(context), DConstants::INVALID_INDEX);
+	                   MaxCandidateFraction(context), DConstants::INVALID_INDEX, ExtraFetchColumns(state.core));
 	state.candidate_count = probe->candidate_upper_bound;
 	if (!probe->admitted) {
 		state.fallback_reason = probe->decline_reason;
@@ -379,7 +386,7 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 		}
 	}
 
-	state->recheck_expr = BuildRecheckExpression(input.filters, state->core.fetch_types);
+	state->recheck_expr = BuildRecheckExpression(input.filters, state->core.fetch_types, state->core.recheck_positions);
 
 	if (TryProbeIndex(context, bind, *state)) {
 		state->mode = NgramScanMode::INDEX;
@@ -418,26 +425,23 @@ static unique_ptr<LocalTableFunctionState> NgramScanInitLocal(ExecutionContext &
 // Execution: scan
 //===----------------------------------------------------------------------===//
 
-//! Rows of `chunk` passing every non-optional pushed filter, selected into
-//! the thread's selection vector. Storage-scan chunks are already filtered
-//! natively; re-running the executor there is an idempotent belt-and-braces
-//! pass over survivors.
-static idx_t RecheckChunk(NgramScanLocalState &lstate, DataChunk &chunk, SelectionVector &sel) {
-	if (!lstate.recheck_executor) {
-		for (idx_t r = 0; r < chunk.size(); r++) {
-			sel.set_index(r, r);
-		}
-		return chunk.size();
-	}
-	return lstate.recheck_executor->SelectExpression(chunk, sel);
-}
-
+//! A chunk a storage scan produced under the pushed filters holds only
+//! passing rows, the same native evaluation the host's seq scan relies on,
+//! so the executor runs only on fetched candidates, which DataTable::Fetch
+//! does not filter.
 static void NgramScanFunc(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<NgramScanGlobalState>();
 	auto &lstate = data.local_state->Cast<NgramScanLocalState>();
 	ExecuteSearchCore(
 	    context, data, state.core, lstate.core,
-	    [&](DataChunk &chunk, SelectionVector &sel) { return RecheckChunk(lstate, chunk, sel); }, output);
+	    [&](DataChunk &chunk, SelectionVector &sel, bool natively_filtered) {
+		    return SelectRechecked(lstate.recheck_executor.get(), chunk, sel, natively_filtered);
+	    },
+	    output);
+}
+
+static idx_t NgramScanRowsScanned(GlobalTableFunctionState &, LocalTableFunctionState &lstate) {
+	return lstate.Cast<NgramScanLocalState>().core.rows_scanned;
 }
 
 //! Ordered sinks reassemble a parallel scan's output by batch index. Fetch
@@ -476,6 +480,9 @@ static InsertionOrderPreservingMap<string> NgramScanDynamicToString(TableFunctio
 	if (state.mode == NgramScanMode::INDEX) {
 		result["Ngram Mode"] = StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
 		                                          state.candidate_count, state.core.probe->decoded_rowids.load());
+		result["Ngram Manifest Rows Scanned"] = to_string(state.core.probe->manifest_rows_scanned);
+		result["Ngram Manifest Rows Visited"] = to_string(state.core.probe->manifest_rows_visited);
+		result["Ngram Admission Rows"] = to_string(state.core.probe->admission_rows);
 		result["Ngram Probe Workers"] = to_string(state.core.probe->max_threads);
 		result["Ngram Decode Workspace Bytes"] = to_string(state.core.probe->workspace_bytes);
 		result["Ngram Decode Peak Bytes"] = to_string(state.core.probe->tracker->peak.load());
@@ -502,6 +509,7 @@ static TableFunction NgramIndexScanFunction() {
 	function.init_global = NgramScanInitGlobal;
 	function.init_local = NgramScanInitLocal;
 	function.get_partition_data = NgramScanGetPartitionData;
+	function.rows_scanned = NgramScanRowsScanned;
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
 	function.filter_prune = true;

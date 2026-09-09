@@ -1,0 +1,526 @@
+{
+ "crossover": {
+  "chemistry": {
+   "admission_share": 0.00975,
+   "candidate_share": 0.00975,
+   "matches": 6350,
+   "mode": "index (<= 106460 candidates, 363715 decoded rowids)",
+   "threads_1": {
+    "index_cpu_ms": 12.8,
+    "index_real_ms": 13.0,
+    "scan_cpu_ms": 1217.0,
+    "scan_real_ms": 1218.0
+   },
+   "threads_24": {
+    "index_cpu_ms": 26.5,
+    "index_real_ms": 5.0,
+    "scan_cpu_ms": 1744.1,
+    "scan_real_ms": 81.0
+   }
+  },
+  "government": {
+   "admission_share": 0.00562,
+   "candidate_share": 0.00562,
+   "matches": 58951,
+   "mode": "index (<= 61372 candidates, 257652 decoded rowids)",
+   "threads_1": {
+    "index_cpu_ms": 87.8,
+    "index_real_ms": 88.0,
+    "scan_cpu_ms": 1123.2,
+    "scan_real_ms": 1123.0
+   },
+   "threads_24": {
+    "index_cpu_ms": 329.7,
+    "index_real_ms": 18.0,
+    "scan_cpu_ms": 1622.3,
+    "scan_real_ms": 77.0
+   }
+  },
+  "history": {
+   "admission_share": 0.03218,
+   "candidate_share": 0.03218,
+   "matches": 90665,
+   "mode": "index (<= 351383 candidates, 1600332 decoded rowids)",
+   "threads_1": {
+    "index_cpu_ms": 154.3,
+    "index_real_ms": 154.0,
+    "scan_cpu_ms": 1228.2,
+    "scan_real_ms": 1228.0
+   },
+   "threads_24": {
+    "index_cpu_ms": 631.2,
+    "index_real_ms": 33.0,
+    "scan_cpu_ms": 1743.4,
+    "scan_real_ms": 81.0
+   }
+  },
+  "parliamentary": {
+   "admission_share": 0.00673,
+   "candidate_share": 0.00673,
+   "matches": 3630,
+   "mode": "index (<= 73529 candidates, 355469 decoded rowids)",
+   "threads_1": {
+    "index_cpu_ms": 28.2,
+    "index_real_ms": 28.0,
+    "scan_cpu_ms": 1156.4,
+    "scan_real_ms": 1157.0
+   },
+   "threads_24": {
+    "index_cpu_ms": 68.9,
+    "index_real_ms": 9.0,
+    "scan_cpu_ms": 1656.7,
+    "scan_real_ms": 78.0
+   }
+  },
+  "the": {
+   "admission_share": 0.08333,
+   "candidate_share": 0.20181,
+   "matches": 2203902,
+   "mode": "index (<= 2203902 candidates, 2203902 decoded rowids)",
+   "threads_1": {
+    "index_cpu_ms": 2660.0,
+    "index_real_ms": 2660.0,
+    "scan_cpu_ms": 1148.4,
+    "scan_real_ms": 1149.0
+   },
+   "threads_24": {
+    "index_cpu_ms": 12383.7,
+    "index_real_ms": 623.0,
+    "scan_cpu_ms": 1717.0,
+    "scan_real_ms": 80.0
+   }
+  },
+  "which": {
+   "admission_share": 0.03575,
+   "candidate_share": 0.03575,
+   "matches": 297687,
+   "mode": "index (<= 390368 candidates, 1291159 decoded rowids)",
+   "threads_1": {
+    "index_cpu_ms": 446.0,
+    "index_real_ms": 446.0,
+    "scan_cpu_ms": 1099.4,
+    "scan_real_ms": 1103.0
+   },
+   "threads_24": {
+    "index_cpu_ms": 1698.9,
+    "index_real_ms": 85.0,
+    "scan_cpu_ms": 1590.5,
+    "scan_real_ms": 74.0
+   }
+  }
+ },
+ "fetch_threads_1": {
+  "Schwarzschild": {
+   "access_cpu_us_per_row": 1.273,
+   "access_real_us_per_row": 0.0,
+   "admission_rows": 225,
+   "fetched_rows": 143,
+   "manifest_rows_visited": 679936,
+   "matches": 141,
+   "mode": "index (<= 225 candidates, 6047 decoded rowids)",
+   "probe_cpu_ms": 1.16,
+   "probe_real_ms": 1.0,
+   "range_rows": 0,
+   "search_cpu_ms": 1.34,
+   "search_real_ms": 1.0
+  },
+  "chemistry": {
+   "access_cpu_us_per_row": 1.292,
+   "access_real_us_per_row": 1.227,
+   "admission_rows": 106460,
+   "fetched_rows": 7334,
+   "manifest_rows_visited": 450560,
+   "matches": 6350,
+   "mode": "index (<= 106460 candidates, 363715 decoded rowids)",
+   "probe_cpu_ms": 2.68,
+   "probe_real_ms": 3.0,
+   "range_rows": 0,
+   "search_cpu_ms": 12.15,
+   "search_real_ms": 12.0
+  },
+  "government": {
+   "access_cpu_us_per_row": 1.443,
+   "access_real_us_per_row": 1.441,
+   "admission_rows": 61372,
+   "fetched_rows": 58970,
+   "manifest_rows_visited": 563200,
+   "matches": 58951,
+   "mode": "index (<= 61372 candidates, 257652 decoded rowids)",
+   "probe_cpu_ms": 2.47,
+   "probe_real_ms": 3.0,
+   "range_rows": 0,
+   "search_cpu_ms": 87.59,
+   "search_real_ms": 88.0
+  },
+  "history": {
+   "access_cpu_us_per_row": 1.35,
+   "access_real_us_per_row": 1.35,
+   "admission_rows": 351383,
+   "fetched_rows": 108929,
+   "manifest_rows_visited": 323584,
+   "matches": 90665,
+   "mode": "index (<= 351383 candidates, 1600332 decoded rowids)",
+   "probe_cpu_ms": 6.46,
+   "probe_real_ms": 7.0,
+   "range_rows": 0,
+   "search_cpu_ms": 153.51,
+   "search_real_ms": 154.0
+  },
+  "parliamentary": {
+   "access_cpu_us_per_row": 1.455,
+   "access_real_us_per_row": 1.45,
+   "admission_rows": 73529,
+   "fetched_rows": 17929,
+   "manifest_rows_visited": 765952,
+   "matches": 3630,
+   "mode": "index (<= 73529 candidates, 355469 decoded rowids)",
+   "probe_cpu_ms": 2.92,
+   "probe_real_ms": 3.0,
+   "range_rows": 0,
+   "search_cpu_ms": 29.02,
+   "search_real_ms": 29.0
+  },
+  "photosynthesis": {
+   "access_cpu_us_per_row": 0.793,
+   "access_real_us_per_row": 2.155,
+   "admission_rows": 4193,
+   "fetched_rows": 464,
+   "manifest_rows_visited": 716800,
+   "matches": 345,
+   "mode": "index (<= 4193 candidates, 39567 decoded rowids)",
+   "probe_cpu_ms": 1.31,
+   "probe_real_ms": 1.0,
+   "range_rows": 0,
+   "search_cpu_ms": 1.68,
+   "search_real_ms": 2.0
+  }
+ },
+ "fetch_threads_24": {
+  "Schwarzschild": {
+   "access_cpu_us_per_row": 1.846,
+   "access_real_us_per_row": 0.0,
+   "admission_rows": 225,
+   "fetched_rows": 143,
+   "manifest_rows_visited": 679936,
+   "matches": 141,
+   "mode": "index (<= 225 candidates, 6047 decoded rowids)",
+   "probe_cpu_ms": 2.66,
+   "probe_real_ms": 1.0,
+   "range_rows": 0,
+   "search_cpu_ms": 2.92,
+   "search_real_ms": 1.0
+  },
+  "chemistry": {
+   "access_cpu_us_per_row": 3.051,
+   "access_real_us_per_row": 0.136,
+   "admission_rows": 106460,
+   "fetched_rows": 7334,
+   "manifest_rows_visited": 450560,
+   "matches": 6350,
+   "mode": "index (<= 106460 candidates, 363715 decoded rowids)",
+   "probe_cpu_ms": 4.0,
+   "probe_real_ms": 3.0,
+   "range_rows": 0,
+   "search_cpu_ms": 26.38,
+   "search_real_ms": 4.0
+  },
+  "government": {
+   "access_cpu_us_per_row": 5.679,
+   "access_real_us_per_row": 0.288,
+   "admission_rows": 61372,
+   "fetched_rows": 58970,
+   "manifest_rows_visited": 563200,
+   "matches": 58951,
+   "mode": "index (<= 61372 candidates, 257652 decoded rowids)",
+   "probe_cpu_ms": 3.24,
+   "probe_real_ms": 2.0,
+   "range_rows": 0,
+   "search_cpu_ms": 338.12,
+   "search_real_ms": 19.0
+  },
+  "history": {
+   "access_cpu_us_per_row": 5.668,
+   "access_real_us_per_row": 0.23,
+   "admission_rows": 351383,
+   "fetched_rows": 108929,
+   "manifest_rows_visited": 323584,
+   "matches": 90665,
+   "mode": "index (<= 351383 candidates, 1600332 decoded rowids)",
+   "probe_cpu_ms": 8.13,
+   "probe_real_ms": 7.0,
+   "range_rows": 0,
+   "search_cpu_ms": 625.58,
+   "search_real_ms": 32.0
+  },
+  "parliamentary": {
+   "access_cpu_us_per_row": 3.097,
+   "access_real_us_per_row": 0.223,
+   "admission_rows": 73529,
+   "fetched_rows": 17929,
+   "manifest_rows_visited": 765952,
+   "matches": 3630,
+   "mode": "index (<= 73529 candidates, 355469 decoded rowids)",
+   "probe_cpu_ms": 4.44,
+   "probe_real_ms": 3.0,
+   "range_rows": 0,
+   "search_cpu_ms": 59.97,
+   "search_real_ms": 7.0
+  },
+  "photosynthesis": {
+   "access_cpu_us_per_row": 6.685,
+   "access_real_us_per_row": 0.0,
+   "admission_rows": 4193,
+   "fetched_rows": 464,
+   "manifest_rows_visited": 716800,
+   "matches": 345,
+   "mode": "index (<= 4193 candidates, 39567 decoded rowids)",
+   "probe_cpu_ms": 2.17,
+   "probe_real_ms": 1.0,
+   "range_rows": 0,
+   "search_cpu_ms": 5.27,
+   "search_real_ms": 1.0
+  }
+ },
+ "git_head": "48407e6b2bf0bac5a477d572818b227f28848b6a",
+ "log": [
+  "scan threads=1 real 1011.0 ms cpu 1010.6 ms: 92.6 ns/row wall, 92.5 ns/row cpu",
+  "scan threads=24 real 69.0 ms cpu 1460.4 ms: 6.3 ns/row wall, 133.7 ns/row cpu",
+  "fetch/1 Schwarzschild         141 matches  fetched      143  range        0  search     1.00 ms (cpu     1.34)  probe    1.00 ms  access 1.273 us/row cpu  index (<= 225 candidates, 6047 decoded rowids)",
+  "fetch/1 photosynthesis        345 matches  fetched      464  range        0  search     2.00 ms (cpu     1.68)  probe    1.00 ms  access 0.793 us/row cpu  index (<= 4193 candidates, 39567 decoded rowids)",
+  "fetch/1 parliamentary        3630 matches  fetched    17929  range        0  search    29.00 ms (cpu    29.02)  probe    3.00 ms  access 1.455 us/row cpu  index (<= 73529 candidates, 355469 decoded rowids)",
+  "fetch/1 chemistry            6350 matches  fetched     7334  range        0  search    12.00 ms (cpu    12.15)  probe    3.00 ms  access 1.292 us/row cpu  index (<= 106460 candidates, 363715 decoded rowids)",
+  "fetch/1 government          58951 matches  fetched    58970  range        0  search    88.00 ms (cpu    87.59)  probe    3.00 ms  access 1.443 us/row cpu  index (<= 61372 candidates, 257652 decoded rowids)",
+  "fetch/1 history             90665 matches  fetched   108929  range        0  search   154.00 ms (cpu   153.51)  probe    7.00 ms  access 1.35 us/row cpu  index (<= 351383 candidates, 1600332 decoded rowids)",
+  "fetch/24 Schwarzschild         141 matches  fetched      143  range        0  search     1.00 ms (cpu     2.92)  probe    1.00 ms  access 1.846 us/row cpu  index (<= 225 candidates, 6047 decoded rowids)",
+  "fetch/24 photosynthesis        345 matches  fetched      464  range        0  search     1.00 ms (cpu     5.27)  probe    1.00 ms  access 6.685 us/row cpu  index (<= 4193 candidates, 39567 decoded rowids)",
+  "fetch/24 parliamentary        3630 matches  fetched    17929  range        0  search     7.00 ms (cpu    59.97)  probe    3.00 ms  access 3.097 us/row cpu  index (<= 73529 candidates, 355469 decoded rowids)",
+  "fetch/24 chemistry            6350 matches  fetched     7334  range        0  search     4.00 ms (cpu    26.38)  probe    3.00 ms  access 3.051 us/row cpu  index (<= 106460 candidates, 363715 decoded rowids)",
+  "fetch/24 government          58951 matches  fetched    58970  range        0  search    19.00 ms (cpu   338.12)  probe    2.00 ms  access 5.679 us/row cpu  index (<= 61372 candidates, 257652 decoded rowids)",
+  "fetch/24 history             90665 matches  fetched   108929  range        0  search    32.00 ms (cpu   625.58)  probe    7.00 ms  access 5.668 us/row cpu  index (<= 351383 candidates, 1600332 decoded rowids)",
+  "range/1 history             90665 matches  fetched    18817  range    90112  search    58.00 ms (cpu    58.18)  probe    6.00 ms  access 0.476 us/row cpu  index (<= 351383 candidates, 1600332 decoded rowids)",
+  "range/1 chemistry            6350 matches  fetched     7334  range        0  search    13.00 ms (cpu    13.13)  probe    3.00 ms  access 1.424 us/row cpu  index (<= 106067 candidates, 363715 decoded rowids)",
+  "range/24 history             90665 matches  fetched    18817  range    90112  search    11.00 ms (cpu   104.19)  probe    6.00 ms  access 0.886 us/row cpu  index (<= 351383 candidates, 1600332 decoded rowids)",
+  "range/24 chemistry            6350 matches  fetched     7334  range        0  search     4.00 ms (cpu    24.62)  probe    3.00 ms  access 2.814 us/row cpu  index (<= 106067 candidates, 363715 decoded rowids)",
+  "default gate: {'clustered': {'Ngram Column': 's', 'Ngram Needle': 'history', 'Ngram Storage Columns': 's', 'Ngram Mode': 'full scan fallback: candidate fraction exceeded', 'Ngram Fetched Rows': 0, 'Ngram Range Rows': 0, 'Ngram Tail Rows': 10920423, 'Ngram Local Rows': 0}, 'docs': {'Ngram Column': 's', 'Ngram Needle': 'history', 'Ngram Storage Columns': 's', 'Ngram Mode': 'full scan fallback: candidate fraction exceeded', 'Ngram Fetched Rows': 0, 'Ngram Range Rows': 0, 'Ngram Tail Rows': 10920423, 'Ngram Local Rows': 0}}",
+  "projection count fetched 17929  index cpu    24.24 ms  scan cpu   479.79 ms  index (<= 73529 candidates, 355469 decoded rowids)",
+  "projection one   fetched 17929  index cpu    24.44 ms  scan cpu   480.59 ms  index (<= 73529 candidates, 355469 decoded rowids)",
+  "projection three fetched 17929  index cpu    28.91 ms  scan cpu   476.20 ms  index (<= 73529 candidates, 355469 decoded rowids)",
+  "projection six   fetched 17929  index cpu    98.98 ms  scan cpu   503.48 ms  index (<= 73529 candidates, 355469 decoded rowids)",
+  "tiny rows=1000 threads=1 transparent 0 us  scan 0 us  explicit 0 us  full scan fallback: candidate fraction exceeded",
+  "tiny rows=1000 threads=24 transparent 0 us  scan 0 us  explicit 0 us  full scan fallback: candidate fraction exceeded",
+  "tiny rows=100000 threads=1 transparent 1000 us  scan 5000 us  explicit 0 us  index (<= 0 candidates, 0 decoded rowids)",
+  "tiny rows=100000 threads=24 transparent 0 us  scan 5000 us  explicit 0 us  index (<= 0 candidates, 0 decoded rowids)",
+  "crossover parliamentary  share 0.00673 admission 0.00673 threads=1  index     28.0 ms  scan   1157.0 ms",
+  "crossover parliamentary  share 0.00673 admission 0.00673 threads=24  index      9.0 ms  scan     78.0 ms",
+  "crossover chemistry      share 0.00975 admission 0.00975 threads=1  index     13.0 ms  scan   1218.0 ms",
+  "crossover chemistry      share 0.00975 admission 0.00975 threads=24  index      5.0 ms  scan     81.0 ms",
+  "crossover government     share 0.00562 admission 0.00562 threads=1  index     88.0 ms  scan   1123.0 ms",
+  "crossover government     share 0.00562 admission 0.00562 threads=24  index     18.0 ms  scan     77.0 ms",
+  "crossover history        share 0.03218 admission 0.03218 threads=1  index    154.0 ms  scan   1228.0 ms",
+  "crossover history        share 0.03218 admission 0.03218 threads=24  index     33.0 ms  scan     81.0 ms",
+  "crossover which          share 0.03575 admission 0.03575 threads=1  index    446.0 ms  scan   1103.0 ms",
+  "crossover which          share 0.03575 admission 0.03575 threads=24  index     85.0 ms  scan     74.0 ms",
+  "crossover the            share 0.20181 admission 0.08333 threads=1  index   2660.0 ms  scan   1149.0 ms",
+  "crossover the            share 0.20181 admission 0.08333 threads=24  index    623.0 ms  scan     80.0 ms",
+  "range/1 history             90665 matches  fetched    18817  range    90112  search    58.00 ms (cpu    58.29)  probe    5.00 ms  access 0.487 us/row cpu  index (<= 351383 candidates, 1600332 decoded rowids)",
+  "range/1 chemistry            6350 matches  fetched     7334  range        0  search    13.00 ms (cpu    12.82)  probe    3.00 ms  access 1.378 us/row cpu  index (<= 106067 candidates, 363715 decoded rowids)",
+  "range/24 history             90665 matches  fetched    18817  range    90112  search    10.00 ms (cpu    94.98)  probe    7.00 ms  access 0.801 us/row cpu  index (<= 351383 candidates, 1600332 decoded rowids)",
+  "range/24 chemistry            6350 matches  fetched     7334  range        0  search     4.00 ms (cpu    24.85)  probe    3.00 ms  access 2.82 us/row cpu  index (<= 106067 candidates, 363715 decoded rowids)",
+  "default gate: {'clustered': {'Ngram Column': 's', 'Ngram Needle': 'history', 'Ngram Storage Columns': 's', 'Ngram Mode': 'full scan fallback: candidate fraction exceeded', 'Ngram Fetched Rows': 0, 'Ngram Range Rows': 0, 'Ngram Tail Rows': 10920423, 'Ngram Local Rows': 0}, 'docs': {'Ngram Column': 's', 'Ngram Needle': 'history', 'Ngram Storage Columns': 's', 'Ngram Mode': 'full scan fallback: candidate fraction exceeded', 'Ngram Fetched Rows': 0, 'Ngram Range Rows': 0, 'Ngram Tail Rows': 10920423, 'Ngram Local Rows': 0}}"
+ ],
+ "projection": {
+  "count": {
+   "columns": "count(*)",
+   "fetched_rows": 17929,
+   "index_cpu_ms": 24.24,
+   "index_real_ms": 24.0,
+   "mode": "index (<= 73529 candidates, 355469 decoded rowids)",
+   "range_rows": 0,
+   "scan_cpu_ms": 479.79,
+   "scan_real_ms": 480.0
+  },
+  "one": {
+   "columns": "max(c1)",
+   "fetched_rows": 17929,
+   "index_cpu_ms": 24.44,
+   "index_real_ms": 25.0,
+   "mode": "index (<= 73529 candidates, 355469 decoded rowids)",
+   "range_rows": 0,
+   "scan_cpu_ms": 480.59,
+   "scan_real_ms": 480.0
+  },
+  "six": {
+   "columns": "max(c1), max(c2), max(c3), max(c4), max(c5), max(id)",
+   "fetched_rows": 17929,
+   "index_cpu_ms": 98.98,
+   "index_real_ms": 99.0,
+   "mode": "index (<= 73529 candidates, 355469 decoded rowids)",
+   "range_rows": 0,
+   "scan_cpu_ms": 503.48,
+   "scan_real_ms": 503.0
+  },
+  "three": {
+   "columns": "max(c1), max(c2), max(c4)",
+   "fetched_rows": 17929,
+   "index_cpu_ms": 28.91,
+   "index_real_ms": 29.0,
+   "mode": "index (<= 73529 candidates, 355469 decoded rowids)",
+   "range_rows": 0,
+   "scan_cpu_ms": 476.2,
+   "scan_real_ms": 476.0
+  }
+ },
+ "range_default_gate": {
+  "clustered": {
+   "Ngram Column": "s",
+   "Ngram Fetched Rows": 0,
+   "Ngram Local Rows": 0,
+   "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+   "Ngram Needle": "history",
+   "Ngram Range Rows": 0,
+   "Ngram Storage Columns": "s",
+   "Ngram Tail Rows": 10920423
+  },
+  "docs": {
+   "Ngram Column": "s",
+   "Ngram Fetched Rows": 0,
+   "Ngram Local Rows": 0,
+   "Ngram Mode": "full scan fallback: candidate fraction exceeded",
+   "Ngram Needle": "history",
+   "Ngram Range Rows": 0,
+   "Ngram Storage Columns": "s",
+   "Ngram Tail Rows": 10920423
+  }
+ },
+ "range_threads_1": {
+  "chemistry": {
+   "access_cpu_us_per_row": 1.378,
+   "access_real_us_per_row": 1.364,
+   "admission_rows": 106067,
+   "fetched_rows": 7334,
+   "manifest_rows_visited": 450560,
+   "matches": 6350,
+   "mode": "index (<= 106067 candidates, 363715 decoded rowids)",
+   "probe_cpu_ms": 2.71,
+   "probe_real_ms": 3.0,
+   "range_rows": 0,
+   "search_cpu_ms": 12.82,
+   "search_real_ms": 13.0
+  },
+  "history": {
+   "access_cpu_us_per_row": 0.487,
+   "access_real_us_per_row": 0.487,
+   "admission_rows": 351383,
+   "fetched_rows": 18817,
+   "manifest_rows_visited": 323584,
+   "matches": 90665,
+   "mode": "index (<= 351383 candidates, 1600332 decoded rowids)",
+   "probe_cpu_ms": 5.26,
+   "probe_real_ms": 5.0,
+   "range_rows": 90112,
+   "search_cpu_ms": 58.29,
+   "search_real_ms": 58.0
+  }
+ },
+ "range_threads_24": {
+  "chemistry": {
+   "access_cpu_us_per_row": 2.82,
+   "access_real_us_per_row": 0.136,
+   "admission_rows": 106067,
+   "fetched_rows": 7334,
+   "manifest_rows_visited": 450560,
+   "matches": 6350,
+   "mode": "index (<= 106067 candidates, 363715 decoded rowids)",
+   "probe_cpu_ms": 4.17,
+   "probe_real_ms": 3.0,
+   "range_rows": 0,
+   "search_cpu_ms": 24.85,
+   "search_real_ms": 4.0
+  },
+  "history": {
+   "access_cpu_us_per_row": 0.801,
+   "access_real_us_per_row": 0.028,
+   "admission_rows": 351383,
+   "fetched_rows": 18817,
+   "manifest_rows_visited": 323584,
+   "matches": 90665,
+   "mode": "index (<= 351383 candidates, 1600332 decoded rowids)",
+   "probe_cpu_ms": 7.75,
+   "probe_real_ms": 7.0,
+   "range_rows": 90112,
+   "search_cpu_ms": 94.98,
+   "search_real_ms": 10.0
+  }
+ },
+ "rows": 10920423,
+ "scan": {
+  "threads_1": {
+   "cpu_ms": 1010.6,
+   "cpu_ns_per_row": 92.54,
+   "real_ms": 1011.0,
+   "real_ns_per_row": 92.58
+  },
+  "threads_24": {
+   "cpu_ms": 1460.4,
+   "cpu_ns_per_row": 133.73,
+   "real_ms": 69.0,
+   "real_ns_per_row": 6.32
+  }
+ },
+ "tiny": {
+  "tiny_1000": {
+   "needle": "the",
+   "rows": 1000,
+   "threads_1": {
+    "explicit_us": 0.0,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "scan_us": 0.0,
+    "transparent_us": 0.0
+   },
+   "threads_24": {
+    "explicit_us": 0.0,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "scan_us": 0.0,
+    "transparent_us": 0.0
+   }
+  },
+  "tiny_100000": {
+   "needle": "Schwarzschild",
+   "rows": 100000,
+   "threads_1": {
+    "explicit_us": 0.0,
+    "mode": "index (<= 0 candidates, 0 decoded rowids)",
+    "scan_us": 5000.0,
+    "transparent_us": 1000.0
+   },
+   "threads_24": {
+    "explicit_us": 0.0,
+    "mode": "index (<= 0 candidates, 0 decoded rowids)",
+    "scan_us": 5000.0,
+    "transparent_us": 0.0
+   }
+  }
+ },
+ "tiny_microseconds": {
+  "tiny_100000_threads_1": {
+   "explicit_us": 440.0,
+   "scan_us": 4815.0,
+   "transparent_us": 514.6
+  },
+  "tiny_100000_threads_24": {
+   "explicit_us": 295.7,
+   "scan_us": 5023.2,
+   "transparent_us": 365.4
+  },
+  "tiny_1000_threads_1": {
+   "explicit_us": 327.0,
+   "scan_us": 209.9,
+   "transparent_us": 314.6
+  },
+  "tiny_1000_threads_24": {
+   "explicit_us": 364.7,
+   "scan_us": 291.9,
+   "transparent_us": 367.7
+  }
+ }
+}

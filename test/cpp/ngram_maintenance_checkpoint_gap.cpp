@@ -12,6 +12,7 @@
 #include "core_functions_extension.hpp"
 #include "ngram_extension.hpp"
 #include "ngram/fence.hpp"
+#include "ngram/gram.hpp"
 #include "ngram/rowid_guard.hpp"
 
 #include <chrono>
@@ -2616,6 +2617,183 @@ static void TestProbeMemoryPeak() {
 	}
 }
 
+//! The ids a query returns, as one sorted list, so results from different
+//! connections compare as multisets.
+static string SortedIds(Connection &con, const string &query) {
+	return ScalarString(con, "SELECT coalesce(list(id ORDER BY id)::VARCHAR, '[]') FROM (" + query + ") q(id)");
+}
+
+//! Requires both exact paths to run through the index and return the
+//! oracle's rows for `needle` over `table`(id, s), and, for a needle of one
+//! gram, the raw candidates to be exactly the rows holding a gram whose key
+//! equals the needle's under the current mask: the widened set that the
+//! recheck must cut back. `con` accelerates; `oracle` never rewrites.
+static void ExpectCollisionExact(Connection &con, Connection &oracle, const string &table, idx_t gram_size,
+                                 const string &needle, bool single_gram) {
+	auto expected = SortedIds(oracle, "SELECT id FROM " + table + " WHERE contains(s, " + needle + ")");
+	auto explicit_ids = SortedIds(con, "SELECT id FROM ngram_search('" + table + "', " + needle + ")");
+	if (explicit_ids != expected) {
+		throw std::runtime_error("ngram_search under colliding keys returned " + explicit_ids + " for " + needle +
+		                         ", expected " + expected);
+	}
+	auto transparent = SortedIds(con, "SELECT id FROM " + table + " WHERE contains(s, " + needle + ")");
+	if (transparent != expected) {
+		throw std::runtime_error("accelerated contains under colliding keys returned " + transparent + " for " +
+		                         needle + ", expected " + expected);
+	}
+	for (auto &query : vector<string> {"SELECT count(*) FROM ngram_search('" + table + "', " + needle + ")",
+	                                   "SELECT count(*) FROM " + table + " WHERE contains(s, " + needle + ")"}) {
+		auto profile = Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) " + query)->GetValue(1, 0).ToString();
+		if (profile.find("\"Ngram Mode\": \"index") == string::npos) {
+			throw std::runtime_error("collision query did not run through the index: " + query);
+		}
+	}
+	auto candidates = SortedIds(con, "SELECT t.id FROM ngram_candidates('" + table + "', 's', " + needle + ") c JOIN " +
+	                                     table + " t ON t.rowid = c.rowid");
+	if (single_gram) {
+		auto widened = SortedIds(con, "SELECT id FROM " + table + " WHERE list_contains(list_transform(trigrams(s, " +
+		                                  to_string(gram_size) +
+		                                  ", false), lambda g: ngram_gram_key(g)), ngram_gram_key(" + needle + "))");
+		if (candidates != widened) {
+			throw std::runtime_error("candidates " + candidates + " for " + needle +
+			                         " are not the rows of every colliding gram " + widened);
+		}
+		if (widened == expected) {
+			throw std::runtime_error("no row collides with " + needle + "; the fixture proves nothing");
+		}
+	} else {
+		auto missing = ScalarInt64(con, "SELECT count(*) FROM (SELECT id FROM " + table + " WHERE contains(s, " +
+		                                    needle + ") EXCEPT SELECT t.id FROM ngram_candidates('" + table +
+		                                    "', 's', " + needle + ") c JOIN " + table + " t ON t.rowid = c.rowid)");
+		if (missing != 0) {
+			throw std::runtime_error("candidates " + candidates + " for " + needle + " miss matches " + expected);
+		}
+	}
+}
+
+//! Same-size gram collisions, forced through the key mask seam: the low bit
+//! of every packed byte is dropped, so 'abc' and 'abb', 'é' and 'è', chr(0)
+//! and chr(1) share keys, and a hashed key keeps eight bits, so 17-grams fall
+//! into 256 buckets. Postings of colliding grams merge under one key: the
+//! probe must return exactly the widened set, both exact paths the oracle's
+//! multiset, through a build, a refresh generation and a compaction, with
+//! two colliding grams in one row and across the refresh.
+static void TestGramKeyCollisions() {
+	ngram::SetGramKeyMask(ngram::GramKeyMask {0xFEFEFEFEFEFEFEFEULL, 0xFF00000000000000ULL});
+	try {
+		DuckDB db(nullptr);
+		LoadNgram(db);
+		Connection con(db);
+		Connection oracle(db);
+		for (auto *c : {&con, &oracle}) {
+			Check(*c, "SET threads=4");
+			Check(*c, "SET ngram_max_candidate_fraction=1");
+		}
+		Check(con, "SET ngram_auto_accelerate=true");
+		if (ScalarInt64(con,
+		                "SELECT (ngram_gram_key('abc') = ngram_gram_key('abb'))::BIGINT + "
+		                "(ngram_gram_key('aéx') = ngram_gram_key('aèx'))::BIGINT + "
+		                "(ngram_gram_key('a' || chr(0) || 'b') = ngram_gram_key('a' || chr(1) || 'b'))::BIGINT") != 3) {
+			throw std::runtime_error("the key mask seam does not collide the packed pairs");
+		}
+		// duplicate text in rows 1 and 10 keeps the multiset comparison honest
+		Check(con, "CREATE TABLE collide(id INTEGER, s VARCHAR)");
+		Check(con, "INSERT INTO collide VALUES (1, 'xabcx'), (2, 'xabbx'), (3, 'xabcabbx'), (4, 'aéxq'), (5, 'aèxq'), "
+		           "(6, 'a' || chr(0) || 'bq'), (7, 'a' || chr(1) || 'bq'), (8, 'zzzz'), (9, NULL), (10, 'xabcx'), "
+		           "(11, 'abbabb')");
+		Check(con, "PRAGMA create_ngram_index('collide', 's', case_insensitive=false)");
+		vector<std::pair<string, bool>> needles {{"'abc'", true},
+		                                         {"'abb'", true},
+		                                         {"'aéx'", true},
+		                                         {"'aèx'", true},
+		                                         {"'a' || chr(0) || 'b'", true},
+		                                         {"'a' || chr(1) || 'b'", true},
+		                                         {"'abcabb'", false},
+		                                         {"'xabcx'", false},
+		                                         {"'zzz'", false}};
+		auto segments = StorageTable(con, "collide", "s", "segments");
+		auto check_all = [&](idx_t generation_rows) {
+			for (auto &needle : needles) {
+				ExpectCollisionExact(con, oracle, "collide", 3, needle.first, needle.second);
+			}
+			// keys of colliding grams merged in storage: the shared key's
+			// posting count is the number of rows holding either gram, over
+			// as many generation rows as the stage leaves
+			auto merged = ScalarInt64(con, "SELECT sum(rowid_count) FROM " + segments +
+			                                   " WHERE gram_key = ngram_gram_key('abc')");
+			auto holders =
+			    ScalarInt64(con, "SELECT count(*) FROM collide WHERE contains(s, 'abc') OR contains(s, 'abb')");
+			auto rows =
+			    ScalarInt64(con, "SELECT count(*) FROM " + segments + " WHERE gram_key = ngram_gram_key('abc')");
+			if (merged != holders || NumericCast<idx_t>(rows) != generation_rows) {
+				throw std::runtime_error("merged key holds " + to_string(merged) + " postings in " + to_string(rows) +
+				                         " rows; " + to_string(holders) + " rows hold a colliding gram");
+			}
+		};
+		check_all(1);
+		// a refresh generation adds colliding rows, one holding both grams
+		Check(con, "INSERT INTO collide VALUES (12, 'yabby'), (13, 'yabcy'), (14, 'yabcabby'), (15, 'aèxz'), "
+		           "(16, 'a' || chr(1) || 'bz'), (17, 'xabcx')");
+		Check(con, "PRAGMA ngram_refresh('collide')");
+		check_all(2);
+		Check(con, "PRAGMA ngram_compact('collide')");
+		check_all(1);
+
+		// hashed keys: 17-grams over pseudo-random lowercase text, in 256 buckets
+		Check(con, "CREATE TABLE collide_long AS SELECT i::INTEGER AS id, list_aggregate(list_transform(range(0, 40), "
+		           "lambda j: chr((97 + hash(i * 1000003 + j) % 26)::INTEGER)), 'string_agg', '') AS s FROM range(400) "
+		           "r(i)");
+		Check(con, "PRAGMA create_ngram_index('collide_long', 's', gram=17, case_insensitive=false)");
+		auto long_segments = StorageTable(con, "collide_long", "s", "segments");
+		auto distinct_keys = ScalarInt64(con, "SELECT count(DISTINCT gram_key) FROM " + long_segments);
+		auto distinct_grams =
+		    ScalarInt64(con, "SELECT count(DISTINCT g) FROM collide_long, unnest(trigrams(s, 17, false)) t(g)");
+		if (distinct_keys >= distinct_grams || distinct_keys > 256) {
+			throw std::runtime_error("17-grams did not collide: " + to_string(distinct_keys) + " keys for " +
+			                         to_string(distinct_grams) + " grams");
+		}
+		auto rows_with_internal_collisions = ScalarInt64(
+		    con, "SELECT count(*) FROM (SELECT id, count(DISTINCT g) AS grams, count(DISTINCT "
+		         "ngram_gram_key(g)) AS keys FROM collide_long, unnest(trigrams(s, 17, false)) t(g) GROUP BY "
+		         "id) WHERE keys < grams");
+		if (rows_with_internal_collisions == 0) {
+			throw std::runtime_error("no row holds two colliding 17-grams");
+		}
+		auto long_needle = [&](int64_t id, int64_t start, int64_t len) {
+			return "'" +
+			       ScalarString(con, "SELECT substr(s, " + to_string(start) + ", " + to_string(len) +
+			                             ") FROM collide_long WHERE id = " + to_string(id)) +
+			       "'";
+		};
+		auto check_long = [&]() {
+			ExpectCollisionExact(con, oracle, "collide_long", 17, long_needle(7, 3, 17), true);
+			ExpectCollisionExact(con, oracle, "collide_long", 17, long_needle(250, 1, 17), true);
+			ExpectCollisionExact(con, oracle, "collide_long", 17, long_needle(123, 5, 30), false);
+			ExpectCollisionExact(con, oracle, "collide_long", 17, "'qqqqqqqqqqqqqqqqq'", false);
+		};
+		check_long();
+		Check(con, "INSERT INTO collide_long SELECT i::INTEGER, list_aggregate(list_transform(range(0, 40), "
+		           "lambda j: chr((97 + hash(i * 7919 + j * 13 + 1) % 26)::INTEGER)), 'string_agg', '') "
+		           "FROM range(400, 500) r(i)");
+		Check(con, "INSERT INTO collide_long SELECT id + 1000, s FROM collide_long WHERE id IN (7, 250)");
+		Check(con, "PRAGMA ngram_refresh('collide_long')");
+		check_long();
+		Check(con, "PRAGMA ngram_compact('collide_long', purge=true)");
+		check_long();
+	} catch (...) {
+		ngram::SetGramKeyMask(ngram::GramKeyMask {});
+		throw;
+	}
+	ngram::SetGramKeyMask(ngram::GramKeyMask {});
+	DuckDB db(nullptr);
+	LoadNgram(db);
+	Connection con(db);
+	if (ScalarInt64(con, "SELECT (ngram_gram_key('abc') <> ngram_gram_key('abb') AND ngram_gram_key('a' || chr(0) || "
+	                     "'b') <> ngram_gram_key('a' || chr(1) || 'b'))::BIGINT") != 1) {
+		throw std::runtime_error("the default key mask still collides distinct grams");
+	}
+}
+
 int main(int argc, char **argv) {
 	try {
 		if (argc == 3 && string(argv[1]) == "--wal-child") {
@@ -2664,6 +2842,7 @@ int main(int argc, char **argv) {
 		TestQueryCancellation();
 		TestParallelCandidateStreams();
 		TestProbeMemoryPeak();
+		TestGramKeyCollisions();
 		RemoveDatabase(unique + ".creation");
 		RemoveDatabase(unique + ".guards");
 		RemoveDatabase(unique + ".vacuum");

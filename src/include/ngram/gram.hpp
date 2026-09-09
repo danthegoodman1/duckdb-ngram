@@ -43,12 +43,33 @@ void ExtractGrams(const char *data, idx_t len, const GramOptions &options, strin
 	}
 }
 
+//! The bits a gram key keeps. Every key is ANDed with the process-wide mask
+//! before it is stored or probed. The default keeps every bit; the C++
+//! harness narrows it to force distinct grams of one size onto one key and
+//! prove that recheck removes the widened candidates. Set it before an index
+//! is built and keep it for that index's lifetime: a key derived under one
+//! mask is only found under the same mask.
+struct GramKeyMask {
+	GramKeyMask() = default;
+	GramKeyMask(uint64_t upper_p, uint64_t lower_p) : upper(upper_p), lower(lower_p) {
+	}
+
+	uint64_t upper = ~uint64_t(0);
+	uint64_t lower = ~uint64_t(0);
+};
+
+//! The current mask, read once per chunk or needle rather than per gram.
+GramKeyMask CurrentGramKeyMask();
+
+//! The collision seam for tests; production code never calls this.
+void SetGramKeyMask(GramKeyMask mask);
+
 //! The storage key of a normalized gram: the leading sorted column of the
 //! segments table, so a probe's `gram_key = ?` is a native fixed-width filter.
 //! Grams of at most 16 bytes (every 3- and 4-gram, since a codepoint is at
 //! most 4 bytes) are byte-packed big-endian into the high bytes with zero
 //! padding below, which preserves byte order; longer grams hash to 64 bits in
-//! the low half under an all-ones high half.
+//! the low half under an all-ones high half. The result is ANDed with `mask`.
 //!
 //! Collisions only widen. Within one index every gram has gram_size
 //! codepoints, so two distinct byte-packed grams share a key only if one is
@@ -58,8 +79,9 @@ void ExtractGrams(const char *data, idx_t len, const GramOptions &options, strin
 //! collision merges the grams' postings under one key, so each gram's
 //! candidate set becomes a superset and recheck removes the excess. Build and
 //! query derive keys with this one function, so a query gram always finds the
-//! rows the build wrote for it.
-uhugeint_t GramKey(const char *data, idx_t len);
+//! rows the build wrote for it. The harness's `TestGramKeyCollisions` forces
+//! same-size collisions of every packing shape through the mask.
+uhugeint_t GramKey(const char *data, idx_t len, const GramKeyMask &mask);
 
 struct GramKeyHash {
 	size_t operator()(const uhugeint_t &key) const {

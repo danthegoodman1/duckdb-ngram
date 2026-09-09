@@ -1,0 +1,36 @@
+{
+ "baseline": {
+  "build_rss_median_bytes": 9474506752,
+  "build_s_median": 7.03,
+  "git_head": "48407e6b2bf0bac5a477d572818b227f28848b6a",
+  "runs": [
+   {
+    "build_rss_bytes": 9474506752,
+    "build_s": 6.99,
+    "build_spill_bytes": 0,
+    "index_bytes": 997982208,
+    "load_rss_bytes": 3700301824,
+    "load_s": 1.36,
+    "stats": "s,3,true,10920422,10920422,0,605513,1958417,0,1,711434908,855979002,NULL"
+   },
+   {
+    "build_rss_bytes": 9354559488,
+    "build_s": 7.03,
+    "build_spill_bytes": 0,
+    "index_bytes": 996933632,
+    "load_rss_bytes": 3668172800,
+    "load_s": 0.75,
+    "stats": "s,3,true,10920422,10920422,0,605513,1958417,0,1,711434908,855979002,NULL"
+   },
+   {
+    "build_rss_bytes": 9637163008,
+    "build_s": 7.98,
+    "build_spill_bytes": 0,
+    "index_bytes": 996933632,
+    "load_rss_bytes": 3677212672,
+    "load_s": 0.86,
+    "stats": "s,3,true,10920422,10920422,0,605513,1958417,0,1,711434908,855979002,NULL"
+   }
+  ]
+ }
+}

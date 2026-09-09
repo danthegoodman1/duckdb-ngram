@@ -1,7 +1,9 @@
 #include "ngram/search_core.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/storage/optimistic_data_writer.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
@@ -138,6 +140,20 @@ void ParallelForEachUnit(ClientContext &context, idx_t units, idx_t workers, con
 	executor.WorkOnTasks();
 }
 
+idx_t ExtraFetchColumns(const SearchCoreGlobal &state) {
+	idx_t extra = 0;
+	for (idx_t i = 0; i < state.fetch_column_ids.size(); i++) {
+		if (state.fetch_column_ids[i].IsRowIdColumn()) {
+			continue;
+		}
+		if (std::find(state.recheck_positions.begin(), state.recheck_positions.end(), i) ==
+		    state.recheck_positions.end()) {
+			extra++;
+		}
+	}
+	return extra;
+}
+
 void FinalizeSearchCore(ClientContext &context, SearchCoreGlobal &state) {
 	D_ASSERT(state.storage && state.tx);
 	if (state.scan_filters && state.scan_filters->filters.empty()) {
@@ -159,6 +175,42 @@ void FinalizeSearchCore(ClientContext &context, SearchCoreGlobal &state) {
 		state.fetch_types.emplace_back(LogicalType::ROW_TYPE);
 	}
 	state.fetch_rowid_position = rowid_position.GetIndex();
+	// the probe layout: the recheck's columns in its order, then the rowid
+	state.probe_positions = state.recheck_positions;
+	if (std::find(state.probe_positions.begin(), state.probe_positions.end(), state.fetch_rowid_position) ==
+	    state.probe_positions.end()) {
+		state.probe_positions.push_back(state.fetch_rowid_position);
+	}
+	for (idx_t i = 0; i < state.fetch_column_ids.size(); i++) {
+		if (std::find(state.probe_positions.begin(), state.probe_positions.end(), i) == state.probe_positions.end()) {
+			state.extra_positions.push_back(i);
+		}
+	}
+	for (auto position : state.probe_positions) {
+		if (position == state.fetch_rowid_position) {
+			state.probe_rowid_position = state.probe_column_ids.size();
+		}
+		state.probe_column_ids.push_back(state.fetch_column_ids[position]);
+		state.probe_types.push_back(state.fetch_types[position]);
+	}
+	for (auto position : state.extra_positions) {
+		state.extra_column_ids.push_back(state.fetch_column_ids[position]);
+		state.extra_types.push_back(state.fetch_types[position]);
+	}
+	for (auto source_id : state.output_ids) {
+		if (source_id == DConstants::INVALID_INDEX) {
+			state.output_sources.emplace_back(true, DConstants::INVALID_INDEX);
+			continue;
+		}
+		auto probe = std::find(state.probe_positions.begin(), state.probe_positions.end(), source_id);
+		if (probe != state.probe_positions.end()) {
+			state.output_sources.emplace_back(true, NumericCast<idx_t>(probe - state.probe_positions.begin()));
+		} else {
+			auto extra = std::find(state.extra_positions.begin(), state.extra_positions.end(), source_id);
+			D_ASSERT(extra != state.extra_positions.end());
+			state.output_sources.emplace_back(false, NumericCast<idx_t>(extra - state.extra_positions.begin()));
+		}
+	}
 	state.tail_end = state.storage->GetTotalRows();
 	state.tail_unit_rows = MaxValue<idx_t>(state.storage->GetRowGroupSize(), 1);
 	state.tail_units = state.tail_start < state.tail_end
@@ -173,8 +225,22 @@ void InitializeSearchCoreLocal(ExecutionContext &context, SearchCoreGlobal &glob
 	                  ? SearchCorePhase::FETCH
 	                  : SearchCorePhase::SCAN;
 	local.fetch_chunk.Initialize(Allocator::Get(context.client), global.fetch_types);
+	local.probe_chunk.Initialize(Allocator::Get(context.client), global.probe_types);
+	if (!global.extra_types.empty()) {
+		local.extra_chunk.Initialize(Allocator::Get(context.client), global.extra_types);
+	}
 	local.scan_chunk.Initialize(Allocator::Get(context.client), global.fetch_types);
 	local.sel.Initialize(STANDARD_VECTOR_SIZE);
+}
+
+idx_t SelectRechecked(ExpressionExecutor *executor, DataChunk &chunk, SelectionVector &sel, bool natively_filtered) {
+	if (!executor || natively_filtered) {
+		for (idx_t r = 0; r < chunk.size(); r++) {
+			sel.set_index(r, r);
+		}
+		return chunk.size();
+	}
+	return executor->SelectExpression(chunk, sel);
 }
 
 static bool SearchCoreYieldEmpty(TableFunctionInput &data) {
@@ -279,32 +345,25 @@ static BatchClaim ClaimCandidateBatch(ClientContext &context, TableFunctionInput
 	}
 }
 
-//! A claimed batch whose rowids fill at least half of their span is read with
-//! one committed scan bounded to that span instead of a fetch per row: the
-//! scan decompresses whole vectors and takes no per-row lock, while
-//! DataTable::Fetch locks the row-group tree for every row and decodes FSST
-//! strings one at a time (measured 3.8 us per fetched row against 0.13 us for
-//! uncompressed strings). The scan starts at the vector holding the first
-//! candidate and stops after the last, so it visits the batch's row groups
-//! only; the rowid filter excludes the rows of that vector before the first
-//! candidate, which an earlier batch owns. Every row the span holds lies
-//! below the high-water mark, and the ones that are not candidates lack a
-//! gram of the needle, so the recheck rejects them.
+//! A claimed batch whose rowids fill at least one part in RANGE_ROWS_PER_FETCH
+//! of their span is read with one committed scan bounded to that span instead
+//! of a fetch per row: the scan decompresses whole vectors and evaluates the
+//! scan filters natively, while DataTable::Fetch locks the row-group tree for
+//! every row and decodes compressed strings one at a time (measured on enwik9
+//! at one thread, docs/review/2026-09-09: a scattered fetch 1.35 us, a span
+//! row 0.29 us). The same ratio prices spans in the admission gate. The scan
+//! starts at the vector holding the first candidate and stops after the last,
+//! so it visits the batch's row groups only; the rowid filter excludes the
+//! rows of that vector before the first candidate, which an earlier batch
+//! owns. Every row the span holds lies below the high-water mark, and the
+//! ones that are not candidates lack a gram of the needle, so the filters or
+//! the recheck reject them. The scan carries the global scan filters, so its
+//! chunks come out natively filtered, like the tail's.
 static constexpr idx_t RANGE_SCAN_MIN_ROWS = 256;
 
-//! Initialize a committed scan of rows [start_row, end_row): positioned at
-//! the row group and vector holding start_row and stopped at end_row, so it
-//! visits only the row groups those rows occupy. The scan starts at the
-//! vector's first row, so the caller's filters must exclude the rows of that
-//! vector before start_row. A row group the filters' zone maps exclude is
-//! skipped, as the host's own scan skips it. v1.5.5 keeps DataTable's offset
-//! initializer private; its row-group collection exposes the same steps.
-//! Local storage stays uninitialized: callers scan the committed collection
-//! state directly. Returns the rows the scan can visit: from the first
-//! vector's start to end_row, before zone-map pruning.
-static idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableScanState &state,
-                                   const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> filters,
-                                   idx_t start_row, idx_t end_row) {
+idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableScanState &state,
+                            const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> filters,
+                            idx_t start_row, idx_t end_row) {
 	D_ASSERT(start_row < end_row && end_row <= storage.GetTotalRows());
 	state.Initialize(column_ids, &context, filters);
 	auto &collection = *storage.GetRowGroupCollection();
@@ -331,10 +390,15 @@ static bool StartRangeScan(ClientContext &context, SearchCoreGlobal &global, Sea
 	auto batch_rows = local.candidate_end - local.candidate_offset;
 	auto first = rowids[local.candidate_offset];
 	auto last = rowids[local.candidate_end - 1];
-	if (batch_rows < RANGE_SCAN_MIN_ROWS || NumericCast<idx_t>(last - first) + 1 > 2 * batch_rows) {
+	if (batch_rows < RANGE_SCAN_MIN_ROWS || NumericCast<idx_t>(last - first) + 1 > RANGE_ROWS_PER_FETCH * batch_rows) {
 		return false;
 	}
 	local.range_filters = make_uniq<TableFilterSet>();
+	if (global.scan_filters) {
+		for (auto &entry : global.scan_filters->filters) {
+			local.range_filters->PushFilter(ColumnIndex(entry.first), entry.second->Copy());
+		}
+	}
 	local.range_filters->PushFilter(
 	    ColumnIndex(global.fetch_rowid_position),
 	    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::BIGINT(first)));
@@ -343,6 +407,7 @@ static bool StartRangeScan(ClientContext &context, SearchCoreGlobal &global, Sea
 	    InitializeBoundedScan(context, *global.storage, *local.range_state, global.fetch_column_ids,
 	                          local.range_filters.get(), NumericCast<idx_t>(first), NumericCast<idx_t>(last) + 1);
 	global.range_rows.fetch_add(span, std::memory_order_relaxed);
+	local.rows_scanned += span;
 	local.candidate_offset = local.candidate_end;
 	return true;
 }
@@ -357,10 +422,17 @@ static bool StartTailUnit(ClientContext &context, SearchCoreGlobal &global, Sear
 	local.scan_local_storage = unit == global.tail_units;
 	if (local.scan_local_storage) {
 		// every local row lies past the committed tail, so the pushed filters
-		// are the only ones
+		// are the only ones; the unit visits every local row
 		auto filters = global.scan_filters.get();
+		auto &local_storage = LocalStorage::Get(*global.tx);
 		local.scan_state->Initialize(global.fetch_column_ids, &context, filters);
-		LocalStorage::Get(*global.tx).InitializeScan(*global.storage, local.scan_state->local_state, filters);
+		local_storage.InitializeScan(*global.storage, local.scan_state->local_state, filters);
+		auto storage = local_storage.GetStorage(*global.storage);
+		auto rows = storage && storage->row_groups && storage->row_groups->collection
+		                ? storage->row_groups->collection->GetTotalRows()
+		                : 0;
+		global.local_rows.fetch_add(rows, std::memory_order_relaxed);
+		local.rows_scanned += rows;
 	} else {
 		// the unit's rowid lower bound excludes the rows of its first vector
 		// that the previous unit owns, or the indexed rows before the tail
@@ -378,6 +450,7 @@ static bool StartTailUnit(ClientContext &context, SearchCoreGlobal &global, Sear
 		auto span = InitializeBoundedScan(context, *global.storage, *local.scan_state, global.fetch_column_ids,
 		                                  local.scan_filters.get(), start, end);
 		global.tail_rows.fetch_add(span, std::memory_order_relaxed);
+		local.rows_scanned += span;
 	}
 	// every chunk of the unit carries the unit's index, past every fetch batch
 	local.batch_index = global.fetch_batch_base + unit;
@@ -398,16 +471,37 @@ static void SearchCoreEmit(SearchCoreGlobal &global, SearchCoreLocal &local, Dat
 	output.SetCardinality(count);
 }
 
+//! Emit the `count` rows the recheck kept from a per-row fetch: probe
+//! columns through the selection, extra columns as fetched for those rows.
+static void SearchCoreEmitFetched(SearchCoreGlobal &global, SearchCoreLocal &local, idx_t count, DataChunk &output) {
+	D_ASSERT(output.ColumnCount() == global.output_sources.size());
+	D_ASSERT(global.extra_column_ids.empty() || local.extra_chunk.size() == count);
+	for (idx_t column = 0; column < global.output_sources.size(); column++) {
+		auto &source = global.output_sources[column];
+		if (source.second == DConstants::INVALID_INDEX) {
+			output.data[column].Reference(Value::BOOLEAN(true));
+		} else if (source.first) {
+			output.data[column].Slice(local.probe_chunk.data[source.second], local.sel, count);
+		} else {
+			output.data[column].Reference(local.extra_chunk.data[source.second]);
+		}
+	}
+	output.SetCardinality(count);
+}
+
 void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchCoreGlobal &global,
-                       SearchCoreLocal &local, const std::function<idx_t(DataChunk &, SelectionVector &)> &recheck,
-                       DataChunk &output) {
+                       SearchCoreLocal &local,
+                       const std::function<idx_t(DataChunk &, SelectionVector &, bool)> &recheck, DataChunk &output) {
 	while (true) {
 		switch (local.phase) {
 		case SearchCorePhase::FETCH: {
 			// The prior output is consumed before re-entry. Release its block pins
 			// before decoding another segment or transitioning to the tail scan.
 			local.fetch_chunk.Reset();
+			local.probe_chunk.Reset();
+			local.extra_chunk.Reset();
 			local.fetch_state = ColumnFetchState();
+			local.extra_state = ColumnFetchState();
 			if (local.range_state) {
 				local.range_state->table_state.Scan(*global.tx, local.fetch_chunk);
 				if (local.fetch_chunk.size() == 0) {
@@ -444,11 +538,37 @@ void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchC
 				auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, local.candidate_end - offset);
 				Vector rowids(LogicalType::ROW_TYPE, reinterpret_cast<data_ptr_t>(local.candidates->data() + offset));
 				local.candidate_offset += count;
-				global.storage->Fetch(*global.tx, local.fetch_chunk, global.fetch_column_ids, rowids, count,
+				global.storage->Fetch(*global.tx, local.probe_chunk, global.probe_column_ids, rowids, count,
 				                      local.fetch_state);
 				global.fetched_rows.fetch_add(count, std::memory_order_relaxed);
+				local.rows_scanned += count;
+				auto hits = local.probe_chunk.size() == 0 ? 0 : recheck(local.probe_chunk, local.sel, false);
+				if (hits == 0) {
+					if (SearchCoreYieldEmpty(data)) {
+						return;
+					}
+					continue;
+				}
+				if (!global.extra_column_ids.empty()) {
+					// Fetch returns the visible rows in the order asked, with
+					// their rowids, so the kept rows are addressed exactly
+					auto fetched_rowids =
+					    FlatVector::GetData<row_t>(local.probe_chunk.data[global.probe_rowid_position]);
+					auto hit_rowids = FlatVector::GetData<row_t>(local.hit_rowids);
+					for (idx_t i = 0; i < hits; i++) {
+						hit_rowids[i] = fetched_rowids[local.sel.get_index(i)];
+					}
+					global.storage->Fetch(*global.tx, local.extra_chunk, global.extra_column_ids, local.hit_rowids,
+					                      hits, local.extra_state);
+					if (local.extra_chunk.size() != hits) {
+						throw InternalException("ngram: a kept candidate row vanished between two fetches");
+					}
+				}
+				SearchCoreEmitFetched(global, local, hits, output);
+				return;
 			}
-			auto hits = local.fetch_chunk.size() == 0 ? 0 : recheck(local.fetch_chunk, local.sel);
+			// a range scan's chunk, produced under the scan filters
+			auto hits = local.fetch_chunk.size() == 0 ? 0 : recheck(local.fetch_chunk, local.sel, true);
 			if (hits == 0) {
 				if (SearchCoreYieldEmpty(data)) {
 					return;
@@ -469,7 +589,6 @@ void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchC
 			if (local.scan_local_storage) {
 				LocalStorage::Get(*global.tx)
 				    .Scan(local.scan_state->local_state, global.fetch_column_ids, local.scan_chunk);
-				global.local_rows.fetch_add(local.scan_chunk.size(), std::memory_order_relaxed);
 			} else {
 				local.scan_state->table_state.Scan(*global.tx, local.scan_chunk);
 			}
@@ -481,7 +600,7 @@ void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchC
 				}
 				continue;
 			}
-			auto hits = recheck(local.scan_chunk, local.sel);
+			auto hits = recheck(local.scan_chunk, local.sel, true);
 			if (hits == 0) {
 				if (SearchCoreYieldEmpty(data)) {
 					return;

@@ -22,6 +22,7 @@ namespace duckdb {
 class DataTable;
 class DuckTableEntry;
 class DuckTransaction;
+class ExpressionExecutor;
 class TableFilterSet;
 
 namespace ngram {
@@ -58,6 +59,21 @@ void AddShadowColumn(DuckTableEntry &entry, const string &column_name, LogicalTy
                      vector<StorageIndex> &column_ids, vector<LogicalType> &types);
 
 void ThrowIfInterrupted(ClientContext &context);
+
+//! Initialize a committed scan of rows [start_row, end_row): positioned at
+//! the row group and vector holding start_row and stopped at end_row, so it
+//! visits only the row groups those rows occupy. The scan starts at the
+//! vector's first row, so the caller's filters must exclude the rows of that
+//! vector before start_row, or tolerate them. A row group the filters' zone
+//! maps exclude is skipped, as the host's own scan skips it. v1.5.5 keeps
+//! DataTable's offset initializer private; its row-group collection exposes
+//! the same steps, and like DataTable::InitializeScan they take no checkpoint
+//! lock. Local storage stays uninitialized: callers scan the committed
+//! collection state directly. Returns the rows the scan can visit: from the
+//! first vector's start to end_row, before zone-map pruning.
+idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableScanState &state,
+                            const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> filters,
+                            idx_t start_row, idx_t end_row);
 
 //! Run `body(unit)` for every unit in [0, units) across at most `workers` of
 //! the scheduler's threads, or inline when there is only one of either. The
@@ -119,9 +135,29 @@ struct SearchCoreGlobal {
 	//! BOOLEAN virtual column used only to carry cardinality for count(*).
 	vector<idx_t> output_ids;
 
-	//! Native filters the storage scans evaluate: the transparent scan's
-	//! pushed filters.
+	//! Native filters every storage scan evaluates: the transparent scan's
+	//! pushed filters, or the explicit search's contains predicate. Rows a
+	//! scan produces under them need no recheck.
 	unique_ptr<TableFilterSet> scan_filters;
+	//! Positions in fetch_column_ids of the columns the recheck reads, in
+	//! the order the recheck expression references them; policy init sets
+	//! it before FinalizeSearchCore.
+	vector<idx_t> recheck_positions;
+	//! A per-row candidate fetch reads the probe layout first, the recheck
+	//! columns then the rowid, and the extra layout, every other column, only
+	//! for the rows the recheck keeps: a fetched column costs from a tenth of
+	//! a string fetch (bit-packed integers) to nine times it (short FSST
+	//! strings), so wide projections are paid per match, not per candidate.
+	//! Both layouts are positions in fetch_column_ids; output_sources maps
+	//! each output column to (in the probe layout, index in that layout).
+	vector<idx_t> probe_positions;
+	vector<idx_t> extra_positions;
+	vector<StorageIndex> probe_column_ids;
+	vector<LogicalType> probe_types;
+	vector<StorageIndex> extra_column_ids;
+	vector<LogicalType> extra_types;
+	idx_t probe_rowid_position = 0;
+	vector<std::pair<bool, idx_t>> output_sources;
 	//! Position of the rowid column in the fetch projection. Bounded scans
 	//! start at a vector boundary, so each carries a rowid filter that
 	//! excludes the rows of that vector before its bound.
@@ -139,8 +175,8 @@ struct SearchCoreGlobal {
 
 	//! Physical work per access path, for profiling and bounded-work tests:
 	//! rows fetched by rowid, rows the range scans and tail scans can visit
-	//! (their vector-aligned spans, before zone-map pruning), and rows the
-	//! local storage scan returned.
+	//! (their vector-aligned spans, before zone-map pruning), and the rows of
+	//! the transaction's local storage, which its scan visits whole.
 	atomic<idx_t> fetched_rows {0};
 	atomic<idx_t> range_rows {0};
 	atomic<idx_t> tail_rows {0};
@@ -148,9 +184,20 @@ struct SearchCoreGlobal {
 };
 
 struct SearchCoreLocal {
+	SearchCoreLocal() : hit_rowids(LogicalType::ROW_TYPE, STANDARD_VECTOR_SIZE) {
+	}
+
 	SearchCorePhase phase = SearchCorePhase::FETCH;
+	//! Range-scan output in the full fetch layout.
 	DataChunk fetch_chunk;
+	//! Per-row fetch output: the probe layout for every candidate of the
+	//! batch, then the extra layout for the rows the recheck kept, whose
+	//! rowids hit_rowids carries between the two fetches.
+	DataChunk probe_chunk;
+	DataChunk extra_chunk;
+	Vector hit_rowids;
 	ColumnFetchState fetch_state;
+	ColumnFetchState extra_state;
 	//! The claimed batch: rowids [candidate_offset, candidate_end) of the
 	//! published segment `segment_ordinal`.
 	shared_ptr<vector<row_t>> candidates;
@@ -174,21 +221,39 @@ struct SearchCoreLocal {
 	DataChunk scan_chunk;
 	SelectionVector sel;
 	idx_t batch_index = 0;
+	//! Rows this thread fetched or could scan, for the host's rows-scanned
+	//! metric, which it reads per thread.
+	idx_t rows_scanned = 0;
 };
 
-//! Partition the tail, drop empty filter sets and set the bounded thread
-//! count after policy-specific init has populated `state`.
+//! Fetched columns outside the recheck's inputs and the rowid: what a wide
+//! projection adds to every kept row's fetch. Available before
+//! FinalizeSearchCore, for the probe's admission.
+idx_t ExtraFetchColumns(const SearchCoreGlobal &state);
+
+//! Partition the tail, split the fetch layout, drop empty filter sets and
+//! set the bounded thread count after policy-specific init has populated
+//! `state`.
 void FinalizeSearchCore(ClientContext &context, SearchCoreGlobal &state);
+
+//! Rows of `chunk` the recheck keeps, selected into `sel`: every row when a
+//! storage scan produced the chunk under the scan filters or there is no
+//! executor, the executor's selection otherwise. DEBUG builds check that a
+//! natively filtered chunk passes the executor whole.
+idx_t SelectRechecked(ExpressionExecutor *executor, DataChunk &chunk, SelectionVector &sel, bool natively_filtered);
 
 //! Initialize per-thread buffers and assign at most probe->max_threads locals
 //! to candidate decoding; remaining locals start on the disjoint scan phase.
 void InitializeSearchCoreLocal(ExecutionContext &context, SearchCoreGlobal &global, SearchCoreLocal &local);
 
-//! Shared candidate fetch, scan, projection and scheduling loop. `recheck`
-//! selects exact matches from either fetched candidates or scan chunks.
+//! Shared candidate fetch, scan, projection and scheduling loop.
+//! `recheck(chunk, sel, natively_filtered)` selects exact matches from
+//! either fetched candidates or scan chunks; natively_filtered says a storage
+//! scan produced the chunk under the global scan filters, so those already
+//! hold for every row.
 void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchCoreGlobal &global,
-                       SearchCoreLocal &local, const std::function<idx_t(DataChunk &, SelectionVector &)> &recheck,
-                       DataChunk &output);
+                       SearchCoreLocal &local,
+                       const std::function<idx_t(DataChunk &, SelectionVector &, bool)> &recheck, DataChunk &output);
 
 } // namespace ngram
 } // namespace duckdb

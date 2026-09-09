@@ -1,0 +1,140 @@
+{
+ "column_probe": {
+  "profile": {},
+  "tail": "\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502  max(c2)   \u2502\n\u2502   double   \u2502\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n\u2502 10916140.0 \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\nRun Time (s): real 0.034 user 0.033119 sys 0.000579\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 max(c3)  \u2502\n\u2502 varchar  \u2502\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n\u2502 x9994898 \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\nRun Time (s): real 0.089 user 0.071499 sys 0.017833\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 max(c3)  \u2502\n\u2502 varchar  \u2502\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n\u2502 x9994898 \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\nRun Time (s): real 0.069 user 0.069028 sys 0.000409\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 max(c5) \u2502\n\u2502 varchar \u2502\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n\u2502 9994898 \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\nRun Time (s): real 0.103 user 0.068226 sys 0.035019\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 max(c5) \u2502\n\u2502 varchar \u2502\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n\u2502 9994898 \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\nRun Time (s): real 0.083 user 0.074838 sys 0.008558\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 max(id)  \u2502\n\u2502  int64   \u2502\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n\u2502 10916140 \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\nRun Time (s): real 0.031 user 0.030315 sys 0.000072\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 max(id)  \u2502\n\u2502  int64   \u2502\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n\u2502 10916140 \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\nRun Time (s): real 0.031 user 0.030981 sys 0.000000\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 column_name \u2502 compression  \u2502 count_star() \u2502\n\u2502   varchar   \u2502   varchar    \u2502    int64     \u2502\n\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524\n\u2502 c1          \u2502 BitPacking   \u2502           89 \u2502\n\u2502 c2          \u2502 ALP          \u2502          202 \u2502\n\u2502 c3          \u2502 FSST         \u2502          183 \u2502\n\u2502 c4          \u2502 BitPacking   \u2502           89 \u2502\n\u2502 c5          \u2502 FSST         \u2502          178 \u2502\n\u2502 id          \u2502 BitPacking   \u2502           89 \u2502\n\u2502 s           \u2502 FSST         \u2502         1594 \u2502\n\u2502 s           \u2502 Uncompressed \u2502         1252 \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n",
+  "timings": [
+   {
+    "cpu_s": 0.293,
+    "real_s": 0.293,
+    "statement": "SELECT count(*) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.0294,
+    "real_s": 0.03,
+    "statement": "SELECT count(*) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.035,
+    "real_s": 0.035,
+    "statement": "SELECT max(c1) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.0304,
+    "real_s": 0.03,
+    "statement": "SELECT max(c1) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.049,
+    "real_s": 0.049,
+    "statement": "SELECT max(c2) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.0337,
+    "real_s": 0.034,
+    "statement": "SELECT max(c2) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.0893,
+    "real_s": 0.089,
+    "statement": "SELECT max(c3) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.0694,
+    "real_s": 0.069,
+    "statement": "SELECT max(c3) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.1032,
+    "real_s": 0.103,
+    "statement": "SELECT max(c5) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.0834,
+    "real_s": 0.083,
+    "statement": "SELECT max(c5) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.0304,
+    "real_s": 0.031,
+    "statement": "SELECT max(id) FROM ngram_search('wide', 'parliamentary');"
+   },
+   {
+    "cpu_s": 0.031,
+    "real_s": 0.031,
+    "statement": "SELECT max(id) FROM ngram_search('wide', 'parliamentary');"
+   }
+  ]
+ },
+ "git_head": "48407e6b2bf0bac5a477d572818b227f28848b6a",
+ "recheck_probe": {
+  "profile": {
+   "Ngram Admission Rows": "351383",
+   "Ngram Column": "s",
+   "Ngram Decode Peak Bytes": "3006480",
+   "Ngram Decode Workspace Bytes": "3435072",
+   "Ngram Fetched Rows": "18817",
+   "Ngram Local Rows": "0",
+   "Ngram Manifest Rows Scanned": "55",
+   "Ngram Manifest Rows Visited": "323584",
+   "Ngram Mode": "index (<= 351383 candidates, 1600332 decoded rowids)",
+   "Ngram Needles": "history",
+   "Ngram Probe Workers": "1",
+   "Ngram Range Rows": "90112",
+   "Ngram Storage Columns": "s",
+   "Ngram Tail Rows": "0"
+  },
+  "tail": " Needles\": \"history\",\n                                \"Projections\": \"\",\n                                \"Filters\": \"(s ~~* '%history%')\",\n                                \"Estimated Cardinality\": \"2184084\",\n                                \"Ngram Storage Columns\": \"s\",\n                                \"Ngram Mode\": \"index (<= 351383 candidates, 1600332 decoded rowids)\",\n                                \"Ngram Manifest Rows Scanned\": \"55\",\n                                \"Ngram Manifest Rows Visited\": \"323584\",\n                                \"Ngram Admission Rows\": \"351383\",\n                                \"Ngram Probe Workers\": \"1\",\n                                \"Ngram Decode Workspace Bytes\": \"3435072\",\n                                \"Ngram Decode Peak Bytes\": \"3006480\",\n                                \"Ngram Fetched Rows\": \"18817\",\n                                \"Ngram Range Rows\": \"90112\",\n                                \"Ngram Tail Rows\": \"0\",\n                                \"Ngram Local Rows\": \"0\"\n                            },\n                            \"cumulative_cardinality\": 90665,\n                            \"cumulative_rows_scanned\": 108929,\n                            \"operator_cardinality\": 90665,\n                            \"operator_name\": \"NGRAM_INDEX_SCAN\",\n                            \"operator_rows_scanned\": 108929,\n                            \"children\": []\n                        }\n                    ]\n                }\n            ]\n        }\n    ]\n}",
+  "timings": [
+   {
+    "cpu_s": 0.3956,
+    "real_s": 0.396,
+    "statement": "SELECT count(*) FROM clustered WHERE s ILIKE '%history%';"
+   },
+   {
+    "cpu_s": 0.0911,
+    "real_s": 0.091,
+    "statement": "SELECT count(*) FROM clustered WHERE s ILIKE '%history%';"
+   },
+   {
+    "cpu_s": 0.0904,
+    "real_s": 0.091,
+    "statement": "SELECT count(*) FROM clustered WHERE s ILIKE '%history%';"
+   },
+   {
+    "cpu_s": 0.0593,
+    "real_s": 0.059,
+    "statement": "SELECT count(*) FROM ngram_search('clustered', 'history');"
+   },
+   {
+    "cpu_s": 0.0586,
+    "real_s": 0.059,
+    "statement": "SELECT count(*) FROM ngram_search('clustered', 'history');"
+   },
+   {
+    "cpu_s": 0.0588,
+    "real_s": 0.058,
+    "statement": "SELECT count(*) FROM ngram_search('clustered', 'history');"
+   },
+   {
+    "cpu_s": 0.4905,
+    "real_s": 0.491,
+    "statement": "SELECT count(*) FROM docs WHERE s ILIKE '%history%';"
+   },
+   {
+    "cpu_s": 0.1879,
+    "real_s": 0.188,
+    "statement": "SELECT count(*) FROM docs WHERE s ILIKE '%history%';"
+   },
+   {
+    "cpu_s": 0.1558,
+    "real_s": 0.156,
+    "statement": "SELECT count(*) FROM ngram_search('docs', 'history');"
+   },
+   {
+    "cpu_s": 0.1551,
+    "real_s": 0.155,
+    "statement": "SELECT count(*) FROM ngram_search('docs', 'history');"
+   }
+  ]
+ }
+}

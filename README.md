@@ -4,8 +4,7 @@
 over large text columns:
 
 ```sql
-INSTALL ngram FROM community;
-LOAD ngram;
+LOAD ngram;   -- from the built binary today; INSTALL ngram FROM community once the submission merges (see Installing)
 
 PRAGMA create_ngram_index('logs', 'message');
 
@@ -111,8 +110,8 @@ The answer is then narrowed to exactly the truth by four mechanisms:
    impossible in every state the index can be in**.
 2. **The tail scan.** Rows appended since the last `create`/`refresh` are past
    the index's high-water mark. Every query brute-force scans that tail and
-   unions the matches in. A rowid zone-map filter means the scan skips the
-   indexed row groups entirely, so it costs about what the unindexed tail costs.
+   unions the matches in. The scan starts at the first row group past the
+   mark, so it costs about what the unindexed tail costs.
 3. **The transaction-local phase.** Rows your own open transaction has inserted
    but not committed have no permanent rowids yet and are never indexed. They
    are covered by the same tail scan, so a search inside a writing transaction
@@ -207,8 +206,10 @@ seal and may conservatively require rebuild; a `DETACH` of an untouched unbound
 guard is the main ordinary example.
 
 The implementation and recovery proof are in
-[docs/stale-updates.md](docs/stale-updates.md). There are no probabilistic row
-witnesses or undetected update/vacuum miss cases.
+[docs/stale-updates.md](docs/stale-updates.md); the ownership, snapshot,
+publication-order and budget invariants behind the whole design are in
+[docs/design.md](docs/design.md). There are no probabilistic row witnesses or
+undetected update/vacuum miss cases.
 
 ---
 
@@ -400,10 +401,10 @@ Each new index receives a canonical UUIDv4 `index_ref`. Its metadata is one
 row of `__ngram.registry`; its postings are the table `__ngram.segments_<id>`,
 named by the id without dashes and sorted by a fixed-width key of each gram
 (`ngram_gram_key`). A query reads the segment rows of every gram of its needle
-to pick the rarest ones, so the index keeps no separate statistics. `PRAGMA ngram_indexes` lists every index across attached DuckDB
-catalogs. Use the catalog-qualified status/drop forms whenever the base table
-or indexed column has disappeared; copied attached databases may legitimately
-contain the same UUID, so the catalog name is part of the public identity.
+to pick the rarest ones, so the index keeps no separate statistics. Use the
+catalog-qualified drop form whenever the base table or indexed column has
+disappeared; copied attached databases may legitimately contain the same
+UUID, so the catalog name is part of the public identity.
 
 Lifecycle status has four values:
 
@@ -673,15 +674,13 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
 
 ## Platform support
 
-The last full distribution-matrix run was Phase 9, before the format-3 rowid
-guard: DuckDB v1.5.5 built on Linux (x86_64, arm64), macOS (x86_64, arm64),
-Windows (x86_64 MSVC, x86_64 MinGW, arm64), and Wasm (mvp, eh, threads).
-Linux x86_64, macOS arm64, and all three Windows targets each passed the same
-2,559 assertions in 21 test cases; the remaining targets built and linked.
-The two opt-in musl targets were not built. The final format-3 submission
-commit must rerun that matrix; local Phase 11 results are recorded separately
-in `ngram_index_plan.md` and do not establish cross-platform coverage for the
-new custom index type and extension callbacks.
+The distribution matrix (`.github/workflows/MainDistributionPipeline.yml`)
+builds DuckDB v1.5.5 with the extension on Linux (x86_64, arm64), macOS
+(x86_64, arm64), Windows (x86_64 MSVC, x86_64 MinGW, arm64) and Wasm (mvp,
+eh, threads), and runs the SQL suite on the targets that can execute it; the
+C++ harness runs on Linux and macOS. The latest matrix run is recorded in
+`ngram_review_plan.md` beside the commit it ran on; the two opt-in musl
+targets are not built.
 
 ---
 
@@ -691,7 +690,7 @@ new custom index type and extension callbacks.
 git clone --recurse-submodules <repo>
 cd duckdb-ngram
 make                # release build; ./build/release/duckdb has the extension linked in
-make test           # sqllogictest suite
+make test           # the C++ harness, then the sqllogictest suite
 GEN=ninja make debug        # DEBUG + AddressSanitizer build
 ```
 
@@ -716,7 +715,8 @@ build/release/extension/ngram/ngram_checkpoint_gap_test /tmp/harness.db test/fix
 ```
 
 Benchmarks and corpus generation live in `benchmarks/`; see
-[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md). Updating the host pin is
+described in [docs/UPDATING.md](docs/UPDATING.md).
 
 ## License
 

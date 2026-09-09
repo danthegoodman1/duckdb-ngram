@@ -1,9 +1,22 @@
 # Benchmarks
 
-This directory contains reproducible performance evidence for `duckdb-ngram`.
-The comparison below is a bounded same-machine point of reference against
-ClickHouse 26.7.3.19's GA `text(tokenizer = ngrams(3))` index, not a universal
-database ranking.
+This directory holds the performance evidence for `duckdb-ngram` and the tools
+that produce it. Two kinds of evidence live here:
+
+- **Release evidence** (`RESULTS.md`, rendered from
+  `artifacts/enwik9-current-v1.json` by `release_evidence.py`): the numbers
+  the README quotes, describing the engine commit the block names and
+  collected again for each release. `release_evidence.py check` verifies the
+  artifact, the pins and the rendered block on every commit;
+  `--current-source` also requires the source to hash to the artifact's
+  records.
+- **The ClickHouse comparison** below (`artifacts/enwik9-clickhouse-*.json`,
+  `clickhouse_compare.py`): a bounded same-machine point of reference against
+  ClickHouse 26.7.3.19's GA `text(tokenizer = ngrams(3))` index, measured on
+  2026-08-13 at extension source `3cfec364`, which wrote storage format 3 and
+  predates the current query and build engine; not a universal database
+  ranking. Its artifacts record their own tool and binary digests and stay
+  valid as a record of that source; the numbers are not the current release's.
 
 Both campaigns used:
 

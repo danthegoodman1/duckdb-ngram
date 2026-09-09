@@ -86,3 +86,9 @@ Variants, each run as above with 24 threads (in transaction / after commit):
 The empty insert has to take the batch (`ORDER BY`) insert path. Below 122,880
 reinserted rows the in-transaction read is still wrong but the commit repairs
 it; from 122,880 rows the table stays empty in-process.
+
+The extension's refresh and merge append through a transaction-local append
+instead (`__ngram_maintenance_append` in `src/fence.cpp`); the block at the
+end of `test/sql/ngram_refresh_noop.test` runs the shape above (a refresh over
+a deleted tail, then a purge, in one transaction) and would fail if the host's
+behavior reached the segments table again.

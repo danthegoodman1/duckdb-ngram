@@ -4,13 +4,17 @@ name: Nightly
 # harness under ASAN/UBSAN, the crash and churn drivers at their default
 # sizes on a release build, and the concurrency tests and the query harness
 # under ThreadSanitizer in the host's own configuration (clang, RelWithDebInfo,
-# the host's suppressions). Each job records the exact source it ran in its
-# summary.
+# the host's suppressions). It runs on the schedule, on dispatch, and on a push
+# that changes this file, so a change to the lanes is exercised at once. Each
+# job records the exact source it ran in its summary.
 
 on:
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/Nightly.yml'
 
 permissions:
   contents: read

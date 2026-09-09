@@ -16,7 +16,8 @@ namespace ngram {
 //! leaves 0.89% of rows as candidates against K=3's 0.28%, close enough to
 //! ngram_max_candidate_fraction to risk giving up the index entirely.
 //! Lowering K is always safe for correctness — fewer grams can only widen the
-//! candidate set, never drop a match (benchmarks/RESULTS.md).
+//! candidate set, never drop a match (the sweep is recorded in
+//! docs/plan/ngram_index_plan.md, row 6B).
 static constexpr idx_t DEFAULT_MAX_GRAMS_PER_QUERY = 3;
 
 //! The gate compares fetching the candidates against scanning the indexed

@@ -246,7 +246,6 @@ def measure_manifest(binary, database, work, label):
                                  "SET ngram_max_candidate_fraction=1;\n")
         entry = {
             "needle": needle, "keys": len(keys),
-            "per_key": per_key,
             "per_key_rows_scanned": sum(e["rows_scanned"] for e in per_key),
             "per_key_row_groups": sum(len(e["row_groups"]) for e in per_key),
             "combined_rows_scanned": scanned, "combined_returned": returned,

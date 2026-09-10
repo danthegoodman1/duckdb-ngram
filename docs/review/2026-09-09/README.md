@@ -111,9 +111,9 @@ the probe time:
 ## Query cost model (19G)
 
 `cost_measure.py` on the full corpus (10,920,423 rows, case-insensitive trigram
-index, 48 GB memory limit, warm). `cost_observations_before_native_recheck.json`
-holds the same run before the two execution changes below;
-`cost_observations.json` the run after them. Costs are CPU seconds at one
+index, 48 GB memory limit, warm); `cost_observations.json` holds the run after
+the two execution changes below, and the figures quoted for the run before
+them came from the same script on the source before those changes. Costs are CPU seconds at one
 thread unless stated, from seven measured runs after a warmup, with the
 probe-only time (`ngram_candidates`) subtracted where a per-row figure is given.
 

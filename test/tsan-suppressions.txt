@@ -30,3 +30,16 @@ race:FinishedPartitionCount
 # glibc's default mutex completes the unlock. Recorded in
 # ngram_review_plan.md as a deferred item.
 mutex:GuardBuildGlobalState
+
+# The creation barrier holds the host's exclusive checkpoint lock, a
+# StorageLockKey, across the statements that invalidate old table storage
+# and install the guard (README, "Staleness and fail-closed recovery"); the
+# key is released by the finish call on whichever thread runs it, and while
+# it is held the next statement takes the client context lock, so
+# ThreadSanitizer reports the release as by the wrong thread and the
+# checkpoint lock and context lock as a lock-order inversion. Both stacks
+# are the host's own lock code; the reports appear only because the barrier
+# spans statements. Recorded with the append lock in ngram_review_plan.md's
+# deferred row 22G.
+mutex:FinishCreation
+deadlock:SharedCheckpointLock

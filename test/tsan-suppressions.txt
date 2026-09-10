@@ -43,3 +43,11 @@ mutex:GuardBuildGlobalState
 # deferred row 22G.
 mutex:FinishCreation
 deadlock:SharedCheckpointLock
+
+# The maintenance fence looks up the transaction from a scalar function
+# (AcquireMaintenanceFence), which starts the catalog's transaction under the
+# host's meta-transaction lock; ThreadSanitizer joins that with the host's
+# own orderings of the transaction-manager, parallel-scan and client-context
+# locks into a four-lock cycle whose other three edges are host code. Any
+# scalar that touches the transaction has the same shape.
+deadlock:AcquireMaintenanceFence

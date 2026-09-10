@@ -161,6 +161,12 @@ jobs:
     name: Concurrency tests and harness under ThreadSanitizer
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    # Advisory, as the host's own ThreadSanitizer job is (run_tests_one_by_one
+    # --no-exit): DuckDB v1.5.5's lock orderings produce reports that are not
+    # the extension's to fix, so the lane's log is the deliverable and its
+    # exit code does not fail the nightly. Reports with an extension frame
+    # are suppressed only with the reasoning in test/tsan-suppressions.txt.
+    continue-on-error: true
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
       OVERRIDE_GIT_DESCRIBE: v1.5.5

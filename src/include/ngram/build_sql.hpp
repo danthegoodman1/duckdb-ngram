@@ -18,7 +18,7 @@ struct ObservedIndex;
 //===----------------------------------------------------------------------===//
 // Partitioned packing
 //
-// Build, refresh and compact turn a (gram, segment_no, rowid) pair stream into
+// Build, refresh and compact turn a (gram_key, segment_no, rowid) pair stream into
 // one segment row per key with the ngram_pack_segment aggregate under a plain
 // GROUP BY: DuckDB's radix-partitioned hash aggregate is the only shape
 // measured to use the whole machine (a global ORDER BY into a streaming packer
@@ -38,8 +38,8 @@ struct ObservedIndex;
 //! the recorded mark exact; a bounded refresh passes false to stop at `hi`.
 vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_t partitions, bool open_ended = true);
 
-//! One statement filling `packed` (gram, segment_no, postings, rowid_count,
-//! min_rowid, max_rowid) from `pair_source`, a SELECT of (gram, segment_no, r).
+//! One statement filling `packed` (gram_key, segment_no, postings, rowid_count,
+//! min_rowid, max_rowid) from `pair_source`, a SELECT of (gram_key, segment_no, r).
 //! The first partition creates the table, the rest append to it.
 string PackPartitionStatement(const string &packed, bool first, const string &pair_source);
 

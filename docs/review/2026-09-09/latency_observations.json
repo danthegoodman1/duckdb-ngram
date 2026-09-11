@@ -1,0 +1,771 @@
+{
+ "after": {
+  "binary": "build/release/duckdb",
+  "build_s": 6.97,
+  "ilike_native": {
+   "history": {
+    "native_threads_1": {
+     "max_ms": 2935.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 2625.0
+    },
+    "native_threads_24": {
+     "max_ms": 273.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 193.0
+    },
+    "transparent_threads_1": {
+     "max_ms": 2942.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 2633.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 273.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 193.0
+    }
+   },
+   "which": {
+    "native_threads_1": {
+     "max_ms": 2695.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 2328.0
+    },
+    "native_threads_24": {
+     "max_ms": 290.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 175.0
+    },
+    "transparent_threads_1": {
+     "max_ms": 2646.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 2339.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 315.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 175.0
+    }
+   }
+  },
+  "load_s": 0.83,
+  "queries": {
+   "Schwarzschild": {
+    "class": "rare",
+    "explicit_threads_1": {
+     "max_ms": 2.0,
+     "min_ms": 1.0,
+     "n": 21,
+     "p50_ms": 1.0,
+     "p95_ms": 2.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 1.0,
+     "min_ms": 0.0,
+     "n": 21,
+     "p50_ms": 1.0,
+     "p95_ms": 1.0
+    },
+    "matches": 141,
+    "mode": "index (<= 225 candidates, 6047 decoded rowids)",
+    "probe_threads_1": {
+     "max_ms": 2.0,
+     "min_ms": 1.0,
+     "n": 21,
+     "p50_ms": 1.0,
+     "p95_ms": 2.0
+    },
+    "probe_threads_24": {
+     "max_ms": 2.0,
+     "min_ms": 0.0,
+     "n": 21,
+     "p50_ms": 1.0,
+     "p95_ms": 2.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1296.0,
+     "min_ms": 1287.0,
+     "n": 21,
+     "p50_ms": 1291.0,
+     "p95_ms": 1295.0
+    },
+    "scan_threads_24": {
+     "max_ms": 89.0,
+     "min_ms": 83.0,
+     "n": 21,
+     "p50_ms": 85.0,
+     "p95_ms": 87.0
+    },
+    "share": 1.3e-05,
+    "transparent_threads_1": {
+     "max_ms": 2.0,
+     "min_ms": 1.0,
+     "n": 21,
+     "p50_ms": 1.0,
+     "p95_ms": 2.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 1.0,
+     "min_ms": 0.0,
+     "n": 21,
+     "p50_ms": 1.0,
+     "p95_ms": 1.0
+    }
+   },
+   "chemistry": {
+    "class": "moderate",
+    "explicit_threads_1": {
+     "max_ms": 14.0,
+     "min_ms": 12.0,
+     "n": 21,
+     "p50_ms": 13.0,
+     "p95_ms": 14.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 6.0,
+     "min_ms": 3.0,
+     "n": 21,
+     "p50_ms": 4.0,
+     "p95_ms": 5.0
+    },
+    "matches": 6350,
+    "mode": "index (<= 106460 candidates, 363715 decoded rowids)",
+    "probe_threads_1": {
+     "max_ms": 4.0,
+     "min_ms": 2.0,
+     "n": 21,
+     "p50_ms": 3.0,
+     "p95_ms": 3.0
+    },
+    "probe_threads_24": {
+     "max_ms": 5.0,
+     "min_ms": 2.0,
+     "n": 21,
+     "p50_ms": 3.0,
+     "p95_ms": 5.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1222.0,
+     "min_ms": 1215.0,
+     "n": 21,
+     "p50_ms": 1218.0,
+     "p95_ms": 1221.0
+    },
+    "scan_threads_24": {
+     "max_ms": 91.0,
+     "min_ms": 80.0,
+     "n": 21,
+     "p50_ms": 81.0,
+     "p95_ms": 86.0
+    },
+    "share": 0.000581,
+    "transparent_threads_1": {
+     "max_ms": 17.0,
+     "min_ms": 14.0,
+     "n": 21,
+     "p50_ms": 15.0,
+     "p95_ms": 16.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 8.0,
+     "min_ms": 4.0,
+     "n": 21,
+     "p50_ms": 4.0,
+     "p95_ms": 7.0
+    }
+   },
+   "history": {
+    "class": "dense",
+    "explicit_threads_1": {
+     "max_ms": 1234.0,
+     "min_ms": 1228.0,
+     "n": 21,
+     "p50_ms": 1231.0,
+     "p95_ms": 1233.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 87.0,
+     "min_ms": 80.0,
+     "n": 21,
+     "p50_ms": 82.0,
+     "p95_ms": 84.0
+    },
+    "matches": 90665,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "probe_threads_1": {
+     "max_ms": 8.0,
+     "min_ms": 5.0,
+     "n": 21,
+     "p50_ms": 6.0,
+     "p95_ms": 7.0
+    },
+    "probe_threads_24": {
+     "max_ms": 10.0,
+     "min_ms": 5.0,
+     "n": 21,
+     "p50_ms": 6.0,
+     "p95_ms": 10.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1232.0,
+     "min_ms": 1225.0,
+     "n": 21,
+     "p50_ms": 1227.0,
+     "p95_ms": 1230.0
+    },
+    "scan_threads_24": {
+     "max_ms": 88.0,
+     "min_ms": 80.0,
+     "n": 21,
+     "p50_ms": 82.0,
+     "p95_ms": 86.0
+    },
+    "share": 0.008302,
+    "transparent_threads_1": {
+     "max_ms": 2670.0,
+     "min_ms": 2634.0,
+     "n": 21,
+     "p50_ms": 2641.0,
+     "p95_ms": 2646.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 202.0,
+     "min_ms": 193.0,
+     "n": 21,
+     "p50_ms": 198.0,
+     "p95_ms": 201.0
+    }
+   },
+   "parliamentary": {
+    "class": "moderate",
+    "explicit_threads_1": {
+     "max_ms": 30.0,
+     "min_ms": 28.0,
+     "n": 21,
+     "p50_ms": 29.0,
+     "p95_ms": 30.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 9.0,
+     "min_ms": 5.0,
+     "n": 21,
+     "p50_ms": 6.0,
+     "p95_ms": 8.0
+    },
+    "matches": 3630,
+    "mode": "index (<= 73529 candidates, 355469 decoded rowids)",
+    "probe_threads_1": {
+     "max_ms": 4.0,
+     "min_ms": 2.0,
+     "n": 21,
+     "p50_ms": 3.0,
+     "p95_ms": 4.0
+    },
+    "probe_threads_24": {
+     "max_ms": 6.0,
+     "min_ms": 2.0,
+     "n": 21,
+     "p50_ms": 2.0,
+     "p95_ms": 5.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1161.0,
+     "min_ms": 1156.0,
+     "n": 21,
+     "p50_ms": 1159.0,
+     "p95_ms": 1161.0
+    },
+    "scan_threads_24": {
+     "max_ms": 83.0,
+     "min_ms": 77.0,
+     "n": 21,
+     "p50_ms": 78.0,
+     "p95_ms": 79.0
+    },
+    "share": 0.000332,
+    "transparent_threads_1": {
+     "max_ms": 41.0,
+     "min_ms": 39.0,
+     "n": 21,
+     "p50_ms": 40.0,
+     "p95_ms": 40.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 10.0,
+     "min_ms": 6.0,
+     "n": 21,
+     "p50_ms": 9.0,
+     "p95_ms": 10.0
+    }
+   },
+   "which": {
+    "class": "dense",
+    "explicit_threads_1": {
+     "max_ms": 1100.0,
+     "min_ms": 1096.0,
+     "n": 21,
+     "p50_ms": 1098.0,
+     "p95_ms": 1100.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 79.0,
+     "min_ms": 73.0,
+     "n": 21,
+     "p50_ms": 75.0,
+     "p95_ms": 78.0
+    },
+    "matches": 297687,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "probe_threads_1": {
+     "max_ms": 7.0,
+     "min_ms": 4.0,
+     "n": 21,
+     "p50_ms": 5.0,
+     "p95_ms": 6.0
+    },
+    "probe_threads_24": {
+     "max_ms": 8.0,
+     "min_ms": 4.0,
+     "n": 21,
+     "p50_ms": 5.0,
+     "p95_ms": 6.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1099.0,
+     "min_ms": 1093.0,
+     "n": 21,
+     "p50_ms": 1096.0,
+     "p95_ms": 1098.0
+    },
+    "scan_threads_24": {
+     "max_ms": 76.0,
+     "min_ms": 72.0,
+     "n": 21,
+     "p50_ms": 74.0,
+     "p95_ms": 76.0
+    },
+    "share": 0.02726,
+    "transparent_threads_1": {
+     "max_ms": 2392.0,
+     "min_ms": 2333.0,
+     "n": 21,
+     "p50_ms": 2347.0,
+     "p95_ms": 2388.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 184.0,
+     "min_ms": 177.0,
+     "n": 21,
+     "p50_ms": 181.0,
+     "p95_ms": 183.0
+    }
+   }
+  },
+  "version": "v1.5.5"
+ },
+ "before": {
+  "binary": "/home/dangoodman/.claude/jobs/9ac4ba05/tmp/main-d3ecccf/build/release/duckdb",
+  "build_s": 7.2,
+  "ilike_native": {
+   "history": {
+    "native_threads_1": {
+     "max_ms": 2938.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 2627.0
+    },
+    "native_threads_24": {
+     "max_ms": 292.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 193.0
+    },
+    "transparent_threads_1": {
+     "max_ms": 2984.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 2623.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 302.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 202.0
+    }
+   },
+   "which": {
+    "native_threads_1": {
+     "max_ms": 2680.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 2374.0
+    },
+    "native_threads_24": {
+     "max_ms": 259.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 176.0
+    },
+    "transparent_threads_1": {
+     "max_ms": 2887.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 2574.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 304.0,
+     "min_ms": 0.0,
+     "n": 43,
+     "p50_ms": 196.0
+    }
+   }
+  },
+  "load_s": 0.8,
+  "queries": {
+   "Schwarzschild": {
+    "class": "rare",
+    "explicit_threads_1": {
+     "max_ms": 12.0,
+     "min_ms": 10.0,
+     "n": 21,
+     "p50_ms": 11.0,
+     "p95_ms": 12.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 11.0,
+     "min_ms": 7.0,
+     "n": 21,
+     "p50_ms": 8.0,
+     "p95_ms": 10.0
+    },
+    "matches": 141,
+    "mode": "index (<= 225 candidates, 6047 decoded rowids)",
+    "probe_threads_1": {
+     "max_ms": 10.0,
+     "min_ms": 9.0,
+     "n": 21,
+     "p50_ms": 9.0,
+     "p95_ms": 10.0
+    },
+    "probe_threads_24": {
+     "max_ms": 10.0,
+     "min_ms": 7.0,
+     "n": 21,
+     "p50_ms": 9.0,
+     "p95_ms": 10.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1350.0,
+     "min_ms": 1294.0,
+     "n": 21,
+     "p50_ms": 1298.0,
+     "p95_ms": 1346.0
+    },
+    "scan_threads_24": {
+     "max_ms": 98.0,
+     "min_ms": 83.0,
+     "n": 21,
+     "p50_ms": 86.0,
+     "p95_ms": 89.0
+    },
+    "share": 1.3e-05,
+    "transparent_threads_1": {
+     "max_ms": 14.0,
+     "min_ms": 11.0,
+     "n": 21,
+     "p50_ms": 11.0,
+     "p95_ms": 14.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 12.0,
+     "min_ms": 7.0,
+     "n": 21,
+     "p50_ms": 8.0,
+     "p95_ms": 11.0
+    }
+   },
+   "chemistry": {
+    "class": "moderate",
+    "explicit_threads_1": {
+     "max_ms": 26.0,
+     "min_ms": 24.0,
+     "n": 21,
+     "p50_ms": 24.0,
+     "p95_ms": 25.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 12.0,
+     "min_ms": 8.0,
+     "n": 21,
+     "p50_ms": 10.0,
+     "p95_ms": 12.0
+    },
+    "matches": 6350,
+    "mode": "index (<= 106460 candidates, 363715 decoded rowids)",
+    "probe_threads_1": {
+     "max_ms": 14.0,
+     "min_ms": 10.0,
+     "n": 21,
+     "p50_ms": 11.0,
+     "p95_ms": 12.0
+    },
+    "probe_threads_24": {
+     "max_ms": 14.0,
+     "min_ms": 8.0,
+     "n": 21,
+     "p50_ms": 10.0,
+     "p95_ms": 13.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1235.0,
+     "min_ms": 1196.0,
+     "n": 21,
+     "p50_ms": 1201.0,
+     "p95_ms": 1224.0
+    },
+    "scan_threads_24": {
+     "max_ms": 92.0,
+     "min_ms": 80.0,
+     "n": 21,
+     "p50_ms": 82.0,
+     "p95_ms": 85.0
+    },
+    "share": 0.000581,
+    "transparent_threads_1": {
+     "max_ms": 26.0,
+     "min_ms": 25.0,
+     "n": 21,
+     "p50_ms": 25.0,
+     "p95_ms": 26.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 14.0,
+     "min_ms": 8.0,
+     "n": 21,
+     "p50_ms": 11.0,
+     "p95_ms": 14.0
+    }
+   },
+   "history": {
+    "class": "dense",
+    "explicit_threads_1": {
+     "max_ms": 1864.0,
+     "min_ms": 1822.0,
+     "n": 21,
+     "p50_ms": 1835.0,
+     "p95_ms": 1844.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 151.0,
+     "min_ms": 123.0,
+     "n": 21,
+     "p50_ms": 125.0,
+     "p95_ms": 135.0
+    },
+    "matches": 90665,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "probe_threads_1": {
+     "max_ms": 18.0,
+     "min_ms": 13.0,
+     "n": 21,
+     "p50_ms": 14.0,
+     "p95_ms": 14.0
+    },
+    "probe_threads_24": {
+     "max_ms": 15.0,
+     "min_ms": 11.0,
+     "n": 21,
+     "p50_ms": 14.0,
+     "p95_ms": 15.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1264.0,
+     "min_ms": 1232.0,
+     "n": 21,
+     "p50_ms": 1234.0,
+     "p95_ms": 1240.0
+    },
+    "scan_threads_24": {
+     "max_ms": 85.0,
+     "min_ms": 80.0,
+     "n": 21,
+     "p50_ms": 83.0,
+     "p95_ms": 85.0
+    },
+    "share": 0.008302,
+    "transparent_threads_1": {
+     "max_ms": 2693.0,
+     "min_ms": 2673.0,
+     "n": 21,
+     "p50_ms": 2678.0,
+     "p95_ms": 2686.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 211.0,
+     "min_ms": 203.0,
+     "n": 21,
+     "p50_ms": 206.0,
+     "p95_ms": 209.0
+    }
+   },
+   "parliamentary": {
+    "class": "moderate",
+    "explicit_threads_1": {
+     "max_ms": 46.0,
+     "min_ms": 44.0,
+     "n": 21,
+     "p50_ms": 45.0,
+     "p95_ms": 46.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 16.0,
+     "min_ms": 12.0,
+     "n": 21,
+     "p50_ms": 12.0,
+     "p95_ms": 15.0
+    },
+    "matches": 3630,
+    "mode": "index (<= 73529 candidates, 355469 decoded rowids)",
+    "probe_threads_1": {
+     "max_ms": 14.0,
+     "min_ms": 10.0,
+     "n": 21,
+     "p50_ms": 10.0,
+     "p95_ms": 12.0
+    },
+    "probe_threads_24": {
+     "max_ms": 13.0,
+     "min_ms": 7.0,
+     "n": 21,
+     "p50_ms": 10.0,
+     "p95_ms": 12.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1168.0,
+     "min_ms": 1163.0,
+     "n": 21,
+     "p50_ms": 1165.0,
+     "p95_ms": 1168.0
+    },
+    "scan_threads_24": {
+     "max_ms": 83.0,
+     "min_ms": 77.0,
+     "n": 21,
+     "p50_ms": 78.0,
+     "p95_ms": 82.0
+    },
+    "share": 0.000332,
+    "transparent_threads_1": {
+     "max_ms": 52.0,
+     "min_ms": 48.0,
+     "n": 21,
+     "p50_ms": 49.0,
+     "p95_ms": 50.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 20.0,
+     "min_ms": 12.0,
+     "n": 21,
+     "p50_ms": 13.0,
+     "p95_ms": 19.0
+    }
+   },
+   "which": {
+    "class": "dense",
+    "explicit_threads_1": {
+     "max_ms": 1739.0,
+     "min_ms": 1686.0,
+     "n": 21,
+     "p50_ms": 1697.0,
+     "p95_ms": 1708.0
+    },
+    "explicit_threads_24": {
+     "max_ms": 120.0,
+     "min_ms": 112.0,
+     "n": 21,
+     "p50_ms": 117.0,
+     "p95_ms": 120.0
+    },
+    "matches": 297687,
+    "mode": "full scan fallback: candidate fraction exceeded",
+    "probe_threads_1": {
+     "max_ms": 18.0,
+     "min_ms": 13.0,
+     "n": 21,
+     "p50_ms": 14.0,
+     "p95_ms": 16.0
+    },
+    "probe_threads_24": {
+     "max_ms": 15.0,
+     "min_ms": 12.0,
+     "n": 21,
+     "p50_ms": 14.0,
+     "p95_ms": 15.0
+    },
+    "scan_threads_1": {
+     "max_ms": 1105.0,
+     "min_ms": 1099.0,
+     "n": 21,
+     "p50_ms": 1101.0,
+     "p95_ms": 1104.0
+    },
+    "scan_threads_24": {
+     "max_ms": 81.0,
+     "min_ms": 72.0,
+     "n": 21,
+     "p50_ms": 75.0,
+     "p95_ms": 78.0
+    },
+    "share": 0.02726,
+    "transparent_threads_1": {
+     "max_ms": 2594.0,
+     "min_ms": 2580.0,
+     "n": 21,
+     "p50_ms": 2585.0,
+     "p95_ms": 2594.0
+    },
+    "transparent_threads_24": {
+     "max_ms": 208.0,
+     "min_ms": 197.0,
+     "n": 21,
+     "p50_ms": 200.0,
+     "p95_ms": 205.0
+    }
+   }
+  },
+  "version": "v1.5.5"
+ },
+ "git_head": "48407e6b2bf0bac5a477d572818b227f28848b6a",
+ "memory_limit": "48GB",
+ "needles": [
+  [
+   "rare",
+   "Schwarzschild"
+  ],
+  [
+   "moderate",
+   "parliamentary"
+  ],
+  [
+   "moderate",
+   "chemistry"
+  ],
+  [
+   "dense",
+   "history"
+  ],
+  [
+   "dense",
+   "which"
+  ]
+ ],
+ "repeats": 21
+}

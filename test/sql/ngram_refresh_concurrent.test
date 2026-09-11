@@ -151,9 +151,9 @@ SELECT count(*) FROM (
 # and the tail scan covers the rest, so results are exact mid-catch-up
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('race', 'tent') EXCEPT SELECT * FROM race WHERE contains(lower(s), 'tent'))
+	(SELECT * FROM ngram_search('race', 'tent') EXCEPT ALL SELECT * FROM race WHERE contains(lower(s), 'tent'))
 	UNION ALL
-	(SELECT * FROM race WHERE contains(lower(s), 'tent') EXCEPT SELECT * FROM ngram_search('race', 'tent'))
+	(SELECT * FROM race WHERE contains(lower(s), 'tent') EXCEPT ALL SELECT * FROM ngram_search('race', 'tent'))
 );
 ----
 0
@@ -171,9 +171,9 @@ SELECT
 		EXCEPT
 		SELECT rowid FROM ngram_candidates('race', 's', 'tent'))),
 	(SELECT count(*) FROM (
-		(SELECT * FROM ngram_search('race', 'tent') EXCEPT SELECT * FROM race WHERE contains(lower(s), 'tent'))
+		(SELECT * FROM ngram_search('race', 'tent') EXCEPT ALL SELECT * FROM race WHERE contains(lower(s), 'tent'))
 		UNION ALL
-		(SELECT * FROM race WHERE contains(lower(s), 'tent') EXCEPT SELECT * FROM ngram_search('race', 'tent'))));
+		(SELECT * FROM race WHERE contains(lower(s), 'tent') EXCEPT ALL SELECT * FROM ngram_search('race', 'tent'))));
 ----
 0	0
 

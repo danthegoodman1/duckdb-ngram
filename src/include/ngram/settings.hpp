@@ -12,8 +12,8 @@ namespace ngram {
 //! ngram index queries probe at most this many of the needle's rarest grams.
 idx_t MaxGramsPerQuery(ClientContext &context);
 
-//! Full-result queries scan instead of probing when the candidate upper bound
-//! exceeds this share of the table's rows.
+//! Full-result queries scan instead of probing when the fetch-equivalent
+//! candidate bound exceeds this share of the indexed rows.
 double MaxCandidateFraction(ClientContext &context);
 
 //! Posting rowids one query may decode before it scans or errors.

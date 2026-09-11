@@ -23,19 +23,19 @@ statement ok
 SET VARIABLE docs_s_id = (SELECT replace(index_id::VARCHAR, '-', '')
                               FROM __ngram.registry WHERE table_name = 'docs' AND column_name = 's');
 
-# the segments and stats tables exist, named by the index id
+# the segments table exists, named by the index id
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE schema_name = '__ngram' AND table_name IN ('segments_' || getvariable('docs_s_id'), 'stats_' || getvariable('docs_s_id'));
+WHERE schema_name = '__ngram' AND table_name = 'segments_' || getvariable('docs_s_id');
 ----
-2
+1
 
 # options round-trip through the registry row
 query IIIIII
 SELECT format_version, schema_name, table_name, column_name, gram_size, case_insensitive
 FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('docs_s_id'));
 ----
-4	main	docs	s	3	true
+5	main	docs	s	3	true
 
 # hwm covers all rows at build time
 query I
@@ -47,26 +47,26 @@ true
 # the index is exactly the brute-force extraction (both directions)
 query I
 SELECT count(*) FROM (
-	(SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	(SELECT gram_key, unnest(ngram_decode_postings(postings)) rid
 	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_s_id'))
-	 EXCEPT SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL)
+	 EXCEPT SELECT DISTINCT ngram_gram_key(unnest(trigrams(s))) gram_key, rowid FROM docs WHERE s IS NOT NULL)
 	UNION ALL
-	(SELECT DISTINCT unnest(trigrams(s)) gram, rowid FROM docs WHERE s IS NOT NULL
-	 EXCEPT SELECT gram, unnest(ngram_decode_postings(postings)) rid
+	(SELECT DISTINCT ngram_gram_key(unnest(trigrams(s))) gram_key, rowid FROM docs WHERE s IS NOT NULL
+	 EXCEPT SELECT gram_key, unnest(ngram_decode_postings(postings)) rid
 	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_s_id')))
 );
 ----
 0
 
-# stats agree with the segments table
+# one key per distinct gram, with its postings described by the row
 query I
-SELECT count(*) FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_s_id'));
+SELECT count(DISTINCT gram_key) FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_s_id'));
 ----
 44
 
 query II
-SELECT row_count, segment_count
-FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_s_id')) WHERE gram = 'hel';
+SELECT sum(rowid_count), count(*)
+FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_s_id')) WHERE gram_key = ngram_gram_key('hel');
 ----
 2	1
 
@@ -130,7 +130,7 @@ query II
 SELECT (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry'),
        (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'docs');
 ----
-4	1
+2	1
 
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
@@ -146,14 +146,14 @@ query II
 SELECT (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry'),
        (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'docs');
 ----
-2	1
+1	1
 
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
 t	2	false	11	11	0	12	12	0	1	72	96	NULL
 
-# dropping the last index removes its storage tables and the table's guard
+# dropping the last index removes its segments table and the table's guard
 statement ok
 PRAGMA drop_ngram_index('docs', 't');
 
@@ -246,13 +246,12 @@ statement ok
 SET VARIABLE empty_id = (SELECT replace(index_id::VARCHAR, '-', '')
                              FROM __ngram.registry WHERE table_name = 'empty_docs');
 
-query IIII
+query III
 SELECT hwm_rowid,
-       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('empty_id'))),
-       (SELECT count(*) FROM query('SELECT * FROM __ngram.stats_' || getvariable('empty_id'))), gram_size
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('empty_id'))), gram_size
 FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('empty_id'));
 ----
--1	0	0	3
+-1	0	3
 
 # NULL named parameters error instead of hitting an internal error
 statement error
@@ -473,9 +472,10 @@ PRAGMA create_ngram_index('guard_output', 's');
 statement ok
 INSERT INTO guard_output VALUES (1000, 'row tail');
 
-query I
+query IIII
 PRAGMA ngram_refresh('guard_output');
 ----
+s	1	100	0
 
 query I
 PRAGMA ngram_compact('guard_output');

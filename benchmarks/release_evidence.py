@@ -32,11 +32,22 @@ END = "<!-- END NGRAM RELEASE EVIDENCE -->"
 
 SCHEMA = 1
 BENCHMARK_ID = "enwik9-current-v1"
-ENGINE_COMMIT = "b6a388c8c39f6e51de44a8365e871a517914bc4d"
+ENGINE_COMMIT = "6fb01c606165dce832d346f3c75198a1b704eefc"
 DUCKDB_GITLINK = "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa"
 CI_GITLINK = "72e76e99cd7fee45a99739cd118ec2db64e034ec"
 DUCKDB_VERSION = "v1.5.5"
 DUCKDB_SOURCE = "d8cdaa33"
+
+
+def source_id_matches(source_id):
+    """The CLI reports the host commit at whatever abbreviation its build's git
+    chose (eight characters in CI, ten on some developer machines); the pin is
+    a prefix of the same commit, so either may be the longer one."""
+    return (
+        isinstance(source_id, str)
+        and len(source_id) >= 7
+        and (source_id.startswith(DUCKDB_SOURCE) or DUCKDB_SOURCE.startswith(source_id))
+    )
 ENGINE_FILES = ("CMakeLists.txt", "Makefile", "extension_config.cmake", "vcpkg.json")
 SUBMODULES = ("duckdb", "extension-ci-tools")
 PINNED_LINKS = {"duckdb": DUCKDB_GITLINK, "extension-ci-tools": CI_GITLINK}
@@ -69,7 +80,7 @@ NEEDLES = (
 )
 FIXED_SETTINGS = dict(
     threads=24, memory_limit="48.0 GiB", preserve_insertion_order=True,
-    gram_size=3, case_insensitive=False, max_grams=3, candidate_fraction="0.01",
+    gram_size=3, case_insensitive=False, max_grams=3, candidate_fraction="0.02",
     probe_rowids=100_000_000, build_partitions=0, auto_accelerate=False,
 )
 
@@ -114,7 +125,7 @@ REGISTRY_COLUMNS = tuple(
     "database_name index_ref schema_name table_name column_name format_version status reason".split()
 )
 #! Artifacts collected under storage format 3 recorded this listing shape. They
-#! stay verifiable until the corpus is re-collected under format 4.
+#! stay verifiable until the corpus is re-collected under the current format.
 FORMAT3_REGISTRY_COLUMNS = tuple(
     "database_name kind index_ref schema_name table_name column_name storage_schema "
     "format_version status reason".split()
@@ -502,7 +513,7 @@ def validate_run(record, pair, stage, corpus, registry_columns):
     if row["database_name"] != "run-%d" % pair:
         fail("registry database mismatch")
     format3 = registry_columns == FORMAT3_REGISTRY_COLUMNS
-    if row["status"] != "READY" or row["reason"] is not None or row["format_version"] != (3 if format3 else 4):
+    if row["status"] != "READY" or row["reason"] is not None or row["format_version"] != (3 if format3 else 5):
         fail("registry status/format mismatch")
     if not INDEX_REF.fullmatch(row["index_ref"]):
         fail("registry allocation mismatch")
@@ -634,7 +645,7 @@ def runtime_identity(binary):
     valid = (
         len(version) == len(extension) == 1
         and version[0].get("library_version") == DUCKDB_VERSION
-        and version[0].get("source_id") == DUCKDB_SOURCE
+        and source_id_matches(version[0].get("source_id"))
         and type(extension[0].get("extension_version")) is str
     )
     if not valid or not re.fullmatch(r"[0-9a-f]{7,40}", extension[0].get("extension_version", "")):
@@ -971,7 +982,7 @@ def index_state(binary, database):
     observed = registry[0]
     if (
         not INDEX_REF.fullmatch(observed["index_ref"])
-        or observed["format_version"] != 4
+        or observed["format_version"] != 5
         or observed["status"] != "READY"
         or observed["reason"] is not None
     ):
@@ -1252,7 +1263,7 @@ def fixture():
                  state=[10, 0, 9, 10, 1000, "3" * 64])
         )
         ref = "11111111-1111-4111-8111-111111111111"
-        registry = ["run-%d" % pair, ref, "main", "docs", "text", 4, "READY", None]
+        registry = ["run-%d" % pair, ref, "main", "docs", "text", 5, "READY", None]
         index_state_fixture = ["text", 3, False, 9, 9, 0, 8, 20, 0, 1, 100, 500, None, registry]
         runs.append(
             dict(common, stage="build", storage=[2000 + pair, 8192, 0, 0], state=index_state_fixture)
@@ -1406,7 +1417,7 @@ def tests(binary):
         fake.file_size = RAW_BYTES
         expect_failure("unsafe archive member", lambda: validate_archive_member([fake]))
     block_hash = hashlib.sha256(render_block(artifact).encode()).hexdigest()
-    if block_hash != "0ea7db47c55173105ae8a90d77e73de9e7dba7ae8c9d125e082baafd97acd384":
+    if block_hash != "ded3f2b43327decf474cfb74d73a89890d8cf6e8dc44b00b30775f90e43bf677":
         fail("full rendered Markdown golden differs")
     expect_failure("missing marker", lambda: replace_block("plain", BEGIN + END, "fixture"))
     expect_failure("duplicate marker", lambda: replace_block(BEGIN + BEGIN + END, BEGIN + END, "x"))

@@ -1,4 +1,9 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/catalog.hpp"
@@ -45,7 +50,8 @@ struct QueryBindData : public TableFunctionData {
 	vector<string> names;
 	vector<LogicalType> types;
 	idx_t search_column_idx = 0;
-	//! ngram_search semantics if a prepared query outlives its index.
+	//! The index's options as bound; ngram_search keeps these semantics if a
+	//! prepared query outlives its index.
 	GramOptions bound_options;
 
 	unique_ptr<FunctionData> Copy() const override {
@@ -65,7 +71,7 @@ static string RequireStringArg(const Value &value, const char *fn, const char *a
 
 //! Resolve the base table plus the index for `column` (or the only indexed
 //! column when none is given), filling everything but the search-specific
-//! members of the bind data.
+//! members of the bind data from one registry read.
 static void BindQueryTarget(ClientContext &context, const char *fn, const string &table_input, string column,
                             QueryBindData &result) {
 	auto target = ResolveTarget(context, table_input, string(), false);
@@ -73,24 +79,25 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 		throw BinderException("%s: %s is not a DuckDB base table", fn, table_input);
 	}
 	if (column.empty()) {
-		auto indexed = ExistingIndexes(context, target);
+		auto indexed = OwnedIndexes(context, target);
 		if (indexed.empty()) {
 			throw BinderException("%s: no ngram index exists on %s; build one with PRAGMA create_ngram_index", fn,
 			                      table_input);
 		}
 		if (indexed.size() > 1) {
 			vector<string> columns;
-			for (auto &location : indexed) {
-				columns.push_back(location.column_name);
+			for (auto &index : indexed) {
+				columns.push_back(index.location.column_name);
 			}
 			throw BinderException("%s: %s has ngram indexes on multiple columns (%s); pass col := '...' to choose", fn,
 			                      table_input, StringUtil::Join(columns, ", "));
 		}
-		result.location = indexed[0];
-		column = indexed[0].column_name;
+		result.location = indexed[0].location;
+		result.bound_options = indexed[0].meta.options;
+		column = indexed[0].location.column_name;
 	} else {
 		target.column_name = column;
-		auto indexed = ExistingIndexes(context, target);
+		auto indexed = OwnedIndexes(context, target);
 		if (indexed.empty()) {
 			throw BinderException("%s: no ngram index exists on %s.%s; build one with PRAGMA create_ngram_index", fn,
 			                      table_input, column);
@@ -98,7 +105,8 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 		if (indexed.size() != 1) {
 			throw InvalidInputException("ngram: multiple allocations claim %s.%s", table_input, column);
 		}
-		result.location = indexed[0];
+		result.location = indexed[0].location;
+		result.bound_options = indexed[0].meta.options;
 	}
 	auto &table_entry = *target.entry;
 	if (!table_entry.ColumnExists(column)) {
@@ -164,17 +172,9 @@ static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunction
 	if (!found) {
 		throw InvalidInputException("ngram_search: indexed column vanished during binding");
 	}
-	auto located = LocateIndex(context, target, result->location);
-	if (located.availability == IndexAvailability::CHANGED) {
-		throw InvalidInputException(located.reason);
-	}
-	if (located.availability == IndexAvailability::ABSENT) {
-		throw CatalogException("ngram_search: index storage is unavailable");
-	}
-	result->bound_options = located.meta.options;
 	return_types = result->types;
 	names = result->names;
-	return std::move(result);
+	return result;
 }
 
 //! ngram_candidates(table, column, needle) emits candidate rowids for the
@@ -195,59 +195,45 @@ static unique_ptr<FunctionData> CandidatesBind(ClientContext &context, TableFunc
 	BindQueryTarget(context, "ngram_candidates", table_input, column, *result);
 	return_types = {LogicalType::BIGINT};
 	names = {"rowid"};
-	return std::move(result);
+	return result;
 }
 
 //===----------------------------------------------------------------------===//
 // Recheck
 //===----------------------------------------------------------------------===//
 
-static bool BytesContain(const char *haystack, idx_t haystack_len, const string &needle) {
-	if (needle.empty()) {
-		return true;
-	}
-	if (needle.size() > haystack_len) {
-		return false;
-	}
-	auto end = haystack + haystack_len;
-	return std::search(haystack, end, needle.begin(), needle.end()) != end;
-}
+//! Decline reason shared by every path that gives up before the manifest.
+static constexpr const char *OVER_BUDGET_REASON = "query grams exceed query memory budget";
 
-struct RecheckState {
-	//! The needle in comparison form: normalized through the index's fold for
-	//! case-insensitive indexes, raw bytes otherwise.
-	string needle_cmp;
-	GramOptions options;
-	string scratch;
-	vector<idx_t> scratch_offsets;
-
-	//! Selects the rows of chunk.data[column_idx] that truly contain the
-	//! needle into sel; returns the match count. NULLs never match.
-	idx_t Recheck(DataChunk &chunk, idx_t column_idx, SelectionVector &sel) {
-		UnifiedVectorFormat format;
-		chunk.data[column_idx].ToUnifiedFormat(chunk.size(), format);
-		auto strings = UnifiedVectorFormat::GetData<string_t>(format);
-		idx_t hits = 0;
-		for (idx_t r = 0; r < chunk.size(); r++) {
-			auto idx = format.sel->get_index(r);
-			if (!format.validity.RowIsValid(idx)) {
-				continue;
-			}
-			auto &value = strings[idx];
-			bool match;
-			if (options.case_insensitive) {
-				NormalizeString(value.GetData(), value.GetSize(), options, scratch, scratch_offsets);
-				match = BytesContain(scratch.data(), scratch.size(), needle_cmp);
-			} else {
-				match = BytesContain(value.GetData(), value.GetSize(), needle_cmp);
-			}
-			if (match) {
-				sel.set_index(hits++, r);
-			}
+//! The exact predicate of an explicit search as the host evaluates it:
+//! contains(lower(column), needle) for a case-insensitive index, whose lower
+//! folds each codepoint exactly as the index's normalization does, and
+//! contains(column, needle) otherwise. `column` references the chunk the
+//! expression runs over: 0 for a pushed filter's one-column chunk and the
+//! probe layout's first column for the recheck executor, which are the same
+//! reference. NULL never matches.
+static unique_ptr<Expression> ContainsPredicate(ClientContext &context, const string &needle, bool case_insensitive) {
+	FunctionBinder binder(context);
+	unique_ptr<Expression> haystack = make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0U);
+	if (case_insensitive) {
+		vector<unique_ptr<Expression>> lower_children;
+		lower_children.push_back(std::move(haystack));
+		ErrorData error;
+		haystack = binder.BindScalarFunction(DEFAULT_SCHEMA, "lower", std::move(lower_children), error);
+		if (!haystack) {
+			error.Throw();
 		}
-		return hits;
 	}
-};
+	vector<unique_ptr<Expression>> children;
+	children.push_back(std::move(haystack));
+	children.push_back(make_uniq<BoundConstantExpression>(Value(needle)));
+	ErrorData error;
+	auto predicate = binder.BindScalarFunction(DEFAULT_SCHEMA, "contains", std::move(children), error);
+	if (!predicate) {
+		error.Throw();
+	}
+	return predicate;
+}
 
 //===----------------------------------------------------------------------===//
 // ngram_search execution
@@ -260,10 +246,11 @@ struct SearchGlobalState : public GlobalTableFunctionState {
 	//! scans. A shared lock has no thread affinity, so one key covers every
 	//! thread.
 	unique_ptr<StorageLockKey> vacuum_lock;
-	//! The needle in comparison form plus the index's options; each thread
-	//! copies these into its own RecheckState, which carries fold scratch.
-	string needle_cmp;
 	GramOptions options;
+	//! The exact predicate over the probe layout, whose first column is the
+	//! searched one; the tail and range scans evaluate a copy natively as a
+	//! pushed filter. Each thread builds its own executor over it.
+	unique_ptr<Expression> recheck_expr;
 	idx_t search_column_idx = 0;
 	string fallback_reason;
 	vector<string> fetched_columns;
@@ -275,10 +262,10 @@ struct SearchGlobalState : public GlobalTableFunctionState {
 
 //! Per-thread scan state. Nothing here may be shared: DataTable::Fetch writes
 //! through its ColumnFetchState, a TableScanState owns per-thread filter
-//! state, and the recheck fold reuses a scratch buffer.
+//! state, and an ExpressionExecutor carries per-evaluation state.
 struct SearchLocalState : public LocalTableFunctionState {
 	SearchCoreLocal core;
-	RecheckState recheck;
+	unique_ptr<ExpressionExecutor> recheck_executor;
 };
 
 //! An upper bound on the row groups the tail scan can hand out, so the
@@ -346,6 +333,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 		state->fetched_columns.push_back(bind.column_name);
 	}
 	state->search_column_idx = search_column_idx.GetIndex();
+	state->core.recheck_positions = {state->search_column_idx};
 	if (input.CanRemoveFilterColumns()) {
 		for (auto projection_id : input.projection_ids) {
 			state->core.output_ids.push_back(requested_to_fetch[projection_id]);
@@ -354,33 +342,42 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 		state->core.output_ids = std::move(requested_to_fetch);
 	}
 
+	// the needle in the index's comparison form: folded for a
+	// case-insensitive index, its bytes otherwise
+	string needle_cmp = bind.needle;
 	if (state->options.case_insensitive) {
 		vector<idx_t> offsets;
-		NormalizeString(bind.needle.data(), bind.needle.size(), state->options, state->needle_cmp, offsets);
-	} else {
-		state->needle_cmp = bind.needle;
+		NormalizeString(bind.needle.data(), bind.needle.size(), state->options, needle_cmp, offsets);
 	}
+	state->recheck_expr = ContainsPredicate(context, needle_cmp, state->options.case_insensitive);
+	state->core.scan_filters = make_uniq<TableFilterSet>();
+	state->core.scan_filters->PushFilter(ColumnIndex(state->search_column_idx),
+	                                     make_uniq<ExpressionFilter>(state->recheck_expr->Copy()));
 
-	auto decomposition = DecomposeNeedle(bind.needle.data(), bind.needle.size(), state->options);
+	NeedleKeys needle_keys;
+	auto shape = state->fallback_reason.empty() ? DecomposeNeedle(context, bind.needle.data(), bind.needle.size(),
+	                                                              state->options, MaxProbeKeys(context), needle_keys)
+	                                            : NeedleShape::TOO_SHORT;
 	if (!state->fallback_reason.empty()) {
 		state->core.hwm = -1;
-	} else if (decomposition.too_short) {
+	} else if (shape == NeedleShape::TOO_SHORT) {
 		// the index cannot be probed; the tail scan becomes a full scan, which
 		// is still exhaustive
 		state->fallback_reason = "needle shorter than gram size";
 		state->core.hwm = -1;
+	} else if (shape == NeedleShape::OVER_BUDGET) {
+		state->fallback_reason = OVER_BUDGET_REASON;
+		state->core.hwm = -1;
 	} else {
 		auto segments = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
 		                                        "ngram index segments table");
-		auto stats = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.StatsTable(),
-		                                     "ngram index stats table");
-		if (!segments || !stats) {
+		if (!segments) {
 			state->fallback_reason = "index unavailable";
 			state->core.hwm = -1;
 		} else {
-			state->core.probe = PlanIndexProbe(context, *state->core.tx, *segments, *stats, decomposition.grams,
-			                                   MaxGramsPerQuery(context), state->core.hwm, storage.GetTotalRows(),
-			                                   MaxCandidateFraction(context), DConstants::INVALID_INDEX);
+			state->core.probe = PlanIndexProbe(
+			    context, *state->core.tx, *segments, needle_keys.keys, MaxGramsPerQuery(context), state->core.hwm,
+			    MaxCandidateFraction(context), DConstants::INVALID_INDEX, ExtraFetchColumns(state->core));
 		}
 		if (state->core.probe && !state->core.probe->admitted) {
 			state->fallback_reason = state->core.probe->decline_reason;
@@ -394,17 +391,16 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 		state->vacuum_lock.reset();
 	}
 	FinalizeSearchCore(context, state->core);
-	return std::move(state);
+	return state;
 }
 
 static unique_ptr<LocalTableFunctionState> SearchInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                            GlobalTableFunctionState *global_state) {
 	auto &gstate = global_state->Cast<SearchGlobalState>();
 	auto state = make_uniq<SearchLocalState>();
-	state->recheck.options = gstate.options;
-	state->recheck.needle_cmp = gstate.needle_cmp;
+	state->recheck_executor = make_uniq<ExpressionExecutor>(context.client, *gstate.recheck_expr);
 	InitializeSearchCoreLocal(context, gstate.core, state->core);
-	return std::move(state);
+	return state;
 }
 
 static void SearchFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -412,10 +408,14 @@ static void SearchFunction(ClientContext &context, TableFunctionInput &data, Dat
 	auto &lstate = data.local_state->Cast<SearchLocalState>();
 	ExecuteSearchCore(
 	    context, data, state.core, lstate.core,
-	    [&](DataChunk &chunk, SelectionVector &sel) {
-		    return lstate.recheck.Recheck(chunk, state.search_column_idx, sel);
+	    [&](DataChunk &chunk, SelectionVector &sel, bool natively_filtered) {
+		    return SelectRechecked(lstate.recheck_executor.get(), chunk, sel, natively_filtered);
 	    },
 	    output);
+}
+
+static idx_t SearchRowsScanned(GlobalTableFunctionState &, LocalTableFunctionState &lstate) {
+	return lstate.Cast<SearchLocalState>().core.rows_scanned;
 }
 
 //! Ordered sinks reassemble a parallel scan's output by batch index. Fetch
@@ -447,11 +447,19 @@ static InsertionOrderPreservingMap<string> SearchDynamicToString(TableFunctionDy
 		result["Ngram Mode"] =
 		    StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
 		                       state.core.probe->candidate_upper_bound, state.core.probe->decoded_rowids.load());
-		result["Ngram Stats Rows Scanned"] = to_string(state.core.probe->stats_rows_scanned);
-		result["Ngram Stats Chunks Scanned"] = to_string(state.core.probe->stats_chunks_scanned);
+		result["Ngram Manifest Rows Scanned"] = to_string(state.core.probe->manifest_rows_scanned);
+		result["Ngram Manifest Rows Visited"] = to_string(state.core.probe->manifest_rows_visited);
+		result["Ngram Admission Rows"] = to_string(state.core.probe->admission_rows);
+		result["Ngram Probe Workers"] = to_string(state.core.probe->max_threads);
+		result["Ngram Decode Workspace Bytes"] = to_string(state.core.probe->workspace_bytes);
+		result["Ngram Decode Peak Bytes"] = to_string(state.core.probe->tracker->peak.load());
 	} else {
 		result["Ngram Mode"] = "full scan fallback: " + state.fallback_reason;
 	}
+	result["Ngram Fetched Rows"] = to_string(state.core.fetched_rows.load());
+	result["Ngram Range Rows"] = to_string(state.core.range_rows.load());
+	result["Ngram Tail Rows"] = to_string(state.core.tail_rows.load());
+	result["Ngram Local Rows"] = to_string(state.core.local_rows.load());
 	return result;
 }
 
@@ -476,6 +484,7 @@ struct CandidatesGlobalState : public GlobalTableFunctionState {
 
 	//! Probed mode: decode and emit one admitted rowid segment at a time.
 	unique_ptr<ProbePlan> probe;
+	ProbeDecodeScratch decode;
 	vector<row_t> candidates;
 	idx_t offset = 0;
 	idx_t segment_ordinal = 0;
@@ -509,23 +518,25 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 	}
 	state->hwm = verdict.meta.hwm_rowid;
 
-	auto decomposition = DecomposeNeedle(bind.needle.data(), bind.needle.size(), verdict.meta.options);
-	if (!verdict.reason.empty()) {
-		state->all_rowids = true;
-	} else if (decomposition.too_short) {
+	NeedleKeys needle_keys;
+	auto shape = verdict.reason.empty() ? DecomposeNeedle(context, bind.needle.data(), bind.needle.size(),
+	                                                      verdict.meta.options, MaxProbeKeys(context), needle_keys)
+	                                    : NeedleShape::TOO_SHORT;
+	if (shape == NeedleShape::OVER_BUDGET) {
+		throw InvalidInputException("ngram_candidates: %s", OVER_BUDGET_REASON);
+	}
+	if (shape == NeedleShape::TOO_SHORT) {
 		state->all_rowids = true;
 	} else {
 		auto &segments = ResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
 		                                      "ngram index segments table");
-		auto &stats = ResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.StatsTable(),
-		                                   "ngram index stats table");
-		state->probe = PlanIndexProbe(context, *state->tx, segments, stats, decomposition.grams,
-		                              MaxGramsPerQuery(context), state->hwm, storage.GetTotalRows(), -1, 1);
+		state->probe = PlanIndexProbe(context, *state->tx, segments, needle_keys.keys, MaxGramsPerQuery(context),
+		                              state->hwm, -1, 1, 0);
 		if (!state->probe->admitted) {
 			throw InvalidInputException("ngram_candidates: %s", state->probe->decline_reason);
 		}
 	}
-	return std::move(state);
+	return state;
 }
 
 static void CandidatesFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -558,7 +569,8 @@ static void CandidatesFunction(ClientContext &context, TableFunctionInput &data,
 	while (state.offset >= state.candidates.size()) {
 		state.candidates.clear();
 		state.offset = 0;
-		if (!NextCandidateSegment(context, *state.tx, *state.probe, state.candidates, state.segment_ordinal)) {
+		if (!NextCandidateSegment(context, *state.tx, *state.probe, state.decode, state.candidates,
+		                          state.segment_ordinal)) {
 			return;
 		}
 	}
@@ -578,9 +590,11 @@ static InsertionOrderPreservingMap<string> CandidatesDynamicToString(TableFuncti
 	auto &state = input.global_state->Cast<CandidatesGlobalState>();
 	if (state.probe) {
 		result["Ngram Probe Workers"] = to_string(state.probe->max_threads);
-		result["Ngram Stats Rows Scanned"] = to_string(state.probe->stats_rows_scanned);
-		result["Ngram Stats Chunks Scanned"] = to_string(state.probe->stats_chunks_scanned);
+		result["Ngram Manifest Rows Scanned"] = to_string(state.probe->manifest_rows_scanned);
+		result["Ngram Manifest Rows Visited"] = to_string(state.probe->manifest_rows_visited);
 		result["Ngram Decoded Rowids"] = to_string(state.probe->decoded_rowids.load());
+		result["Ngram Decode Workspace Bytes"] = to_string(state.probe->workspace_bytes);
+		result["Ngram Decode Peak Bytes"] = to_string(state.probe->tracker->peak.load());
 	}
 	return result;
 }
@@ -598,6 +612,7 @@ void RegisterSearchFunctions(ExtensionLoader &loader) {
 	TableFunction search("ngram_search", {LogicalType::VARCHAR, LogicalType::VARCHAR}, SearchFunction, SearchBind,
 	                     SearchInitGlobal, SearchInitLocal);
 	search.get_partition_data = SearchGetPartitionData;
+	search.rows_scanned = SearchRowsScanned;
 	search.projection_pushdown = true;
 	search.supports_pushdown_extract = SearchSupportsPushdownExtract;
 	search.to_string = SearchToString;

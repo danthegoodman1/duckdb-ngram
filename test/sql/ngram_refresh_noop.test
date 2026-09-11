@@ -8,10 +8,13 @@ require ngram
 # when one transaction runs an empty batch INSERT ... ORDER BY into it, then
 # DELETE FROM it, then a batch INSERT ... ORDER BY of at least 122,880 rows
 # (docs/upstream/duckdb-empty-batch-insert.md). A refresh with nothing past
-# the high-water mark rewrites the stats table in one transaction, so its
-# generated script must never insert into stats before the DELETE. The stats
-# table here holds about 262,000 rows: 150,000 rows of 40 random symbols drawn
-# from 90, folded to 64 by the case-insensitive index.
+# the high-water mark and a merge of one generation write nothing at all; a
+# refresh generation and a merge are appended at execution through the
+# fence's append call, which writes nothing when there is nothing; only the
+# build and the purge use the batch insert, and no empty batch insert into the
+# segments table can precede them in one transaction. The segments table here
+# holds about 262,000 keys: 150,000 rows of 40 random symbols drawn from 90,
+# folded to 64 by the case-insensitive index.
 
 statement ok
 CREATE TABLE t AS
@@ -30,9 +33,9 @@ SET VARIABLE t_id = (SELECT replace(index_id::VARCHAR, '-', '')
 statement ok
 SET ngram_auto_accelerate = true;
 
-# the stats table is past the host bug's batch threshold
+# the segments table is past the host bug's batch threshold
 query I
-SELECT count(*) >= 122880 FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'));
+SELECT count(*) >= 122880 FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'));
 ----
 true
 
@@ -57,15 +60,10 @@ PRAGMA ngram_index_stats('t');
 ----
 s	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
 
-# Byte-exact fingerprints of both shadow tables. A no-op call must leave the
-# stats and segments tables equal to these; an emptied stats table hashes to
-# NULL and fails the equality below.
+# Byte-exact fingerprint of the segments table. A no-op call must leave it
+# equal to this; an emptied table hashes to NULL and fails the equality below.
 statement ok
-SET VARIABLE stats_fp = (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-                         FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id')));
-
-statement ok
-SET VARIABLE segments_fp = (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+SET VARIABLE segments_fp = (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY gram_key, segment_no, generation))
                             FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id')));
 
 #===----------------------------------------------------------------------===#
@@ -99,13 +97,11 @@ SELECT count(*) FROM (
 ----
 0
 
-query II
-SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-        FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'))) = getvariable('stats_fp'),
-       (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+query I
+SELECT (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY gram_key, segment_no, generation))
         FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
 ----
-true	true
+true
 
 #===----------------------------------------------------------------------===#
 # no-op bounded refresh: the bound covers the whole (empty) tail
@@ -131,13 +127,11 @@ EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 ----
 physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
 
-query II
-SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-        FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'))) = getvariable('stats_fp'),
-       (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+query I
+SELECT (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY gram_key, segment_no, generation))
         FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
 ----
-true	true
+true
 
 #===----------------------------------------------------------------------===#
 # no-op compact: no key has more than one row, so nothing is merged
@@ -170,19 +164,140 @@ SELECT count(*) FROM (
 ----
 0
 
-query II
-SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-        FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'))) = getvariable('stats_fp'),
-       (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+query I
+SELECT (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY gram_key, segment_no, generation))
         FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
 ----
-true	true
+true
 
 # the same stats the build reported, after every in-process no-op call
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('t');
 ----
 s	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
+
+#===----------------------------------------------------------------------===#
+# the no-op shortcuts: a refresh with nothing past the mark and a merge of
+# one generation write nothing, inside their own transaction, after the
+# execution-time validation their fence performs
+#===----------------------------------------------------------------------===#
+
+# a no-op inside a transaction that rolls back leaves the same state as one
+# that commits: neither wrote anything
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+query IIII
+PRAGMA ngram_refresh('t', 10);
+----
+s	0	149999	0
+
+statement ok
+PRAGMA ngram_compact('t');
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY gram_key, segment_no, generation))
+        FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
+----
+true
+
+# a no-op call still validates: a dropped index is refused before any work
+statement ok
+CREATE TABLE gone(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO gone VALUES (1, 'one row tent');
+
+statement ok
+PRAGMA create_ngram_index('gone', 's');
+
+statement ok
+PRAGMA drop_ngram_index('gone', 's');
+
+statement error
+PRAGMA ngram_refresh('gone');
+----
+no ngram index exists
+
+statement error
+PRAGMA ngram_compact('gone');
+----
+no ngram index exists
+
+# a merge leaves every row at generation 0, the state the next call
+# recognizes as nothing to merge; a later refresh numbers its rows from there
+statement ok
+INSERT INTO t SELECT i, 'appended ' || i || ' noop needle' FROM range(150000, 150010) r(i);
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+query I
+SELECT count(DISTINCT generation) FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'));
+----
+2
+
+statement ok
+PRAGMA ngram_compact('t');
+
+query II
+SELECT count(DISTINCT generation), max(generation) FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'));
+----
+1	0
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+13
+
+statement ok
+INSERT INTO t SELECT i, 'appended again ' || i || ' noop needle' FROM range(150010, 150020) r(i);
+
+statement ok
+PRAGMA ngram_refresh('t');
+
+query II
+SELECT count(DISTINCT generation), max(generation) FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'));
+----
+2	1
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+23
+
+statement ok
+PRAGMA ngram_compact('t');
+
+query I
+SELECT count(*) FROM (
+	(SELECT i FROM ngram_search('t', 'noop needle') EXCEPT ALL SELECT i FROM t WHERE contains(lower(s), 'noop needle'))
+	UNION ALL
+	(SELECT i FROM t WHERE contains(lower(s), 'noop needle') EXCEPT ALL SELECT i FROM ngram_search('t', 'noop needle'))
+);
+----
+0
+
+statement ok
+DELETE FROM t WHERE i >= 150000;
+
+statement ok
+PRAGMA ngram_compact('t', purge = true);
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+3
+
+statement ok
+SET VARIABLE segments_fp = (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY gram_key, segment_no, generation))
+                            FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id')));
 
 #===----------------------------------------------------------------------===#
 # the same three calls after a checkpoint
@@ -207,7 +322,7 @@ SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 query IIII
 PRAGMA ngram_refresh('t', 1000);
 ----
-s	0	149999	0
+s	0	150019	0
 
 query I
 SELECT count(*) FROM ngram_search('t', 'noop needle');
@@ -246,16 +361,64 @@ SELECT count(*) FROM (
 ----
 0
 
-query II
-SELECT (SELECT md5(string_agg(encode(gram) || ':' || row_count || ':' || segment_count, ',' ORDER BY encode(gram)))
-        FROM query('SELECT * FROM __ngram.stats_' || getvariable('t_id'))) = getvariable('stats_fp'),
-       (SELECT md5(string_agg(encode(gram) || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY encode(gram), segment_no, generation))
+query I
+SELECT (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY gram_key, segment_no, generation))
         FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
 ----
-true	true
+true
 
-# the same stats the build reported, after the checkpointed round
+# the same stats the build reported, after the checkpointed round; the mark
+# stays at the last allocated rowid while the highest live rowid is 149999
 query IIIIIIIIIIIII
 PRAGMA ngram_index_stats('t');
 ----
-s	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
+s	3	true	150019	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
+
+#===----------------------------------------------------------------------===#
+# the host's empty-batch-insert shape, assembled across calls in one user
+# transaction: a refresh over a tail whose rows were all deleted packs an
+# empty delta, and a purge then deletes and reinserts every segment row.
+# The delta is appended at execution and writes nothing, so the table keeps
+# its rows in the transaction and after it.
+#===----------------------------------------------------------------------===#
+
+statement ok
+INSERT INTO t SELECT i, 'dead ' || i || ' noop needle' FROM range(150020, 150040) r(i);
+
+statement ok
+DELETE FROM t WHERE i >= 150020;
+
+statement ok
+BEGIN;
+
+query IIII
+PRAGMA ngram_refresh('t', 10);
+----
+s	0	150019	0
+
+statement ok
+PRAGMA ngram_compact('t', purge = true);
+
+query I
+SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'));
+----
+262123
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'));
+----
+262123
+
+query I
+SELECT count(*) FROM ngram_search('t', 'noop needle');
+----
+3
+
+query I
+SELECT (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY gram_key, segment_no, generation))
+        FROM query('SELECT * FROM __ngram.segments_' || getvariable('t_id'))) = getvariable('segments_fp');
+----
+true

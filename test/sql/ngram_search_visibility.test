@@ -68,9 +68,9 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 
 query I con2
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('docs', 'tent') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'tent'))
+	(SELECT * FROM ngram_search('docs', 'tent') EXCEPT ALL SELECT * FROM docs WHERE contains(lower(s), 'tent'))
 	UNION ALL
-	(SELECT * FROM docs WHERE contains(lower(s), 'tent') EXCEPT SELECT * FROM ngram_search('docs', 'tent'))
+	(SELECT * FROM docs WHERE contains(lower(s), 'tent') EXCEPT ALL SELECT * FROM ngram_search('docs', 'tent'))
 );
 ----
 0

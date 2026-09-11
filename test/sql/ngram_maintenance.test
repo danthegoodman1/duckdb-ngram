@@ -108,40 +108,20 @@ SELECT id FROM ngram_search('docs', 'tent') ORDER BY id;
 #===----------------------------------------------------------------------===#
 
 query I
-SELECT count(*) > 0 FROM (SELECT gram, segment_no FROM
+SELECT count(*) > 0 FROM (SELECT gram_key, segment_no FROM
 	query('SELECT * FROM __ngram.segments_' || getvariable('docs_id'))
-	GROUP BY gram, segment_no HAVING count(*) > 1);
+	GROUP BY gram_key, segment_no HAVING count(*) > 1);
 ----
 true
 
 statement ok
 PRAGMA ngram_compact('docs');
 
-# every (gram, segment_no) is one row again
+# every (gram_key, segment_no) is one row again
 query I
-SELECT count(*) FROM (SELECT gram, segment_no FROM
+SELECT count(*) FROM (SELECT gram_key, segment_no FROM
 	query('SELECT * FROM __ngram.segments_' || getvariable('docs_id'))
-	GROUP BY gram, segment_no HAVING count(*) > 1);
-----
-0
-
-# stats hold one row per gram, matching the merged segments
-query I
-SELECT count(*) FROM (SELECT gram FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_id'))
-	GROUP BY gram HAVING count(*) > 1);
-----
-0
-
-query I
-SELECT count(*) FROM (
-	(SELECT gram, row_count FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_id'))
-	 EXCEPT SELECT gram, sum(rowid_count)::BIGINT
-	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_id')) GROUP BY gram)
-	UNION ALL
-	(SELECT gram, sum(rowid_count)::BIGINT
-	 FROM query('SELECT * FROM __ngram.segments_' || getvariable('docs_id')) GROUP BY gram
-	 EXCEPT SELECT gram, row_count FROM query('SELECT * FROM __ngram.stats_' || getvariable('docs_id')))
-);
+	GROUP BY gram_key, segment_no HAVING count(*) > 1);
 ----
 0
 
@@ -167,9 +147,9 @@ statement ok
 PRAGMA ngram_compact('docs');
 
 query I
-SELECT count(*) FROM (SELECT gram, segment_no FROM
+SELECT count(*) FROM (SELECT gram_key, segment_no FROM
 	query('SELECT * FROM __ngram.segments_' || getvariable('docs_id'))
-	GROUP BY gram, segment_no HAVING count(*) > 1);
+	GROUP BY gram_key, segment_no HAVING count(*) > 1);
 ----
 0
 
@@ -278,9 +258,9 @@ SELECT (SELECT count(*) FROM ngram_candidates('purge_nulls', 's', 'old')),
 # a full differential check over the compacted index
 query I
 SELECT count(*) FROM (
-	(SELECT * FROM ngram_search('docs', 'ten') EXCEPT SELECT * FROM docs WHERE contains(lower(s), 'ten'))
+	(SELECT * FROM ngram_search('docs', 'ten') EXCEPT ALL SELECT * FROM docs WHERE contains(lower(s), 'ten'))
 	UNION ALL
-	(SELECT * FROM docs WHERE contains(lower(s), 'ten') EXCEPT SELECT * FROM ngram_search('docs', 'ten'))
+	(SELECT * FROM docs WHERE contains(lower(s), 'ten') EXCEPT ALL SELECT * FROM ngram_search('docs', 'ten'))
 );
 ----
 0
@@ -322,16 +302,16 @@ SET VARIABLE collation_id = (SELECT replace(index_id::VARCHAR, '-', '')
                                  WHERE table_name='compact_collation' AND column_name='s');
 
 query II
-SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
-       count(*) FILTER (WHERE encode(gram) = encode('aaa'))
-FROM query('SELECT * FROM __ngram.stats_' || getvariable('collation_id'));
+SELECT count(*) FILTER (WHERE gram_key = ngram_gram_key('Aaa')),
+       count(*) FILTER (WHERE gram_key = ngram_gram_key('aaa'))
+FROM query('SELECT * FROM __ngram.segments_' || getvariable('collation_id'));
 ----
 1	1
 
 query I
 SELECT count(*) FROM (
-	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,rowid FROM __ngram.stats_' || getvariable('collation_id')))
+	SELECT gram_key < lag(gram_key) OVER (ORDER BY rowid) AS out_of_order
+	FROM query('SELECT gram_key,rowid FROM __ngram.segments_' || getvariable('collation_id')))
 WHERE out_of_order;
 ----
 0
@@ -342,27 +322,19 @@ INSERT INTO compact_collation VALUES (4, 'Aaa'), (5, 'aaa'), (6, 'é日🙂y');
 statement ok
 PRAGMA ngram_refresh('compact_collation');
 
-# Refresh folds stats history immediately, retaining byte-distinct grams and
-# binary physical order before compaction folds the segment generation.
+# Refresh keeps byte-distinct grams apart and writes each generation in key
+# order before compaction folds the generations.
 query II
-SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
-       count(*) FILTER (WHERE encode(gram) = encode('aaa'))
-FROM query('SELECT * FROM __ngram.stats_' || getvariable('collation_id'));
+SELECT count(*) FILTER (WHERE gram_key = ngram_gram_key('Aaa')),
+       count(*) FILTER (WHERE gram_key = ngram_gram_key('aaa'))
+FROM query('SELECT * FROM __ngram.segments_' || getvariable('collation_id'));
 ----
-1	1
+2	2
 
 query I
 SELECT count(*) FROM (
-	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,rowid FROM __ngram.stats_' || getvariable('collation_id')))
-WHERE out_of_order;
-----
-0
-
-query I
-SELECT count(*) FROM (
-	SELECT encode(gram) < lag(encode(gram)) OVER (PARTITION BY generation ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,generation,rowid FROM __ngram.segments_' || getvariable('collation_id')))
+	SELECT gram_key < lag(gram_key) OVER (PARTITION BY generation ORDER BY rowid) AS out_of_order
+	FROM query('SELECT gram_key,generation,rowid FROM __ngram.segments_' || getvariable('collation_id')))
 WHERE out_of_order;
 ----
 0
@@ -381,30 +353,22 @@ SELECT (SELECT count(*) FROM ngram_search('compact_collation', 'Aaa')),
 2	2	2
 
 query II
-SELECT row_count, segment_count FROM query('SELECT * FROM __ngram.stats_' || getvariable('collation_id'))
-WHERE encode(gram) = encode('Aaa');
+SELECT sum(rowid_count), count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('collation_id'))
+WHERE gram_key = ngram_gram_key('Aaa');
 ----
 2	1
 
 query II
-SELECT count(*) FILTER (WHERE encode(gram) = encode('Aaa')),
-       count(*) FILTER (WHERE encode(gram) = encode('aaa'))
+SELECT count(*) FILTER (WHERE gram_key = ngram_gram_key('Aaa')),
+       count(*) FILTER (WHERE gram_key = ngram_gram_key('aaa'))
 FROM query('SELECT * FROM __ngram.segments_' || getvariable('collation_id'));
 ----
 1	1
 
 query I
 SELECT count(*) FROM (
-	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,rowid FROM __ngram.stats_' || getvariable('collation_id')))
-WHERE out_of_order;
-----
-0
-
-query I
-SELECT count(*) FROM (
-	SELECT encode(gram) < lag(encode(gram)) OVER (ORDER BY rowid) AS out_of_order
-	FROM query('SELECT gram,rowid FROM __ngram.segments_' || getvariable('collation_id')))
+	SELECT gram_key < lag(gram_key) OVER (ORDER BY rowid) AS out_of_order
+	FROM query('SELECT gram_key,rowid FROM __ngram.segments_' || getvariable('collation_id')))
 WHERE out_of_order;
 ----
 0
@@ -648,14 +612,10 @@ SELECT count(*) FROM ngram_candidates('atomic', 's', 'tent');
 2
 
 # Merge-only compaction joins a surrounding transaction and rolls back as one
-# unit, including its stats rewrite and scratch tables.
+# unit, including its scratch tables.
 statement ok
 CREATE TEMP TABLE phase13_segments_before AS
 SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id'));
-
-statement ok
-CREATE TEMP TABLE phase13_stats_before AS
-SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('atomic_id'));
 
 statement ok
 CREATE TEMP TABLE phase13_meta_before AS
@@ -668,16 +628,16 @@ statement ok
 PRAGMA ngram_compact('atomic');
 
 query I
-SELECT count(*) FROM (SELECT gram, segment_no FROM
+SELECT count(*) FROM (SELECT gram_key, segment_no FROM
 	query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id'))
-	GROUP BY gram, segment_no HAVING count(*) > 1);
+	GROUP BY gram_key, segment_no HAVING count(*) > 1);
 ----
 0
 
 statement ok
 ROLLBACK;
 
-query III
+query II
 SELECT (SELECT count(*) FROM (
 	(SELECT * FROM phase13_segments_before EXCEPT
 	 SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id')))
@@ -685,19 +645,13 @@ SELECT (SELECT count(*) FROM (
 	(SELECT * FROM query('SELECT * FROM __ngram.segments_' || getvariable('atomic_id'))
 	 EXCEPT SELECT * FROM phase13_segments_before))),
        (SELECT count(*) FROM (
-	(SELECT * FROM phase13_stats_before EXCEPT
-	 SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('atomic_id')))
-	UNION ALL
-	(SELECT * FROM query('SELECT * FROM __ngram.stats_' || getvariable('atomic_id'))
-	 EXCEPT SELECT * FROM phase13_stats_before))),
-       (SELECT count(*) FROM (
 	(SELECT * FROM phase13_meta_before EXCEPT
 	 SELECT * FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('atomic_id')))
 	UNION ALL
 	(SELECT * FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('atomic_id'))
 	 EXCEPT SELECT * FROM phase13_meta_before)));
 ----
-0	0	0
+0	0
 
 query I
 SELECT count(*) FROM duckdb_tables()
@@ -707,9 +661,6 @@ WHERE database_name = 'temp' AND table_name LIKE '__ngram_%';
 
 statement ok
 DROP TABLE phase13_segments_before;
-
-statement ok
-DROP TABLE phase13_stats_before;
 
 statement ok
 DROP TABLE phase13_meta_before;
@@ -735,13 +686,12 @@ PRAGMA ngram_compact('compact_empty');
 statement ok
 PRAGMA ngram_compact('compact_empty', purge = true);
 
-query III
+query II
 SELECT hwm_rowid,
-       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('compact_empty_id'))),
-       (SELECT count(*) FROM query('SELECT * FROM __ngram.stats_' || getvariable('compact_empty_id')))
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('compact_empty_id')))
 FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('compact_empty_id'));
 ----
--1	0	0
+-1	0
 
 query I
 SELECT count(*) FROM duckdb_tables()

@@ -1,0 +1,146 @@
+# name: test/sql/gram_key.test
+# description: the fixed-width gram key: byte packing, hash fallback, collision widening
+# group: [sql]
+
+require ngram
+
+# A gram of at most 16 bytes is packed big-endian into the high bytes of the
+# UHUGEINT with zero padding below: 'abc' is 0x616263 followed by 13 zero bytes.
+query I
+SELECT format('{:032x}', ngram_gram_key('abc'));
+----
+61626300000000000000000000000000
+
+# byte order is preserved for equal-length grams, so a key-sorted segments
+# table is also byte-sorted
+query I
+SELECT ngram_gram_key('abc') < ngram_gram_key('abd') AND ngram_gram_key('abd') < ngram_gram_key('b')
+   AND ngram_gram_key('Aaa') < ngram_gram_key('aaa');
+----
+true
+
+# multi-byte codepoints pack their UTF-8 bytes: é (2), 日 (3), 🙂 (4)
+query I
+SELECT format('{:032x}', ngram_gram_key('é日🙂'));
+----
+c3a9e697a5f09f998200000000000000
+
+# a 4-gram of 4-byte codepoints fills all 16 bytes
+query I
+SELECT format('{:032x}', ngram_gram_key('🙂🙂🙂🙂'));
+----
+f09f9982f09f9982f09f9982f09f9982
+
+# gram sizes 1 to 6 over ASCII: every key is the packed gram
+foreach n 1 2 3 4 5 6
+
+query I
+SELECT list_distinct(list_transform(trigrams('abcdefgh', ${n}, false), g -> ngram_gram_key(g) = ngram_gram_key(g)))
+       = [true];
+----
+true
+
+query I
+SELECT format('{:032x}', ngram_gram_key(trigrams('abcdefgh', ${n}, false)[1]))
+       = rpad(hex(trigrams('abcdefgh', ${n}, false)[1]), 32, '0');
+----
+true
+
+endloop
+
+# past 16 bytes the key is a 64-bit hash under an all-ones high half, which no
+# byte-packed key of valid UTF-8 can reach
+query II
+SELECT ngram_gram_key('🙂🙂🙂🙂x') >> 64 = 18446744073709551615::UHUGEINT,
+       ngram_gram_key('🙂🙂🙂🙂x') <> ngram_gram_key('🙂🙂🙂🙂y');
+----
+true	true
+
+query I
+SELECT format('{:032x}', ngram_gram_key('seventeen bytes..'));
+----
+ffffffffffffffffe2bfd6fb421a4a19
+
+# NULL in, NULL out
+query I
+SELECT ngram_gram_key(NULL);
+----
+NULL
+
+# ngram_gram_keys(text, gram_size, case_insensitive) is the build pipeline's
+# emitter: the keys of the distinct normalized grams, ascending
+query I
+SELECT ngram_gram_keys('Aba abA', 3, true) =
+       list_sort(list_distinct(list_transform(trigrams('Aba abA', 3, true), g -> ngram_gram_key(g))));
+----
+true
+
+query I
+SELECT length(ngram_gram_keys('abcabc', 3, false));
+----
+3
+
+query I
+SELECT ngram_gram_keys('ab', 3, false);
+----
+[]
+
+query I
+SELECT ngram_gram_keys(NULL, 3, true);
+----
+NULL
+
+statement error
+SELECT ngram_gram_keys('abc', 0, true);
+----
+at least 1
+
+# Collision widening: two grams forced onto one key merge their postings, and
+# a query for either gram still finds every matching row because recheck
+# discards the other gram's rows. The key of the 3-gram 'ab' || chr(0) equals
+# the key of the 2-gram 'ab' by construction (zero padding); an index with
+# gram_size 2 over text holding both shapes never confuses them, since every
+# key it stores comes from a 2-codepoint gram, and the query for 'ab' finds
+# the rows of both.
+query I
+SELECT ngram_gram_key('ab') = ngram_gram_key('ab' || chr(0));
+----
+true
+
+statement ok
+CREATE TABLE collide(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO collide VALUES (1, 'xab'), (2, 'yab' || chr(0)), (3, 'zzz');
+
+statement ok
+PRAGMA create_ngram_index('collide', 's', gram = 2, case_insensitive = false);
+
+statement ok
+SET ngram_max_candidate_fraction = 1.0;
+
+# both rows share the merged key's postings: the candidate set is the union
+query I
+SELECT count(*) FROM ngram_candidates('collide', 's', 'ab');
+----
+2
+
+# exact results are unaffected by the merge
+query I
+SELECT id FROM ngram_search('collide', 'ab') ORDER BY id;
+----
+1
+2
+
+query I
+SELECT id FROM ngram_search('collide', 'ab' || chr(0)) ORDER BY id;
+----
+2
+
+query I
+SELECT id FROM ngram_search('collide', 'xab') ORDER BY id;
+----
+1
+
+statement ok
+RESET ngram_max_candidate_fraction;

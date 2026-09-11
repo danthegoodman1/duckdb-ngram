@@ -1,0 +1,326 @@
+# name: test/sql/ngram_physical_access.test
+# description: candidate range scans and the tail visit only the row groups their rowids occupy; the work is fixed by the candidates and the tail, not by the rows around them
+# group: [sql]
+
+require ngram
+
+statement ok
+SET threads=1;
+
+statement ok
+SET ngram_max_candidate_fraction=1;
+
+# the same 50,000 dense candidates at rowids 600000..649999, first inside
+# 800,000 rows and then inside 2,400,000
+statement ok
+CREATE TABLE small AS SELECT i AS id, CASE WHEN i BETWEEN 600000 AND 649999 THEN 'needle' ELSE 'xxxxxxxx' END AS s
+	FROM range(800000) r(i);
+
+statement ok
+CREATE TABLE big AS SELECT i AS id, CASE WHEN i BETWEEN 600000 AND 649999 THEN 'needle' ELSE 'xxxxxxxx' END AS s
+	FROM range(2400000) r(i);
+
+statement ok
+PRAGMA create_ngram_index('small', 's', case_insensitive=false);
+
+statement ok
+PRAGMA create_ngram_index('big', 's', case_insensitive=false);
+
+statement ok
+PRAGMA enable_profiling='json';
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/small.json';
+
+query I
+SELECT count(*) FROM ngram_search('small', 'needle');
+----
+50000
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/big.json';
+
+query I
+SELECT count(*) FROM ngram_search('big', 'needle');
+----
+50000
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/big_transparent.json';
+
+statement ok
+SET ngram_auto_accelerate=true;
+
+query I
+SELECT count(*) FROM big WHERE contains(s, 'needle');
+----
+50000
+
+statement ok
+SET ngram_auto_accelerate=false;
+
+statement ok
+PRAGMA disable_profiling;
+
+# every candidate arrived through range scans over the candidates' own
+# vectors: no row was fetched one at a time, no tail exists, and the unrelated
+# 1.6 million extra rows of the big table cost nothing
+query IIII
+SELECT regexp_extract(content, '"Ngram Range Rows": "(\d+)"', 1)::BIGINT BETWEEN 50000 AND 50000 + 2 * 2048,
+	regexp_extract(content, '"Ngram Fetched Rows": "(\d+)"', 1),
+	regexp_extract(content, '"Ngram Tail Rows": "(\d+)"', 1),
+	regexp_extract(content, '"Ngram Local Rows": "(\d+)"', 1)
+FROM read_text('__TEST_DIR__/small.json');
+----
+true	0	0	0
+
+query I
+SELECT (SELECT regexp_extract(content, '"Ngram Range Rows": "(\d+)"', 1) FROM read_text('__TEST_DIR__/small.json'))
+	= (SELECT regexp_extract(content, '"Ngram Range Rows": "(\d+)"', 1) FROM read_text('__TEST_DIR__/big.json'))
+	AND (SELECT regexp_extract(content, '"Ngram Range Rows": "(\d+)"', 1) FROM read_text('__TEST_DIR__/big.json'))
+	= (SELECT regexp_extract(content, '"Ngram Range Rows": "(\d+)"', 1) FROM read_text('__TEST_DIR__/big_transparent.json'));
+----
+true
+
+# sparse candidates take the per-row fetch: one fetch per candidate and no scan
+statement ok
+CREATE TABLE sparse AS SELECT i AS id, CASE WHEN i % 20 = 0 THEN 'needle' ELSE 'xxxxxxxx' END AS s FROM range(400000) r(i);
+
+statement ok
+PRAGMA create_ngram_index('sparse', 's', case_insensitive=false);
+
+statement ok
+PRAGMA enable_profiling='json';
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/sparse.json';
+
+query I
+SELECT count(*) FROM ngram_search('sparse', 'needle');
+----
+20000
+
+statement ok
+PRAGMA disable_profiling;
+
+query IIII
+SELECT regexp_extract(content, '"Ngram Range Rows": "(\d+)"', 1),
+	regexp_extract(content, '"Ngram Fetched Rows": "(\d+)"', 1),
+	regexp_extract(content, '"Ngram Tail Rows": "(\d+)"', 1),
+	regexp_extract(content, '"Ngram Local Rows": "(\d+)"', 1)
+FROM read_text('__TEST_DIR__/sparse.json');
+----
+0	20000	0	0
+
+# the tail is the rows past the index and nothing before them: 300,000 rows
+# appended after the build, then 1,000 more inside the transaction
+statement ok
+INSERT INTO small SELECT i, CASE WHEN i % 1000 = 0 THEN 'needle' ELSE 'yyyyyyyy' END FROM range(800000, 1100000) r(i);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO small SELECT i, CASE WHEN i % 100 = 0 THEN 'needle' ELSE 'zzzzzzzz' END FROM range(1100000, 1101000) r(i);
+
+statement ok
+PRAGMA enable_profiling='json';
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/tail.json';
+
+query I
+SELECT count(*) FROM ngram_search('small', 'needle');
+----
+50310
+
+statement ok
+PRAGMA disable_profiling;
+
+# the tail span may start one vector early per unit (three units of a row
+# group each)
+query IIII
+SELECT regexp_extract(content, '"Ngram Range Rows": "(\d+)"', 1)::BIGINT BETWEEN 50000 AND 50000 + 2 * 2048,
+	regexp_extract(content, '"Ngram Fetched Rows": "(\d+)"', 1),
+	regexp_extract(content, '"Ngram Tail Rows": "(\d+)"', 1)::BIGINT BETWEEN 300000 AND 300000 + 3 * 2048,
+	regexp_extract(content, '"Ngram Local Rows": "(\d+)"', 1)
+FROM read_text('__TEST_DIR__/tail.json');
+----
+true	0	true	1000
+
+statement ok
+COMMIT;
+
+# deletes, in-transaction updates and a checkpoint change what the bounded
+# scans see, never what the query returns
+statement ok
+DELETE FROM small WHERE id BETWEEN 610000 AND 619999;
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE small SET s = 'needle no more' WHERE id BETWEEN 620000 AND 620009;
+
+statement ok
+UPDATE small SET s = 'now a needle' WHERE id BETWEEN 700000 AND 700009;
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM ngram_search('small', 'needle') EXCEPT ALL SELECT id FROM small WHERE contains(s, 'needle'))
+	UNION ALL
+	(SELECT id FROM small WHERE contains(s, 'needle') EXCEPT ALL SELECT id FROM ngram_search('small', 'needle')));
+----
+0
+
+statement ok
+COMMIT;
+
+statement ok
+CHECKPOINT;
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM ngram_search('small', 'needle') EXCEPT ALL SELECT id FROM small WHERE contains(s, 'needle'))
+	UNION ALL
+	(SELECT id FROM small WHERE contains(s, 'needle') EXCEPT ALL SELECT id FROM ngram_search('small', 'needle')));
+----
+0
+
+query I
+SELECT count(*) FROM ngram_search('small', 'needle');
+----
+40320
+
+# Tail units start wherever hwm+1 plus a multiple of the row-group size lands,
+# which is inside a vector whenever the row groups after the index are not
+# aligned to it: a 100-row append shifts every later row group. Each unit's
+# rowid lower bound keeps the rows of its first vector that belong to the
+# previous unit from being emitted twice.
+statement ok
+CREATE TABLE offgrid AS SELECT i AS id, CASE WHEN i % 7 = 0 THEN 'needle' ELSE 'xxxxxxxx' END AS s FROM range(800000) r(i);
+
+statement ok
+PRAGMA create_ngram_index('offgrid', 's', case_insensitive=false);
+
+statement ok
+INSERT INTO offgrid SELECT i, CASE WHEN i % 7 = 0 THEN 'needle' ELSE 'yyyyyyyy' END FROM range(800000, 800100) r(i);
+
+statement ok
+INSERT INTO offgrid SELECT i, CASE WHEN i % 7 = 0 THEN 'needle' ELSE 'zzzzzzzz' END FROM range(800100, 1100100) r(i);
+
+statement ok
+CREATE TABLE offgrid_oracle AS SELECT id FROM offgrid WHERE contains(s, 'needle');
+
+query I
+SELECT count(*) FROM offgrid_oracle;
+----
+157158
+
+foreach threads 1 8
+
+statement ok
+SET threads=${threads};
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM ngram_search('offgrid', 'needle') EXCEPT ALL SELECT id FROM offgrid_oracle)
+	UNION ALL
+	(SELECT id FROM offgrid_oracle EXCEPT ALL SELECT id FROM ngram_search('offgrid', 'needle')));
+----
+0
+
+statement ok
+SET ngram_auto_accelerate=true;
+
+statement ok
+CREATE TABLE offgrid_got AS SELECT id FROM offgrid WHERE contains(s, 'needle');
+
+statement ok
+SET ngram_auto_accelerate=false;
+
+query I
+SELECT count(*) FROM (
+	(SELECT id FROM offgrid_got EXCEPT ALL SELECT id FROM offgrid_oracle)
+	UNION ALL
+	(SELECT id FROM offgrid_oracle EXCEPT ALL SELECT id FROM offgrid_got));
+----
+0
+
+statement ok
+DROP TABLE offgrid_got;
+
+endloop
+
+statement ok
+SET threads=1;
+
+# A pushed filter whose zone map excludes a unit's first row group: the unit
+# skips to the next row group instead of failing, in index mode and in the
+# fraction-gated full scan
+statement ok
+SET VARIABLE low = (SELECT count(*) FROM offgrid WHERE contains(s, 'needle') AND id < 10);
+
+statement ok
+SET VARIABLE high = (SELECT count(*) FROM offgrid WHERE contains(s, 'needle') AND id > 1000000);
+
+statement ok
+SET ngram_auto_accelerate=true;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM offgrid WHERE contains(s, 'needle') AND id < 10;
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index .*
+
+query II
+SELECT (SELECT count(*) FROM offgrid WHERE contains(s, 'needle') AND id < 10) = getvariable('low'),
+	(SELECT count(*) FROM offgrid WHERE contains(s, 'needle') AND id > 1000000) = getvariable('high');
+----
+true	true
+
+statement ok
+SET ngram_max_candidate_fraction=0.01;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM offgrid WHERE contains(s, 'needle') AND id > 1000000;
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: candidate fraction exceeded".*
+
+query II
+SELECT (SELECT count(*) FROM offgrid WHERE contains(s, 'needle') AND id < 10) = getvariable('low'),
+	(SELECT count(*) FROM offgrid WHERE contains(s, 'needle') AND id > 1000000) = getvariable('high');
+----
+true	true
+
+statement ok
+SET ngram_auto_accelerate=false;
+
+statement ok
+SET ngram_max_candidate_fraction=1;
+
+# Row groups that start at row 100: the whole-table scan units of the
+# short-needle fallback start inside vectors too
+statement ok
+CREATE TABLE rg100(id BIGINT, s VARCHAR);
+
+statement ok
+INSERT INTO rg100 SELECT i, CASE WHEN i % 7 = 0 THEN 'needle' ELSE 'xxxxxxxx' END FROM range(100) r(i);
+
+statement ok
+INSERT INTO rg100 SELECT i, CASE WHEN i % 7 = 0 THEN 'needle' ELSE 'xxxxxxxx' END FROM range(100, 300100) r(i);
+
+statement ok
+PRAGMA create_ngram_index('rg100', 's', case_insensitive=false);
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('rg100', 'ne');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: needle shorter than gram size".*
+
+query I
+SELECT count(*) = (SELECT count(*) FROM rg100 WHERE contains(s, 'ne')) FROM ngram_search('rg100', 'ne');
+----
+true
+
+statement ok
+RESET threads;

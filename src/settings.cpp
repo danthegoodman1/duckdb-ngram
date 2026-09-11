@@ -16,14 +16,23 @@ namespace ngram {
 //! leaves 0.89% of rows as candidates against K=3's 0.28%, close enough to
 //! ngram_max_candidate_fraction to risk giving up the index entirely.
 //! Lowering K is always safe for correctness — fewer grams can only widen the
-//! candidate set, never drop a match (benchmarks/RESULTS.md).
+//! candidate set, never drop a match (the sweep is recorded in
+//! docs/plan/ngram_index_plan.md, row 6B).
 static constexpr idx_t DEFAULT_MAX_GRAMS_PER_QUERY = 3;
 
-//! Fetch costs 250-300 ns per candidate at every scale, while a parallel scan
-//! of the whole table costs about 0.04 s at 1 GB, 0.35 s at 10 GB and 3.5 s
-//! at 100 GB, which puts the break-even at 1.6%, 1.3% and 1.1% of rows. One
-//! percent is that crossover rounded toward scanning (benchmarks/RESULTS.md).
-static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.01;
+//! The gate compares fetching the candidates against scanning the indexed
+//! rows, in fetch-equivalent rows: a candidate of a scattered segment counts
+//! one, a segment whose candidates could be read as range scans counts its
+//! span over the range-to-fetch ratio, and every projected column beyond the
+//! recheck's multiplies the charge. Measured on enwik9 (10.9M rows, warm,
+//! docs/review/2026-09-09/cost_observations.json): a scattered fetch costs
+//! 0.8-1.5 us of CPU at one thread and 0.22-0.29 us of wall time at 24, a
+//! scanned row 92 ns and 6.3 ns. With the gate open, a needle whose candidate
+//! bound is 3.2% of the rows ran 8x faster than the scan at one thread and
+//! 2.5x at 24, one at 3.6% ran 2.5x faster at one thread and 1.15x slower at
+//! 24, and one at 20% ran 2.3x and 7.8x slower. Two percent sits below the
+//! 24-thread crossover, rounded toward scanning.
+static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.02;
 static constexpr int64_t DEFAULT_MAX_PROBE_ROWIDS = 100000000;
 static constexpr idx_t MAX_PROBE_MEMORY_BYTES = 256ULL * 1024ULL * 1024ULL;
 
@@ -101,7 +110,8 @@ void RegisterSettings(ExtensionLoader &loader) {
 	                          "ngram index queries probe at most this many of the needle's rarest grams",
 	                          LogicalType::BIGINT, Value::BIGINT(DEFAULT_MAX_GRAMS_PER_QUERY));
 	config.AddExtensionOption("ngram_max_candidate_fraction",
-	                          "full-result ngram queries scan when the candidate upper bound exceeds this fraction",
+	                          "full-result ngram queries scan when the fetch-equivalent candidate bound (dense spans "
+	                          "discounted, extra projected columns charged) exceeds this fraction of the indexed rows",
 	                          LogicalType::DOUBLE, Value::DOUBLE(DEFAULT_MAX_CANDIDATE_FRACTION));
 	config.AddExtensionOption("ngram_max_probe_rowids",
 	                          "hard limit on posting rowids an ngram query may decode before scanning or erroring",

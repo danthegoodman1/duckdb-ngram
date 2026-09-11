@@ -2,8 +2,54 @@
 
 #include "utf8proc_wrapper.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <limits>
+
 namespace duckdb {
 namespace ngram {
+
+//! Grams up to this many bytes are byte-packed; longer ones are hashed.
+constexpr idx_t PACKED_KEY_BYTES = 16;
+
+static std::atomic<uint64_t> key_mask_upper {~uint64_t(0)};
+static std::atomic<uint64_t> key_mask_lower {~uint64_t(0)};
+
+GramKeyMask CurrentGramKeyMask() {
+	GramKeyMask mask;
+	mask.upper = key_mask_upper.load(std::memory_order_relaxed);
+	mask.lower = key_mask_lower.load(std::memory_order_relaxed);
+	return mask;
+}
+
+void SetGramKeyMask(GramKeyMask mask) {
+	key_mask_upper.store(mask.upper, std::memory_order_relaxed);
+	key_mask_lower.store(mask.lower, std::memory_order_relaxed);
+}
+
+uhugeint_t GramKey(const char *data, idx_t len, const GramKeyMask &mask) {
+	if (len <= PACKED_KEY_BYTES) {
+		uint64_t upper = 0;
+		uint64_t lower = 0;
+		for (idx_t i = 0; i < len; i++) {
+			auto byte = static_cast<uint64_t>(static_cast<uint8_t>(data[i]));
+			if (i < 8) {
+				upper |= byte << ((7 - i) * 8);
+			} else {
+				lower |= byte << ((15 - i) * 8);
+			}
+		}
+		return uhugeint_t(upper & mask.upper, lower & mask.lower);
+	}
+	// FNV-1a; any fixed function works, since collisions only widen and the
+	// key never leaves this extension's storage
+	uint64_t hash = 14695981039346656037ULL;
+	for (idx_t i = 0; i < len; i++) {
+		hash ^= static_cast<uint64_t>(static_cast<uint8_t>(data[i]));
+		hash *= 1099511628211ULL;
+	}
+	return uhugeint_t(std::numeric_limits<uint64_t>::max() & mask.upper, hash & mask.lower);
+}
 
 void NormalizeString(const char *data, idx_t len, const GramOptions &options, string &normalized,
                      vector<idx_t> &offsets) {
@@ -36,21 +82,52 @@ void NormalizeString(const char *data, idx_t len, const GramOptions &options, st
 	offsets.push_back(normalized.size());
 }
 
-NeedleDecomposition DecomposeNeedle(const char *data, idx_t len, const GramOptions &options) {
-	NeedleDecomposition result;
+bool NeedleKeys::Add(uhugeint_t key, idx_t max_keys) {
+	if (seen.find(key) != seen.end()) {
+		return true;
+	}
+	if (keys.size() >= max_keys) {
+		return false;
+	}
+	seen.insert(key);
+	keys.push_back(key);
+	return true;
+}
+
+static constexpr idx_t GRAMS_PER_INTERRUPT_CHECK = 4096;
+static constexpr idx_t NEEDLE_BYTES_PER_KEY = 16;
+
+NeedleShape DecomposeNeedle(ClientContext &context, const char *data, idx_t len, const GramOptions &options,
+                            idx_t max_keys, NeedleKeys &keys) {
+	// The normalized copy and its codepoint offsets take about nine bytes per
+	// needle byte, so a needle of sixteen bytes per admitted key stays inside
+	// the per-key allowance the budget was derived from, whatever its grams.
+	if (len > NEEDLE_BYTES_PER_KEY * max_keys) {
+		return NeedleShape::OVER_BUDGET;
+	}
 	string scratch;
 	vector<idx_t> offsets;
-	unordered_set<string> seen;
 	bool emitted = false;
+	bool over_budget = false;
+	idx_t grams_since_check = 0;
+	auto mask = CurrentGramKeyMask();
 	ExtractGrams(data, len, options, scratch, offsets, [&](const char *gram, idx_t gram_len) {
 		emitted = true;
-		string gram_str(gram, gram_len);
-		if (seen.insert(gram_str).second) {
-			result.grams.push_back(std::move(gram_str));
+		if (over_budget) {
+			return;
 		}
+		if (++grams_since_check == GRAMS_PER_INTERRUPT_CHECK) {
+			grams_since_check = 0;
+			if (context.interrupted.load(std::memory_order_relaxed)) {
+				throw InterruptException();
+			}
+		}
+		over_budget = !keys.Add(GramKey(gram, gram_len, mask), max_keys);
 	});
-	result.too_short = !emitted;
-	return result;
+	if (over_budget) {
+		return NeedleShape::OVER_BUDGET;
+	}
+	return emitted ? NeedleShape::PROBEABLE : NeedleShape::TOO_SHORT;
 }
 
 //! trigrams(text[, gram_size[, case_insensitive]]) -> LIST(VARCHAR)
@@ -139,6 +216,79 @@ static void TrigramsFunction(DataChunk &args, ExpressionState &state, Vector &re
 	}
 }
 
+//! ngram_gram_key(gram) -> UHUGEINT: the storage key of one already
+//! normalized gram, for tests and inspection of the segments table.
+static void GramKeyFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto mask = CurrentGramKeyMask();
+	UnaryExecutor::Execute<string_t, uhugeint_t>(args.data[0], result, args.size(), [&](string_t gram) {
+		return GramKey(gram.GetData(), gram.GetSize(), mask);
+	});
+}
+
+//! ngram_gram_keys(text, gram_size, case_insensitive) -> LIST(UHUGEINT): the
+//! keys of the distinct grams of `text`, ascending. The build pipeline unnests
+//! this into its (gram_key, segment_no, rowid) pair stream; deduplicating
+//! here keeps repeated grams of one row out of the grouping pass.
+static void GramKeysFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto count = args.size();
+	UnifiedVectorFormat input_format, gram_format, ci_format;
+	args.data[0].ToUnifiedFormat(count, input_format);
+	args.data[1].ToUnifiedFormat(count, gram_format);
+	args.data[2].ToUnifiedFormat(count, ci_format);
+	auto input_strings = UnifiedVectorFormat::GetData<string_t>(input_format);
+	auto gram_sizes = UnifiedVectorFormat::GetData<int32_t>(gram_format);
+	auto case_insensitive_flags = UnifiedVectorFormat::GetData<bool>(ci_format);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto list_entries = FlatVector::GetData<list_entry_t>(result);
+	auto &result_validity = FlatVector::Validity(result);
+	ListVector::SetListSize(result, 0);
+
+	idx_t total = 0;
+	string scratch;
+	vector<idx_t> offsets;
+	vector<uhugeint_t> keys;
+	auto mask = CurrentGramKeyMask();
+	for (idx_t row = 0; row < count; row++) {
+		auto input_idx = input_format.sel->get_index(row);
+		auto gram_idx = gram_format.sel->get_index(row);
+		auto ci_idx = ci_format.sel->get_index(row);
+		if (!input_format.validity.RowIsValid(input_idx) || !gram_format.validity.RowIsValid(gram_idx) ||
+		    !ci_format.validity.RowIsValid(ci_idx)) {
+			result_validity.SetInvalid(row);
+			list_entries[row] = list_entry_t(total, 0);
+			continue;
+		}
+		if (gram_sizes[gram_idx] < 1) {
+			throw InvalidInputException("ngram_gram_keys: gram_size must be at least 1, got %d", gram_sizes[gram_idx]);
+		}
+		GramOptions options;
+		options.gram_size = static_cast<idx_t>(gram_sizes[gram_idx]);
+		options.case_insensitive = case_insensitive_flags[ci_idx];
+		auto &input = input_strings[input_idx];
+		keys.clear();
+		ExtractGrams(input.GetData(), input.GetSize(), options, scratch, offsets,
+		             [&](const char *gram, idx_t gram_len) { keys.push_back(GramKey(gram, gram_len, mask)); });
+		std::sort(keys.begin(), keys.end());
+		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		if (total + keys.size() > ListVector::GetListCapacity(result)) {
+			ListVector::SetListSize(result, total);
+			ListVector::Reserve(result, NextPowerOfTwo(total + keys.size()));
+		}
+		auto child_keys = FlatVector::GetData<uhugeint_t>(ListVector::GetEntry(result));
+		for (idx_t i = 0; i < keys.size(); i++) {
+			child_keys[total + i] = keys[i];
+		}
+		list_entries[row] = list_entry_t(total, keys.size());
+		total += keys.size();
+	}
+	ListVector::SetListSize(result, total);
+
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
 void RegisterGram(ExtensionLoader &loader) {
 	auto list_type = LogicalType::LIST(LogicalType::VARCHAR);
 	ScalarFunctionSet trigrams("trigrams");
@@ -147,6 +297,12 @@ void RegisterGram(ExtensionLoader &loader) {
 	trigrams.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN}, list_type,
 	                                    TrigramsFunction));
 	loader.RegisterFunction(trigrams);
+
+	loader.RegisterFunction(
+	    ScalarFunction("ngram_gram_key", {LogicalType::VARCHAR}, LogicalType::UHUGEINT, GramKeyFunction));
+	loader.RegisterFunction(ScalarFunction("ngram_gram_keys",
+	                                       {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN},
+	                                       LogicalType::LIST(LogicalType::UHUGEINT), GramKeysFunction));
 }
 
 } // namespace ngram

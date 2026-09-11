@@ -87,7 +87,7 @@ static const array<LogicalType, 12> REGISTRY_TYPES = {LogicalType::INTEGER, Logi
                                                       LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR};
 static constexpr idx_t IDENTITY_COLUMNS = 6;
 
-RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name) {
+RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name, const RegistrySelector &selector) {
 	RegistrySnapshot result;
 	// EntryLookupInfo stores the name by reference.
 	string registry_table = REGISTRY_TABLE;
@@ -120,10 +120,21 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 	}
 	result.oid = table.oid;
 	auto &transaction = DuckTransaction::Get(context, table.ParentCatalog());
+	TableFilterSet filters;
+	if (!selector.index_ref.empty()) {
+		filters.PushFilter(ColumnIndex(1),
+		                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::UUID(selector.index_ref)));
+	}
+	if (!selector.owner_key.empty()) {
+		filters.PushFilter(ColumnIndex(2), make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL,
+		                                                             Value::BLOB_RAW(selector.owner_key)));
+	}
 	TableScanState state;
-	InitializeExhaustiveScan(context, transaction, table.GetStorage(), state, column_ids, nullptr);
+	InitializeExhaustiveScan(context, transaction, table.GetStorage(), state, column_ids,
+	                         filters.filters.empty() ? nullptr : &filters);
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), types);
+	vector<UnifiedVectorFormat> identity(IDENTITY_COLUMNS);
 	while (true) {
 		ThrowIfInterrupted(context);
 		chunk.Reset();
@@ -131,8 +142,23 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 		if (chunk.size() == 0) {
 			break;
 		}
+		for (idx_t c = 0; c < IDENTITY_COLUMNS; c++) {
+			chunk.data[c].ToUnifiedFormat(chunk.size(), identity[c]);
+		}
+		auto names = [&](idx_t column, idx_t r) {
+			return UnifiedVectorFormat::GetData<string_t>(identity[column])[identity[column].sel->get_index(r)];
+		};
 		for (idx_t r = 0; r < chunk.size(); r++) {
-			for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+			for (idx_t c = 0; c < IDENTITY_COLUMNS; c++) {
+				if (!identity[c].validity.RowIsValid(identity[c].sel->get_index(r))) {
+					throw InvalidInputException("ngram: registry contains NULLs");
+				}
+			}
+			if (!selector.table_name.empty() && (!StringUtil::CIEquals(names(3, r).GetString(), selector.schema_name) ||
+			                                     !StringUtil::CIEquals(names(4, r).GetString(), selector.table_name))) {
+				continue;
+			}
+			for (idx_t c = IDENTITY_COLUMNS; c < chunk.ColumnCount(); c++) {
 				if (chunk.GetValue(c, r).IsNull()) {
 					throw InvalidInputException("ngram: registry contains NULLs");
 				}
@@ -140,10 +166,10 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 			auto version = chunk.GetValue(0, r).GetValue<int32_t>();
 			RegistryRow row;
 			row.index_ref = UUID::ToString(chunk.GetValue(1, r).GetValue<hugeint_t>());
-			row.owner_key = StringValue::Get(chunk.GetValue(2, r));
-			row.schema_name = StringValue::Get(chunk.GetValue(3, r));
-			row.table_name = StringValue::Get(chunk.GetValue(4, r));
-			row.column_name = StringValue::Get(chunk.GetValue(5, r));
+			row.owner_key = names(2, r).GetString();
+			row.schema_name = names(3, r).GetString();
+			row.table_name = names(4, r).GetString();
+			row.column_name = names(5, r).GetString();
 			row.meta.column_name = row.column_name;
 			if (!IsCanonicalUUID(row.index_ref)) {
 				throw InvalidInputException("ngram: registry row has a noncanonical ID");
@@ -152,7 +178,7 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 				row.format_version = 3;
 				row.error =
 				    StringUtil::Format("index format 3 (registry version %d) predates format %lld; drop it with "
-				                       "drop_ngram_index_by_id and rebuild it",
+				                       "drop_ngram_index(index_ref, catalog = ...) and rebuild it",
 				                       version, NGRAM_FORMAT_VERSION);
 				result.rows.push_back(std::move(row));
 				continue;
@@ -168,9 +194,10 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 			} else if (row.owner_key != OwnerKey(row.schema_name, row.table_name, row.column_name)) {
 				row.error = "registry row owner key does not match its owner";
 			} else if (row.format_version != NGRAM_FORMAT_VERSION) {
-				row.error = StringUtil::Format("index format %lld is not readable by this extension, which uses format "
-				                               "%lld; drop it with drop_ngram_index_by_id and rebuild it",
-				                               row.format_version, NGRAM_FORMAT_VERSION);
+				row.error =
+				    StringUtil::Format("index format %lld is not readable by this extension, which uses format "
+				                       "%lld; drop it with drop_ngram_index(index_ref, catalog = ...) and rebuild it",
+				                       row.format_version, NGRAM_FORMAT_VERSION);
 			} else if (gram_size < 1) {
 				row.error = StringUtil::Format("registry row records gram_size %lld", gram_size);
 			} else if (row.meta.hwm_rowid < -1 || row.meta.hwm_rowid >= MAX_ROW_ID) {
@@ -202,8 +229,8 @@ IndexLocation LocationOf(const RegistryRow &row, idx_t registry_oid) {
 	return location;
 }
 
-vector<IndexLocation> Locations(const RegistrySnapshot &registry, const ResolvedTarget &target, bool lenient) {
-	vector<IndexLocation> result;
+static vector<OwnedIndex> Owned(const RegistrySnapshot &registry, const ResolvedTarget &target, bool lenient) {
+	vector<OwnedIndex> result;
 	for (auto &row : registry.rows) {
 		if (!RowBelongsTo(row, target)) {
 			continue;
@@ -215,15 +242,35 @@ vector<IndexLocation> Locations(const RegistrySnapshot &registry, const Resolved
 			throw InvalidInputException("ngram: the index on %s.%s (%s) is unusable: %s", target.table_name,
 			                            row.column_name, row.index_ref, row.error);
 		}
-		result.push_back(LocationOf(row, registry.oid));
+		result.push_back(OwnedIndex {LocationOf(row, registry.oid), row.meta});
 	}
 	return result;
 }
 
-vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient) {
+static vector<IndexLocation> LocationsOf(vector<OwnedIndex> owned) {
+	vector<IndexLocation> result;
+	result.reserve(owned.size());
+	for (auto &index : owned) {
+		result.push_back(std::move(index.location));
+	}
+	return result;
+}
+
+vector<IndexLocation> Locations(const RegistrySnapshot &registry, const ResolvedTarget &target, bool lenient) {
+	return LocationsOf(Owned(registry, target, lenient));
+}
+
+vector<OwnedIndex> OwnedIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient) {
 	RegistrySnapshot registry;
+	RegistrySelector selector;
+	if (!target.column_name.empty()) {
+		selector.owner_key = OwnerKey(target.schema_name, target.table_name, target.column_name);
+	} else {
+		selector.schema_name = target.schema_name;
+		selector.table_name = target.table_name;
+	}
 	try {
-		registry = ReadRegistry(context, target.catalog_name);
+		registry = ReadRegistry(context, target.catalog_name, selector);
 	} catch (CatalogException &) {
 		if (lenient) {
 			return {};
@@ -235,7 +282,11 @@ vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarg
 		}
 		throw;
 	}
-	return Locations(registry, target, lenient);
+	return Owned(registry, target, lenient);
+}
+
+vector<IndexLocation> ExistingIndexes(ClientContext &context, const ResolvedTarget &target, bool lenient) {
+	return LocationsOf(OwnedIndexes(context, target, lenient));
 }
 
 void RequireUniqueIndexColumns(const vector<IndexLocation> &indexes) {
@@ -275,7 +326,7 @@ RegistrySnapshot ReadRegistryForCreate(ClientContext &context, const string &cat
 	auto registry = ReadRegistry(context, catalog_name);
 	if (registry.legacy_shape) {
 		throw InvalidInputException("create_ngram_index: the ngram registry in %s predates format %lld; drop each "
-		                            "listed index with drop_ngram_index_by_id and rebuild it",
+		                            "listed index with drop_ngram_index(index_ref, catalog = ...) and rebuild it",
 		                            catalog_name, NGRAM_FORMAT_VERSION);
 	}
 	return registry;
@@ -289,24 +340,26 @@ void ValidateRegistryForCreate(ClientContext &context, const string &catalog_nam
 	}
 }
 
-bool ParseStorageName(const string &name, string &index_ref, bool &segments) {
+static bool ParsePrefixedId(const string &name, const char *prefix, string &index_ref) {
 	auto lower = StringUtil::Lower(name);
-	string hex;
-	if (StringUtil::StartsWith(lower, "segments_")) {
-		hex = lower.substr(strlen("segments_"));
-		segments = true;
-	} else if (StringUtil::StartsWith(lower, "stats_")) {
-		hex = lower.substr(strlen("stats_"));
-		segments = false;
-	} else {
+	if (!StringUtil::StartsWith(lower, prefix)) {
 		return false;
 	}
+	auto hex = lower.substr(strlen(prefix));
 	if (hex.size() != 32) {
 		return false;
 	}
 	index_ref = hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) + "-" + hex.substr(16, 4) + "-" +
 	            hex.substr(20);
 	return IsCanonicalUUID(index_ref);
+}
+
+bool ParseStorageName(const string &name, string &index_ref) {
+	return ParsePrefixedId(name, "segments_", index_ref);
+}
+
+bool ParseFormat4StatsName(const string &name, string &index_ref) {
+	return ParsePrefixedId(name, "stats_", index_ref);
 }
 
 ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, const string &column_name,
@@ -366,8 +419,12 @@ ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, 
 	return target;
 }
 
+string ScratchTableName(const char *purpose) {
+	return string("__ngram_") + purpose + "_" + UUID::ToString(UUID::GenerateRandomUUID());
+}
+
 string ScratchName(const char *purpose) {
-	return Ident(string("__ngram_") + purpose + "_" + UUID::ToString(UUID::GenerateRandomUUID()));
+	return Ident(ScratchTableName(purpose));
 }
 
 string LegacyGuardToken(ClientContext &context, const string &catalog_name, const string &schema_name) {

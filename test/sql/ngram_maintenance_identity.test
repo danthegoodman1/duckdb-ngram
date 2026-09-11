@@ -145,12 +145,11 @@ DETACH side;
 statement ok
 ATTACH '__TEST_DIR__/ngram_identity_attached.db' AS side;
 
-# a pragma cannot be wrapped in a subquery, so the row is pinned whole; the
-# last column is the staleness verdict
-query IIIIIIIIIIIII
-PRAGMA ngram_index_stats('side.main.docs');
+# the last column is the staleness verdict, the listing's reason
+query I
+SELECT stale_reason FROM ngram_index_stats('side.main.docs');
 ----
-s	3	true	1	1	0	9	9	0	1	9	27	the rowid guard cannot exclude reuse of rowids already covered by the ngram index
+exact rowid guard is unavailable: the rowid guard cannot exclude reuse of rowids already covered by the ngram index
 
 statement error
 PRAGMA ngram_refresh('side.main.docs');

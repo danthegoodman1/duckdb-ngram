@@ -7,15 +7,22 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/common/map.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "ngram/probe.hpp"
+
+#include <condition_variable>
+#include <deque>
 
 namespace duckdb {
 
 class DataTable;
 class DuckTableEntry;
 class DuckTransaction;
+class ExpressionExecutor;
 class TableFilterSet;
 
 namespace ngram {
@@ -53,21 +60,62 @@ void AddShadowColumn(DuckTableEntry &entry, const string &column_name, LogicalTy
 
 void ThrowIfInterrupted(ClientContext &context);
 
-//! Scan an entire table (committed storage plus this transaction's local rows)
-//! through the caller's transaction, invoking fn per non-empty chunk.
-void ScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
-                     const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
-                     optional_ptr<TableFilterSet> filters, const std::function<void(DataChunk &)> &fn);
+//! Initialize a committed scan of rows [start_row, end_row): positioned at
+//! the row group and vector holding start_row and stopped at end_row, so it
+//! visits only the row groups those rows occupy. The scan starts at the
+//! vector's first row, so the caller's filters must exclude the rows of that
+//! vector before start_row, or tolerate them. A row group the filters' zone
+//! maps exclude is skipped, as the host's own scan skips it. v1.5.5 keeps
+//! DataTable's offset initializer private; its row-group collection exposes
+//! the same steps, and like DataTable::InitializeScan they take no checkpoint
+//! lock. Local storage stays uninitialized: callers scan the committed
+//! collection state directly. Returns the rows the scan can visit: from the
+//! first vector's start to end_row, before zone-map pruning.
+idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableScanState &state,
+                            const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> filters,
+                            idx_t start_row, idx_t end_row);
 
-//! Scan a whole table in parallel, one row group per claim. `body` is called
-//! once per chunk with the worker's own index so it can accumulate into a
-//! private slot.
-void ParallelScanShadowTable(ClientContext &context, DuckTransaction &tx, DataTable &storage,
-                             const vector<StorageIndex> &column_ids, const vector<LogicalType> &types,
-                             optional_ptr<TableFilterSet> filters, idx_t workers,
-                             const std::function<void(DataChunk &, idx_t)> &body);
+//! Run `body(unit)` for every unit in [0, units) across at most `workers` of
+//! the scheduler's threads, or inline when there is only one of either. The
+//! caller's work must be order-independent and must not share mutable state
+//! between units without its own synchronization.
+void ParallelForEachUnit(ClientContext &context, idx_t units, idx_t workers, const std::function<void(idx_t)> &body);
 
 enum class SearchCorePhase : uint8_t { FETCH, SCAN, DONE };
+
+//! One intersected segment whose candidate rowids are being handed out in
+//! FETCH_BATCH_ROWS batches.
+struct PublishedCandidates {
+	PublishedCandidates(idx_t segment_ordinal_p, shared_ptr<vector<row_t>> rowids_p)
+	    : segment_ordinal(segment_ordinal_p), rowids(std::move(rowids_p)) {
+	}
+	idx_t segment_ordinal;
+	shared_ptr<vector<row_t>> rowids;
+	idx_t next_offset = 0;
+};
+
+//! The shared cursor over intersected segments. A fetch worker takes the next
+//! batch of a published segment when one is waiting and otherwise decodes the
+//! next admitted segment, so every worker fetches whatever segment is
+//! published rather than only its own. Segments publish in ordinal order: a
+//! decoded segment waits in `pending` until every lower ordinal has
+//! published. Every batch a worker claims therefore has a higher batch index
+//! than its previous one, which the host requires of each pipeline thread.
+struct CandidateQueue {
+	mutex lock;
+	std::condition_variable published;
+	//! Published segments, in ordinal order, with batches still to hand out.
+	std::deque<PublishedCandidates> ready;
+	//! Decoded segments whose predecessors are still decoding, by ordinal.
+	map<idx_t, shared_ptr<vector<row_t>>> pending;
+	//! The ordinal that publishes next.
+	idx_t next_publish = 0;
+	//! Segments claimed for decoding whose result is not yet in `pending`.
+	idx_t decoding = 0;
+	//! A decode threw; the remaining workers finish with the tail scan while
+	//! the host propagates that error.
+	bool failed = false;
+};
 
 //! Projection-neutral execution state shared by ngram_search and the
 //! transparent NGRAM_INDEX_SCAN. Policy-specific init supplies layouts,
@@ -78,6 +126,7 @@ struct SearchCoreGlobal {
 	int64_t hwm = -1;
 	unique_ptr<ProbePlan> probe;
 	atomic<idx_t> next_probe_thread {0};
+	CandidateQueue candidates;
 	idx_t fetch_batch_base = 0;
 
 	vector<StorageIndex> fetch_column_ids;
@@ -86,41 +135,125 @@ struct SearchCoreGlobal {
 	//! BOOLEAN virtual column used only to carry cardinality for count(*).
 	vector<idx_t> output_ids;
 
-	vector<StorageIndex> scan_column_ids;
-	vector<LogicalType> scan_types;
+	//! Native filters every storage scan evaluates: the transparent scan's
+	//! pushed filters, or the explicit search's contains predicate. Rows a
+	//! scan produces under them need no recheck.
 	unique_ptr<TableFilterSet> scan_filters;
-	ParallelTableScanState parallel_scan;
+	//! Positions in fetch_column_ids of the columns the recheck reads, in
+	//! the order the recheck expression references them; policy init sets
+	//! it before FinalizeSearchCore.
+	vector<idx_t> recheck_positions;
+	//! A per-row candidate fetch reads the probe layout first, the recheck
+	//! columns then the rowid, and the extra layout, every other column, only
+	//! for the rows the recheck keeps: a fetched column costs from a tenth of
+	//! a string fetch (bit-packed integers) to nine times it (short FSST
+	//! strings), so wide projections are paid per match, not per candidate.
+	//! Both layouts are positions in fetch_column_ids; output_sources maps
+	//! each output column to (in the probe layout, index in that layout).
+	vector<idx_t> probe_positions;
+	vector<idx_t> extra_positions;
+	vector<StorageIndex> probe_column_ids;
+	vector<LogicalType> probe_types;
+	vector<StorageIndex> extra_column_ids;
+	vector<LogicalType> extra_types;
+	idx_t probe_rowid_position = 0;
+	vector<std::pair<bool, idx_t>> output_sources;
+	//! Position of the rowid column in the fetch projection. Bounded scans
+	//! start at a vector boundary, so each carries a rowid filter that
+	//! excludes the rows of that vector before its bound.
+	idx_t fetch_rowid_position = 0;
+	//! The committed rows past the index, [tail_start, tail_end), scanned in
+	//! units of tail_unit_rows through the host's offset scan, so a scan
+	//! visits the row groups those rows occupy. Unit tail_units is the
+	//! transaction-local storage, whose rows all lie past the index.
+	idx_t tail_start = 0;
+	idx_t tail_end = 0;
+	idx_t tail_unit_rows = 1;
+	idx_t tail_units = 0;
+	atomic<idx_t> next_tail_unit {0};
 	idx_t max_threads = 1;
+
+	//! Physical work per access path, for profiling and bounded-work tests:
+	//! rows fetched by rowid, rows the range scans and tail scans can visit
+	//! (their vector-aligned spans, before zone-map pruning), and the rows of
+	//! the transaction's local storage, which its scan visits whole.
+	atomic<idx_t> fetched_rows {0};
+	atomic<idx_t> range_rows {0};
+	atomic<idx_t> tail_rows {0};
+	atomic<idx_t> local_rows {0};
 };
 
 struct SearchCoreLocal {
-	SearchCorePhase phase = SearchCorePhase::FETCH;
-	DataChunk fetch_chunk;
-	ColumnFetchState fetch_state;
-	vector<row_t> candidates;
-	idx_t candidate_offset = 0;
-	idx_t segment_ordinal = 0;
+	SearchCoreLocal() : hit_rowids(LogicalType::ROW_TYPE, STANDARD_VECTOR_SIZE) {
+	}
 
-	TableScanState scan_state;
+	SearchCorePhase phase = SearchCorePhase::FETCH;
+	//! Range-scan output in the full fetch layout.
+	DataChunk fetch_chunk;
+	//! Per-row fetch output: the probe layout for every candidate of the
+	//! batch, then the extra layout for the rows the recheck kept, whose
+	//! rowids hit_rowids carries between the two fetches.
+	DataChunk probe_chunk;
+	DataChunk extra_chunk;
+	Vector hit_rowids;
+	ColumnFetchState fetch_state;
+	ColumnFetchState extra_state;
+	//! The claimed batch: rowids [candidate_offset, candidate_end) of the
+	//! published segment `segment_ordinal`.
+	shared_ptr<vector<row_t>> candidates;
+	idx_t candidate_offset = 0;
+	idx_t candidate_end = 0;
+	idx_t segment_ordinal = 0;
+	ProbeDecodeScratch decode;
+	//! A dense batch in progress as a committed scan bounded to the batch's
+	//! rowid span; the filter excludes the rows before its first rowid. Both
+	//! are fresh per batch: a TableScanState keeps appending filter info when
+	//! initialized again.
+	unique_ptr<TableScanState> range_state;
+	unique_ptr<TableFilterSet> range_filters;
+
+	//! The tail unit in progress: a bounded committed scan with its own rowid
+	//! lower bound beside the pushed filters, or the local storage scan when
+	//! scan_local_storage is set. Fresh per unit.
+	unique_ptr<TableScanState> scan_state;
+	unique_ptr<TableFilterSet> scan_filters;
+	bool scan_local_storage = false;
 	DataChunk scan_chunk;
-	bool scan_unit_active = false;
 	SelectionVector sel;
 	idx_t batch_index = 0;
+	//! Rows this thread fetched or could scan, for the host's rows-scanned
+	//! metric, which it reads per thread.
+	idx_t rows_scanned = 0;
 };
 
-//! Add the tail/full-scan rowid filter, initialize the parallel cursor and set
-//! the bounded thread count after policy-specific init has populated `state`.
+//! Fetched columns outside the recheck's inputs and the rowid: what a wide
+//! projection adds to every kept row's fetch. Available before
+//! FinalizeSearchCore, for the probe's admission.
+idx_t ExtraFetchColumns(const SearchCoreGlobal &state);
+
+//! Partition the tail, split the fetch layout, drop empty filter sets and
+//! set the bounded thread count after policy-specific init has populated
+//! `state`.
 void FinalizeSearchCore(ClientContext &context, SearchCoreGlobal &state);
+
+//! Rows of `chunk` the recheck keeps, selected into `sel`: every row when a
+//! storage scan produced the chunk under the scan filters or there is no
+//! executor, the executor's selection otherwise. DEBUG builds check that a
+//! natively filtered chunk passes the executor whole.
+idx_t SelectRechecked(ExpressionExecutor *executor, DataChunk &chunk, SelectionVector &sel, bool natively_filtered);
 
 //! Initialize per-thread buffers and assign at most probe->max_threads locals
 //! to candidate decoding; remaining locals start on the disjoint scan phase.
 void InitializeSearchCoreLocal(ExecutionContext &context, SearchCoreGlobal &global, SearchCoreLocal &local);
 
-//! Shared candidate fetch, scan, projection and scheduling loop. `recheck`
-//! selects exact matches from either fetched candidates or scan chunks.
+//! Shared candidate fetch, scan, projection and scheduling loop.
+//! `recheck(chunk, sel, natively_filtered)` selects exact matches from
+//! either fetched candidates or scan chunks; natively_filtered says a storage
+//! scan produced the chunk under the global scan filters, so those already
+//! hold for every row.
 void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchCoreGlobal &global,
-                       SearchCoreLocal &local, const std::function<idx_t(DataChunk &, SelectionVector &)> &recheck,
-                       DataChunk &output);
+                       SearchCoreLocal &local,
+                       const std::function<idx_t(DataChunk &, SelectionVector &, bool)> &recheck, DataChunk &output);
 
 } // namespace ngram
 } // namespace duckdb

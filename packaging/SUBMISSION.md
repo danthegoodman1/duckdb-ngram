@@ -49,22 +49,20 @@ boundaries. No collision.
 
 ## Blocking checklist
 
-- [ ] **The repository is public.** Community extensions "must be public,
-      open-source, and hosted on GitHub". This repo is private today.
-- [ ] **The full platform matrix is green in this repo's CI on the current
-      head.** A run on the current head is pending. `exclude_archs` is gone from
-      `.github/workflows/MainDistributionPipeline.yml`, and the last green run,
-      [31415223698](https://github.com/danthegoodman1/duckdb-ngram/actions/runs/31415223698)
-      on commit `ccac5b0` (2026-08-10), covered all ten default archs at
-      `duckdb_version: v1.5.5` / `ci_tools_version: v1.5.5` — Linux amd64/arm64,
-      macOS amd64/arm64, Windows amd64/arm64/mingw, and wasm mvp/eh/threads. The
-      storage format and the maintenance scripts have changed since, so that run
-      is history, not evidence for this tree. The workflow now runs on pushes to
-      `main`, on `v*` tags, on pull requests, and on dispatch; dispatch it
-      against the exact commit being submitted and record the run here. It *is*
-      the workflow community CI calls, and its tooling side is a mutable branch
-      ref (`extension-ci-tools` `v1.5.5` is `refs/heads/v1.5.5`, not a tag), so
-      upstream can move it.
+- [x] **The repository is public.** Community extensions "must be public,
+      open-source, and hosted on GitHub"; `danthegoodman1/duckdb-ngram` is
+      public.
+- [ ] **The full platform matrix is green in this repo's CI on the submitted
+      commit.** `exclude_archs` is gone from
+      `.github/workflows/MainDistributionPipeline.yml`; the matrix covers all
+      ten default archs plus the opt-in `windows_arm64` at
+      `duckdb_version: v1.5.5` / `ci_tools_version: v1.5.5` (Linux amd64/arm64,
+      macOS amd64/arm64, Windows amd64/arm64/mingw, wasm mvp/eh/threads). The
+      latest green runs are recorded in `ngram_review_plan.md` beside the commit
+      they ran on; dispatch the workflow against the exact commit being
+      submitted and record that run here. It *is* the workflow community CI
+      calls, and its tooling side is a mutable branch ref (`extension-ci-tools`
+      `v1.5.5` is `refs/heads/v1.5.5`, not a tag), so upstream can move it.
 - [x] **Set `excluded_platforms`** in the descriptor from whatever that run
       shows failing, using the `;`-separated syntax
       (e.g. `"wasm_mvp;wasm_eh;wasm_threads"`). Nothing failed, so the key stays
@@ -101,7 +99,11 @@ The point of this test is that a **stock** DuckDB binary — not this repo's
 build, which links the extension statically — can install the distributable
 artifact from a repository and use it.
 
-Revalidated on 2026-08-12 with the current format-3/opaque-registry artifact
+The record below is from the format-3 artifact of 2026-08-12; the current
+format's run is recorded under "Current-format revalidation" at the end of
+this section once the release evidence is collected on the final source.
+
+Revalidated on 2026-08-12 with the then-current format-3/opaque-registry artifact
 (SHA-256 `b60144ff2c4fe56459b565b7c3479a494a4add40228c071277197eb7873eb1e8`)
 and the official
 v1.5.5 CLI (`d8cdaa33fd`, SHA-256
@@ -211,6 +213,23 @@ SELECT count(*) FROM ngram_search('logs','reset by peer #4242');   -- 1
 SELECT count(*) FROM ngram_search('logs','after the extension');   -- 1
 ```
 
+### Current-format revalidation
+
+Run on the release-evidence build of engine commit `6fb01c606165` with the
+official v1.5.5 (Variegata) d8cdaa33fd CLI, SHA-256
+`3d33b1df037cb049155c393778df7853fafb23e9d49d7c9cacdde4dd67155788`,
+against the loadable artifact, SHA-256
+`846d5408fec67f9b041062c2593333ae65151b7eb928a7aa7d322edb4b3fc17b`,
+through `INSTALL ngram` from a repository in DuckDB's layout
+with a fresh `extension_directory`: install mode `REPOSITORY`; a 50,000-row
+table indexed and searched exactly on both paths; a second process reopened
+the file with the index `READY`, ran a covered update and a tail insert,
+searched exactly before and after `ngram_refresh` (mark advanced, no tail
+left, no staleness), dropped the index by reference and found no ngram table
+or index left with all rows intact; a third, extension-free process read the
+table. The script is `docs/review/2026-09-09/install_check.sh` and the
+transcript `docs/review/2026-09-09/install_check.log`.
+
 ## Draft PR
 
 **Title**
@@ -242,18 +261,19 @@ one exhaustive scan. A stock build can read the database, but guarded-table DML
 requires `ngram` to be loaded; on pinned v1.5.5 extension-free DELETE may
 busy-spin, so guarded tables must be treated as read-only before `LOAD ngram`.
 
-Transparent rewriting of plain `LIKE` is opt-in
-(`SET ngram_auto_accelerate = true`) until the next phase bounds candidate
-materialization and consolidates the explicit and transparent engines; both
-paths are exhaustive today.
+Transparent rewriting of plain `LIKE`/`contains`/`ILIKE` is opt-in
+(`SET ngram_auto_accelerate = true`): rewrites are exhaustive and
+resource-bounded, and the default stays off so that loading the extension
+changes no plan.
 
 Testing: local release and DEBUG + AddressSanitizer gates, property-based
 differential harnesses (explicit and transparent paths), churn over
 insert/delete/update/refresh/compact/checkpoint/reopen cycles, deterministic
 transaction/checkpoint schedules, and crash interruption. The full distribution
 matrix must be rerun against the exact submitted commit; earlier cross-platform
-runs are historical, not evidence for this final tree. Scale benchmarks up to a
-100 GB corpus are recorded in `benchmarks/RESULTS.md`.
+runs are historical, not evidence for this final tree. The release evidence is
+`benchmarks/RESULTS.md`; the 1/10/100 GB scale runs of an earlier format are
+recorded in `docs/plan/ngram_index_plan.md` as history.
 
 No scope collision with existing extensions: nothing in the registry provides
 substring/trigram indexing, and duckdb-fts's (unreleased) trigram sidecar

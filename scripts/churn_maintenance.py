@@ -33,13 +33,11 @@ import argparse
 import csv
 import os
 import random
-import re
-import subprocess
 import sys
 import tempfile
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DUCKDB = os.path.join(REPO, "build", "release", "duckdb")
+from ngram_harness import Cli, DEFAULT_DUCKDB, sql_quote
+
 ROW_GROUP_SIZE = 2048
 # words the rows are built from; UPDATE splices in MARKER, which no generated
 # row contains, so indexed-column update exhaustiveness is directly checked
@@ -47,10 +45,6 @@ WORDS = ["tent", "ten", "cent", "often", "entered", "content", "connection",
          "reset", "peer", "needle", "haystack", "gram", "index", "duck", "row"]
 MARKER = "grendel"
 NEEDLES = ["tent", "ten", "ent", "connection", "duck", "gram", MARKER, "xyzzy"]
-
-
-def sql_quote(s):
-    return "'" + s.replace("'", "''") + "'"
 
 
 def predicate(needle):
@@ -61,30 +55,15 @@ class Db:
     """One duckdb process per script: every step reopens the database, which
     also exercises checkpoint-on-close and WAL replay."""
 
-    def __init__(self, path):
+    def __init__(self, path, cli):
         self.path = path
+        self.cli = cli
 
     def run(self, script, allow_error=False, attached=True):
-        proc = subprocess.run([DUCKDB] + ([self.path] if attached else []),
-                              input=".headers off\n.mode csv\n" + script,
-                              capture_output=True, text=True, timeout=900)
-        if proc.returncode != 0 and not allow_error:
-            raise RuntimeError("duckdb failed:\n%s\n--- script ---\n%s" % (proc.stderr[-4000:], script[:2000]))
-        return proc.returncode, proc.stdout, proc.stderr
+        return self.cli.run(self.path, script, allow_error=allow_error, attached=attached)
 
     def index_ref(self):
-        _, catalog_out, _ = self.run("SELECT current_database();")
-        catalog = next(csv.reader(catalog_out.splitlines()))[0]
-        _, out, _ = self.run("PRAGMA ngram_indexes;")
-        rows = [row for row in csv.reader(out.splitlines())
-                if len(row) == 8 and row[0] == catalog
-                and row[2:5] == ["main", "corpus", "s"] and row[5] == "4" and row[6] == "READY"]
-        if len(rows) != 1:
-            raise RuntimeError("expected one READY format-4 corpus.s index")
-        ref = rows[0][1]
-        if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", ref):
-            raise RuntimeError("public corpus.s index id is not a canonical UUIDv4")
-        return ref
+        return self.cli.index_ref(self.path)
 
 
 def rows_sql(rng, start, count):
@@ -97,15 +76,16 @@ def rows_sql(rng, start, count):
 
 
 def verification_script():
-    """Per needle, check both directions of the exact-search invariant."""
+    """Per needle, both directions of the exact-search invariant as multisets:
+    rows the index returns more often than brute force, and rows it omits."""
     out = []
     for needle in NEEDLES:
         q = sql_quote(needle)
         out.append("SELECT 'extra', %s, count(*) FROM "
-                   "(SELECT * FROM ngram_search('corpus', %s) EXCEPT SELECT * FROM corpus WHERE %s);"
+                   "(SELECT * FROM ngram_search('corpus', %s) EXCEPT ALL SELECT * FROM corpus WHERE %s);"
                    % (q, q, predicate(needle)))
         out.append("SELECT 'missing', %s, count(*) FROM "
-                   "(SELECT * FROM corpus WHERE %s EXCEPT SELECT * FROM ngram_search('corpus', %s));"
+                   "(SELECT * FROM corpus WHERE %s EXCEPT ALL SELECT * FROM ngram_search('corpus', %s));"
                    % (q, predicate(needle), q))
     return "\n".join(out)
 
@@ -271,16 +251,15 @@ class Churn:
 
 
 def main():
-    global DUCKDB
     ap = argparse.ArgumentParser()
     ap.add_argument("--rounds", type=int, default=40)
     ap.add_argument("--rows", type=int, default=4000)
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--duckdb", default=DUCKDB)
+    ap.add_argument("--duckdb", default=DEFAULT_DUCKDB)
     ap.add_argument("--no-stale-expected", action="store_true",
                     help="only run operations that keep an index valid, and fail on any detector verdict")
     args = ap.parse_args()
-    DUCKDB = args.duckdb
+    cli = Cli(args.duckdb)
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(0, 2**31)
     print("master seed: %d%s" % (seed, " (no-stale-expected: any detector verdict fails)"
@@ -289,7 +268,7 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "churn.db")
-        db = Db(path)
+        db = Db(path, cli)
         # a small row-group size makes a few thousand rows span many row
         # groups, so deletes produce real vacuum merges
         # created through ATTACH so the row-group size can be set; it is stored

@@ -173,15 +173,19 @@ static void CollectFilterNeedles(const TableFilter &filter, vector<RewriteNeedle
 
 //! The needles that may probe this index: ILIKE needles require a
 //! case-insensitive index, and a needle must decompose into at least one gram
-//! under the index's options to contribute to the probe.
-static vector<RewriteNeedle> UsableNeedles(const vector<RewriteNeedle> &needles, const GramOptions &options) {
+//! within the query memory budget under the index's options to contribute to
+//! the probe.
+static vector<RewriteNeedle> UsableNeedles(ClientContext &context, const vector<RewriteNeedle> &needles,
+                                           const GramOptions &options) {
 	vector<RewriteNeedle> usable;
+	auto max_keys = MaxProbeKeys(context);
 	for (auto &needle : needles) {
 		if (needle.requires_ci && !options.case_insensitive) {
 			continue;
 		}
-		auto decomposition = DecomposeNeedle(needle.text.data(), needle.text.size(), options);
-		if (!decomposition.too_short && !decomposition.grams.empty()) {
+		NeedleKeys keys;
+		if (DecomposeNeedle(context, needle.text.data(), needle.text.size(), options, max_keys, keys) ==
+		    NeedleShape::PROBEABLE) {
 			usable.push_back(needle);
 		}
 	}
@@ -216,10 +220,10 @@ struct NgramScanGlobalState final : public GlobalTableFunctionState {
 	idx_t candidate_count = 0;
 	vector<string> fetched_columns;
 
-	//! The conjunction of every non-optional pushed filter, evaluated on
-	//! fetched candidate chunks (DataTable::Fetch applies no filters). Shared
-	//! read-only; each thread builds its own executor over it, because an
-	//! ExpressionExecutor carries per-evaluation state.
+	//! The conjunction of every non-optional pushed filter over the probe
+	//! layout, evaluated on fetched candidate chunks (DataTable::Fetch applies
+	//! no filters). Shared read-only; each thread builds its own executor over
+	//! it, because an ExpressionExecutor carries per-evaluation state.
 	unique_ptr<Expression> recheck_expr;
 
 	idx_t MaxThreads() const override {
@@ -239,12 +243,14 @@ struct NgramScanLocalState final : public LocalTableFunctionState {
 // Execution: init
 //===----------------------------------------------------------------------===//
 
-//! The conjunction of every non-optional pushed filter over the scanned
-//! chunk. Optional filters (zone-map hints, dynamic TopN/join filters) are
-//! skipped: their contract says executing them is not required for
-//! correctness, and their state can change between init and evaluation.
+//! The conjunction of every non-optional pushed filter over the probe
+//! layout, whose columns `recheck_positions` lists in the expression's
+//! reference order. Optional filters (zone-map hints, dynamic TopN/join
+//! filters) are skipped: their contract says executing them is not required
+//! for correctness, and their state can change between init and evaluation.
 static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet> filters,
-                                                     const vector<LogicalType> &scanned_types) {
+                                                     const vector<LogicalType> &scanned_types,
+                                                     vector<idx_t> &recheck_positions) {
 	unique_ptr<Expression> result;
 	if (!filters) {
 		return result;
@@ -257,7 +263,12 @@ static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet
 			throw InvalidInputException("ngram accelerated scan: table filter references column %llu of %llu scanned",
 			                            entry.first, scanned_types.size());
 		}
-		BoundReferenceExpression column(scanned_types[entry.first], entry.first);
+		auto position = std::find(recheck_positions.begin(), recheck_positions.end(), entry.first);
+		idx_t reference = NumericCast<idx_t>(position - recheck_positions.begin());
+		if (position == recheck_positions.end()) {
+			recheck_positions.push_back(entry.first);
+		}
+		BoundReferenceExpression column(scanned_types[entry.first], reference);
 		auto expr = entry.second->ToExpression(column);
 		if (result) {
 			result = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
@@ -285,37 +296,45 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 		return false;
 	}
 	auto &info = verdict.meta;
-	auto usable = UsableNeedles(bind.needles, info.options);
-	if (usable.empty()) {
+	// a matching row must contain every needle, hence every gram of every
+	// needle: one intersection over the union of gram sets is exactly the
+	// per-needle candidate-set intersection, and any subset of that union
+	// still yields a superset of the matches, so needles or grams past the
+	// key budget are left out rather than declining the probe
+	NeedleKeys keys;
+	auto max_keys = MaxProbeKeys(context);
+	idx_t usable = 0;
+	for (auto &needle : bind.needles) {
+		if (needle.requires_ci && !info.options.case_insensitive) {
+			continue;
+		}
+		NeedleKeys own;
+		if (DecomposeNeedle(context, needle.text.data(), needle.text.size(), info.options, max_keys, own) !=
+		    NeedleShape::PROBEABLE) {
+			continue;
+		}
+		usable++;
+		for (auto &key : own.keys) {
+			if (!keys.Add(key, max_keys)) {
+				break;
+			}
+		}
+	}
+	if (usable == 0) {
 		// only possible when the index was rebuilt with different options
 		// after planning; the rewrite never fires without a usable needle
 		state.fallback_reason = "no probeable needle";
 		return false;
 	}
-	// a matching row must contain every needle, hence every gram of every
-	// needle: one intersection over the union of gram sets is exactly the
-	// per-needle candidate-set intersection
-	vector<string> grams;
-	unordered_set<string> seen;
-	for (auto &needle : usable) {
-		auto decomposition = DecomposeNeedle(needle.text.data(), needle.text.size(), info.options);
-		for (auto &gram : decomposition.grams) {
-			if (seen.insert(gram).second) {
-				grams.push_back(gram);
-			}
-		}
-	}
 	auto segments = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.SegmentsTable(),
 	                                        "ngram index segments table");
-	auto stats = TryResolveExistingTable(context, bind.catalog_name, NGRAM_SCHEMA, bind.location.StatsTable(),
-	                                     "ngram index stats table");
-	if (!segments || !stats) {
+	if (!segments) {
 		state.fallback_reason = "index unavailable";
 		return false;
 	}
 	auto probe =
-	    PlanIndexProbe(context, *state.core.tx, *segments, *stats, grams, MaxGramsPerQuery(context), info.hwm_rowid,
-	                   state.core.storage->GetTotalRows(), MaxCandidateFraction(context), DConstants::INVALID_INDEX);
+	    PlanIndexProbe(context, *state.core.tx, *segments, keys.keys, MaxGramsPerQuery(context), info.hwm_rowid,
+	                   MaxCandidateFraction(context), DConstants::INVALID_INDEX, ExtraFetchColumns(state.core));
 	state.candidate_count = probe->candidate_upper_bound;
 	if (!probe->admitted) {
 		state.fallback_reason = probe->decline_reason;
@@ -367,7 +386,7 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 		}
 	}
 
-	state->recheck_expr = BuildRecheckExpression(input.filters, state->core.fetch_types);
+	state->recheck_expr = BuildRecheckExpression(input.filters, state->core.fetch_types, state->core.recheck_positions);
 
 	if (TryProbeIndex(context, bind, *state)) {
 		state->mode = NgramScanMode::INDEX;
@@ -388,7 +407,7 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 	}
 	FinalizeSearchCore(context, state->core);
 
-	return std::move(state);
+	return state;
 }
 
 static unique_ptr<LocalTableFunctionState> NgramScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
@@ -399,33 +418,30 @@ static unique_ptr<LocalTableFunctionState> NgramScanInitLocal(ExecutionContext &
 		state->recheck_executor = make_uniq<ExpressionExecutor>(context.client, *gstate.recheck_expr);
 	}
 	InitializeSearchCoreLocal(context, gstate.core, state->core);
-	return std::move(state);
+	return state;
 }
 
 //===----------------------------------------------------------------------===//
 // Execution: scan
 //===----------------------------------------------------------------------===//
 
-//! Rows of `chunk` passing every non-optional pushed filter, selected into
-//! the thread's selection vector. Storage-scan chunks are already filtered
-//! natively; re-running the executor there is an idempotent belt-and-braces
-//! pass over survivors.
-static idx_t RecheckChunk(NgramScanLocalState &lstate, DataChunk &chunk, SelectionVector &sel) {
-	if (!lstate.recheck_executor) {
-		for (idx_t r = 0; r < chunk.size(); r++) {
-			sel.set_index(r, r);
-		}
-		return chunk.size();
-	}
-	return lstate.recheck_executor->SelectExpression(chunk, sel);
-}
-
+//! A chunk a storage scan produced under the pushed filters holds only
+//! passing rows, the same native evaluation the host's seq scan relies on,
+//! so the executor runs only on fetched candidates, which DataTable::Fetch
+//! does not filter.
 static void NgramScanFunc(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<NgramScanGlobalState>();
 	auto &lstate = data.local_state->Cast<NgramScanLocalState>();
 	ExecuteSearchCore(
 	    context, data, state.core, lstate.core,
-	    [&](DataChunk &chunk, SelectionVector &sel) { return RecheckChunk(lstate, chunk, sel); }, output);
+	    [&](DataChunk &chunk, SelectionVector &sel, bool natively_filtered) {
+		    return SelectRechecked(lstate.recheck_executor.get(), chunk, sel, natively_filtered);
+	    },
+	    output);
+}
+
+static idx_t NgramScanRowsScanned(GlobalTableFunctionState &, LocalTableFunctionState &lstate) {
+	return lstate.Cast<NgramScanLocalState>().core.rows_scanned;
 }
 
 //! Ordered sinks reassemble a parallel scan's output by batch index. Fetch
@@ -464,9 +480,19 @@ static InsertionOrderPreservingMap<string> NgramScanDynamicToString(TableFunctio
 	if (state.mode == NgramScanMode::INDEX) {
 		result["Ngram Mode"] = StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
 		                                          state.candidate_count, state.core.probe->decoded_rowids.load());
+		result["Ngram Manifest Rows Scanned"] = to_string(state.core.probe->manifest_rows_scanned);
+		result["Ngram Manifest Rows Visited"] = to_string(state.core.probe->manifest_rows_visited);
+		result["Ngram Admission Rows"] = to_string(state.core.probe->admission_rows);
+		result["Ngram Probe Workers"] = to_string(state.core.probe->max_threads);
+		result["Ngram Decode Workspace Bytes"] = to_string(state.core.probe->workspace_bytes);
+		result["Ngram Decode Peak Bytes"] = to_string(state.core.probe->tracker->peak.load());
 	} else {
 		result["Ngram Mode"] = "full scan fallback: " + state.fallback_reason;
 	}
+	result["Ngram Fetched Rows"] = to_string(state.core.fetched_rows.load());
+	result["Ngram Range Rows"] = to_string(state.core.range_rows.load());
+	result["Ngram Tail Rows"] = to_string(state.core.tail_rows.load());
+	result["Ngram Local Rows"] = to_string(state.core.local_rows.load());
 	return result;
 }
 
@@ -483,6 +509,7 @@ static TableFunction NgramIndexScanFunction() {
 	function.init_global = NgramScanInitGlobal;
 	function.init_local = NgramScanInitLocal;
 	function.get_partition_data = NgramScanGetPartitionData;
+	function.rows_scanned = NgramScanRowsScanned;
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
 	function.filter_prune = true;
@@ -523,11 +550,9 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		}
 	}
 	auto &columns = table->GetColumns();
-	auto catalog_name = table->ParentCatalog().GetName();
-	auto schema_name = table->ParentSchema().name;
-	ResolvedTarget resolved {catalog_name, schema_name, table->name, string(), table};
-	auto locations = ExistingIndexes(context, resolved, true);
-
+	// filter shapes first: a scan without a substring filter on a VARCHAR
+	// column never reads the registry
+	vector<std::pair<const ColumnDefinition *, vector<RewriteNeedle>>> probeable;
 	for (auto &entry : get.table_filters.filters) {
 		if (entry.first >= columns.LogicalColumnCount()) {
 			continue;
@@ -538,31 +563,34 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		}
 		vector<RewriteNeedle> needles;
 		CollectFilterNeedles(*entry.second, needles);
-		if (needles.empty()) {
+		if (!needles.empty()) {
+			probeable.emplace_back(&column, std::move(needles));
+		}
+	}
+	if (probeable.empty()) {
+		return;
+	}
+	auto catalog_name = table->ParentCatalog().GetName();
+	auto schema_name = table->ParentSchema().name;
+	for (auto &candidate : probeable) {
+		auto &column = *candidate.first;
+		auto &needles = candidate.second;
+		// one owner-keyed registry read per filtered column
+		ResolvedTarget resolved {catalog_name, schema_name, table->name, column.Name(), table};
+		auto owned = OwnedIndexes(context, resolved, true);
+		if (owned.size() > 1) {
+			return;
+		}
+		if (owned.empty()) {
 			continue;
 		}
-		IndexLocation location;
-		bool found = false;
-		for (auto &candidate : locations) {
-			if (StringUtil::CIEquals(candidate.column_name, column.Name())) {
-				if (found) {
-					return;
-				}
-				location = candidate;
-				found = true;
-			}
-		}
-		if (!found) {
+		auto index = &owned[0];
+		// the row was read in this statement's snapshot, so the plan-time
+		// verdict is the guard's alone; execution revalidates row and guard
+		if (!RowIdGuardReason(context, table->Cast<DuckTableEntry>(), index->meta).empty()) {
 			continue;
 		}
-		auto verdict = ValidateIndex(context, resolved, location);
-		if (verdict.availability == IndexAvailability::CHANGED) {
-			throw InvalidInputException(verdict.reason);
-		}
-		if (verdict.availability != IndexAvailability::AVAILABLE || !verdict.reason.empty()) {
-			continue;
-		}
-		auto usable = UsableNeedles(needles, verdict.meta.options);
+		auto usable = UsableNeedles(context, needles, index->meta.options);
 		if (usable.empty()) {
 			// short needles, or ILIKE against a case-sensitive index
 			continue;
@@ -572,7 +600,7 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		bind->catalog_name = catalog_name;
 		bind->schema_name = schema_name;
 		bind->table_name = table->name;
-		bind->location = location;
+		bind->location = index->location;
 		bind->column_name = column.Name();
 		bind->needles = std::move(usable);
 		for (auto &col : columns.Logical()) {

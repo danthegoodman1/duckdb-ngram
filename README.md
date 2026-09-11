@@ -4,8 +4,7 @@
 over large text columns:
 
 ```sql
-INSTALL ngram FROM community;
-LOAD ngram;
+LOAD ngram;   -- from the built binary today; INSTALL ngram FROM community once the submission merges (see Installing)
 
 PRAGMA create_ngram_index('logs', 'message');
 
@@ -111,8 +110,8 @@ The answer is then narrowed to exactly the truth by four mechanisms:
    impossible in every state the index can be in**.
 2. **The tail scan.** Rows appended since the last `create`/`refresh` are past
    the index's high-water mark. Every query brute-force scans that tail and
-   unions the matches in. A rowid zone-map filter means the scan skips the
-   indexed row groups entirely, so it costs about what the unindexed tail costs.
+   unions the matches in. The scan starts at the first row group past the
+   mark, so it costs about what the unindexed tail costs.
 3. **The transaction-local phase.** Rows your own open transaction has inserted
    but not committed have no permanent rowids yet and are never indexed. They
    are covered by the same tail scan, so a search inside a writing transaction
@@ -207,8 +206,10 @@ seal and may conservatively require rebuild; a `DETACH` of an untouched unbound
 guard is the main ordinary example.
 
 The implementation and recovery proof are in
-[docs/stale-updates.md](docs/stale-updates.md). There are no probabilistic row
-witnesses or undetected update/vacuum miss cases.
+[docs/stale-updates.md](docs/stale-updates.md); the ownership, snapshot,
+publication-order and budget invariants behind the whole design are in
+[docs/design.md](docs/design.md). There are no probabilistic row witnesses or
+undetected update/vacuum miss cases.
 
 ---
 
@@ -257,10 +258,11 @@ while True:
 
 One row comes back per indexed column of the table — one row for the usual
 single-index table, and `col = 'message'` narrows it to one index as always.
-Calling it again on a caught-up index is a cheap no-op that reports
-`remaining_tail = 0`, so the loop is safe to run one extra time. A bound wider
-than the tail does exactly what the unbounded form does, in one call, and still
-reports progress — which is the way to get a summary out of a full catch-up.
+Calling it again on a caught-up index is a no-op that validates the index,
+writes nothing, and reports `remaining_tail = 0`, so the loop is safe to run
+one extra time. A bound wider than the tail does exactly what the unbounded
+form does, in one call, and still reports progress — which is the way to get a
+summary out of a full catch-up.
 
 The bound is approximate in one direction only: it is spent as a span of rowids,
 so deletes and gaps mean a call may index **fewer** rows than asked, never more.
@@ -283,10 +285,14 @@ A long run of deleted rowids costs one no-op call per bound: crossing a gap of
 1,000 deleted rowids at `max_rows = 100` takes ten calls that each report
 `rows_indexed = 0` before the loop reaches live rows again. They are cheap —
 there is nothing to index, so the call is a mark update — but if a catch-up
-crawls, a wider bound walks the gap in fewer steps.
+crawls, a wider bound walks the gap in fewer steps. A single row larger than
+the bound is one increment: the bound is a rowid span, never a byte budget.
+Rows this transaction appended and has not committed are neither indexed nor
+counted; their rowids are assigned at commit, and they join the tail then.
 
-Without a bound, `ngram_refresh` behaves exactly as it always has and returns no
-rows.
+Without a bound, `ngram_refresh` indexes the whole tail in one transaction and
+returns the same progress row; `remaining_tail` is 0 unless another connection
+committed rows between the call's expansion and its transaction.
 
 ### When to compact
 
@@ -301,8 +307,7 @@ postings.
 
 **On an append-only table, compaction has little to merge.** Each refresh
 generation lands in a fresh range of rowids, so successive generations barely
-share `(gram, segment_no)` keys. Refresh performs a validated, byte-sorted
-stats-only fold itself, so stats history is no longer a reason to compact.
+share `(gram_key, segment_no)` keys.
 
 Compaction is mainly for **delete-heavy or interleaved workloads**. Check
 `fragmented_keys` and `generations` in `ngram_index_stats` before running it,
@@ -314,11 +319,9 @@ That one-BIGINT temp and the selected encoded source are spillable, and can use
 substantial temporary disk alongside the packed output and MVCC-old rows.
 Purging is consequently much more expensive than a merge-only compaction.
 
-Corruption checks follow the data each path reads: a probe validates requested
-gram stats, merge-only compact validates selected segment rows, purge validates
-all segment rows, and the refresh stats fold validates every historical stats
-row it rewrites. Compact rebuilds stats from the resulting segment metadata;
-it does not separately validate superseded stats rows.
+Corruption checks follow the data each path reads: a probe validates the
+segment rows of the needle's grams, merge-only compact validates selected
+segment rows, and purge validates all segment rows.
 
 ### When to rebuild
 
@@ -341,14 +344,19 @@ PRAGMA create_ngram_index('logs', 'message');
 ### Reading `ngram_index_stats`
 
 ```sql
-PRAGMA ngram_index_stats('logs');
+SELECT * FROM ngram_index_stats('logs');
+PRAGMA ngram_index_stats('logs');   -- the same rows
 ```
+
+Every column is read by the statement that runs the function, so one call
+describes one snapshot; `ngram_indexes()` is the cheap listing to poll, this
+is the storage aggregation to read before deciding on maintenance.
 
 | Column | Meaning |
 | --- | --- |
 | `column_name`, `gram_size`, `case_insensitive` | the options the index was built with |
 | `hwm_rowid` | the highest rowid the index covers |
-| `table_max_rowid` | the table's current highest rowid — the gap is what the tail scan reads on every query |
+| `table_max_rowid` | the highest committed live rowid of the table; below `hwm_rowid` once deletes have emptied the end of the indexed range |
 | `remaining_tail` | committed rows past `hwm_rowid`: what the tail scan actually reads, and what a refresh would index (the rowid gap counts deleted rows, this does not) |
 | `distinct_grams` | size of the index's gram dictionary |
 | `segments` | posting-list rows |
@@ -367,11 +375,19 @@ PRAGMA ngram_index_stats('logs');
 PRAGMA create_ngram_index('table', 'column');
 PRAGMA create_ngram_index('table', 'column', gram = 3, case_insensitive = true);
 PRAGMA drop_ngram_index('table', 'column');
+PRAGMA drop_ngram_index('index_ref');                          -- in the current database
+PRAGMA drop_ngram_index('index_ref', catalog = 'database_name');
 
-PRAGMA ngram_indexes;
-PRAGMA ngram_index_status('database_name', 'index_ref');
-PRAGMA drop_ngram_index_by_id('database_name', 'index_ref');
+SELECT * FROM ngram_indexes();          -- every index of every attached DuckDB catalog
+PRAGMA ngram_indexes;                   -- the same rows, ordered
 ```
+
+`ngram_indexes()` is the cheap lifecycle listing: one row per registry row or
+stray storage object, with `database_name`, `index_ref`, `schema_name`,
+`table_name`, `column_name`, `format_version`, `status` and `reason`, observed
+when the statement executes. It composes like any table function, so
+`SELECT * FROM ngram_indexes() WHERE index_ref = ...` is the status of one
+index and `... WHERE status <> 'READY'` the list of what needs attention.
 
 `gram` is the number of characters per gram (default 3). Larger grams are more
 selective but cannot answer needles shorter than themselves; smaller grams
@@ -382,34 +398,38 @@ temporary tables, tables in foreign catalogs (SQLite, Postgres, …), tables wit
 generated columns, and tables with a user column named `rowid` are rejected.
 
 Each new index receives a canonical UUIDv4 `index_ref`. Its metadata is one
-row of `__ngram.registry`; its postings and per-gram statistics are the tables
-`__ngram.segments_<id>` and `__ngram.stats_<id>`, named by the id without
-dashes. `PRAGMA ngram_indexes` lists every index across attached DuckDB
-catalogs. Use the catalog-qualified status/drop forms whenever the base table
-or indexed column has disappeared; copied attached databases may legitimately
-contain the same UUID, so the catalog name is part of the public identity.
+row of `__ngram.registry`; its postings are the table `__ngram.segments_<id>`,
+named by the id without dashes and sorted by a fixed-width key of each gram
+(`ngram_gram_key`). A query reads the segment rows of every gram of its needle
+to pick the rarest ones, so the index keeps no separate statistics. Use the
+catalog-qualified drop form whenever the base table or indexed column has
+disappeared; copied attached databases may legitimately contain the same
+UUID, so the catalog name is part of the public identity.
 
 Lifecycle status has four values:
 
 | Status | Meaning |
 | --- | --- |
-| `READY` | The registry row, both storage tables, and the rowid guard validate; indexed reads may accelerate. |
+| `READY` | The registry row, the segments table, and the rowid guard validate; indexed reads may accelerate. |
 | `SCAN_ONLY` | The table and column exist but the guard is missing, replaced, incompatible, or cannot exclude rowid reuse; exhaustive queries scan and maintenance refuses. |
 | `ORPHAN` | The recorded base table or column is absent. Drop by id remains available. |
-| `MALFORMED` | The row is unreadable (another storage format, corrupt values), a storage table is missing, or an object in `__ngram` has no row. The reason names the cause. A row is dropped by id; an object without a row is dropped by hand. |
+| `MALFORMED` | The row is unreadable (another storage format, corrupt values), the segments table is missing, or an object in `__ngram` has no row. The reason names the cause. A row is dropped by id; an object without a row is dropped by hand. |
 
 A database written by an earlier storage format lists each of its indexes as
-`MALFORMED` with the format in the reason. `drop_ngram_index_by_id` removes
-such an index, guard included, once its recorded guard token still matches;
-`create_ngram_index` then builds a current one.
+`MALFORMED` with the format in the reason. `drop_ngram_index` by reference
+removes such an index, guard included, once its recorded guard token still
+matches; `create_ngram_index` then builds a current one. The reference form
+drops in the current database unless `catalog` names another attached one:
+copied attached databases may hold the same reference, so the catalog is part
+of the identity.
 
 DuckDB v1.5.5 refuses table and indexed-column rename while the physical guard
 exists, including case-only rename. Moving a table between schemas and renaming
 a schema are host-not-implemented. The supported workflow is therefore:
 
 ```sql
-PRAGMA ngram_indexes;  -- save database_name + index_ref
-PRAGMA drop_ngram_index_by_id('database_name', 'index_ref');
+SELECT database_name, index_ref FROM ngram_indexes();  -- save both
+PRAGMA drop_ngram_index('index_ref', catalog = 'database_name');
 ALTER TABLE old_name RENAME TO new_name;
 PRAGMA create_ngram_index('new_name', 'column');
 ```
@@ -423,26 +443,27 @@ live guard.
 ### Maintenance
 
 ```sql
-PRAGMA ngram_refresh('table');                        -- index the whole tail, returns nothing
-PRAGMA ngram_refresh('table', 1000000);               -- at most ~1e6 rows, returns a progress row
+PRAGMA ngram_refresh('table');                        -- index the whole tail
+PRAGMA ngram_refresh('table', 1000000);               -- at most ~1e6 rows of rowid span
 PRAGMA ngram_refresh('table', max_rows = 1000000);    -- same, named
 PRAGMA ngram_refresh('table', 1000000, col = 'c');    -- one index of a multi-index table
 PRAGMA ngram_compact('table');
 PRAGMA ngram_compact('table', col = 'c', purge = true);
-PRAGMA ngram_index_stats('table');
+SELECT * FROM ngram_index_stats('table');             -- the full storage statistics
+PRAGMA ngram_index_stats('table');                    -- the same rows
 ```
 
 Pragma named parameters take `=`, not `:=`. Each call is one transaction,
 whether or not it is bounded; `max_rows` must be at least 1.
 
-The bounded form returns one row per index it advanced:
+Every refresh returns one progress row per index it covers, bounded or not:
 
 | Column | Meaning |
 | --- | --- |
 | `column_name` | the indexed column this row is about |
 | `rows_indexed` | committed rows this call brought under the mark (rows whose value is `NULL` included: they are covered, they just hold no grams) |
 | `hwm_rowid` | the high-water mark the call committed |
-| `remaining_tail` | committed rows still past it — loop until this is 0 |
+| `remaining_tail` | committed rows still past it in this statement's snapshot — loop until this is 0; rows this transaction has not committed are not counted |
 
 ### Querying
 
@@ -501,13 +522,22 @@ EXPLAIN ANALYZE SELECT * FROM logs WHERE message LIKE '%reset%';
 Two kill switches: `SET ngram_auto_accelerate = false`, and DuckDB's own
 `SET disabled_optimizers = 'extension'`.
 
-### Helper functions
+### Diagnostic helpers
+
+These expose the pieces the index is built from. `trigrams` is a general text
+helper; the rest are for inspecting an index, reproducing its build steps, and
+tests. `ngram_candidates` above belongs to the same family.
 
 ```sql
 SELECT trigrams('hello');                     -- ['hel', 'ell', 'llo']
 SELECT trigrams('Hello', 4, false);           -- gram size 4, case-sensitive
+SELECT ngram_gram_key('hel');                 -- the storage key of one normalized gram
+SELECT ngram_gram_keys('Hello', 3, true);     -- keys of a text's distinct grams, ascending
 SELECT ngram_encode_postings([1, 2, 5]);      -- posting blob codec
 SELECT ngram_decode_postings(blob);
+SELECT ngram_pack_segment(rowid) FROM t;      -- the build's aggregate: one segment's postings row
+SELECT * FROM ngram_unpack_postings(           -- every (gram_key, segment_no, rowid) of a segments table
+    (SELECT gram_key, segment_no, postings FROM __ngram.segments_<hex>));
 ```
 
 ---
@@ -517,7 +547,7 @@ SELECT ngram_decode_postings(blob);
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `ngram_auto_accelerate` | `false` | Whether plain `LIKE`/`contains`/`ILIKE` may be rewritten to use the index. Rewrites are exhaustive and resource-bounded, including guard-, work-, memory-, and density-driven full-scan fallback. It remains opt-in so enabling the extension does not silently change query plans. |
-| `ngram_max_candidate_fraction` | `0.01` | A full-result ngram query whose candidate upper bound exceeds this fraction of the table scans instead. This bounds fetch-and-recheck work after the probe; the raw candidate API does not use this fetch-vs-scan policy. |
+| `ngram_max_candidate_fraction` | `0.02` | A full-result ngram query scans instead of probing when its fetch-equivalent candidate bound exceeds this fraction of the indexed rows. The bound counts each candidate of a scattered segment as one fetch, discounts a segment whose candidates could be read as range scans to its rowid span over four, and multiplies by one plus the projected columns beyond the recheck's, charged per candidate because the match rate is unknown at planning and every such column is one more fetch per kept row. The raw candidate API does not use this fetch-versus-scan policy. The default is the measured break-even on enwik9 (`docs/review/2026-09-09`): a scattered fetch costs 0.8 to 1.5 µs of CPU at one thread and 0.22 to 0.29 µs of wall time at 24 threads against 92 ns and 6.3 ns for a scanned row; a needle with a 3.2% candidate bound still beats the scan at every thread count, one at 3.6% loses at 24 threads, and 2% rounds toward scanning. |
 | `ngram_max_grams_per_query` | `3` | How many of the needle's rarest grams to probe. Each extra gram costs another posting-list decode but can narrow the candidate set; the default balances those costs for natural-language text. |
 | `ngram_max_probe_rowids` | `100000000` | Hard upper bound on posting rowids decoded by one query. Exact query paths scan instead when the estimate exceeds it; `ngram_candidates` returns a resource-limit error. |
 | `ngram_build_partitions` | `0` | How many rowid-range partitions `create_ngram_index`, `ngram_refresh` and `ngram_compact` split their packing pass into. Build and refresh size zero from `memory_limit` using a sample; compact instead uses fine segment-aligned ranges without sampling the base. Because range width is rounded down to whole segments, auto can emit up to nearly twice its 4096-range request. An explicit value overrides either policy. Raise it if a build runs out of memory on unusually long rows, or lower it to pack in fewer passes. The index it produces is identical whatever you set. |
@@ -554,25 +584,25 @@ Same-machine observations; queries are warm-cache for a **non-default case-sensi
 index** over nonempty line-per-row `enwik9`. These are not cold-cache, large-scale, or
 shipped-default claims. Raw evidence: [`benchmarks/artifacts/enwik9-current-v1.json`](benchmarks/artifacts/enwik9-current-v1.json).
 
-- Engine commit: `b6a388c8c39f`; build commit: `b6a388c8c39f`; DuckDB v1.5.5 / source d8cdaa33;
+- Engine commit: `6fb01c606165`; build commit: `6fb01c606165`; DuckDB v1.5.5 / source d8cdaa33;
   static-extension release CLI. The numbers describe the engine commit's `src/**` and are
   re-collected on release; later commits keep this block until the next collection.
 - Corpus: 10,920,423 rows, 0.919 GiB of UTF-8 text; three fresh load/build pairs.
 - Timed load—fresh CLI and absent DB through create, hex decode, insert, CHECKPOINT—was
-  2.299 s median (2.170–2.401 s). Timed index build—fresh CLI through create-index and
-  CHECKPOINT—was 7.834 s median (7.781–7.941 s), 120.14 MiB/s of source text.
-- Paired whole-database size increase: 0.996 GiB apparent, 0.996 GiB allocated
-  (median); 1.083× source bytes. This whole-DB effect includes allocator/checkpoint effects.
-- Build-process max RSS: 11.752 GiB median. Sampled peak temp apparent file bytes: 0.000 GiB
+  2.066 s median (1.981–2.138 s). Timed index build—fresh CLI through create-index and
+  CHECKPOINT—was 7.554 s median (7.477–8.880 s), 124.59 MiB/s of source text.
+- Paired whole-database size increase: 0.992 GiB apparent, 0.992 GiB allocated
+  (median); 1.080× source bytes. This whole-DB effect includes allocator/checkpoint effects.
+- Build-process max RSS: 7.920 GiB median. Sampled peak temp apparent file bytes: 0.000 GiB
   median, polled every 100 ms; zero means none observed, not proof that no brief spill occurred.
   Acquisition, normalization, relation/stat checks, EXPLAIN, and parity are untimed. Loads may
   read cached transport pages; builds follow relation identity and may read cached source pages.
 
 | needle class | ngram_search mode | exact matches | candidates | ngram_search p50 / p95 / range | scan p50 / p95 / range | scan ÷ search p50 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| rare | index | 1 | 12 | 7 / 7 ms / 6–7 ms | 43 / 45 ms / 42–47 ms | 6.14× |
-| moderate | index | 26,068 | 26,381 | 15 / 16 ms / 14–17 ms | 29 / 30 ms / 27–31 ms | 1.93× |
-| dense | full-scan-fallback | 1,963,067 | 1,963,067 | 44 / 45 ms / 43–46 ms | 39 / 40 ms / 37–40 ms | 0.89× |
+| rare | index | 1 | 12 | 1 / 2 ms / 0–4 ms | 42 / 43 ms / 40–45 ms | 42.00× |
+| moderate | index | 26,068 | 26,381 | 6 / 7 ms / 5–8 ms | 28 / 30 ms / 26–31 ms | 4.67× |
+| dense | full-scan-fallback | 1,963,067 | 1,963,067 | 37 / 40 ms / 36–43 ms | 37 / 39 ms / 36–45 ms | 1.00× |
 
 The timed campaign adds one warmup per variant after untimed parity/EXPLAIN executions, then
 twenty-one measured observations per variant using a fixed-seed interleaving on one connection.
@@ -644,15 +674,13 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
 
 ## Platform support
 
-The last full distribution-matrix run was Phase 9, before the format-3 rowid
-guard: DuckDB v1.5.5 built on Linux (x86_64, arm64), macOS (x86_64, arm64),
-Windows (x86_64 MSVC, x86_64 MinGW, arm64), and Wasm (mvp, eh, threads).
-Linux x86_64, macOS arm64, and all three Windows targets each passed the same
-2,559 assertions in 21 test cases; the remaining targets built and linked.
-The two opt-in musl targets were not built. The final format-3 submission
-commit must rerun that matrix; local Phase 11 results are recorded separately
-in `ngram_index_plan.md` and do not establish cross-platform coverage for the
-new custom index type and extension callbacks.
+The distribution matrix (`.github/workflows/MainDistributionPipeline.yml`)
+builds DuckDB v1.5.5 with the extension on Linux (x86_64, arm64), macOS
+(x86_64, arm64), Windows (x86_64 MSVC, x86_64 MinGW, arm64) and Wasm (mvp,
+eh, threads), and runs the SQL suite on the targets that can execute it; the
+C++ harness runs on Linux and macOS. The latest matrix run is recorded in
+`ngram_review_plan.md` beside the commit it ran on; the two opt-in musl
+targets are not built.
 
 ---
 
@@ -662,7 +690,7 @@ new custom index type and extension callbacks.
 git clone --recurse-submodules <repo>
 cd duckdb-ngram
 make                # release build; ./build/release/duckdb has the extension linked in
-make test           # sqllogictest suite
+make test           # the C++ harness, then the sqllogictest suite
 GEN=ninja make debug        # DEBUG + AddressSanitizer build
 ```
 
@@ -674,17 +702,21 @@ DuckDB v1.5.5 with:
 duckdb -unsigned -c "LOAD '/path/to/ngram.duckdb_extension';"
 ```
 
-Property-based and long-running harnesses live in `scripts/`:
+Property-based and long-running harnesses live in `scripts/`, and the C++
+harness for invariants SQL cannot control in `test/cpp`; `test/README.md`
+describes each kind and how to select the harness's tests by mechanism:
 
 ```sh
 python3 scripts/differential_search.py --trials 8 --seed 12345
 python3 scripts/differential_search.py --transparent --trials 8 --seed 12345
 python3 scripts/churn_maintenance.py --rounds 40 --seed 12345
 python3 scripts/crash_maintenance.py --seed 12345
+build/release/extension/ngram/ngram_checkpoint_gap_test /tmp/harness.db test/fixtures --only query
 ```
 
 Benchmarks and corpus generation live in `benchmarks/`; see
-[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md). Updating the host pin is
+described in [docs/UPDATING.md](docs/UPDATING.md).
 
 ## License
 

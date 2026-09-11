@@ -1,0 +1,60 @@
+{
+ "compact_merge": {
+  "max_ms": 719.0,
+  "min_ms": 719.0,
+  "n": 1,
+  "p50_ms": 719.0
+ },
+ "compact_noop": {
+  "max_ms": 1.0,
+  "min_ms": 0.0,
+  "n": 7,
+  "p50_ms": 0.0
+ },
+ "compact_noop_after_checkpoint": {
+  "max_ms": 1.0,
+  "min_ms": 0.0,
+  "n": 7,
+  "p50_ms": 0.0
+ },
+ "compact_noop_in_merge_process": {
+  "max_ms": 28.0,
+  "min_ms": 22.0,
+  "n": 7,
+  "p50_ms": 24.0
+ },
+ "git_head": "464023e399ca37696d514b70f0803224d502ff3b",
+ "refresh_100k_rows": {
+  "max_ms": 529.0,
+  "min_ms": 529.0,
+  "n": 1,
+  "p50_ms": 529.0
+ },
+ "refresh_noop": {
+  "max_ms": 1.0,
+  "min_ms": 0.0,
+  "n": 7,
+  "p50_ms": 0.0
+ },
+ "refresh_noop_after_checkpoint": {
+  "max_ms": 1.0,
+  "min_ms": 0.0,
+  "n": 7,
+  "p50_ms": 0.0
+ },
+ "refresh_noop_bounded": {
+  "max_ms": 3.0,
+  "min_ms": 1.0,
+  "n": 7,
+  "p50_ms": 2.0
+ },
+ "refresh_noop_in_refresh_process": {
+  "max_ms": 1.0,
+  "min_ms": 0.0,
+  "n": 7,
+  "p50_ms": 0.0
+ },
+ "rows": "10920423",
+ "stats_after": "s,3,true,11020422,10936319,0,605513,1958417,0,1,711434908,855979002,NULL",
+ "stats_two_generations": "s,3,true,11020422,11020422,0,605513,2033670,52426,2,718747172,865019871,NULL"
+}

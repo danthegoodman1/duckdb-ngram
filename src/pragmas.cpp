@@ -1,9 +1,13 @@
 //===----------------------------------------------------------------------===//
-// pragmas.cpp: the PRAGMA entry points: parameter parsing, target resolution, and the query or script each one
-// returns to the statement preprocessor.
+// pragmas.cpp: the PRAGMA entry points and the metadata table functions: parameter parsing, target resolution, and
+// the query or script each one returns to the statement preprocessor.
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "ngram/build_sql.hpp"
 #include "ngram/index_state.hpp"
 #include "ngram_extension.hpp"
@@ -93,40 +97,61 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	return CreateIndexScript(context, target, options);
 }
 
-static string DropNgramIndexByIdQuery(ClientContext &context, const FunctionParameters &parameters) {
-	auto catalog_name = parameters.values[0].ToString();
-	auto index_ref = parameters.values[1].ToString();
+//! The drop script of the index `index_ref` in `catalog_name`: the form that
+//! needs no base table, for orphaned, malformed and old-format rows.
+static string DropByReference(ClientContext &context, const string &catalog_name, const string &index_ref) {
 	auto database = DatabaseManager::Get(context).GetDatabase(context, catalog_name);
 	if (!database || database->IsReadOnly()) {
-		throw InvalidInputException("drop_ngram_index_by_id: catalog %s is missing or read-only", catalog_name);
+		throw InvalidInputException("drop_ngram_index: catalog %s is missing or read-only", catalog_name);
 	}
 	auto index = FindObserved(context, catalog_name, index_ref);
 	if (!index.location.registry_oid) {
-		throw InvalidInputException("drop_ngram_index_by_id: %s: %s; drop the storage tables of that id in the %s "
-		                            "schema manually",
+		throw InvalidInputException("drop_ngram_index: %s: %s; drop the storage tables of that id in the %s schema "
+		                            "manually",
 		                            index_ref, index.reason, NGRAM_SCHEMA);
 	}
 	return DropIndexScript(context, index);
 }
 
+//! drop_ngram_index(table, column) drops the one index of that column;
+//! drop_ngram_index(index_ref, catalog = 'db') drops by reference, in the
+//! current database unless a catalog is named, since copied attached
+//! databases may hold the same reference.
 static string DropNgramIndexQuery(ClientContext &context, const FunctionParameters &parameters) {
+	string catalog_name;
+	auto named = parameters.named_parameters.find("catalog");
+	if (named != parameters.named_parameters.end()) {
+		catalog_name = RequireStringParam(named->second, "drop_ngram_index", "catalog");
+	}
+	if (parameters.values.size() == 1) {
+		if (catalog_name.empty()) {
+			catalog_name = DatabaseManager::GetDefaultDatabase(context);
+		}
+		return DropByReference(context, catalog_name, parameters.values[0].ToString());
+	}
+	if (!catalog_name.empty()) {
+		throw BinderException("drop_ngram_index: the catalog parameter belongs to the index_ref form; qualify the "
+		                      "table name instead");
+	}
 	auto table_input = parameters.values[0].ToString();
 	auto column_name = parameters.values[1].ToString();
-
 	auto target = ResolveTarget(context, table_input, column_name, false);
 	auto indexes = ExistingIndexes(context, target);
 	RequireUniqueIndexColumns(indexes);
 	if (indexes.empty()) {
 		throw CatalogException("No ngram index exists on %s.%s", target.table_name, target.column_name);
 	}
-	FunctionParameters by_id;
-	by_id.values = {Value(target.catalog_name), Value(indexes[0].index_ref)};
-	return DropNgramIndexByIdQuery(context, by_id);
+	return DropByReference(context, target.catalog_name, indexes[0].index_ref);
 }
 
-static string NgramIndexStatsQuery(ClientContext &context, const FunctionParameters &parameters) {
-	auto table_input = parameters.values[0].ToString();
-
+//! The statistics SELECT of every index of `table_input`. A stats run is
+//! where a user decides whether to refresh or compact, so it reports the
+//! table facts the maintenance pragmas compare against: how far the index
+//! lags the table, how fragmented the segments are, and whether the guard
+//! already knows the index is dead. Every fact is read by the SELECT itself,
+//! the guard verdict through one join with ngram_indexes(), so one executing
+//! statement sees one snapshot; only the list of indexes is resolved at bind.
+static string IndexStatsSelect(ClientContext &context, const string &table_input) {
 	auto target = ResolveTarget(context, table_input, string(), false);
 	if (!target.entry->IsDuckTable()) {
 		throw BinderException("ngram_index_stats: %s is not a DuckDB base table", table_input);
@@ -136,106 +161,132 @@ static string NgramIndexStatsQuery(ClientContext &context, const FunctionParamet
 	if (indexes.empty()) {
 		throw CatalogException("No ngram indexes exist on %s", target.table_name);
 	}
-
-	// A stats run is where a user decides whether to refresh or compact, so it
-	// reports the table facts the maintenance pragmas compare against: how far
-	// the index lags the table, how fragmented the segments are, and whether the
-	// guard already knows the index is dead. The guard verdict and the table's
-	// rowid count are read here, in the pragma callback, and embedded as literals.
-	auto total_rows = TableTotalRows(*target.entry);
 	auto base = target.Qualified();
 	auto count = SystemFunction("count");
-	auto encode = SystemFunction("encode");
 	auto subquery = [](const string &select) {
 		return "(SELECT " + select + ")";
 	};
-	string query;
+	auto committed = " AND rowid < " + to_string(MAX_ROW_ID);
 	std::sort(indexes.begin(), indexes.end(), [](const IndexLocation &left, const IndexLocation &right) {
 		return left.column_name < right.column_name;
 	});
+	string rows;
 	for (auto &location : indexes) {
 		auto segments = StorageTable(target.catalog_name, location.SegmentsTable());
-		auto stats = StorageTable(target.catalog_name, location.StatsTable());
-		auto verdict = ValidateIndex(context, target, location);
-		if (verdict.availability != IndexAvailability::AVAILABLE) {
-			throw CatalogException("ngram: index %s no longer exists; was it dropped after binding?",
-			                       location.index_ref);
-		}
-		auto &staleness = verdict.reason;
-		if (!query.empty()) {
-			query += "UNION ALL ";
+		if (!rows.empty()) {
+			rows += " UNION ALL ";
 		}
 		// remaining_tail is what a bounded-refresh loop watches from outside the
 		// call: the committed rows the index does not cover yet, counted against
 		// the registry row's own mark, so it is exact even though deletes leave
-		// rowid gaps below table_max_rowid.
-		query +=
-		    "SELECT m.column_name, m.gram_size, m.case_insensitive, m.hwm_rowid, " + to_string(total_rows - 1) +
-		    "::BIGINT AS table_max_rowid, " +
-		    subquery(count + "(*) FROM " + base + " WHERE rowid > m.hwm_rowid AND rowid < " + to_string(MAX_ROW_ID)) +
-		    " AS remaining_tail, " + subquery(count + "(DISTINCT " + encode + "(gram)) FROM " + stats) +
-		    " AS distinct_grams, " + subquery(count + "(*) FROM " + segments) + " AS segments, " +
-		    subquery(count + "(*) FROM (SELECT " + encode + "(gram) AS gram_key, segment_no FROM " + segments +
-		             " GROUP BY " + encode + "(gram), segment_no HAVING " + count + "(*) > 1)") +
+		// rowid gaps below table_max_rowid, the highest committed live rowid.
+		// Rows this transaction appended carry provisional rowids past
+		// MAX_ROW_ID and are in neither.
+		rows +=
+		    "SELECT m.index_id::VARCHAR AS index_ref, m.column_name, m.gram_size, m.case_insensitive, "
+		    "m.hwm_rowid, " +
+		    subquery("coalesce(" + SystemFunction("max") + "(rowid), -1)::BIGINT FROM " + base + " WHERE true" +
+		             committed) +
+		    " AS table_max_rowid, " + subquery(count + "(*) FROM " + base + " WHERE rowid > m.hwm_rowid" + committed) +
+		    " AS remaining_tail, " + subquery(count + "(DISTINCT gram_key) FROM " + segments) + " AS distinct_grams, " +
+		    subquery(count + "(*) FROM " + segments) + " AS segments, " +
+		    subquery(count + "(*) FROM (SELECT gram_key, segment_no FROM " + segments +
+		             " GROUP BY gram_key, segment_no HAVING " + count + "(*) > 1)") +
 		    " AS fragmented_keys, " + subquery(count + "(DISTINCT generation) FROM " + segments) + " AS generations, " +
 		    subquery("coalesce(" + SystemFunction("sum") + "(rowid_count), 0) FROM " + segments) +
 		    " AS posting_entries, " +
 		    subquery("coalesce(" + SystemFunction("sum") + "(" + SystemFunction("octet_length") +
 		             "(postings)), 0) FROM " + segments) +
-		    " AS postings_bytes, " + (staleness.empty() ? string("NULL::VARCHAR") : Lit(staleness)) +
-		    " AS stale_reason FROM " + Registry(target.catalog_name) +
-		    " m WHERE m.index_id = " + Lit(location.index_ref) + "::UUID ";
+		    " AS postings_bytes FROM " + Registry(target.catalog_name) +
+		    " m WHERE m.index_id = " + Lit(location.index_ref) + "::UUID";
 	}
-	query += "ORDER BY column_name;";
-	return query;
+	// the guard verdict of every index from one observation of the listing
+	return "SELECT s.column_name, s.gram_size, s.case_insensitive, s.hwm_rowid, s.table_max_rowid, "
+	       "s.remaining_tail, s.distinct_grams, s.segments, s.fragmented_keys, s.generations, s.posting_entries, "
+	       "s.postings_bytes, i.reason AS stale_reason FROM (" +
+	       rows + ") s LEFT JOIN " + SystemFunction("ngram_indexes") +
+	       "() i ON i.database_name = " + Lit(target.catalog_name) +
+	       " AND i.index_ref = s.index_ref ORDER BY s.column_name";
 }
 
-static constexpr const char *OBSERVED_COLUMNS =
-    "v(database_name,index_ref,schema_name,table_name,column_name,format_version,status,reason)";
-
-static string ValuesRow(const ObservedIndex &index) {
-	auto value = [](const string &text) {
-		return text.empty() ? string("NULL::VARCHAR") : Lit(text);
-	};
-	return "(" + Lit(index.catalog_name) + ", " + Lit(index.location.index_ref) + ", " + value(index.schema_name) +
-	       ", " + value(index.table_name) + ", " + value(index.location.column_name) + ", " +
-	       (index.format_version < 0 ? "NULL::BIGINT" : to_string(index.format_version) + "::BIGINT") + ", " +
-	       Lit(index.status) + ", " + value(index.reason) + ")";
+//! ngram_index_stats(table) as a table function: the SELECT above replaces
+//! the call at bind, so it composes in FROM clauses and joins.
+static unique_ptr<TableRef> IndexStatsBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	auto table_input = RequireStringParam(input.inputs[0], "ngram_index_stats", "table");
+	Parser parser(context.GetParserOptions());
+	parser.ParseQuery(IndexStatsSelect(context, table_input));
+	D_ASSERT(parser.statements.size() == 1 && parser.statements[0]->type == StatementType::SELECT_STATEMENT);
+	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+	return make_uniq<SubqueryRef>(std::move(select));
 }
 
-static string NgramIndexesQuery(ClientContext &context, const FunctionParameters &) {
-	vector<ObservedIndex> indexes;
+static string NgramIndexStatsQuery(ClientContext &context, const FunctionParameters &parameters) {
+	return "SELECT * FROM " + SystemFunction("ngram_index_stats") + "(" + Lit(parameters.values[0].ToString()) + ");";
+}
+
+//===----------------------------------------------------------------------===//
+// ngram_indexes(): every index and stray storage object of every attached
+// DuckDB catalog, with its lifecycle status. The catalogs are observed when
+// the statement executes, so a row describes the executing snapshot; the
+// listing is the cheap status, ngram_index_stats the full aggregation.
+//===----------------------------------------------------------------------===//
+
+struct IndexesGlobalState : public GlobalTableFunctionState {
+	vector<ObservedIndex> rows;
+	idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> IndexesBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"database_name", "index_ref",      "schema_name", "table_name",
+	         "column_name",   "format_version", "status",      "reason"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR};
+	return make_uniq<TableFunctionData>();
+}
+
+static unique_ptr<GlobalTableFunctionState> IndexesInitGlobal(ClientContext &context, TableFunctionInitInput &) {
+	auto state = make_uniq<IndexesGlobalState>();
 	for (auto &database : DatabaseManager::Get(context).GetDatabases(context)) {
 		if (!database->HasStorageManager() || !database->GetCatalog().IsDuckCatalog()) {
 			continue;
 		}
 		auto observed = ObserveCatalog(context, database->GetName());
-		indexes.insert(indexes.end(), std::make_move_iterator(observed.begin()),
-		               std::make_move_iterator(observed.end()));
+		state->rows.insert(state->rows.end(), std::make_move_iterator(observed.begin()),
+		                   std::make_move_iterator(observed.end()));
 	}
-	string query = "SELECT * FROM (VALUES ";
-	if (indexes.empty()) {
-		query += "(NULL::VARCHAR,NULL::VARCHAR,NULL::VARCHAR,NULL::VARCHAR,NULL::VARCHAR,NULL::BIGINT,NULL::VARCHAR,"
-		         "NULL::VARCHAR)";
-	} else {
-		for (idx_t i = 0; i < indexes.size(); i++) {
-			if (i) {
-				query += ",";
-			}
-			query += ValuesRow(indexes[i]);
+	std::sort(state->rows.begin(), state->rows.end(), [](const ObservedIndex &left, const ObservedIndex &right) {
+		if (left.catalog_name != right.catalog_name) {
+			return left.catalog_name < right.catalog_name;
 		}
-	}
-	query += ") " + string(OBSERVED_COLUMNS);
-	if (indexes.empty()) {
-		query += " WHERE false";
-	}
-	query += " ORDER BY database_name,index_ref";
-	return query;
+		return left.location.index_ref < right.location.index_ref;
+	});
+	return state;
 }
 
-static string NgramIndexStatusQuery(ClientContext &context, const FunctionParameters &parameters) {
-	auto index = FindObserved(context, parameters.values[0].ToString(), parameters.values[1].ToString());
-	return "SELECT * FROM (VALUES " + ValuesRow(index) + ") " + OBSERVED_COLUMNS;
+static void IndexesFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<IndexesGlobalState>();
+	auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.rows.size() - state.offset);
+	auto text = [](const string &value) {
+		return value.empty() ? Value(LogicalType::VARCHAR) : Value(value);
+	};
+	for (idx_t i = 0; i < count; i++) {
+		auto &row = state.rows[state.offset + i];
+		output.SetValue(0, i, Value(row.catalog_name));
+		output.SetValue(1, i, Value(row.location.index_ref));
+		output.SetValue(2, i, text(row.schema_name));
+		output.SetValue(3, i, text(row.table_name));
+		output.SetValue(4, i, text(row.location.column_name));
+		output.SetValue(5, i, row.format_version < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(row.format_version));
+		output.SetValue(6, i, Value(row.status));
+		output.SetValue(7, i, text(row.reason));
+	}
+	state.offset += count;
+	output.SetCardinality(count);
+}
+
+static string NgramIndexesQuery(ClientContext &context, const FunctionParameters &) {
+	return "SELECT * FROM " + SystemFunction("ngram_indexes") + "() ORDER BY database_name, index_ref";
 }
 
 static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParameters &parameters) {
@@ -281,16 +332,25 @@ void RegisterPragmas(ExtensionLoader &loader) {
 	create_fun.named_parameters["case_insensitive"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(create_fun);
 
-	loader.RegisterFunction(PragmaFunction::PragmaCall("drop_ngram_index", DropNgramIndexQuery,
-	                                                   {LogicalType::VARCHAR, LogicalType::VARCHAR}));
+	// drop_ngram_index(table, column) and drop_ngram_index(index_ref, catalog = 'db')
+	PragmaFunctionSet drop_set("drop_ngram_index");
+	for (auto &arguments :
+	     vector<vector<LogicalType>> {{LogicalType::VARCHAR}, {LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
+		auto drop = PragmaFunction::PragmaCall("drop_ngram_index", DropNgramIndexQuery, arguments);
+		drop.named_parameters["catalog"] = LogicalType::VARCHAR;
+		drop_set.AddFunction(std::move(drop));
+	}
+	loader.RegisterFunction(std::move(drop_set));
 
+	// the metadata table functions and their pragma spellings
+	TableFunction indexes("ngram_indexes", {}, IndexesFunction, IndexesBind, IndexesInitGlobal);
+	loader.RegisterFunction(indexes);
+	TableFunction stats("ngram_index_stats", {LogicalType::VARCHAR}, nullptr);
+	stats.bind_replace = IndexStatsBindReplace;
+	loader.RegisterFunction(stats);
 	loader.RegisterFunction(
 	    PragmaFunction::PragmaCall("ngram_index_stats", NgramIndexStatsQuery, {LogicalType::VARCHAR}));
 	loader.RegisterFunction(PragmaFunction::PragmaStatement("ngram_indexes", NgramIndexesQuery));
-	loader.RegisterFunction(PragmaFunction::PragmaCall("ngram_index_status", NgramIndexStatusQuery,
-	                                                   {LogicalType::VARCHAR, LogicalType::VARCHAR}));
-	loader.RegisterFunction(PragmaFunction::PragmaCall("drop_ngram_index_by_id", DropNgramIndexByIdQuery,
-	                                                   {LogicalType::VARCHAR, LogicalType::VARCHAR}));
 
 	// two overloads so the bound can be written either way: positionally,
 	// PRAGMA ngram_refresh('t', 100000), or by name, max_rows = 100000 (pragma

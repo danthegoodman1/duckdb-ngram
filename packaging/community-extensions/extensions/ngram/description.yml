@@ -68,9 +68,8 @@ docs:
 
     * `PRAGMA create_ngram_index(table, column[, gram, case_insensitive])`,
       `PRAGMA drop_ngram_index(table, column)`
-    * `PRAGMA ngram_indexes`,
-      `PRAGMA ngram_index_status(database_name, index_ref)`, and
-      `PRAGMA drop_ngram_index_by_id(database_name, index_ref)` — discover and
+    * `ngram_indexes()` — the lifecycle listing, one row per index or stray
+      storage object, and `PRAGMA drop_ngram_index(index_ref[, catalog])` —
       remove UUID-backed or legacy allocations even after the base is absent
     * `ngram_search(table, needle[, col])` — rows, exact and complete
     * `ngram_candidates(table, column, needle)` — the raw superset, for
@@ -86,9 +85,9 @@ docs:
     Guard identity and durable state are validated on every query. If they
     cannot prove the indexed prefix safe, explicit and transparent search take
     one exhaustive scan, candidates enumerate the visible indexed prefix, and
-    maintenance refuses until rebuild. Transparent acceleration remains opt-in
-    until candidate materialization is resource-bounded and its two execution
-    engines are consolidated; exactness is unconditional today.
+    maintenance refuses until rebuild. Transparent acceleration is opt-in so
+    that loading the extension changes no plan; rewrites are exhaustive and
+    resource-bounded, and exactness is unconditional.
 
     DuckDB v1.5.5 refuses table/column rename while the physical guard exists;
     schema moves/renames are host-not-implemented. Save the catalog-qualified

@@ -1,0 +1,429 @@
+# name: test/sql/ngram_api.test
+# description: the metadata table functions, drop by reference, refresh progress, and the query-shape matrix
+# group: [sql]
+
+require ngram
+
+statement ok
+CREATE TABLE docs(id INTEGER, s VARCHAR, t VARCHAR);
+
+# duplicate rows (ids 3 and 4), NULLs, empty strings, literal wildcards, and
+# folds that change byte length
+statement ok
+INSERT INTO docs VALUES
+	(1, 'one tent', 'x'),
+	(2, 'two TENT city', 'y'),
+	(3, 'same tent', 'same'),
+	(4, 'same tent', 'same'),
+	(5, NULL, 'null s'),
+	(6, '', 'empty s'),
+	(7, '50% off_road', 'pct'),
+	(8, 'back\slash', 'bs'),
+	(9, 'Straße tent', 'sharp s'),
+	(10, 'İstanbul', 'dotted I'),
+	(11, 'x_y tent', 'underscore');
+
+#===----------------------------------------------------------------------===#
+# ngram_indexes(): the cheap status, composable, in the executing snapshot
+#===----------------------------------------------------------------------===#
+
+query I
+SELECT count(*) FROM ngram_indexes();
+----
+0
+
+statement ok
+PRAGMA create_ngram_index('docs', 's');
+
+# the pragma spelling is the same function, ordered by database and reference
+query IIIIIIII
+PRAGMA ngram_indexes;
+----
+memory	<REGEX>:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}	main	docs	s	5	READY	NULL
+
+statement ok
+PRAGMA create_ngram_index('docs', 't', case_insensitive = false);
+
+query IIII
+SELECT table_name, column_name, format_version, status FROM ngram_indexes() WHERE table_name = 'docs' ORDER BY column_name;
+----
+docs	s	5	READY
+docs	t	5	READY
+
+statement ok
+SET VARIABLE s_ref = (SELECT index_ref FROM ngram_indexes() WHERE table_name = 'docs' AND column_name = 's');
+
+#===----------------------------------------------------------------------===#
+# ngram_index_stats(table): the full statistics, composable, every fact read
+# by the statement that runs it
+#===----------------------------------------------------------------------===#
+
+query IIIIII
+SELECT column_name, hwm_rowid, table_max_rowid, remaining_tail, generations, stale_reason
+FROM ngram_index_stats('docs') ORDER BY column_name;
+----
+s	10	10	0	1	NULL
+t	10	10	0	1	NULL
+
+# the pragma spelling is the same function
+query IIIIIIIIIIIII
+PRAGMA ngram_index_stats('docs');
+----
+s	3	true	10	10	0	<REGEX>:[1-9][0-9]*	<REGEX>:[1-9][0-9]*	0	1	<REGEX>:[1-9][0-9]*	<REGEX>:[1-9][0-9]*	NULL
+t	3	false	10	10	0	<REGEX>:[1-9][0-9]*	<REGEX>:[1-9][0-9]*	0	1	<REGEX>:[1-9][0-9]*	<REGEX>:[1-9][0-9]*	NULL
+
+# joined with the listing on the reference
+query II
+SELECT i.status, st.remaining_tail
+FROM ngram_indexes() i JOIN ngram_index_stats('docs') st ON st.column_name = i.column_name
+WHERE i.index_ref = getvariable('s_ref');
+----
+READY	0
+
+statement ok
+INSERT INTO docs VALUES (12, 'late tent', 'late');
+
+# the statement's own snapshot: the row appended above is tail
+query III
+SELECT hwm_rowid, table_max_rowid, remaining_tail FROM ngram_index_stats('docs') WHERE column_name = 's';
+----
+10	11	1
+
+# a prepared statement observes at each execution, never at its bind
+statement ok
+PREPARE stats AS SELECT hwm_rowid, table_max_rowid, remaining_tail FROM ngram_index_stats('docs') WHERE column_name = 's';
+
+query III
+EXECUTE stats;
+----
+10	11	1
+
+statement ok
+INSERT INTO docs VALUES (13, 'later tent', 'later');
+
+query III
+EXECUTE stats;
+----
+10	12	2
+
+statement ok
+DELETE FROM docs WHERE id = 13;
+
+# this transaction's own rows carry provisional rowids and are in no column
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO docs VALUES (14, 'local tent', 'local');
+
+query III
+SELECT hwm_rowid, table_max_rowid, remaining_tail FROM ngram_index_stats('docs') WHERE column_name = 's';
+----
+10	11	1
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT * FROM ngram_index_stats('nope');
+----
+does not exist
+
+#===----------------------------------------------------------------------===#
+# every refresh reports progress
+#===----------------------------------------------------------------------===#
+
+query IIII
+PRAGMA ngram_refresh('docs', col = 's');
+----
+s	1	11	0
+
+query IIII
+PRAGMA ngram_refresh('docs');
+----
+s	0	11	0
+t	1	11	0
+
+query IIII
+PRAGMA ngram_refresh('docs', 100);
+----
+s	0	11	0
+t	0	11	0
+
+#===----------------------------------------------------------------------===#
+# drop by reference, catalog explicit or current
+#===----------------------------------------------------------------------===#
+
+statement error
+PRAGMA drop_ngram_index('docs', 't', catalog = 'memory');
+----
+qualify the table name
+
+statement error
+PRAGMA drop_ngram_index(getvariable('s_ref'), owner = 'memory');
+----
+Invalid named parameter "owner"
+
+statement error
+PRAGMA drop_ngram_index('not-a-uuid');
+----
+canonical lowercase UUID
+
+statement ok
+PRAGMA drop_ngram_index(getvariable('s_ref'), catalog = 'memory');
+
+query II
+SELECT column_name, status FROM ngram_indexes() WHERE table_name = 'docs';
+----
+t	READY
+
+statement ok
+SET VARIABLE t_ref = (SELECT index_ref FROM ngram_indexes() WHERE table_name = 'docs' AND column_name = 't');
+
+statement ok
+PRAGMA drop_ngram_index(getvariable('t_ref'));
+
+query I
+SELECT count(*) FROM ngram_indexes();
+----
+0
+
+statement error
+PRAGMA drop_ngram_index(getvariable('t_ref'), catalog = 'memory');
+----
+does not exist
+
+statement error
+PRAGMA drop_ngram_index(getvariable('t_ref'), catalog = 'nope');
+----
+missing or read-only
+
+statement error
+PRAGMA drop_ngram_index('docs');
+----
+drop_ngram_index(table, column)
+
+#===----------------------------------------------------------------------===#
+# the query-shape matrix: the transparent rewrite and ngram_search against
+# the native predicate, as multisets, with and without an index
+#===----------------------------------------------------------------------===#
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+statement ok
+SET ngram_max_candidate_fraction = 1;
+
+# without any index the shapes are the host's own
+query I
+SELECT list(id ORDER BY id)::VARCHAR FROM docs WHERE s LIKE '%tent%';
+----
+[1, 3, 4, 9, 11, 12]
+
+statement ok
+PRAGMA create_ngram_index('docs', 's');
+
+statement ok
+SET VARIABLE s_ref = (SELECT index_ref FROM ngram_indexes() WHERE table_name = 'docs' AND column_name = 's');
+
+# every shape: accelerated result equals the extension-disabled result, both
+# ways; the predicates are spliced into query() so that one loop covers them
+statement ok
+SET VARIABLE predicates = [
+	's LIKE ''%tent%''',
+	's ILIKE ''%TENT%''',
+	'contains(s, ''tent'')',
+	's LIKE ''%50\%%'' ESCAPE ''\''',
+	's LIKE ''%x_y%''',
+	's LIKE ''%off_road%''',
+	's LIKE ''%off\_road%'' ESCAPE ''\''',
+	's LIKE ''one%''',
+	's LIKE ''%tent''',
+	's LIKE ''same tent''',
+	's ILIKE ''%straße%''',
+	's ILIKE ''%STRASSE%''',
+	's ILIKE ''%istanbul%''',
+	's LIKE ''%''',
+	's LIKE ''''',
+	's LIKE ''%te%nt%''',
+	's LIKE ''%\\%'' ESCAPE ''\''',
+	'contains(s, '''')',
+	's LIKE NULL',
+	'contains(s, NULL)',
+	's LIKE ''%tent%'' AND t <> ''x''',
+	's LIKE ''%tent%'' OR t = ''pct''',
+	'NOT (s LIKE ''%tent%'')',
+	's LIKE ''%tent%'' AND s LIKE ''%same%'''
+];
+
+foreach i 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TEMP TABLE oracle AS SELECT * FROM query('SELECT id, s, t FROM docs WHERE ' || getvariable('predicates')[${i}]);
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM query('SELECT id, s, t FROM docs WHERE ' || getvariable('predicates')[${i}]) EXCEPT ALL SELECT id, s, t FROM oracle)
+	UNION ALL
+	(SELECT id, s, t FROM oracle EXCEPT ALL SELECT * FROM query('SELECT id, s, t FROM docs WHERE ' || getvariable('predicates')[${i}]))
+);
+----
+0
+
+endloop
+
+# the shapes that accelerate, and the ones that stay native
+query II
+EXPLAIN SELECT count(*) FROM docs WHERE s LIKE '%tent%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+query II
+EXPLAIN SELECT count(*) FROM docs WHERE s ILIKE '%TENT%';
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+query II
+EXPLAIN SELECT count(*) FROM docs WHERE contains(s, 'tent');
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+# a single-character wildcard, an escape, a bare wildcard, a NULL pattern and
+# a pattern without a wildcard are not decomposed: the native scan answers them
+statement ok
+SET VARIABLE native_shapes = [
+	's LIKE ''%x_y%''',
+	's LIKE ''%off\_road%'' ESCAPE ''\''',
+	's LIKE ''%''',
+	's LIKE NULL',
+	's LIKE ''same tent'''
+];
+
+foreach i 1 2 3 4 5
+
+query II
+EXPLAIN SELECT count(*) FROM query('SELECT id FROM docs WHERE ' || getvariable('native_shapes')[${i}]);
+----
+physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+
+endloop
+
+# ngram_search: one native predicate; the index does not change what a needle
+# means, only how it is found
+foreach needle 'tent' 'TENT' 'straße' 'STRASSE' 'istanbul' 'İSTANBUL' '50%' 'x_y' '' 'nothing_here'
+
+query I
+SELECT count(*) FROM (
+	(SELECT id, s FROM ngram_search('docs', ${needle}) EXCEPT ALL SELECT id, s FROM docs WHERE contains(lower(s), lower(${needle})))
+	UNION ALL
+	(SELECT id, s FROM docs WHERE contains(lower(s), lower(${needle})) EXCEPT ALL SELECT id, s FROM ngram_search('docs', ${needle}))
+);
+----
+0
+
+endloop
+
+# a prepared statement's parameter is not a constant at planning: the plan
+# stays native and the answer stays exact
+statement ok
+PREPARE find AS SELECT list(id ORDER BY id)::VARCHAR FROM docs WHERE s LIKE $1;
+
+query I
+EXECUTE find('%tent%');
+----
+[1, 3, 4, 9, 11, 12]
+
+query I
+EXECUTE find('%x_y%');
+----
+[11]
+
+# a join and a nested projection over the accelerated scan
+query II
+SELECT d.id, struct_pack(a := d.s, b := d.t).a
+FROM docs d JOIN (SELECT 3 AS id UNION ALL SELECT 4) k USING (id)
+WHERE d.s LIKE '%tent%' ORDER BY d.id;
+----
+3	same tent
+4	same tent
+
+# both kill switches
+statement ok
+SET ngram_auto_accelerate = false;
+
+query II
+EXPLAIN SELECT count(*) FROM docs WHERE s LIKE '%tent%';
+----
+physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II
+EXPLAIN SELECT count(*) FROM docs WHERE s LIKE '%tent%';
+----
+physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+
+statement ok
+SET disabled_optimizers = '';
+
+# dropping and rebuilding the index with other options leaves every answer
+statement ok
+PRAGMA drop_ngram_index('docs', 's');
+
+statement ok
+PRAGMA create_ngram_index('docs', 's', gram = 2, case_insensitive = false);
+
+query I
+SELECT list(id ORDER BY id)::VARCHAR FROM docs WHERE s LIKE '%tent%';
+----
+[1, 3, 4, 9, 11, 12]
+
+# the same 24 shapes against the case-sensitive gram-2 index, where ILIKE
+# stays native and the accelerated set differs
+foreach i 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TEMP TABLE oracle AS SELECT * FROM query('SELECT id, s, t FROM docs WHERE ' || getvariable('predicates')[${i}]);
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM query('SELECT id, s, t FROM docs WHERE ' || getvariable('predicates')[${i}]) EXCEPT ALL SELECT id, s, t FROM oracle)
+	UNION ALL
+	(SELECT id, s, t FROM oracle EXCEPT ALL SELECT * FROM query('SELECT id, s, t FROM docs WHERE ' || getvariable('predicates')[${i}]))
+);
+----
+0
+
+endloop
+
+query I
+SELECT list(id ORDER BY id)::VARCHAR FROM ngram_search('docs', 'tent');
+----
+[1, 3, 4, 9, 11, 12]
+
+query I
+SELECT list(id ORDER BY id)::VARCHAR FROM ngram_search('docs', 'TENT');
+----
+[2]
+
+statement ok
+RESET ngram_max_candidate_fraction;
+
+statement ok
+RESET ngram_auto_accelerate;

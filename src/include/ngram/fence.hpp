@@ -52,6 +52,16 @@ uint64_t NewMaintenanceGroup(ClientContext &context);
 //! expansion.
 string PreparedMaintenanceCall(ClientContext &context, uint64_t group, PreparedMaintenance prepared);
 
+//! The scalar call that appends every row of the temporary table `source`
+//! to the index's segments table at execution time, through the host's
+//! transaction-local append, in the source's row order. It runs after the
+//! group's fence call in the same transaction and appends nothing when the
+//! source is empty, so a refresh over a deleted tail or a merge with nothing
+//! fragmented issues no insert statement at all: an empty batch insert
+//! followed by a delete and a large batch insert in one transaction leaves
+//! the table reading empty on v1.5.5 (docs/upstream/duckdb-empty-batch-insert.md).
+string PreparedAppendCall(ClientContext &context, uint64_t group, PreparedMaintenance prepared, const string &source);
+
 //! True while this context owns the creation EXCLUSIVE for `manager`. Seal
 //! readers can then use that lock instead of trying to nest a shared lock.
 bool ContextOwnsCreationBarrier(ClientContext &context, DuckTransactionManager &manager);

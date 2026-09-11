@@ -1,0 +1,154 @@
+# name: test/sql/ngram_long_inputs.test
+# description: long haystacks, long needles, and folds that change byte length, exact on every path
+# group: [sql]
+
+require ngram
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+statement ok
+SET ngram_max_candidate_fraction = 1;
+
+# rows of 4 KiB, 64 KiB and 256 KiB: the needle sits at the start, in the
+# middle and at the end, and one row holds a fold that grows when lowered
+statement ok
+CREATE TABLE longs AS
+SELECT i AS id,
+       CASE i % 4
+            WHEN 0 THEN 'needle ' || repeat('x', 4096)
+            WHEN 1 THEN repeat('y', 32768) || ' needle ' || repeat('y', 32768)
+            WHEN 2 THEN repeat('z', 262144) || ' needle'
+            ELSE repeat('w', 65536) || ' İstanbul Straße'
+       END AS s
+FROM range(16) t(i);
+
+statement ok
+PRAGMA create_ngram_index('longs', 's');
+
+statement ok
+SET VARIABLE predicates = [
+	'contains(s, ''needle'')',
+	's LIKE ''%needle%''',
+	's ILIKE ''%NEEDLE%''',
+	's ILIKE ''%istanbul%''',
+	's ILIKE ''%strasse%''',
+	'contains(s, ''xxxxxxxxxx'')',
+	's LIKE ''%zzz needle'''
+];
+
+foreach i 1 2 3 4 5 6 7
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TEMP TABLE oracle AS SELECT * FROM query('SELECT id, s FROM longs WHERE ' || getvariable('predicates')[${i}]);
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM query('SELECT id, s FROM longs WHERE ' || getvariable('predicates')[${i}]) EXCEPT ALL SELECT id, s FROM oracle)
+	UNION ALL
+	(SELECT id, s FROM oracle EXCEPT ALL SELECT * FROM query('SELECT id, s FROM longs WHERE ' || getvariable('predicates')[${i}]))
+);
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM longs WHERE s ILIKE '%istanbul%';
+----
+4
+
+query II
+EXPLAIN SELECT count(*) FROM longs WHERE contains(s, 'needle');
+----
+physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+
+# a 128 KiB needle of varied content: every gram is distinct, so the needle
+# carries tens of thousands of keys; both paths answer it exactly and the
+# explicit path reports the mode it took
+statement ok
+SET VARIABLE big_needle = (SELECT string_agg(chr(97 + (hash(i) % 26)::INTEGER), '') FROM range(131072) t(i));
+
+statement ok
+INSERT INTO longs SELECT 100 + i, repeat('p', 1024) || getvariable('big_needle') || repeat('q', 1024) FROM range(3) t(i);
+
+statement ok
+PRAGMA ngram_refresh('longs');
+
+# at a fixed budget the needle's keys fit and the index answers it
+statement ok
+SET memory_limit = '256MB';
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('longs', getvariable('big_needle'));
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index.*
+
+query I
+SELECT count(*) FROM ngram_search('longs', getvariable('big_needle'));
+----
+3
+
+query I
+SELECT count(*) FROM longs WHERE contains(s, getvariable('big_needle'));
+----
+3
+
+statement ok
+RESET memory_limit;
+
+query I
+SELECT count(*) FROM ngram_search('longs', substr(getvariable('big_needle'), 1000, 70000));
+----
+3
+
+query I
+SELECT count(*) FROM ngram_search('longs', getvariable('big_needle') || 'r');
+----
+0
+
+# with the query budget squeezed, the same needle exceeds the key budget and
+# every path declines before the manifest: still exact
+statement ok
+SET memory_limit = '8MB';
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('longs', getvariable('big_needle'));
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: query grams exceed query memory budget".*
+
+query I
+SELECT count(*) FROM ngram_search('longs', getvariable('big_needle'));
+----
+3
+
+query II
+EXPLAIN SELECT count(*) FROM longs WHERE contains(s, getvariable('big_needle'));
+----
+physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM longs WHERE contains(s, getvariable('big_needle'));
+----
+3
+
+statement ok
+RESET memory_limit;
+
+# the candidate function refuses the over-budget needle instead of allocating
+statement ok
+SET memory_limit = '8MB';
+
+statement error
+SELECT count(*) FROM ngram_candidates('longs', 's', getvariable('big_needle'));
+----
+query grams exceed query memory budget
+
+statement ok
+RESET memory_limit;

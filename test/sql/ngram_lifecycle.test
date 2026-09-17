@@ -72,7 +72,7 @@ Dependency Error
 statement error
 ALTER TABLE lifecycle_docs SET SCHEMA information_schema;
 ----
-Not implemented
+syntax error at or near "SCHEMA"
 
 statement error
 ALTER SCHEMA main RENAME TO renamed_main;

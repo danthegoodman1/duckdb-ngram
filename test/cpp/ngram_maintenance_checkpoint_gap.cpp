@@ -1,4 +1,8 @@
 #include "duckdb.hpp"
+#include "duckdb/main/statement_iterator.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/index.hpp"
+#include "duckdb/storage/table/index_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/index/unbound_index.hpp"
@@ -30,7 +34,7 @@
 
 using namespace duckdb;
 
-static unique_ptr<MaterializedQueryResult> Query(Connection &con, const string &sql) {
+static unique_ptr<QueryResult> Query(Connection &con, const string &sql) {
 	auto result = con.Query(sql);
 	if (result->HasError()) {
 		throw std::runtime_error(result->GetError() + "\nSQL: " + sql);
@@ -78,8 +82,7 @@ static string GuardName(Connection &con, const string &table_name, const string 
 
 //! The ngram_indexes() row of one index; an index the listing lacks is an
 //! error, as the status pragma it replaces made it.
-static unique_ptr<MaterializedQueryResult> StatusByRef(Connection &con, const string &catalog,
-                                                       const string &index_ref) {
+static unique_ptr<QueryResult> StatusByRef(Connection &con, const string &catalog, const string &index_ref) {
 	auto result =
 	    Query(con, "SELECT * FROM ngram_indexes() WHERE database_name = " + KeywordHelper::WriteQuoted(catalog) +
 	                   " AND index_ref = " + KeywordHelper::WriteQuoted(index_ref));
@@ -155,10 +158,11 @@ static bool HasRowIdGuard(Connection &con, const string &table_name) {
 	bool found = false;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &table = Catalog::GetEntry<TableCatalogEntry>(
-		                  *con.context, DatabaseManager::GetDefaultDatabase(*con.context), "main", table_name)
+		                  *con.context, QualifiedName(DatabaseManager::GetDefaultDatabase(*con.context), "main",
+		                                              Identifier(table_name)))
 		                  .Cast<DuckTableEntry>();
-		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-			if (entry.index->GetIndexType() == ngram::NGRAM_ROWID_GUARD_TYPE) {
+		for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+			if (entry->GetIndexType() == ngram::NGRAM_ROWID_GUARD_TYPE) {
 				found = true;
 				break;
 			}
@@ -172,17 +176,18 @@ static bool RowIdGuardIsBound(Connection &con, const string &table_name) {
 	bool bound = false;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &table = Catalog::GetEntry<TableCatalogEntry>(
-		                  *con.context, DatabaseManager::GetDefaultDatabase(*con.context), "main", table_name)
+		                  *con.context, QualifiedName(DatabaseManager::GetDefaultDatabase(*con.context), "main",
+		                                              Identifier(table_name)))
 		                  .Cast<DuckTableEntry>();
-		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-			if (entry.index->GetIndexType() != ngram::NGRAM_ROWID_GUARD_TYPE) {
+		for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+			if (entry->GetIndexType() != ngram::NGRAM_ROWID_GUARD_TYPE) {
 				continue;
 			}
 			if (found) {
 				throw std::runtime_error("expected exactly one rowid guard on " + table_name);
 			}
 			found = true;
-			bound = entry.index->IsBound();
+			bound = entry->GetBindState() == IndexBindState::BOUND;
 		}
 	});
 	if (!found) {
@@ -196,16 +201,17 @@ static void SetRowIdGuardBindState(Connection &con, const string &table_name, co
 	bool found = false;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &table = Catalog::GetEntry<TableCatalogEntry>(
-		                  *con.context, DatabaseManager::GetDefaultDatabase(*con.context), "main", table_name)
+		                  *con.context, QualifiedName(DatabaseManager::GetDefaultDatabase(*con.context), "main",
+		                                              Identifier(table_name)))
 		                  .Cast<DuckTableEntry>();
-		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-			if (entry.index->GetIndexName() != guard_name) {
+		for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+			if (entry->GetName() != guard_name) {
 				continue;
 			}
-			if (require_unbound && entry.index->IsBound()) {
+			if (require_unbound && entry->GetBindState() == IndexBindState::BOUND) {
 				throw std::runtime_error("expected an unbound rowid guard on " + table_name);
 			}
-			entry.bind_state.store(state);
+			entry->SetBindState(state);
 			found = true;
 			break;
 		}
@@ -241,11 +247,13 @@ static void ExpectPreparedWriteFailure(Connection &con, PreparedStatement &prepa
 }
 
 static int64_t PreparedScalar(PreparedStatement &prepared) {
-	// Materialize: a streamed result keeps the statement's transaction and
-	// operator states alive until the connection's next statement, which would
-	// block a creation barrier taken by another connection in the meantime.
+	// Complete the result: an unmaterialized one keeps the statement's
+	// transaction and operator states alive until the connection's next
+	// statement, which would block a creation barrier taken by another
+	// connection in the meantime.
 	vector<Value> values;
-	auto result = prepared.Execute(values, false);
+	auto result = prepared.Execute(values);
+	result->Complete();
 	if (result->HasError()) {
 		throw std::runtime_error("prepared query failed: " + result->GetError());
 	}
@@ -265,7 +273,15 @@ static void ExpectPreparedError(PreparedStatement &prepared, const string &needl
 }
 
 static vector<unique_ptr<SQLStatement>> Expand(Connection &con, const string &sql) {
-	auto statements = con.context->ParseStatements(sql);
+	vector<unique_ptr<SQLStatement>> statements;
+	auto iterator = con.context->IterateStatements(sql);
+	while (iterator.Peek()) {
+		auto statement = iterator.GetStatement();
+		if (!statement) {
+			continue;
+		}
+		statements.push_back(std::move(statement));
+	}
 	if (statements.empty() || statements.front()->type != StatementType::TRANSACTION_STATEMENT ||
 	    statements.front()->Cast<TransactionStatement>().info->type != TransactionType::BEGIN_TRANSACTION) {
 		throw std::runtime_error("pragma expansion did not begin with a generated transaction");
@@ -398,14 +414,15 @@ static void MutateGuardOption(Connection &con, const string &table_name, const s
 	auto catalog_name = DatabaseManager::GetDefaultDatabase(*con.context);
 	bool found = false;
 	con.context->RunFunctionInTransaction([&]() {
-		auto &table =
-		    Catalog::GetEntry<TableCatalogEntry>(*con.context, catalog_name, "main", table_name).Cast<DuckTableEntry>();
-		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-			auto &index = *entry.index;
-			if (index.GetIndexName() != guard_name || index.IsBound()) {
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(*con.context,
+		                                                   QualifiedName(catalog_name, "main", Identifier(table_name)))
+		                  .Cast<DuckTableEntry>();
+		for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+			if (entry->GetName() != guard_name || entry->GetBindState() == IndexBindState::BOUND) {
 				continue;
 			}
-			auto &storage = const_cast<IndexStorageInfo &>(index.Cast<UnboundIndex>().GetStorageInfo());
+			auto unbound = entry->GetWriteHandle<UnboundIndex>();
+			auto &storage = const_cast<IndexStorageInfo &>(unbound->GetStorageInfo());
 			storage.options[option] = std::move(value);
 			found = true;
 		}
@@ -427,12 +444,14 @@ static void TestCreationSchedules(const string &path) {
 		auto version = Query(host, "SELECT library_version, source_id FROM system.main.pragma_version()");
 		auto library_version = version->GetValue(0, 0).ToString();
 		auto source_id = version->GetValue(1, 0).ToString();
-		// The extension's pin: v1.5.5 built from this commit, with source_id an
-		// abbreviation of it that has at least seven characters.
-		const string pinned_commit = "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa";
+		// The extension's pin: v2.0.0 built from this commit, with source_id an
+		// abbreviation of it that has at least seven characters. The 2.0 branch
+		// carries no tag, so the build names the version through
+		// OVERRIDE_GIT_DESCRIBE; without it the host reports v2.0.0-dev<n>.
+		const string pinned_commit = "2d17945cffee40ea0199d327c0c269c9af243294";
 		bool pinned_source = source_id.size() >= 7 && source_id.size() <= pinned_commit.size() &&
 		                     pinned_commit.compare(0, source_id.size(), source_id) == 0;
-		if (library_version != "v1.5.5" || !pinned_source) {
+		if (library_version != "v2.0.0" || !pinned_source) {
 			throw std::runtime_error("host pragma_version is outside the pinned rowid-guard runtime");
 		}
 	}
@@ -550,8 +569,8 @@ static void TestCreationSchedules(const string &path) {
 	      "INSERT INTO staged_revert SELECT i, CASE WHEN i=0 THEN 'base needle' ELSE 'x' END FROM range(8) t(i)");
 	Check(staged_writer, "BEGIN");
 	Check(staged_writer, "INSERT INTO staged_revert VALUES (8, 'staged needle')");
-	auto &staged_catalog =
-	    Catalog::GetCatalog(*staged_writer.context, ScalarString(staged_writer, "SELECT current_database()"));
+	auto &staged_catalog = Catalog::GetCatalog(*staged_writer.context,
+	                                           Identifier(ScalarString(staged_writer, "SELECT current_database()")));
 	DuckTransaction::Get(*staged_writer.context, staged_catalog).GetLocalStorage().Commit(nullptr);
 	auto staged_create = Expand(staged_creator, "PRAGMA create_ngram_index('staged_revert', 's')");
 	auto staged_next = ExecuteThrough(staged_creator, staged_create, "__ngram_creation_finish");
@@ -595,7 +614,7 @@ static void TestCreationSchedules(const string &path) {
 	ExecuteThrough(fence, fenced_refresh, "__ngram_maintenance_guard");
 	Check(checkpoint, "BEGIN");
 	auto catalog_name = ScalarString(checkpoint, "SELECT current_database()");
-	auto &catalog = Catalog::GetCatalog(*checkpoint.context, catalog_name);
+	auto &catalog = Catalog::GetCatalog(*checkpoint.context, Identifier(catalog_name));
 	auto &manager = DuckTransaction::Get(*checkpoint.context, catalog).GetTransactionManager();
 	auto blocked = manager.TryGetVacuumLock();
 	if (blocked) {
@@ -683,7 +702,7 @@ static void TestSharedGuardAndDrop(const string &path) {
 		Check(con, "DROP INDEX " + guard);
 		if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('drop_cross_owner', 'needle')") != 1 ||
 		    ScalarInt64(con, "SELECT count(*) FROM drop_cross_owner WHERE s LIKE '%needle%'") != 1 ||
-		    Query(con, "EXPLAIN SELECT * FROM drop_cross_owner WHERE s LIKE '%needle%'")->ToString().find("SEQ_SCAN") ==
+		    Query(con, "EXPLAIN SELECT * FROM drop_cross_owner WHERE s LIKE '%needle%'")->ToString().find("Seq Scan") ==
 		        string::npos) {
 			throw std::runtime_error("missing rowid guard did not choose exact explicit/transparent fallback");
 		}
@@ -847,7 +866,7 @@ static void TestVacuumAndConflict(const string &path) {
 	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('vacuum_rows', 'vacuum needle')") != 1 ||
 	    Query(con, "EXPLAIN SELECT * FROM vacuum_rows WHERE s LIKE '%vacuum needle%'")
 	            ->ToString()
-	            .find("NGRAM_INDEX_SCAN") == string::npos) {
+	            .find("Ngram Index Scan") == string::npos) {
 		throw std::runtime_error("non-ART guard did not prevent moving vacuum with rebuild enabled");
 	}
 
@@ -878,7 +897,7 @@ static void TestVacuumAndConflict(const string &path) {
 	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('conflict_rows', 'conflict needle')") != 1 ||
 	    Query(con, "EXPLAIN SELECT * FROM conflict_rows WHERE s LIKE '%conflict needle%'")
 	            ->ToString()
-	            .find("NGRAM_INDEX_SCAN") != string::npos) {
+	            .find("Ngram Index Scan") != string::npos) {
 		throw std::runtime_error("rejected append did not conservatively force exact scan fallback");
 	}
 }
@@ -919,7 +938,7 @@ static void TestRejectedCommitKeepsGuard(const string &path) {
 	}
 	if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('retried', 'needle')") != 2 ||
 	    ScalarInt64(con, "SELECT count(*) FROM retried WHERE s LIKE '%needle%'") != 2 ||
-	    Query(con, "EXPLAIN SELECT * FROM retried WHERE s LIKE '%needle%'")->ToString().find("NGRAM_INDEX_SCAN") ==
+	    Query(con, "EXPLAIN SELECT * FROM retried WHERE s LIKE '%needle%'")->ToString().find("Ngram Index Scan") ==
 	        string::npos) {
 		throw std::runtime_error("index mode was lost after a rejected commit into a fresh rowid range");
 	}
@@ -1112,7 +1131,7 @@ static void TestIncompatibleGuardQuarantine(const string &path) {
 		}
 		if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('max_guard', 'needle')") != 1 ||
 		    ScalarInt64(con, "SELECT count(*) FROM max_guard WHERE s LIKE '%needle%'") != 1 ||
-		    Query(con, "EXPLAIN SELECT * FROM max_guard WHERE s LIKE '%needle%'")->ToString().find("SEQ_SCAN") ==
+		    Query(con, "EXPLAIN SELECT * FROM max_guard WHERE s LIKE '%needle%'")->ToString().find("Seq Scan") ==
 		        string::npos ||
 		    Query(con, "PRAGMA ngram_index_stats('max_guard')")->GetValue(12, 0).ToString().find("not observed") ==
 		        string::npos) {
@@ -1306,7 +1325,7 @@ static void TestStorageCorruption() {
 	ExpectError(con, "PRAGMA ngram_compact('versioned')", "format 1");
 	ExpectError(con, "PRAGMA ngram_index_stats('versioned')", "format 1");
 	if (ScalarInt64(con, "SELECT count(*) FROM versioned WHERE s LIKE '%tent%'") != 1 ||
-	    Query(con, "EXPLAIN SELECT count(*) FROM versioned WHERE s LIKE '%tent%'")->ToString().find("SEQ_SCAN") ==
+	    Query(con, "EXPLAIN SELECT count(*) FROM versioned WHERE s LIKE '%tent%'")->ToString().find("Seq Scan") ==
 	        string::npos) {
 		throw std::runtime_error("an unreadable format did not decline transparent acceleration");
 	}
@@ -1493,8 +1512,8 @@ static void TestRegistryLifecycle(const string &path) {
 		}
 		auto listed = Query(con, "PRAGMA ngram_indexes");
 		auto status = StatusByRef(con, catalog, ref);
-		if (IndexStatus(con, "lifecycle", "s") != "READY" || listed->types[5].id() != LogicalTypeId::BIGINT ||
-		    status->types[5].id() != LogicalTypeId::BIGINT) {
+		if (IndexStatus(con, "lifecycle", "s") != "READY" || listed->GetTypes()[5].id() != LogicalTypeId::BIGINT ||
+		    status->GetTypes()[5].id() != LogicalTypeId::BIGINT) {
 			throw std::runtime_error("list/status schema or READY state changed");
 		}
 		ExpectError(con, "ALTER TABLE lifecycle RENAME TO LIFECYCLE", "Dependency");
@@ -2412,7 +2431,7 @@ static void TestRegistryScale() {
 //! stream to fail with the interrupt. No timing is involved, so a faster
 //! machine cannot let the query finish before the interrupt lands.
 static void ExpectStreamInterrupted(Connection &con, const string &sql, idx_t chunks_before = 1) {
-	auto stream = con.SendQuery(sql);
+	auto stream = con.Query(sql);
 	if (stream->HasError()) {
 		throw std::runtime_error("streaming query failed before its interrupt: " + stream->GetError());
 	}
@@ -2508,7 +2527,7 @@ static void TestQueryCancellation() {
 	auto expected_matches = ScalarInt64(con, "SELECT count(*) FROM cancel_rows WHERE contains(s, 'aaaa')");
 	for (auto &pragma :
 	     vector<string> {"PRAGMA ngram_compact('cancel_rows')", "PRAGMA ngram_compact('cancel_rows', purge=true)"}) {
-		unique_ptr<MaterializedQueryResult> result;
+		unique_ptr<QueryResult> result;
 		bool purge = pragma.find("purge") != string::npos;
 		idx_t chunks_seen = 0;
 		ngram::GetNgramTestHooks().before_maintenance_append_chunk = [&]() {
@@ -2580,7 +2599,7 @@ static void TestParallelCandidateStreams() {
 		throw std::runtime_error("stream fixture produced " + to_string(expected_rows) + " matches");
 	}
 
-	auto stream = con.SendQuery(search);
+	auto stream = con.Query(search);
 	if (stream->HasError()) {
 		throw std::runtime_error("streaming search failed: " + stream->GetError());
 	}
@@ -2675,7 +2694,7 @@ static void TestPublicationBarrier() {
 				}
 			}
 		});
-		auto stream = con.SendQuery(search);
+		auto stream = con.Query(search);
 		if (stream->HasError()) {
 			throw std::runtime_error("barrier search failed: " + stream->GetError());
 		}

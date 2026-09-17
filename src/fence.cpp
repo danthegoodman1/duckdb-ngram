@@ -1,10 +1,14 @@
 #include "ngram/fence.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "ngram/index_state.hpp"
 #include "ngram/search_core.hpp"
 #include "ngram/test_hooks.hpp"
@@ -127,7 +131,7 @@ public:
 			held.creation_table_name = std::move(table_name);
 			held.creation_column_name = std::move(column_name);
 			held.creation_guard_name = std::move(guard_name);
-			held.transaction_id = transaction.transaction_id;
+			held.transaction_id = transaction.GetTransactionId();
 			return;
 		}
 		throw InvalidInputException("ngram creation barrier has no maintenance fence");
@@ -140,7 +144,7 @@ public:
 			if (held.manager != &transaction.GetTransactionManager() || !held.creation_lock) {
 				continue;
 			}
-			if (held.transaction_id != transaction.transaction_id || !held.creation_table) {
+			if (held.transaction_id != transaction.GetTransactionId() || !held.creation_table) {
 				throw TransactionException("ngram creation barrier belongs to a different transaction");
 			}
 			if (!StringUtil::CIEquals(held.creation_schema_name, schema_name) ||
@@ -364,10 +368,10 @@ static void CheckPreparedMaintenance(ClientContext &context, const PreparedMaint
 static void MaintenanceGuardFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto output = FlatVector::GetData<bool>(result);
+	auto output = FlatVector::GetDataMutable<bool>(result);
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto prepared = GetMaintenanceState(context)->Take(context, args.GetValue(0, row).ToString());
-		auto &catalog = Catalog::GetCatalog(context, prepared.target.catalog_name);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(prepared.target.catalog_name));
 		AcquireMaintenanceFence(context, catalog);
 		switch (prepared.kind) {
 		case PreparedMaintenance::Kind::DROP:
@@ -434,7 +438,7 @@ static int64_t AppendSegmentRows(ClientContext &context, const PreparedMaintenan
 			started = true;
 		}
 		chunk.Flatten();
-		target_storage.LocalAppend(append, context, chunk, false);
+		target_storage.LocalAppend(append, target, context, chunk, false);
 		appended += NumericCast<int64_t>(chunk.size());
 	}
 	if (started) {
@@ -450,13 +454,13 @@ static int64_t AppendSegmentRows(ClientContext &context, const PreparedMaintenan
 static void MaintenanceAppendFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto output = FlatVector::GetData<int64_t>(result);
+	auto output = FlatVector::GetDataMutable<int64_t>(result);
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto prepared = GetMaintenanceState(context)->Take(context, args.GetValue(0, row).ToString());
 		if (prepared.kind != PreparedMaintenance::Kind::MAINTAIN) {
 			throw InvalidInputException("ngram: the append call belongs to refresh and compact scripts");
 		}
-		AcquireMaintenanceFence(context, Catalog::GetCatalog(context, prepared.target.catalog_name));
+		AcquireMaintenanceFence(context, Catalog::GetCatalog(context, Identifier(prepared.target.catalog_name)));
 		CheckPreparedMaintenance(context, prepared);
 		output[row] = AppendSegmentRows(context, prepared, args.GetValue(1, row).ToString());
 	}
@@ -467,14 +471,14 @@ static void MaintenanceAppendFunction(DataChunk &args, ExpressionState &state, V
 static void CreationFinishFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto output = FlatVector::GetData<string_t>(result);
+	auto output = FlatVector::GetDataMutable<string_t>(result);
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto catalog_name = args.GetValue(0, row).ToString();
 		auto schema_name = args.GetValue(1, row).ToString();
 		auto table_name = args.GetValue(2, row).ToString();
 		auto column_name = args.GetValue(3, row).ToString();
 		auto guard_name = args.GetValue(4, row).ToString();
-		auto &catalog = Catalog::GetCatalog(context, catalog_name);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 		auto &table = ResolveExistingTable(context, catalog_name, schema_name, table_name, "ngram index base table");
 		auto token = InstalledRowIdGuardToken(table, column_name, guard_name);
 		GetMaintenanceState(context)->FinishCreation(DuckTransaction::Get(context, catalog), table.GetStorage(),
@@ -486,13 +490,13 @@ static void CreationFinishFunction(DataChunk &args, ExpressionState &state, Vect
 void RegisterFence(ExtensionLoader &loader) {
 	auto check =
 	    ScalarFunction(NGRAM_MAINTENANCE_GUARD, {LogicalType::VARCHAR}, LogicalType::BOOLEAN, MaintenanceGuardFunction);
-	check.stability = FunctionStability::VOLATILE;
+	check.SetStability(FunctionStability::VOLATILE);
 	check.SetFallible();
 	loader.RegisterFunction(check);
 
 	auto append = ScalarFunction(NGRAM_MAINTENANCE_APPEND, {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                             LogicalType::BIGINT, MaintenanceAppendFunction);
-	append.stability = FunctionStability::VOLATILE;
+	append.SetStability(FunctionStability::VOLATILE);
 	append.SetFallible();
 	loader.RegisterFunction(append);
 
@@ -500,7 +504,7 @@ void RegisterFence(ExtensionLoader &loader) {
 	    NGRAM_CREATION_FINISH,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	    LogicalType::VARCHAR, CreationFinishFunction);
-	finish.stability = FunctionStability::VOLATILE;
+	finish.SetStability(FunctionStability::VOLATILE);
 	finish.SetFallible();
 	loader.RegisterFunction(finish);
 }

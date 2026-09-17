@@ -12,7 +12,7 @@ namespace duckdb {
 
 class AttachedDatabase;
 class DuckTableEntry;
-class Index;
+class IndexEntry;
 
 namespace ngram {
 
@@ -57,8 +57,9 @@ struct RowIdGuardState {
 };
 
 //! The live state of a bound guard, applying its pending persisted seal
-//! against `current_iteration` when one is given.
-RowIdGuardState ReadBoundGuardState(Index &index, optional_idx current_iteration);
+//! against `current_iteration` when one is given. Applying the seal mutates the
+//! guard, so this takes the entry's exclusive handle.
+RowIdGuardState ReadBoundGuardState(IndexEntry &entry, optional_idx current_iteration);
 
 //! Whether every unbound guard on `table` is well-formed enough to bind.
 //! DuckDB's v1.5.5 bind state stays poisoned by a malformed expression, so

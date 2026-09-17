@@ -151,7 +151,7 @@ SELECT count(*) FROM (
 query II
 EXPLAIN SELECT count(*) FROM big WHERE s LIKE '%3456%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # the in-scan full-scan fallback is a parallel scan too, not a one-thread
 # crawl: with the gate at zero every accelerated query takes it

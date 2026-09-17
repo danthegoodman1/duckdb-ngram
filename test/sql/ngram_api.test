@@ -282,17 +282,17 @@ endloop
 query II
 EXPLAIN SELECT count(*) FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 query II
 EXPLAIN SELECT count(*) FROM docs WHERE s ILIKE '%TENT%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 query II
 EXPLAIN SELECT count(*) FROM docs WHERE contains(s, 'tent');
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # a single-character wildcard, an escape, a bare wildcard, a NULL pattern and
 # a pattern without a wildcard are not decomposed: the native scan answers them
@@ -310,7 +310,7 @@ foreach i 1 2 3 4 5
 query II
 EXPLAIN SELECT count(*) FROM query('SELECT id FROM docs WHERE ' || getvariable('native_shapes')[${i}]);
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 endloop
 
@@ -360,7 +360,7 @@ SET ngram_auto_accelerate = false;
 query II
 EXPLAIN SELECT count(*) FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 statement ok
 SET ngram_auto_accelerate = true;
@@ -371,7 +371,7 @@ SET disabled_optimizers = 'extension';
 query II
 EXPLAIN SELECT count(*) FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 statement ok
 SET disabled_optimizers = '';

@@ -35,7 +35,7 @@ f09f9982f09f9982f09f9982f09f9982
 foreach n 1 2 3 4 5 6
 
 query I
-SELECT list_distinct(list_transform(trigrams('abcdefgh', ${n}, false), g -> ngram_gram_key(g) = ngram_gram_key(g)))
+SELECT list_distinct(list_transform(trigrams('abcdefgh', ${n}, false), lambda g: ngram_gram_key(g) = ngram_gram_key(g)))
        = [true];
 ----
 true
@@ -71,7 +71,7 @@ NULL
 # emitter: the keys of the distinct normalized grams, ascending
 query I
 SELECT ngram_gram_keys('Aba abA', 3, true) =
-       list_sort(list_distinct(list_transform(trigrams('Aba abA', 3, true), g -> ngram_gram_key(g))));
+       list_sort(list_distinct(list_transform(trigrams('Aba abA', 3, true), lambda g: ngram_gram_key(g))));
 ----
 true
 

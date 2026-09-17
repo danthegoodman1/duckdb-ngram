@@ -2,7 +2,7 @@
 # description: EXPLAIN plan shapes of the transparent optimizer rewrite:
 # group: [sql]
 
-# every accelerated shape renders NGRAM_INDEX_SCAN, every fallback shape
+# every accelerated shape renders Ngram Index Scan, every fallback shape
 # stays a seq scan.
 
 require ngram
@@ -40,12 +40,12 @@ SET ngram_max_candidate_fraction = 1.0;
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<REGEX>:.*SEQ_SCAN.*
+physical_plan	<REGEX>:.*Seq Scan.*
 
 statement ok
 SET ngram_auto_accelerate = true;
@@ -58,25 +58,25 @@ SET ngram_auto_accelerate = true;
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # explicit contains
 query II
 EXPLAIN SELECT * FROM docs WHERE contains(s, 'tent');
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # ILIKE against a case-insensitive index
 query II
 EXPLAIN SELECT * FROM docs WHERE s ILIKE '%TeNt%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # multi-pattern LIKE: literal segments intersected, original pattern rechecked
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%row%tent%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # anchored pattern: the optimizer keeps the ~~ in a residual FILTER and only
 # pushes a derived prefix range into the scan, so the rewrite (which matches
@@ -84,55 +84,55 @@ physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE 'row%tent here';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # pure-literal regexp becomes contains before the rewrite sees it
 query II
 EXPLAIN SELECT * FROM docs WHERE regexp_matches(s, 'tent');
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # case-sensitive predicates may use a case-sensitive index
 query II
 EXPLAIN SELECT * FROM cs_docs WHERE s LIKE '%Tent%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # composite predicate: the numeric filter rides along and stays visible
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent%' AND id > 100;
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*Filters.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*Filters.*
 
 # two substring predicates on the same column: both needles narrow the probe
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent%' AND s LIKE '%row%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # projection excluding the searched column
 query II
 EXPLAIN SELECT id FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # rowid output
 query II
 EXPLAIN SELECT rowid FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # count(*) over the filter
 query II
 EXPLAIN SELECT count(*) FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # join over the accelerated scan
 query II
 EXPLAIN SELECT d.id FROM docs d JOIN cs_docs e ON d.id = e.id WHERE d.s LIKE '%tent%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # ORDER BY ... LIMIT: LATE_MATERIALIZATION restructures this into a rowid
 # join before the rewrite runs; the filtered inner scan is swapped (the
@@ -140,14 +140,14 @@ physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent%' ORDER BY id LIMIT 5;
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # ... and the row-group ordering hint of the non-late-materialized TopN shape
 # is dropped rather than blocking the rewrite
 query II
 EXPLAIN SELECT rowid, id FROM docs WHERE s LIKE '%tent%' ORDER BY id LIMIT 5;
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 #===----------------------------------------------------------------------===#
 # fallback shapes: no rewrite fires
@@ -157,68 +157,68 @@ physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%te%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # '_' wildcard: conservative v1 never decomposes such patterns
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%te_t%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # ESCAPE binds to like_escape, which is never matched
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent!%%' ESCAPE '!';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # NOT LIKE
 query II
 EXPLAIN SELECT * FROM docs WHERE s NOT LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # prefix/suffix patterns become prefix()/suffix(), which are not matched
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE 'tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # filter over a column without an index
 query II
 EXPLAIN SELECT * FROM docs WHERE other LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # ILIKE against a case-sensitive index: probing would miss case-variant
 # matches, so the rewrite never fires in this direction
 query II
 EXPLAIN SELECT * FROM cs_docs WHERE s ILIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # OR of substring predicates: pushed as one expression filter, but candidate
 # intersection cannot serve a disjunction; conservative fallback
 query II
 EXPLAIN SELECT * FROM docs WHERE contains(s, 'tent') OR contains(s, 'row');
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # predicate over an expression of the column, not the column itself
 query II
 EXPLAIN SELECT * FROM docs WHERE lower(s) LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # needle is the empty string / pure wildcards: nothing to probe
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # table without any index
 statement ok
@@ -230,13 +230,13 @@ INSERT INTO plain VALUES (1, 'a tent');
 query II
 EXPLAIN SELECT * FROM plain WHERE s LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 # TABLESAMPLE scans are never swapped
 query II
 EXPLAIN SELECT * FROM docs TABLESAMPLE SYSTEM (50 PERCENT) WHERE s LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 #===----------------------------------------------------------------------===#
 # kill switches
@@ -248,7 +248,7 @@ SET disabled_optimizers = 'extension';
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 statement ok
 SET disabled_optimizers = '';
@@ -259,7 +259,7 @@ SET ngram_auto_accelerate = false;
 query II
 EXPLAIN SELECT * FROM docs WHERE s LIKE '%tent%';
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 statement ok
 SET ngram_auto_accelerate = true;

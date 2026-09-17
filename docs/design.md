@@ -153,9 +153,9 @@ reports as the probe's peak (`query/probe-memory-peak` in the harness).
 
 ## Host dependencies
 
-- DuckDB v1.5.5 at source `d8cdaa33`, pinned by the `duckdb` gitlink and by
+- DuckDB v2.0.0 at source `2d17945c`, pinned by the `duckdb` gitlink and by
   the guard, which refuses to trust any other host (`docs/UPDATING.md`).
-- The custom index type: v1.5.5 lets the guard persist a checkpoint seal and
+- The custom index type: the host lets the guard persist a checkpoint seal and
   refuses guard-touching `ALTER`; a stock host without the extension can read
   a guarded table but not write it.
 - The pragma preprocessor, which expands a maintenance pragma into a

@@ -1,5 +1,13 @@
 #
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
+# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension.
+#
+# Both jobs still name v1.5.5. The distribution pipeline builds against a
+# released DuckDB, and extension-ci-tools publishes no 2.0 line yet, so there is
+# nothing for them to target: DuckDB 2.0 lives only on the v2.0-cyanoptera
+# branch that the duckdb submodule tracks. Until 2.0 tags and extension-ci-tools
+# follows it, these two jobs build the ported sources against 1.5.5 headers and
+# fail. The Correctness and Nightly workflows build the submodule directly and
+# are the lanes that exercise this branch.
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -32,4 +40,9 @@ jobs:
       duckdb_version: v1.5.5
       ci_tools_version: v1.5.5
       extension_name: ngram
-      format_checks: 'format;tidy'
+      # Only tidy here. This job installs the formatter's tools into the system
+      # python, and the 2.0 formatter prepends that interpreter's bin directory
+      # to PATH, which puts the runner's clang-format 14 ahead of the pinned
+      # 11.0.1 and fails its version check. Correctness.yml runs the format
+      # check from a venv, where the pinned tools win.
+      format_checks: 'tidy'

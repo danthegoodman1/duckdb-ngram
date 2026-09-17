@@ -4,6 +4,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -100,7 +102,7 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 //! The drop script of the index `index_ref` in `catalog_name`: the form that
 //! needs no base table, for orphaned, malformed and old-format rows.
 static string DropByReference(ClientContext &context, const string &catalog_name, const string &index_ref) {
-	auto database = DatabaseManager::Get(context).GetDatabase(context, catalog_name);
+	auto database = DatabaseManager::Get(context).GetDatabase(context, Identifier(catalog_name));
 	if (!database || database->IsReadOnly()) {
 		throw InvalidInputException("drop_ngram_index: catalog %s is missing or read-only", catalog_name);
 	}
@@ -125,7 +127,7 @@ static string DropNgramIndexQuery(ClientContext &context, const FunctionParamete
 	}
 	if (parameters.values.size() == 1) {
 		if (catalog_name.empty()) {
-			catalog_name = DatabaseManager::GetDefaultDatabase(context);
+			catalog_name = DatabaseManager::GetDefaultDatabase(context).GetIdentifierName();
 		}
 		return DropByReference(context, catalog_name, parameters.values[0].ToString());
 	}
@@ -237,7 +239,7 @@ struct IndexesGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> IndexesBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names = {"database_name", "index_ref",      "schema_name", "table_name",
 	         "column_name",   "format_version", "status",      "reason"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
@@ -251,7 +253,7 @@ static unique_ptr<GlobalTableFunctionState> IndexesInitGlobal(ClientContext &con
 		if (!database->HasStorageManager() || !database->GetCatalog().IsDuckCatalog()) {
 			continue;
 		}
-		auto observed = ObserveCatalog(context, database->GetName());
+		auto observed = ObserveCatalog(context, database->GetName().GetIdentifierName());
 		state->rows.insert(state->rows.end(), std::make_move_iterator(observed.begin()),
 		                   std::make_move_iterator(observed.end()));
 	}
@@ -272,17 +274,18 @@ static void IndexesFunction(ClientContext &context, TableFunctionInput &data, Da
 	};
 	for (idx_t i = 0; i < count; i++) {
 		auto &row = state.rows[state.offset + i];
-		output.SetValue(0, i, Value(row.catalog_name));
-		output.SetValue(1, i, Value(row.location.index_ref));
-		output.SetValue(2, i, text(row.schema_name));
-		output.SetValue(3, i, text(row.table_name));
-		output.SetValue(4, i, text(row.location.column_name));
-		output.SetValue(5, i, row.format_version < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(row.format_version));
-		output.SetValue(6, i, Value(row.status));
-		output.SetValue(7, i, text(row.reason));
+		output.data[0].SetValue(i, Value(row.catalog_name));
+		output.data[1].SetValue(i, Value(row.location.index_ref));
+		output.data[2].SetValue(i, text(row.schema_name));
+		output.data[3].SetValue(i, text(row.table_name));
+		output.data[4].SetValue(i, text(row.location.column_name));
+		output.data[5].SetValue(i, row.format_version < 0 ? Value(LogicalType::BIGINT)
+		                                                  : Value::BIGINT(row.format_version));
+		output.data[6].SetValue(i, Value(row.status));
+		output.data[7].SetValue(i, text(row.reason));
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 static string NgramIndexesQuery(ClientContext &context, const FunctionParameters &) {

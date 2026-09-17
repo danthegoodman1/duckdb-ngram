@@ -4,7 +4,7 @@ Updates, deletes, checkpoint vacuum, WAL replay, and reopened databases cannot
 silently make an ngram query omit a matching row. When the extension cannot
 prove that indexed rowids are still safe, it scans or refuses before returning.
 
-This note describes the v1.5.5-specific mechanism, its proof, and its costs.
+This note describes the host-specific mechanism, its proof, and its costs.
 The implementation is one zero-posting native guard per table plus one
 permanent uncertainty bit.
 
@@ -25,7 +25,7 @@ That is exhaustive if both conditions hold:
 Each table with ngram indexes therefore carries one DuckDB `NGRAM_ROWID_GUARD`
 index. It stores no keys or postings. Its physical column dependencies make
 DuckDB rewrite updates of covered columns as delete plus insert, and its non-ART
-type keeps v1.5.5's moving vacuum disabled even under `vacuum_rebuild_indexes`.
+type keeps the host's moving vacuum disabled even under `vacuum_rebuild_indexes`.
 The guard persists four facts:
 
 - the greatest append rowid it has observed;
@@ -99,7 +99,7 @@ is to drop and re-create it.
   cannot change an indexed value: every indexed column is covered.
 - Delete alone is safe. Visibility and recheck remove deleted candidates.
 - Any index on a table makes DuckDB skip moving vacuum by default. With
-  `vacuum_rebuild_indexes` enabled, v1.5.5 moves rows only when every index on
+  `vacuum_rebuild_indexes` enabled, the host moves rows only when every index on
   the table is an ART it can rebuild; the guard's non-ART type makes
   `CanRebuildExistingIndexesAfterVacuum` false, so vacuum cannot move a
   surviving live rowid.
@@ -183,11 +183,11 @@ conservatively require rebuild on the next attach.
 Malformed non-identity persisted guard options (source, version, seal, or
 state) create a bound quarantine guard with
 `protection_compatible=false` and `unsafe_reuse=true` instead of leaving
-DuckDB's v1.5.5 bind state stuck at `BINDING`. Queries scan, a later index on
+DuckDB's bind state stuck at `BINDING`. Queries scan, a later index on
 the table is refused, ordinary extension-loaded writes remain usable, and public
 drop can recover it while the recorded token remains readable and matches.
 A missing or wrong-typed identity token must make exact drop refuse. Every use
-of checkpoint internals is gated by the exact v1.5.5 version/source pin.
+of checkpoint internals is gated by the exact version/source pin.
 
 ## API and operational costs
 
@@ -201,7 +201,7 @@ of checkpoint internals is gated by the exact v1.5.5 version/source pin.
   the guard stores no key data and handles the sequence rowid vector without
   flattening or per-row iteration.
 - DELETE and rollback cleanup on a wide guarded table may fetch every
-  guard-covered `VARCHAR`: v1.5.5 unions index dependencies before calling the
+  guard-covered `VARCHAR`: the host unions index dependencies before calling the
   value-independent `TryDelete`.
 - ADD COLUMN is safe for existing ngram indexes, but a newly added `VARCHAR` is
   outside the guard's dependency set. Indexing that new column requires
@@ -211,9 +211,9 @@ of checkpoint internals is gated by the exact v1.5.5 version/source pin.
 - Creation invalidates the reservoir sample and can make overlapping writers
   retry. Quiescing writes around a first build avoids that API cost.
 - The native guard queries the host's built-in `pragma_version()` at load and
-  accepts only DuckDB v1.5.5 reporting an abbreviation of commit `d8cdaa33fd…`
-  with seven or more characters (`d8cdaa33` from a local build, `d8cdaa33fd`
-  from the official binary). Query and maintenance paths fail closed
+  accepts only DuckDB v2.0.0 reporting an abbreviation of commit `2d17945cff…`
+  with seven or more characters. An index written against a different host
+  build reads back `SCAN_ONLY` until it is rebuilt. Query and maintenance paths fail closed
   on mismatch; the generic drop validator stays available when the extension
   is loadable so an exact incompatible guard can be removed.
 

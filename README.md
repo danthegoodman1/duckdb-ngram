@@ -47,8 +47,10 @@ INSTALL ngram FROM community;
 LOAD ngram;
 ```
 
-The extension is built against DuckDB **v1.5.5** and links its internal C++
-API, so it must be loaded into a matching DuckDB version.
+The extension is built against DuckDB **v2.0.0** and links its internal C++
+API, so it must be loaded into a matching DuckDB version. DuckDB 2.0 is not
+released yet: the `duckdb` submodule tracks the `v2.0-cyanoptera` branch, and a
+local build names the version with `OVERRIDE_GIT_DESCRIBE=v2.0.0`.
 
 > The community-extensions submission is prepared but not yet merged (see
 > [`packaging/SUBMISSION.md`](packaging/SUBMISSION.md)). Until it is, load the
@@ -198,7 +200,7 @@ removes before it builds; a drop concurrent with a create on the same table can
 yield an index that is `SCAN_ONLY` from birth, whose remedy is to drop and
 re-create it.
 
-Load the extension before writing a guarded table. Stock v1.5.5 can SELECT it,
+Load the extension before writing a guarded table. A stock host can SELECT it,
 but INSERT/UPDATE fail on the unknown index type, DELETE may busy-spin in the
 host binder, and guard-touching ALTER is refused. An unrelated ADD COLUMN is
 safe. An extension-free or context-free checkpoint is detected by the durable
@@ -423,7 +425,7 @@ drops in the current database unless `catalog` names another attached one:
 copied attached databases may hold the same reference, so the catalog is part
 of the identity.
 
-DuckDB v1.5.5 refuses table and indexed-column rename while the physical guard
+DuckDB refuses table and indexed-column rename while the physical guard
 exists, including case-only rename. Moving a table between schemas and renaming
 a schema are host-not-implemented. The supported workflow is therefore:
 
@@ -648,18 +650,18 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
 - No fuzzy or similarity ranking, and no general regular-expression support —
   only regexes that are a plain literal reduce to an indexable substring.
 - Guarded tables require `ngram` to be loaded for supported DML. Without it,
-  treat the base table as read-only; v1.5.5 DELETE may busy-spin while trying
+  treat the base table as read-only; DELETE may busy-spin while trying
   to bind the unknown custom index type.
-- The rowid guard is pinned to host-reported DuckDB v1.5.5 built from commit
-  `d8cdaa33fd…`; it accepts any abbreviation of that commit with seven or more
-  characters as `pragma_version().source_id` (`d8cdaa33` from a local build,
-  `d8cdaa33fd` from the official binary). Other hosts load only for
+- The rowid guard is pinned to host-reported DuckDB v2.0.0 built from commit
+  `2d17945cff…`; it accepts any abbreviation of that commit with seven or more
+  characters as `pragma_version().source_id`. An index built against a
+  different host build reads back `SCAN_ONLY` until it is rebuilt. Other hosts load only for
   fail-closed inspection and cleanup; create/query/maintenance refuse to trust
   the custom index internals.
 - A first build invalidates DuckDB's reservoir sample and may make overlapping
   writers retry. Guard dependencies restrict column/table rename and dependent
-  DROP/ALTER operations until the ngram index is dropped. On v1.5.5, table
-  schema moves and schema rename are not implemented; use stable-ID drop,
+  DROP/ALTER operations until the ngram index is dropped. Table schema moves
+  and schema rename are not implemented by the host; use stable-ID drop,
   rename, then rebuild.
 - One index per (table, column). Multi-column indexes do not exist; build one
   index per column you search.
@@ -675,7 +677,7 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
 ## Platform support
 
 The distribution matrix (`.github/workflows/MainDistributionPipeline.yml`)
-builds DuckDB v1.5.5 with the extension on Linux (x86_64, arm64), macOS
+builds DuckDB v2.0.0 with the extension on Linux (x86_64, arm64), macOS
 (x86_64, arm64), Windows (x86_64 MSVC, x86_64 MinGW, arm64) and Wasm (mvp,
 eh, threads), and runs the SQL suite on the targets that can execute it; the
 C++ harness runs on Linux and macOS. The latest matrix run is recorded in
@@ -696,7 +698,7 @@ GEN=ninja make debug        # DEBUG + AddressSanitizer build
 
 The loadable binary is
 `build/release/extension/ngram/ngram.duckdb_extension`; load it into a stock
-DuckDB v1.5.5 with:
+DuckDB v2.0.0 with:
 
 ```sh
 duckdb -unsigned -c "LOAD '/path/to/ngram.duckdb_extension';"

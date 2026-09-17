@@ -451,8 +451,7 @@ void EncodePostingsCombine(Vector &state_vector, Vector &combined, AggregateInpu
 }
 
 void EncodePostingsFinalize(Vector &state_vector, AggregateFinalizeInputData &aggr_input_data, Vector &result,
-                            idx_t count,
-                            idx_t offset) {
+                            idx_t count, idx_t offset) {
 	UnifiedVectorFormat states_format;
 	state_vector.ToUnifiedFormat(states_format);
 	auto states = UnifiedVectorFormat::GetData<EncodePostingsState *>(states_format);
@@ -500,12 +499,12 @@ void EncodePostingsFinalize(Vector &state_vector, AggregateFinalizeInputData &ag
 void RegisterPostings(ExtensionLoader &loader) {
 	auto rowid_list = LogicalType::LIST(LogicalType::BIGINT);
 	// both reject malformed input
-	auto encode_postings = ScalarFunction("ngram_encode_postings", {rowid_list}, LogicalType::BLOB,
-	                                      EncodePostingsFunction);
+	auto encode_postings =
+	    ScalarFunction("ngram_encode_postings", {rowid_list}, LogicalType::BLOB, EncodePostingsFunction);
 	encode_postings.SetFallible();
 	loader.RegisterFunction(encode_postings);
-	auto decode_postings = ScalarFunction("ngram_decode_postings", {LogicalType::BLOB}, rowid_list,
-	                                      DecodePostingsFunction);
+	auto decode_postings =
+	    ScalarFunction("ngram_decode_postings", {LogicalType::BLOB}, rowid_list, DecodePostingsFunction);
 	decode_postings.SetFallible();
 	loader.RegisterFunction(decode_postings);
 

@@ -453,10 +453,9 @@ static void SearchGetMetrics(TableFunctionGetMetricsInput &input) {
 	auto &state = input.global_state->Cast<SearchGlobalState>();
 	metrics.AddExtraInfo("Ngram Storage Columns", StringUtil::Join(state.fetched_columns, ", "));
 	if (state.core.probe) {
-		metrics.AddExtraInfo("Ngram Mode",
-		                     StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
-		                                        state.core.probe->candidate_upper_bound,
-		                                        state.core.probe->decoded_rowids.load()));
+		metrics.AddExtraInfo("Ngram Mode", StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
+		                                                      state.core.probe->candidate_upper_bound,
+		                                                      state.core.probe->decoded_rowids.load()));
 		metrics.AddExtraInfo("Ngram Manifest Rows Scanned", to_string(state.core.probe->manifest_rows_scanned));
 		metrics.AddExtraInfo("Ngram Manifest Rows Visited", to_string(state.core.probe->manifest_rows_visited));
 		metrics.AddExtraInfo("Ngram Admission Rows", to_string(state.core.probe->admission_rows));

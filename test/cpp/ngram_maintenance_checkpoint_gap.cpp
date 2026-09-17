@@ -82,8 +82,7 @@ static string GuardName(Connection &con, const string &table_name, const string 
 
 //! The ngram_indexes() row of one index; an index the listing lacks is an
 //! error, as the status pragma it replaces made it.
-static unique_ptr<QueryResult> StatusByRef(Connection &con, const string &catalog,
-                                                       const string &index_ref) {
+static unique_ptr<QueryResult> StatusByRef(Connection &con, const string &catalog, const string &index_ref) {
 	auto result =
 	    Query(con, "SELECT * FROM ngram_indexes() WHERE database_name = " + KeywordHelper::WriteQuoted(catalog) +
 	                   " AND index_ref = " + KeywordHelper::WriteQuoted(index_ref));
@@ -415,8 +414,8 @@ static void MutateGuardOption(Connection &con, const string &table_name, const s
 	auto catalog_name = DatabaseManager::GetDefaultDatabase(*con.context);
 	bool found = false;
 	con.context->RunFunctionInTransaction([&]() {
-		auto &table = Catalog::GetEntry<TableCatalogEntry>(
-		                  *con.context, QualifiedName(catalog_name, "main", Identifier(table_name)))
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(*con.context,
+		                                                   QualifiedName(catalog_name, "main", Identifier(table_name)))
 		                  .Cast<DuckTableEntry>();
 		for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
 			if (entry->GetName() != guard_name || entry->GetBindState() == IndexBindState::BOUND) {
@@ -570,9 +569,8 @@ static void TestCreationSchedules(const string &path) {
 	      "INSERT INTO staged_revert SELECT i, CASE WHEN i=0 THEN 'base needle' ELSE 'x' END FROM range(8) t(i)");
 	Check(staged_writer, "BEGIN");
 	Check(staged_writer, "INSERT INTO staged_revert VALUES (8, 'staged needle')");
-	auto &staged_catalog =
-	    Catalog::GetCatalog(*staged_writer.context,
-	                        Identifier(ScalarString(staged_writer, "SELECT current_database()")));
+	auto &staged_catalog = Catalog::GetCatalog(*staged_writer.context,
+	                                           Identifier(ScalarString(staged_writer, "SELECT current_database()")));
 	DuckTransaction::Get(*staged_writer.context, staged_catalog).GetLocalStorage().Commit(nullptr);
 	auto staged_create = Expand(staged_creator, "PRAGMA create_ngram_index('staged_revert', 's')");
 	auto staged_next = ExecuteThrough(staged_creator, staged_create, "__ngram_creation_finish");

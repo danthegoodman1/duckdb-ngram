@@ -334,9 +334,9 @@ string DropIndexScript(ClientContext &context, const ObservedIndex &index) {
 	ResolvedTarget owner {index.catalog_name, index.schema_name, index.table_name, index.location.column_name, nullptr};
 	auto table_target = owner;
 	table_target.column_name.clear();
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
-	                       QualifiedName(Identifier(index.catalog_name), Identifier(index.schema_name),
-	                                     Identifier(index.table_name)));
+	EntryLookupInfo lookup(
+	    CatalogType::TABLE_ENTRY,
+	    QualifiedName(Identifier(index.catalog_name), Identifier(index.schema_name), Identifier(index.table_name)));
 	auto base = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 	auto base_exists = base && base->type == CatalogType::TABLE_ENTRY && base->Cast<TableCatalogEntry>().IsDuckTable();
 

@@ -316,8 +316,8 @@ vector<string> PrefixedGuardNames(ClientContext &context, DuckTableEntry &table)
 	auto info = table.GetStorage().GetDataTableInfo().get();
 	table.ParentSchema().Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
 		auto &index = entry.Cast<DuckIndexEntry>();
-		if (index.index_type == NGRAM_ROWID_GUARD_TYPE && index.name.StartsWith(GUARD_PREFIX) &&
-		    index.info && index.info->info.get() == info) {
+		if (index.index_type == NGRAM_ROWID_GUARD_TYPE && index.name.StartsWith(GUARD_PREFIX) && index.info &&
+		    index.info->info.get() == info) {
 			names.push_back(index.name.GetIdentifierName());
 		}
 	});

@@ -367,9 +367,9 @@ static unique_ptr<IndexBuildGlobalState> GuardBuildGlobalInit(IndexBuildInitGlob
 	auto next_row_id = storage.GetNextRowId();
 	auto max_seen = next_row_id == 0 ? int64_t(-1) : NumericCast<int64_t>(next_row_id - 1);
 	state->index =
-	    make_uniq<RowIdGuard>(input.info.GetIndexName(), input.storage_ids, TableIOManager::Get(storage), input.expressions,
-	                          storage.db, UUID::ToString(UUID::GenerateRandomUUID()), max_seen, false, true,
-	                          optional_idx(), ObservableCheckpointIteration(storage.db));
+	    make_uniq<RowIdGuard>(input.info.GetIndexName(), input.storage_ids, TableIOManager::Get(storage),
+	                          input.expressions, storage.db, UUID::ToString(UUID::GenerateRandomUUID()), max_seen,
+	                          false, true, optional_idx(), ObservableCheckpointIteration(storage.db));
 	return state;
 }
 
@@ -503,9 +503,9 @@ static void BindAllRowIdGuards(ClientContext &context) {
 	// another catalog lookup and would otherwise self-deadlock.
 	for (auto &name : tables) {
 		try {
-			EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
-			                       QualifiedName(Identifier(name.catalog), Identifier(name.schema),
-			                                     Identifier(name.table)));
+			EntryLookupInfo lookup(
+			    CatalogType::TABLE_ENTRY,
+			    QualifiedName(Identifier(name.catalog), Identifier(name.schema), Identifier(name.table)));
 			auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 			if (!entry || entry->type != CatalogType::TABLE_ENTRY || !entry->Cast<TableCatalogEntry>().IsDuckTable()) {
 				continue;

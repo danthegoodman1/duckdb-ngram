@@ -57,12 +57,17 @@ jobs:
           python3 scripts/gen_trigram_fixtures.py
           git diff --exit-code -- test/sql/trigrams_fixtures.test
 
+      # The formatter prepends the running interpreter's bin directory to PATH, so
+      # the tools have to live beside the python that runs it: installed with
+      # --user they sit behind the runner's own clang-format 14, which the
+      # version check then rejects.
       - name: Check formatting of the extension sources
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet 'clang-format==11.0.1' 'black==24.4.0' cmake-format
-          make format-check
+          python3 -m venv "$RUNNER_TEMP/format-venv"
+          "$RUNNER_TEMP/format-venv/bin/pip" install --quiet 'clang-format==11.0.1' 'black==24.4.0' cmake-format
+          PATH="$RUNNER_TEMP/format-venv/bin:$PATH" make format-check
 
       - name: Restore compiler cache
         uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24

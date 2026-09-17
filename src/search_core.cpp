@@ -403,9 +403,8 @@ idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableSca
 		scan.SetRowGroup(nullptr);
 		return 0;
 	}
-	auto vector_index = row_group->GetRowStart() >= start_row
-	                        ? 0
-	                        : (start_row - row_group->GetRowStart()) / STANDARD_VECTOR_SIZE;
+	auto vector_index =
+	    row_group->GetRowStart() >= start_row ? 0 : (start_row - row_group->GetRowStart()) / STANDARD_VECTOR_SIZE;
 	auto span_start = row_group->GetRowStart() + vector_index * STANDARD_VECTOR_SIZE;
 	while (row_group && row_group->GetRowStart() < end_row) {
 		if (RowGroupCollection::InitializeScanInRowGroup(context, scan, collection, *row_group, vector_index,
@@ -560,7 +559,8 @@ void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchC
 				}
 				auto offset = local.candidate_offset;
 				auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, local.candidate_end - offset);
-				Vector rowids(LogicalType::ROW_TYPE, reinterpret_cast<data_ptr_t>(local.candidates->data() + offset), count);
+				Vector rowids(LogicalType::ROW_TYPE, reinterpret_cast<data_ptr_t>(local.candidates->data() + offset),
+				              count);
 				local.candidate_offset += count;
 				global.storage->Fetch(*global.tx, local.probe_chunk, global.probe_column_ids, rowids, count,
 				                      local.fetch_state);

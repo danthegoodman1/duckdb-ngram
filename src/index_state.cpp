@@ -105,9 +105,8 @@ string RowIdGuardDropReason(ClientContext &context, DuckTableEntry &table, const
 	}
 
 	auto &storage = table.GetStorage();
-	EntryLookupInfo lookup(CatalogType::INDEX_ENTRY,
-	                       QualifiedName(table.ParentCatalog().GetName(), table.ParentSchema().name,
-	                                     Identifier(guard_name)));
+	EntryLookupInfo lookup(CatalogType::INDEX_ENTRY, QualifiedName(table.ParentCatalog().GetName(),
+	                                                               table.ParentSchema().name, Identifier(guard_name)));
 	auto catalog_entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 	if (catalog_entry) {
 		auto &index_entry = catalog_entry->Cast<DuckIndexEntry>();
@@ -386,9 +385,9 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 				return;
 			}
 			if (!table || !ParseStorageName(entry.name.GetIdentifierName(), index_ref)) {
-				foreign.push_back(malformed(entry.name.GetIdentifierName(),
-				                            StringUtil::Format("%s.%s is not a storage table of this extension",
-				                                               NGRAM_SCHEMA, entry.name)));
+				foreign.push_back(malformed(
+				    entry.name.GetIdentifierName(),
+				    StringUtil::Format("%s.%s is not a storage table of this extension", NGRAM_SCHEMA, entry.name)));
 				return;
 			}
 			storage.insert(index_ref);

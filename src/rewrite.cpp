@@ -388,7 +388,8 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 			throw InvalidInputException("ngram accelerated scan: unsupported column reference in scan");
 		} else if (col_idx.HasType()) {
 			state->core.fetch_types.push_back(col_idx.GetScanType());
-			state->fetched_columns.push_back(columns.GetColumn(col_idx.ToLogical()).Name().GetIdentifierName() + " (extract)");
+			state->fetched_columns.push_back(columns.GetColumn(col_idx.ToLogical()).Name().GetIdentifierName() +
+			                                 " (extract)");
 		} else {
 			state->core.fetch_types.push_back(columns.GetColumn(col_idx.ToLogical()).Type());
 			state->fetched_columns.push_back(columns.GetColumn(col_idx.ToLogical()).Name().GetIdentifierName());

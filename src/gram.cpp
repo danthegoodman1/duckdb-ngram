@@ -294,10 +294,10 @@ void RegisterGram(ExtensionLoader &loader) {
 	auto list_type = LogicalType::LIST(LogicalType::VARCHAR);
 	ScalarFunctionSet trigrams("trigrams");
 	// every overload rejects a gram size below one
-	for (auto &arguments : vector<vector<LogicalType>> {{LogicalType::VARCHAR},
-	                                                    {LogicalType::VARCHAR, LogicalType::INTEGER},
-	                                                    {LogicalType::VARCHAR, LogicalType::INTEGER,
-	                                                     LogicalType::BOOLEAN}}) {
+	for (auto &arguments :
+	     vector<vector<LogicalType>> {{LogicalType::VARCHAR},
+	                                  {LogicalType::VARCHAR, LogicalType::INTEGER},
+	                                  {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN}}) {
 		ScalarFunction overload(arguments, list_type, TrigramsFunction);
 		overload.SetFallible();
 		trigrams.AddFunction(overload);
@@ -306,9 +306,9 @@ void RegisterGram(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(
 	    ScalarFunction("ngram_gram_key", {LogicalType::VARCHAR}, LogicalType::UHUGEINT, GramKeyFunction));
-	auto gram_keys = ScalarFunction("ngram_gram_keys",
-	                                {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN},
-	                                LogicalType::LIST(LogicalType::UHUGEINT), GramKeysFunction);
+	auto gram_keys =
+	    ScalarFunction("ngram_gram_keys", {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN},
+	                   LogicalType::LIST(LogicalType::UHUGEINT), GramKeysFunction);
 	gram_keys.SetFallible();
 	loader.RegisterFunction(gram_keys);
 }

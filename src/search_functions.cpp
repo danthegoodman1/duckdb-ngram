@@ -4,6 +4,9 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/catalog.hpp"
@@ -109,11 +112,11 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 		result.bound_options = indexed[0].meta.options;
 	}
 	auto &table_entry = *target.entry;
-	if (!table_entry.ColumnExists(column)) {
+	if (!table_entry.ColumnExists(Identifier(column))) {
 		throw BinderException("%s: the ngram index on %s references column %s, which no longer exists", fn, table_input,
 		                      column);
 	}
-	auto &col = table_entry.GetColumn(column);
+	auto &col = table_entry.GetColumn(Identifier(column));
 	if (col.Type().id() != LogicalTypeId::VARCHAR) {
 		throw BinderException("%s: column %s of %s is %s, not VARCHAR", fn, column, table_input, col.Type().ToString());
 	}
@@ -122,7 +125,7 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 	result.table_name = target.table_name;
 	// the catalog's spelling: `column` may carry the user's casing (from col :=),
 	// and later name comparisons and owner keys must be casing-stable
-	result.column_name = col.Name();
+	result.column_name = col.Name().GetIdentifierName();
 }
 
 //! ngram_search(table, needle[, col := ...]) returns every row of `table`
@@ -134,7 +137,7 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 //! replaced, or cannot exclude reuse of a discarded trailing range the whole
 //! table is scanned instead. Malformed present index objects still raise.
 static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<QueryBindData>();
 	auto table_input = RequireStringArg(input.inputs[0], "ngram_search", "table");
 	result->needle = RequireStringArg(input.inputs[1], "ngram_search", "needle");
@@ -165,7 +168,7 @@ static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunction
 			result->search_column_idx = position;
 			found = true;
 		}
-		result->names.push_back(col.Name());
+		result->names.push_back(col.Name().GetIdentifierName());
 		result->types.push_back(col.Type());
 		position++;
 	}
@@ -173,7 +176,11 @@ static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunction
 		throw InvalidInputException("ngram_search: indexed column vanished during binding");
 	}
 	return_types = result->types;
-	names = result->names;
+	names.clear();
+	names.reserve(result->names.size());
+	for (auto &name : result->names) {
+		names.emplace_back(name);
+	}
 	return result;
 }
 
@@ -184,7 +191,7 @@ static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunction
 //! gram_size codepoints cannot be probed: candidates degrade to every indexed
 //! rowid ("all rowids" semantics), i.e. callers fall back to a full scan.
 static unique_ptr<FunctionData> CandidatesBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<QueryBindData>();
 	auto table_input = RequireStringArg(input.inputs[0], "ngram_candidates", "table");
 	auto column = RequireStringArg(input.inputs[1], "ngram_candidates", "column");
@@ -351,7 +358,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	}
 	state->recheck_expr = ContainsPredicate(context, needle_cmp, state->options.case_insensitive);
 	state->core.scan_filters = make_uniq<TableFilterSet>();
-	state->core.scan_filters->PushFilter(ColumnIndex(state->search_column_idx),
+	state->core.scan_filters->PushFilter(ProjectionIndex(state->search_column_idx),
 	                                     make_uniq<ExpressionFilter>(state->recheck_expr->Copy()));
 
 	NeedleKeys needle_keys;
@@ -414,10 +421,6 @@ static void SearchFunction(ClientContext &context, TableFunctionInput &data, Dat
 	    output);
 }
 
-static idx_t SearchRowsScanned(GlobalTableFunctionState &, LocalTableFunctionState &lstate) {
-	return lstate.Cast<SearchLocalState>().core.rows_scanned;
-}
-
 //! Ordered sinks reassemble a parallel scan's output by batch index. Fetch
 //! blocks carry their block number and tail batches follow them, so the
 //! reassembled order is the one the single-threaded scan produced: candidate
@@ -436,31 +439,37 @@ static InsertionOrderPreservingMap<string> SearchToString(TableFunctionToStringI
 	return result;
 }
 
-static InsertionOrderPreservingMap<string> SearchDynamicToString(TableFunctionDynamicToStringInput &input) {
-	InsertionOrderPreservingMap<string> result;
+//! Invoked once per (global, local) state pair: the scanned-row count is the
+//! calling thread's, while the rendered counters describe the shared global
+//! state and so are keyed-insert idempotent.
+static void SearchGetMetrics(TableFunctionGetMetricsInput &input) {
+	auto &metrics = input.operator_metrics;
+	if (input.local_state) {
+		metrics.rows_scanned = input.local_state->Cast<SearchLocalState>().core.rows_scanned;
+	}
 	if (!input.global_state) {
-		return result;
+		return;
 	}
 	auto &state = input.global_state->Cast<SearchGlobalState>();
-	result["Ngram Storage Columns"] = StringUtil::Join(state.fetched_columns, ", ");
+	metrics.AddExtraInfo("Ngram Storage Columns", StringUtil::Join(state.fetched_columns, ", "));
 	if (state.core.probe) {
-		result["Ngram Mode"] =
-		    StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
-		                       state.core.probe->candidate_upper_bound, state.core.probe->decoded_rowids.load());
-		result["Ngram Manifest Rows Scanned"] = to_string(state.core.probe->manifest_rows_scanned);
-		result["Ngram Manifest Rows Visited"] = to_string(state.core.probe->manifest_rows_visited);
-		result["Ngram Admission Rows"] = to_string(state.core.probe->admission_rows);
-		result["Ngram Probe Workers"] = to_string(state.core.probe->max_threads);
-		result["Ngram Decode Workspace Bytes"] = to_string(state.core.probe->workspace_bytes);
-		result["Ngram Decode Peak Bytes"] = to_string(state.core.probe->tracker->peak.load());
+		metrics.AddExtraInfo("Ngram Mode",
+		                     StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
+		                                        state.core.probe->candidate_upper_bound,
+		                                        state.core.probe->decoded_rowids.load()));
+		metrics.AddExtraInfo("Ngram Manifest Rows Scanned", to_string(state.core.probe->manifest_rows_scanned));
+		metrics.AddExtraInfo("Ngram Manifest Rows Visited", to_string(state.core.probe->manifest_rows_visited));
+		metrics.AddExtraInfo("Ngram Admission Rows", to_string(state.core.probe->admission_rows));
+		metrics.AddExtraInfo("Ngram Probe Workers", to_string(state.core.probe->max_threads));
+		metrics.AddExtraInfo("Ngram Decode Workspace Bytes", to_string(state.core.probe->workspace_bytes));
+		metrics.AddExtraInfo("Ngram Decode Peak Bytes", to_string(state.core.probe->tracker->peak.load()));
 	} else {
-		result["Ngram Mode"] = "full scan fallback: " + state.fallback_reason;
+		metrics.AddExtraInfo("Ngram Mode", "full scan fallback: " + state.fallback_reason);
 	}
-	result["Ngram Fetched Rows"] = to_string(state.core.fetched_rows.load());
-	result["Ngram Range Rows"] = to_string(state.core.range_rows.load());
-	result["Ngram Tail Rows"] = to_string(state.core.tail_rows.load());
-	result["Ngram Local Rows"] = to_string(state.core.local_rows.load());
-	return result;
+	metrics.AddExtraInfo("Ngram Fetched Rows", to_string(state.core.fetched_rows.load()));
+	metrics.AddExtraInfo("Ngram Range Rows", to_string(state.core.range_rows.load()));
+	metrics.AddExtraInfo("Ngram Tail Rows", to_string(state.core.tail_rows.load()));
+	metrics.AddExtraInfo("Ngram Local Rows", to_string(state.core.local_rows.load()));
 }
 
 static bool SearchSupportsPushdownExtract(const FunctionData &bind_data, const LogicalIndex &column_idx) {
@@ -551,8 +560,8 @@ static void CandidatesFunction(ClientContext &context, TableFunctionInput &data,
 			column_ids.push_back(StorageIndex(COLUMN_IDENTIFIER_ROW_ID));
 			state.scan_filters = make_uniq<TableFilterSet>();
 			state.scan_filters->PushFilter(
-			    ColumnIndex(0),
-			    make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::BIGINT(state.hwm)));
+			    ProjectionIndex(0),
+			    ConstantComparisonFilter(ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::BIGINT(state.hwm)));
 			InitializeExhaustiveScan(context, *state.tx, *state.storage, state.scan_state, column_ids,
 			                         state.scan_filters.get());
 			state.scan_chunk.Initialize(Allocator::Get(context), {LogicalType::ROW_TYPE});
@@ -576,27 +585,27 @@ static void CandidatesFunction(ClientContext &context, TableFunctionInput &data,
 	}
 	auto remaining = state.candidates.size() - state.offset;
 	idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
-	auto result = FlatVector::GetData<int64_t>(output.data[0]);
+	auto result = FlatVector::GetDataMutable<int64_t>(output.data[0]);
 	memcpy(result, state.candidates.data() + state.offset, count * sizeof(int64_t));
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
-static InsertionOrderPreservingMap<string> CandidatesDynamicToString(TableFunctionDynamicToStringInput &input) {
-	InsertionOrderPreservingMap<string> result;
+static void CandidatesGetMetrics(TableFunctionGetMetricsInput &input) {
 	if (!input.global_state) {
-		return result;
+		return;
 	}
 	auto &state = input.global_state->Cast<CandidatesGlobalState>();
-	if (state.probe) {
-		result["Ngram Probe Workers"] = to_string(state.probe->max_threads);
-		result["Ngram Manifest Rows Scanned"] = to_string(state.probe->manifest_rows_scanned);
-		result["Ngram Manifest Rows Visited"] = to_string(state.probe->manifest_rows_visited);
-		result["Ngram Decoded Rowids"] = to_string(state.probe->decoded_rowids.load());
-		result["Ngram Decode Workspace Bytes"] = to_string(state.probe->workspace_bytes);
-		result["Ngram Decode Peak Bytes"] = to_string(state.probe->tracker->peak.load());
+	if (!state.probe) {
+		return;
 	}
-	return result;
+	auto &metrics = input.operator_metrics;
+	metrics.AddExtraInfo("Ngram Probe Workers", to_string(state.probe->max_threads));
+	metrics.AddExtraInfo("Ngram Manifest Rows Scanned", to_string(state.probe->manifest_rows_scanned));
+	metrics.AddExtraInfo("Ngram Manifest Rows Visited", to_string(state.probe->manifest_rows_visited));
+	metrics.AddExtraInfo("Ngram Decoded Rowids", to_string(state.probe->decoded_rowids.load()));
+	metrics.AddExtraInfo("Ngram Decode Workspace Bytes", to_string(state.probe->workspace_bytes));
+	metrics.AddExtraInfo("Ngram Decode Peak Bytes", to_string(state.probe->tracker->peak.load()));
 }
 
 //===----------------------------------------------------------------------===//
@@ -606,17 +615,16 @@ static InsertionOrderPreservingMap<string> CandidatesDynamicToString(TableFuncti
 void RegisterSearchFunctions(ExtensionLoader &loader) {
 	TableFunction candidates("ngram_candidates", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                         CandidatesFunction, CandidatesBind, CandidatesInitGlobal);
-	candidates.dynamic_to_string = CandidatesDynamicToString;
+	candidates.get_metrics = CandidatesGetMetrics;
 	loader.RegisterFunction(candidates);
 
 	TableFunction search("ngram_search", {LogicalType::VARCHAR, LogicalType::VARCHAR}, SearchFunction, SearchBind,
 	                     SearchInitGlobal, SearchInitLocal);
 	search.get_partition_data = SearchGetPartitionData;
-	search.rows_scanned = SearchRowsScanned;
 	search.projection_pushdown = true;
 	search.supports_pushdown_extract = SearchSupportsPushdownExtract;
 	search.to_string = SearchToString;
-	search.dynamic_to_string = SearchDynamicToString;
+	search.get_metrics = SearchGetMetrics;
 	search.get_virtual_columns = [](ClientContext &, optional_ptr<FunctionData>) {
 		virtual_column_map_t result;
 		result.emplace(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN));

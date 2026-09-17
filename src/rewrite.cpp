@@ -1,11 +1,15 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/catalog.hpp"
@@ -118,14 +122,26 @@ static bool CollectLikeSegments(const string &pattern, bool requires_ci, vector<
 //! one-column chunk, so a qualifying shape is exactly
 //! fn(BOUND_REF, VARCHAR constant) for fn in {contains, ~~, ~~*}.
 static void CollectExprNeedles(const Expression &expr, vector<RewriteNeedle> &needles) {
+	// several filters on one column arrive ANDed into a single pushed
+	// expression, and every conjunct independently narrows the candidate set
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
+		auto &conjunction = expr.Cast<BoundConjunctionExpression>();
+		if (conjunction.GetExpressionType() != ExpressionType::CONJUNCTION_AND) {
+			return;
+		}
+		for (auto &child : conjunction.GetChildren()) {
+			CollectExprNeedles(*child, needles);
+		}
+		return;
+	}
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return;
 	}
 	auto &func = expr.Cast<BoundFunctionExpression>();
-	if (func.children.size() != 2) {
+	if (func.GetChildren().size() != 2) {
 		return;
 	}
-	auto &name = func.function.name;
+	auto &name = func.Function().GetName();
 	bool is_contains = name == "contains";
 	bool is_like = name == "~~";
 	bool is_ilike = name == "~~*";
@@ -134,14 +150,14 @@ static void CollectExprNeedles(const Expression &expr, vector<RewriteNeedle> &ne
 	}
 	// column on the left, literal on the right: contains('lit', col) probes
 	// nothing
-	if (func.children[0]->GetExpressionType() != ExpressionType::BOUND_REF ||
-	    func.children[0]->return_type.id() != LogicalTypeId::VARCHAR) {
+	if (func.GetChildren()[0]->GetExpressionType() != ExpressionType::BOUND_REF ||
+	    func.GetChildren()[0]->GetReturnType().id() != LogicalTypeId::VARCHAR) {
 		return;
 	}
-	if (func.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+	if (func.GetChildren()[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 		return;
 	}
-	auto &value = func.children[1]->Cast<BoundConstantExpression>().value;
+	auto &value = func.GetChildren()[1]->Cast<BoundConstantExpression>().GetValue();
 	if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR) {
 		return;
 	}
@@ -158,8 +174,8 @@ static void CollectExprNeedles(const Expression &expr, vector<RewriteNeedle> &ne
 //! the candidate set); anything under an OR is ignored.
 static void CollectFilterNeedles(const TableFilter &filter, vector<RewriteNeedle> &needles) {
 	switch (filter.filter_type) {
-	case TableFilterType::CONJUNCTION_AND:
-		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
+	case TableFilterType::LEGACY_CONJUNCTION_AND:
+		for (auto &child : filter.Cast<LegacyConjunctionAndFilter>().child_filters) {
 			CollectFilterNeedles(*child, needles);
 		}
 		break;
@@ -255,21 +271,22 @@ static unique_ptr<Expression> BuildRecheckExpression(optional_ptr<TableFilterSet
 	if (!filters) {
 		return result;
 	}
-	for (auto &entry : filters->filters) {
-		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+	for (auto &entry : *filters) {
+		auto column_index = entry.GetIndex();
+		if (entry.Filter().filter_type == TableFilterType::LEGACY_OPTIONAL_FILTER) {
 			continue;
 		}
-		if (entry.first >= scanned_types.size()) {
+		if (column_index >= scanned_types.size()) {
 			throw InvalidInputException("ngram accelerated scan: table filter references column %llu of %llu scanned",
-			                            entry.first, scanned_types.size());
+			                            column_index, scanned_types.size());
 		}
-		auto position = std::find(recheck_positions.begin(), recheck_positions.end(), entry.first);
+		auto position = std::find(recheck_positions.begin(), recheck_positions.end(), column_index);
 		idx_t reference = NumericCast<idx_t>(position - recheck_positions.begin());
 		if (position == recheck_positions.end()) {
-			recheck_positions.push_back(entry.first);
+			recheck_positions.push_back(column_index);
 		}
-		BoundReferenceExpression column(scanned_types[entry.first], reference);
-		auto expr = entry.second->ToExpression(column);
+		BoundReferenceExpression column(scanned_types[column_index], reference);
+		auto expr = entry.Filter().ToExpression(column);
 		if (result) {
 			result = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
 			                                               std::move(expr));
@@ -371,10 +388,10 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 			throw InvalidInputException("ngram accelerated scan: unsupported column reference in scan");
 		} else if (col_idx.HasType()) {
 			state->core.fetch_types.push_back(col_idx.GetScanType());
-			state->fetched_columns.push_back(columns.GetColumn(col_idx.ToLogical()).Name() + " (extract)");
+			state->fetched_columns.push_back(columns.GetColumn(col_idx.ToLogical()).Name().GetIdentifierName() + " (extract)");
 		} else {
 			state->core.fetch_types.push_back(columns.GetColumn(col_idx.ToLogical()).Type());
-			state->fetched_columns.push_back(columns.GetColumn(col_idx.ToLogical()).Name());
+			state->fetched_columns.push_back(columns.GetColumn(col_idx.ToLogical()).Name().GetIdentifierName());
 		}
 		state->core.fetch_column_ids.push_back(base.GetStorageIndex(col_idx));
 	}
@@ -399,12 +416,7 @@ static unique_ptr<GlobalTableFunctionState> NgramScanInitGlobal(ClientContext &c
 
 	// the storage scan: tail (rowid > hwm) in INDEX mode, whole table in
 	// FULL_SCAN mode; the pushed filters are applied natively either way
-	state->core.scan_filters = make_uniq<TableFilterSet>();
-	if (input.filters) {
-		for (auto &entry : input.filters->filters) {
-			state->core.scan_filters->PushFilter(ColumnIndex(entry.first), entry.second->Copy());
-		}
-	}
+	state->core.scan_filters = input.filters ? input.filters->Copy() : make_uniq<TableFilterSet>();
 	FinalizeSearchCore(context, state->core);
 
 	return state;
@@ -440,10 +452,6 @@ static void NgramScanFunc(ClientContext &context, TableFunctionInput &data, Data
 	    output);
 }
 
-static idx_t NgramScanRowsScanned(GlobalTableFunctionState &, LocalTableFunctionState &lstate) {
-	return lstate.Cast<NgramScanLocalState>().core.rows_scanned;
-}
-
 //! Ordered sinks reassemble a parallel scan's output by batch index. Fetch
 //! blocks carry their block number and storage batches follow them, so the
 //! reassembled order is the one the single-threaded scan produced: candidate
@@ -470,30 +478,36 @@ static InsertionOrderPreservingMap<string> NgramScanToString(TableFunctionToStri
 	return result;
 }
 
-static InsertionOrderPreservingMap<string> NgramScanDynamicToString(TableFunctionDynamicToStringInput &input) {
-	InsertionOrderPreservingMap<string> result;
+//! Invoked once per (global, local) state pair, as the core table scan's own
+//! hook is: the scanned-row count is the calling thread's, while the rendered
+//! counters describe the shared global state and so are keyed-insert idempotent.
+static void NgramScanGetMetrics(TableFunctionGetMetricsInput &input) {
+	auto &metrics = input.operator_metrics;
+	if (input.local_state) {
+		metrics.rows_scanned = input.local_state->Cast<NgramScanLocalState>().core.rows_scanned;
+	}
 	if (!input.global_state) {
-		return result;
+		return;
 	}
 	auto &state = input.global_state->Cast<NgramScanGlobalState>();
-	result["Ngram Storage Columns"] = StringUtil::Join(state.fetched_columns, ", ");
+	metrics.AddExtraInfo("Ngram Storage Columns", StringUtil::Join(state.fetched_columns, ", "));
 	if (state.mode == NgramScanMode::INDEX) {
-		result["Ngram Mode"] = StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
-		                                          state.candidate_count, state.core.probe->decoded_rowids.load());
-		result["Ngram Manifest Rows Scanned"] = to_string(state.core.probe->manifest_rows_scanned);
-		result["Ngram Manifest Rows Visited"] = to_string(state.core.probe->manifest_rows_visited);
-		result["Ngram Admission Rows"] = to_string(state.core.probe->admission_rows);
-		result["Ngram Probe Workers"] = to_string(state.core.probe->max_threads);
-		result["Ngram Decode Workspace Bytes"] = to_string(state.core.probe->workspace_bytes);
-		result["Ngram Decode Peak Bytes"] = to_string(state.core.probe->tracker->peak.load());
+		metrics.AddExtraInfo("Ngram Mode",
+		                     StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
+		                                        state.candidate_count, state.core.probe->decoded_rowids.load()));
+		metrics.AddExtraInfo("Ngram Manifest Rows Scanned", to_string(state.core.probe->manifest_rows_scanned));
+		metrics.AddExtraInfo("Ngram Manifest Rows Visited", to_string(state.core.probe->manifest_rows_visited));
+		metrics.AddExtraInfo("Ngram Admission Rows", to_string(state.core.probe->admission_rows));
+		metrics.AddExtraInfo("Ngram Probe Workers", to_string(state.core.probe->max_threads));
+		metrics.AddExtraInfo("Ngram Decode Workspace Bytes", to_string(state.core.probe->workspace_bytes));
+		metrics.AddExtraInfo("Ngram Decode Peak Bytes", to_string(state.core.probe->tracker->peak.load()));
 	} else {
-		result["Ngram Mode"] = "full scan fallback: " + state.fallback_reason;
+		metrics.AddExtraInfo("Ngram Mode", "full scan fallback: " + state.fallback_reason);
 	}
-	result["Ngram Fetched Rows"] = to_string(state.core.fetched_rows.load());
-	result["Ngram Range Rows"] = to_string(state.core.range_rows.load());
-	result["Ngram Tail Rows"] = to_string(state.core.tail_rows.load());
-	result["Ngram Local Rows"] = to_string(state.core.local_rows.load());
-	return result;
+	metrics.AddExtraInfo("Ngram Fetched Rows", to_string(state.core.fetched_rows.load()));
+	metrics.AddExtraInfo("Ngram Range Rows", to_string(state.core.range_rows.load()));
+	metrics.AddExtraInfo("Ngram Tail Rows", to_string(state.core.tail_rows.load()));
+	metrics.AddExtraInfo("Ngram Local Rows", to_string(state.core.local_rows.load()));
 }
 
 static void NgramScanDependency(LogicalDependencyList &dependencies, const FunctionData *bind_data) {
@@ -509,13 +523,12 @@ static TableFunction NgramIndexScanFunction() {
 	function.init_global = NgramScanInitGlobal;
 	function.init_local = NgramScanInitLocal;
 	function.get_partition_data = NgramScanGetPartitionData;
-	function.rows_scanned = NgramScanRowsScanned;
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
 	function.filter_prune = true;
 	function.dependency = NgramScanDependency;
 	function.to_string = NgramScanToString;
-	function.dynamic_to_string = NgramScanDynamicToString;
+	function.get_metrics = NgramScanGetMetrics;
 	// injected post-optimize, never serialized; skips the DEBUG-build plan
 	// serialization verification
 	function.verify_serialization = false;
@@ -533,7 +546,7 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 	if (get.function.name != "seq_scan") {
 		return;
 	}
-	if (get.table_filters.filters.empty()) {
+	if (!get.table_filters.HasFilters()) {
 		return;
 	}
 	// shapes the swapped scan does not reproduce
@@ -553,16 +566,23 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 	// filter shapes first: a scan without a substring filter on a VARCHAR
 	// column never reads the registry
 	vector<std::pair<const ColumnDefinition *, vector<RewriteNeedle>>> probeable;
-	for (auto &entry : get.table_filters.filters) {
-		if (entry.first >= columns.LogicalColumnCount()) {
+	auto &scanned_columns = get.GetColumnIds();
+	for (auto &entry : get.table_filters) {
+		// a pushed filter is keyed by its position in the scan's projection
+		auto projection_index = entry.GetIndex();
+		if (projection_index >= scanned_columns.size()) {
 			continue;
 		}
-		auto &column = columns.GetColumn(LogicalIndex(entry.first));
+		auto &scanned = scanned_columns[projection_index];
+		if (scanned.IsVirtualColumn()) {
+			continue;
+		}
+		auto &column = columns.GetColumn(scanned.ToLogical());
 		if (column.Type().id() != LogicalTypeId::VARCHAR) {
 			continue;
 		}
 		vector<RewriteNeedle> needles;
-		CollectFilterNeedles(*entry.second, needles);
+		CollectFilterNeedles(entry.Filter(), needles);
 		if (!needles.empty()) {
 			probeable.emplace_back(&column, std::move(needles));
 		}
@@ -570,13 +590,14 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 	if (probeable.empty()) {
 		return;
 	}
-	auto catalog_name = table->ParentCatalog().GetName();
-	auto schema_name = table->ParentSchema().name;
+	auto catalog_name = table->ParentCatalog().GetName().GetIdentifierName();
+	auto schema_name = table->ParentSchema().name.GetIdentifierName();
 	for (auto &candidate : probeable) {
 		auto &column = *candidate.first;
 		auto &needles = candidate.second;
 		// one owner-keyed registry read per filtered column
-		ResolvedTarget resolved {catalog_name, schema_name, table->name, column.Name(), table};
+		ResolvedTarget resolved {catalog_name, schema_name, table->name.GetIdentifierName(),
+		                         column.Name().GetIdentifierName(), table};
 		auto owned = OwnedIndexes(context, resolved, true);
 		if (owned.size() > 1) {
 			return;
@@ -599,12 +620,12 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		auto bind = make_uniq<NgramScanBindData>();
 		bind->catalog_name = catalog_name;
 		bind->schema_name = schema_name;
-		bind->table_name = table->name;
+		bind->table_name = table->name.GetIdentifierName();
 		bind->location = index->location;
-		bind->column_name = column.Name();
+		bind->column_name = column.Name().GetIdentifierName();
 		bind->needles = std::move(usable);
 		for (auto &col : columns.Logical()) {
-			bind->base_names.push_back(col.Name());
+			bind->base_names.push_back(col.Name().GetIdentifierName());
 			bind->base_types.push_back(col.Type());
 		}
 		bind->table = table;

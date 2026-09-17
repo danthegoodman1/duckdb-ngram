@@ -91,8 +91,8 @@ SELECT ngram_pack_segment(-1::BIGINT);
 ----
 negative
 
-# wrong argument type is a binder error
+# a wrong argument type fails converting the literal to the bound type
 statement error
 SELECT ngram_pack_segment('abc');
 ----
-No function matches
+Could not convert string 'abc' to INT64

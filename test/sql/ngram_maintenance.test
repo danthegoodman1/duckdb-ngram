@@ -948,21 +948,20 @@ SELECT (SELECT count(*) FROM __ngram.registry WHERE table_name = 'pair'),
 ----
 1	1	1
 
-# Each script is planned when the string is expanded, before the scripts ahead
-# of it run. A guardless table's first two indexes in one string are both
-# planned as the guard's installer, so the second is refused at execution.
+# Each script is planned as the statement ahead of it finishes, so a guardless
+# table's first two indexes in one string both apply: the second is planned
+# after the first has installed the guard, and sees it.
 statement ok
 CREATE TABLE pair_other(s VARCHAR, u VARCHAR);
 
 statement ok
 INSERT INTO pair_other VALUES ('sigma tent', 'tau tent');
 
-statement error
+statement ok
 PRAGMA create_ngram_index('pair_other', 's'); PRAGMA create_ngram_index('pair_other', 'u');
-----
-the ngram indexes on pair_other changed while the statement was being prepared; run it again
 
 query I
-SELECT column_name FROM __ngram.registry WHERE table_name = 'pair_other';
+SELECT column_name FROM __ngram.registry WHERE table_name = 'pair_other' ORDER BY column_name;
 ----
 s
+u

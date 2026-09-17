@@ -1,8 +1,12 @@
 #include "ngram/catalog.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "ngram/rowid_guard.hpp"
 #include "ngram/search_core.hpp"
@@ -51,11 +55,11 @@ bool IsCanonicalUUID(const string &value) {
 }
 
 string Ident(const string &name) {
-	return KeywordHelper::WriteOptionallyQuoted(name);
+	return SQLIdentifier::ToString(name);
 }
 
 string Lit(const string &value) {
-	return KeywordHelper::WriteQuoted(value);
+	return SQLString::ToString(value);
 }
 
 string SystemFunction(const string &name) {
@@ -89,10 +93,9 @@ static constexpr idx_t IDENTITY_COLUMNS = 6;
 
 RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name, const RegistrySelector &selector) {
 	RegistrySnapshot result;
-	// EntryLookupInfo stores the name by reference.
-	string registry_table = REGISTRY_TABLE;
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, registry_table);
-	auto entry = Catalog::GetEntry(context, catalog_name, NGRAM_SCHEMA, lookup, OnEntryNotFound::RETURN_NULL);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+	                       QualifiedName(Identifier(catalog_name), NGRAM_SCHEMA, REGISTRY_TABLE));
+	auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 	if (!entry) {
 		return result;
 	}
@@ -122,16 +125,16 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 	auto &transaction = DuckTransaction::Get(context, table.ParentCatalog());
 	TableFilterSet filters;
 	if (!selector.index_ref.empty()) {
-		filters.PushFilter(ColumnIndex(1),
-		                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::UUID(selector.index_ref)));
+		filters.PushFilter(ProjectionIndex(1),
+		                   ConstantComparisonFilter(ExpressionType::COMPARE_EQUAL, Value::UUID(selector.index_ref)));
 	}
 	if (!selector.owner_key.empty()) {
-		filters.PushFilter(ColumnIndex(2), make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL,
-		                                                             Value::BLOB_RAW(selector.owner_key)));
+		filters.PushFilter(ProjectionIndex(2), ConstantComparisonFilter(ExpressionType::COMPARE_EQUAL,
+		                                                                Value::BLOB_RAW(selector.owner_key)));
 	}
 	TableScanState state;
 	InitializeExhaustiveScan(context, transaction, table.GetStorage(), state, column_ids,
-	                         filters.filters.empty() ? nullptr : &filters);
+	                         filters.HasFilters() ? &filters : nullptr);
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), types);
 	vector<UnifiedVectorFormat> identity(IDENTITY_COLUMNS);
@@ -143,7 +146,7 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 			break;
 		}
 		for (idx_t c = 0; c < IDENTITY_COLUMNS; c++) {
-			chunk.data[c].ToUnifiedFormat(chunk.size(), identity[c]);
+			chunk.data[c].ToUnifiedFormat(identity[c]);
 		}
 		auto names = [&](idx_t column, idx_t r) {
 			return UnifiedVectorFormat::GetData<string_t>(identity[column])[identity[column].sel->get_index(r)];
@@ -313,9 +316,9 @@ vector<string> PrefixedGuardNames(ClientContext &context, DuckTableEntry &table)
 	auto info = table.GetStorage().GetDataTableInfo().get();
 	table.ParentSchema().Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
 		auto &index = entry.Cast<DuckIndexEntry>();
-		if (index.index_type == NGRAM_ROWID_GUARD_TYPE && StringUtil::StartsWith(index.name, GUARD_PREFIX) &&
+		if (index.index_type == NGRAM_ROWID_GUARD_TYPE && index.name.StartsWith(GUARD_PREFIX) &&
 		    index.info && index.info->info.get() == info) {
-			names.push_back(index.name);
+			names.push_back(index.name.GetIdentifierName());
 		}
 	});
 	std::sort(names.begin(), names.end());
@@ -364,9 +367,8 @@ bool ParseFormat4StatsName(const string &name, string &index_ref) {
 
 ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, const string &column_name,
                              bool require_column) {
-	auto qname = QualifiedName::Parse(table_input);
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, qname.name);
-	auto entry = Catalog::GetEntry(context, qname.catalog, qname.schema, lookup, OnEntryNotFound::THROW_EXCEPTION);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, QualifiedName::Parse(table_input));
+	auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::THROW_EXCEPTION);
 	// a TABLE_ENTRY lookup can also return a view (they share a catalog set)
 	if (entry->type != CatalogType::TABLE_ENTRY) {
 		if (entry->type == CatalogType::VIEW_ENTRY) {
@@ -384,16 +386,16 @@ ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, 
 		// the pseudo-column the build reads as the row identifier, so the build
 		// would silently index that column's values instead of row ids
 		for (auto &col : table_entry.GetColumns().Logical()) {
-			if (StringUtil::Lower(col.Name()) == "rowid") {
+			if (col.Name() == "rowid") {
 				throw BinderException("cannot build an ngram index on %s: its column \"%s\" shadows the rowid "
 				                      "pseudo-column used as the row identifier",
 				                      table_input, col.Name());
 			}
 		}
-		if (!table_entry.ColumnExists(column_name)) {
+		if (!table_entry.ColumnExists(Identifier(column_name))) {
 			throw CatalogException("Table %s does not have a column named %s", table_input, column_name);
 		}
-		auto &column = table_entry.GetColumn(column_name);
+		auto &column = table_entry.GetColumn(Identifier(column_name));
 		if (column.Generated()) {
 			throw BinderException("ngram indexes require a physical VARCHAR column; %s.%s is generated", table_input,
 			                      column_name);
@@ -404,16 +406,16 @@ ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, 
 		}
 	}
 	ResolvedTarget target;
-	target.catalog_name = table_entry.ParentCatalog().GetName();
-	target.schema_name = table_entry.ParentSchema().name;
-	target.table_name = table_entry.name;
+	target.catalog_name = table_entry.ParentCatalog().GetName().GetIdentifierName();
+	target.schema_name = table_entry.ParentSchema().name.GetIdentifierName();
+	target.table_name = table_entry.name.GetIdentifierName();
 	// store the catalog's spelling of the column: lookups are case-insensitive,
 	// but owner keys and name comparisons are not. When the column no longer
 	// exists on the base table (e.g. dropping an orphaned index after the
 	// column was removed), the user's spelling passes through.
 	target.column_name = column_name;
-	if (!column_name.empty() && table_entry.ColumnExists(column_name)) {
-		target.column_name = table_entry.GetColumn(column_name).Name();
+	if (!column_name.empty() && table_entry.ColumnExists(Identifier(column_name))) {
+		target.column_name = table_entry.GetColumn(Identifier(column_name)).Name().GetIdentifierName();
 	}
 	target.entry = &table_entry;
 	return target;
@@ -428,9 +430,9 @@ string ScratchName(const char *purpose) {
 }
 
 string LegacyGuardToken(ClientContext &context, const string &catalog_name, const string &schema_name) {
-	string meta_name = "meta";
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, meta_name);
-	auto entry = Catalog::GetEntry(context, catalog_name, schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+	                       QualifiedName(Identifier(catalog_name), Identifier(schema_name), "meta"));
+	auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 	if (!entry || entry->type != CatalogType::TABLE_ENTRY || !entry->Cast<TableCatalogEntry>().IsDuckTable() ||
 	    !entry->Cast<TableCatalogEntry>().ColumnExists("guard_token")) {
 		return string();

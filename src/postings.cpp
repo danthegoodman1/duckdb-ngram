@@ -1,5 +1,7 @@
 #include "ngram/postings.hpp"
 
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "ngram/catalog.hpp"
 
 #include <algorithm>
@@ -101,18 +103,17 @@ static void EncodePostingsFunction(DataChunk &args, ExpressionState &state, Vect
 	auto count = args.size();
 
 	UnifiedVectorFormat list_format;
-	args.data[0].ToUnifiedFormat(count, list_format);
+	args.data[0].ToUnifiedFormat(list_format);
 	auto list_entries = UnifiedVectorFormat::GetData<list_entry_t>(list_format);
 
-	auto &child = ListVector::GetEntry(args.data[0]);
-	auto child_size = ListVector::GetListSize(args.data[0]);
+	auto &child = ListVector::GetChild(args.data[0]);
 	UnifiedVectorFormat child_format;
-	child.ToUnifiedFormat(child_size, child_format);
+	child.ToUnifiedFormat(child_format);
 	auto child_values = UnifiedVectorFormat::GetData<int64_t>(child_format);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_strings = FlatVector::GetData<string_t>(result);
-	auto &result_validity = FlatVector::Validity(result);
+	auto result_strings = FlatVector::GetDataMutable<string_t>(result);
+	auto &result_validity = FlatVector::ValidityMutable(result);
 
 	vector<int64_t> rowids;
 	for (idx_t row = 0; row < count; row++) {
@@ -143,12 +144,12 @@ static void DecodePostingsFunction(DataChunk &args, ExpressionState &state, Vect
 	auto count = args.size();
 
 	UnifiedVectorFormat blob_format;
-	args.data[0].ToUnifiedFormat(count, blob_format);
+	args.data[0].ToUnifiedFormat(blob_format);
 	auto blobs = UnifiedVectorFormat::GetData<string_t>(blob_format);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto list_entries = FlatVector::GetData<list_entry_t>(result);
-	auto &result_validity = FlatVector::Validity(result);
+	auto list_entries = FlatVector::GetDataMutable<list_entry_t>(result);
+	auto &result_validity = FlatVector::ValidityMutable(result);
 	ListVector::SetListSize(result, 0);
 
 	idx_t total = 0;
@@ -167,8 +168,8 @@ static void DecodePostingsFunction(DataChunk &args, ExpressionState &state, Vect
 			ListVector::SetListSize(result, total);
 			ListVector::Reserve(result, NextPowerOfTwo(total + rowids.size()));
 		}
-		auto &child = ListVector::GetEntry(result);
-		auto child_values = FlatVector::GetData<int64_t>(child);
+		auto &child = ListVector::GetChildMutable(result);
+		auto child_values = FlatVector::GetDataMutable<int64_t>(child);
 		for (idx_t i = 0; i < rowids.size(); i++) {
 			child_values[total + i] = rowids[i];
 		}
@@ -201,7 +202,7 @@ struct UnpackPostingsLocalState : LocalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> UnpackPostingsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &types = input.input_table_types;
 	if ((types.size() != 3 && types.size() != 8) || types[0].id() != LogicalTypeId::UHUGEINT ||
 	    types[1].id() != LogicalTypeId::BIGINT || types[2].id() != LogicalTypeId::BLOB ||
@@ -234,16 +235,16 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 
 	UnifiedVectorFormat key_format, segment_format, blob_format, count_format, min_format, max_format,
 	    generation_format, hwm_format;
-	input.data[0].ToUnifiedFormat(input.size(), key_format);
-	input.data[1].ToUnifiedFormat(input.size(), segment_format);
-	input.data[2].ToUnifiedFormat(input.size(), blob_format);
+	input.data[0].ToUnifiedFormat(key_format);
+	input.data[1].ToUnifiedFormat(segment_format);
+	input.data[2].ToUnifiedFormat(blob_format);
 	auto checked = input.ColumnCount() == 8;
 	if (checked) {
-		input.data[3].ToUnifiedFormat(input.size(), count_format);
-		input.data[4].ToUnifiedFormat(input.size(), min_format);
-		input.data[5].ToUnifiedFormat(input.size(), max_format);
-		input.data[6].ToUnifiedFormat(input.size(), generation_format);
-		input.data[7].ToUnifiedFormat(input.size(), hwm_format);
+		input.data[3].ToUnifiedFormat(count_format);
+		input.data[4].ToUnifiedFormat(min_format);
+		input.data[5].ToUnifiedFormat(max_format);
+		input.data[6].ToUnifiedFormat(generation_format);
+		input.data[7].ToUnifiedFormat(hwm_format);
 	}
 	auto keys = UnifiedVectorFormat::GetData<uhugeint_t>(key_format);
 	auto segments = UnifiedVectorFormat::GetData<int64_t>(segment_format);
@@ -254,9 +255,9 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 	auto generations = checked ? UnifiedVectorFormat::GetData<int64_t>(generation_format) : nullptr;
 	auto hwms = checked ? UnifiedVectorFormat::GetData<int64_t>(hwm_format) : nullptr;
 
-	auto out_key = FlatVector::GetData<uhugeint_t>(output.data[0]);
-	auto out_segment = FlatVector::GetData<int64_t>(output.data[1]);
-	auto out_rowid = FlatVector::GetData<int64_t>(output.data[2]);
+	auto out_key = FlatVector::GetDataMutable<uhugeint_t>(output.data[0]);
+	auto out_segment = FlatVector::GetDataMutable<int64_t>(output.data[1]);
+	auto out_rowid = FlatVector::GetDataMutable<int64_t>(output.data[2]);
 
 	idx_t out_count = 0;
 	while (state.input_offset < input.size()) {
@@ -300,7 +301,7 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 		}
 		while (state.rowid_offset < state.rowids.size()) {
 			if (out_count >= STANDARD_VECTOR_SIZE) {
-				output.SetCardinality(out_count);
+				output.SetChildCardinality(out_count);
 				return OperatorResultType::HAVE_MORE_OUTPUT;
 			}
 			out_key[out_count] = keys[key_idx];
@@ -312,7 +313,7 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 		state.input_offset++;
 	}
 	state.input_offset = 0;
-	output.SetCardinality(out_count);
+	output.SetChildCardinality(out_count);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
@@ -399,11 +400,11 @@ void EncodePostingsUpdate(Vector inputs[], AggregateInputData &aggr_input_data, 
                           idx_t count) {
 	D_ASSERT(input_count == 1);
 	UnifiedVectorFormat rowid_format;
-	inputs[0].ToUnifiedFormat(count, rowid_format);
+	inputs[0].ToUnifiedFormat(rowid_format);
 	auto rowids = UnifiedVectorFormat::GetData<int64_t>(rowid_format);
 
 	UnifiedVectorFormat states_format;
-	state_vector.ToUnifiedFormat(count, states_format);
+	state_vector.ToUnifiedFormat(states_format);
 	auto states = UnifiedVectorFormat::GetData<EncodePostingsState *>(states_format);
 
 	for (idx_t i = 0; i < count; i++) {
@@ -417,7 +418,7 @@ void EncodePostingsUpdate(Vector inputs[], AggregateInputData &aggr_input_data, 
 
 void EncodePostingsCombine(Vector &state_vector, Vector &combined, AggregateInputData &aggr_input_data, idx_t count) {
 	UnifiedVectorFormat states_format;
-	state_vector.ToUnifiedFormat(count, states_format);
+	state_vector.ToUnifiedFormat(states_format);
 	auto states = UnifiedVectorFormat::GetData<EncodePostingsState *>(states_format);
 	auto targets = FlatVector::GetData<EncodePostingsState *>(combined);
 
@@ -449,19 +450,20 @@ void EncodePostingsCombine(Vector &state_vector, Vector &combined, AggregateInpu
 	}
 }
 
-void EncodePostingsFinalize(Vector &state_vector, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
+void EncodePostingsFinalize(Vector &state_vector, AggregateFinalizeInputData &aggr_input_data, Vector &result,
+                            idx_t count,
                             idx_t offset) {
 	UnifiedVectorFormat states_format;
-	state_vector.ToUnifiedFormat(count, states_format);
+	state_vector.ToUnifiedFormat(states_format);
 	auto states = UnifiedVectorFormat::GetData<EncodePostingsState *>(states_format);
 
 	auto &children = StructVector::GetEntries(result);
-	auto &postings_child = *children[0];
-	auto postings = FlatVector::GetData<string_t>(postings_child);
-	auto rowid_count = FlatVector::GetData<int64_t>(*children[1]);
-	auto min_rowid = FlatVector::GetData<int64_t>(*children[2]);
-	auto max_rowid = FlatVector::GetData<int64_t>(*children[3]);
-	auto &mask = FlatVector::Validity(result);
+	auto &postings_child = children[0];
+	auto postings = FlatVector::GetDataMutable<string_t>(postings_child);
+	auto rowid_count = FlatVector::GetDataMutable<int64_t>(children[1]);
+	auto min_rowid = FlatVector::GetDataMutable<int64_t>(children[2]);
+	auto max_rowid = FlatVector::GetDataMutable<int64_t>(children[3]);
+	auto &mask = FlatVector::ValidityMutable(result);
 
 	vector<int64_t> rowids;
 	for (idx_t i = 0; i < count; i++) {
@@ -472,7 +474,7 @@ void EncodePostingsFinalize(Vector &state_vector, AggregateInputData &aggr_input
 			// there is no segment to describe
 			mask.SetInvalid(row);
 			for (auto &child : children) {
-				FlatVector::Validity(*child).SetInvalid(row);
+				FlatVector::ValidityMutable(child).SetInvalid(row);
 			}
 			continue;
 		}
@@ -497,10 +499,15 @@ void EncodePostingsFinalize(Vector &state_vector, AggregateInputData &aggr_input
 
 void RegisterPostings(ExtensionLoader &loader) {
 	auto rowid_list = LogicalType::LIST(LogicalType::BIGINT);
-	loader.RegisterFunction(
-	    ScalarFunction("ngram_encode_postings", {rowid_list}, LogicalType::BLOB, EncodePostingsFunction));
-	loader.RegisterFunction(
-	    ScalarFunction("ngram_decode_postings", {LogicalType::BLOB}, rowid_list, DecodePostingsFunction));
+	// both reject malformed input
+	auto encode_postings = ScalarFunction("ngram_encode_postings", {rowid_list}, LogicalType::BLOB,
+	                                      EncodePostingsFunction);
+	encode_postings.SetFallible();
+	loader.RegisterFunction(encode_postings);
+	auto decode_postings = ScalarFunction("ngram_decode_postings", {LogicalType::BLOB}, rowid_list,
+	                                      DecodePostingsFunction);
+	decode_postings.SetFallible();
+	loader.RegisterFunction(decode_postings);
 
 	TableFunction unpack("ngram_unpack_postings", {LogicalType::TABLE}, nullptr, UnpackPostingsBind,
 	                     UnpackPostingsInitGlobal, UnpackPostingsInitLocal);

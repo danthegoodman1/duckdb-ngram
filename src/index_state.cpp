@@ -1,7 +1,13 @@
 #include "ngram/index_state.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/storage/index.hpp"
+#include "duckdb/storage/table/index_entry.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/catalog.hpp"
@@ -24,45 +30,43 @@ static unique_ptr<RowIdGuardState> ReadGuardState(DuckTableEntry &table, const s
 		return nullptr;
 	}
 	auto &storage = table.GetStorage();
-	auto has_column = table.ColumnExists(column_name);
+	auto has_column = table.ColumnExists(Identifier(column_name));
 	StorageIndex expected_column;
 	if (has_column) {
-		expected_column = table.GetStorageIndex(ColumnIndex(table.GetColumn(column_name).Logical().index));
+		expected_column = table.GetStorageIndex(ColumnIndex(table.GetColumn(Identifier(column_name)).Logical().index));
 	}
-	for (auto &entry : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
-		auto &index = *entry.index;
-		if (index.GetIndexName() != guard_name) {
+	for (auto entry : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
+		if (entry->GetName() != guard_name) {
 			continue;
 		}
-		if (entry.bind_state.load() == IndexBindState::BINDING) {
+		if (entry->GetBindState() == IndexBindState::BINDING) {
 			reason = "the recorded rowid guard is in an uncertain bind state";
 			return nullptr;
 		}
-		if (!has_column || index.GetIndexType() != NGRAM_ROWID_GUARD_TYPE ||
-		    std::find(index.GetColumnIds().begin(), index.GetColumnIds().end(), expected_column.GetPrimaryIndex()) ==
-		        index.GetColumnIds().end()) {
+		// scoped: the bound path below takes the same entry's exclusive handle
+		vector<column_t> column_ids;
+		{
+			auto index = entry->GetReadHandle<Index>();
+			column_ids = index->GetColumnIds();
+		}
+		if (!has_column || entry->GetIndexType() != NGRAM_ROWID_GUARD_TYPE ||
+		    std::find(column_ids.begin(), column_ids.end(), expected_column.GetPrimaryIndex()) == column_ids.end()) {
 			reason = "the recorded rowid guard has the wrong type or column dependency";
 			return nullptr;
 		}
-		if (index.IsBound()) {
-			return make_uniq<RowIdGuardState>(ReadBoundGuardState(index, checkpoint_iteration));
+		if (entry->GetBindState() == IndexBindState::BOUND) {
+			return make_uniq<RowIdGuardState>(ReadBoundGuardState(*entry, checkpoint_iteration));
 		}
-		auto &unbound = index.Cast<UnboundIndex>();
-		auto stored = ReadStoredGuardState(unbound.GetStorageInfo());
+		// DataTable::AppendToIndexes buffers replay chunks under the entry lock,
+		// which this read handle holds for as long as the unbound index is read.
+		auto unbound = entry->GetReadHandle<UnboundIndex>();
+		auto stored = ReadStoredGuardState(unbound->GetStorageInfo());
 		if (checkpoint_iteration.IsValid() &&
 		    (!stored.checkpoint_iteration.IsValid() ||
 		     stored.checkpoint_iteration.GetIndex() != checkpoint_iteration.GetIndex())) {
 			stored.unsafe_reuse = true;
 		}
-		bool buffered;
-		{
-			// DataTable::AppendToIndexes buffers replay chunks under entry.lock
-			// while IndexEntries() holds only the list lock; take the same lock
-			// to read the buffer.
-			lock_guard<mutex> entry_guard(entry.lock);
-			buffered = unbound.HasBufferedReplays();
-		}
-		if (buffered) {
+		if (unbound->HasBufferedReplays()) {
 			// The exact rowid effects are deliberately left to DuckDB's replay
 			// binder; until then, one full scan is the only safe answer.
 			stored.unsafe_reuse = true;
@@ -72,7 +76,7 @@ static unique_ptr<RowIdGuardState> ReadGuardState(DuckTableEntry &table, const s
 		result->max_seen = stored.max_seen;
 		result->unsafe_reuse = stored.unsafe_reuse;
 		result->protection_compatible = stored.protection_compatible;
-		result->column_ids = index.GetColumnIds();
+		result->column_ids = std::move(column_ids);
 		return result;
 	}
 	reason = "the recorded rowid guard is missing";
@@ -101,9 +105,10 @@ string RowIdGuardDropReason(ClientContext &context, DuckTableEntry &table, const
 	}
 
 	auto &storage = table.GetStorage();
-	EntryLookupInfo lookup(CatalogType::INDEX_ENTRY, guard_name);
-	auto catalog_entry = Catalog::GetEntry(context, table.ParentCatalog().GetName(), table.ParentSchema().name, lookup,
-	                                       OnEntryNotFound::RETURN_NULL);
+	EntryLookupInfo lookup(CatalogType::INDEX_ENTRY,
+	                       QualifiedName(table.ParentCatalog().GetName(), table.ParentSchema().name,
+	                                     Identifier(guard_name)));
+	auto catalog_entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 	if (catalog_entry) {
 		auto &index_entry = catalog_entry->Cast<DuckIndexEntry>();
 		if (index_entry.index_type != NGRAM_ROWID_GUARD_TYPE ||
@@ -113,25 +118,25 @@ string RowIdGuardDropReason(ClientContext &context, DuckTableEntry &table, const
 	}
 
 	bool needs_bind = false;
-	for (auto &entry : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
-		auto &index = *entry.index;
-		if (index.GetIndexName() != guard_name) {
+	for (auto entry : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
+		if (entry->GetName() != guard_name) {
 			continue;
 		}
 		if (!catalog_entry) {
 			return "the recorded rowid guard exists in table storage but not in the index catalog";
 		}
-		if (entry.bind_state.load() == IndexBindState::BINDING) {
+		if (entry->GetBindState() == IndexBindState::BINDING) {
 			return "the recorded rowid guard is being bound; retry the drop";
 		}
-		if (index.GetIndexType() != NGRAM_ROWID_GUARD_TYPE) {
+		if (entry->GetIndexType() != NGRAM_ROWID_GUARD_TYPE) {
 			return "the recorded rowid guard has the wrong type";
 		}
 		string token;
-		if (index.IsBound()) {
-			token = ReadBoundGuardState(index, optional_idx()).token;
+		if (entry->GetBindState() == IndexBindState::BOUND) {
+			token = ReadBoundGuardState(*entry, optional_idx()).token;
 		} else {
-			auto &options = index.Cast<UnboundIndex>().GetStorageInfo().options;
+			auto unbound = entry->GetReadHandle<UnboundIndex>();
+			auto &options = unbound->GetStorageInfo().options;
 			auto token_entry = options.find(NGRAM_GUARD_TOKEN_OPTION);
 			if (token_entry == options.end() || token_entry->second.IsNull()) {
 				return "the unbound rowid guard does not persist an incarnation token";
@@ -291,7 +296,7 @@ IndexVerdict ValidateIndex(ClientContext &context, const ResolvedTarget &target,
 MaintenanceColumn ResolveMaintenanceColumn(ClientContext &context, const char *fn, const ResolvedTarget &target,
                                            const IndexLocation &location) {
 	auto &column_name = location.column_name;
-	if (!target.entry->ColumnExists(column_name)) {
+	if (!target.entry->ColumnExists(Identifier(column_name))) {
 		throw CatalogException("%s: the ngram index on %s references column %s, which no longer exists; drop the "
 		                       "index with PRAGMA drop_ngram_index",
 		                       fn, target.table_name, column_name);
@@ -318,16 +323,17 @@ MaintenanceColumn ResolveMaintenanceColumn(ClientContext &context, const char *f
 }
 
 static void ClassifyBase(ClientContext &context, const MetaInfo &meta, ObservedIndex &observed) {
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, observed.table_name);
-	auto base =
-	    Catalog::GetEntry(context, observed.catalog_name, observed.schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+	                       QualifiedName(Identifier(observed.catalog_name), Identifier(observed.schema_name),
+	                                     Identifier(observed.table_name)));
+	auto base = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 	if (!base || base->type != CatalogType::TABLE_ENTRY || !base->Cast<TableCatalogEntry>().IsDuckTable()) {
 		observed.status = "ORPHAN";
 		observed.reason = "base table is missing or no longer an ordinary DuckDB table";
 		return;
 	}
 	auto &table = base->Cast<DuckTableEntry>();
-	if (!table.ColumnExists(observed.location.column_name)) {
+	if (!table.ColumnExists(Identifier(observed.location.column_name))) {
 		observed.status = "ORPHAN";
 		observed.reason = "indexed column is missing";
 		return;
@@ -367,22 +373,22 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 	unordered_set<string> storage;
 	unordered_set<string> format4_stats;
 	vector<ObservedIndex> foreign;
-	auto schema = Catalog::GetSchema(context, catalog_name, NGRAM_SCHEMA, OnEntryNotFound::RETURN_NULL);
+	auto schema = Catalog::GetSchema(context, Identifier(catalog_name), NGRAM_SCHEMA, OnEntryNotFound::RETURN_NULL);
 	if (schema) {
 		schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
 			string index_ref;
 			bool table = entry.type == CatalogType::TABLE_ENTRY && entry.Cast<TableCatalogEntry>().IsDuckTable();
-			if (table && StringUtil::CIEquals(entry.name, REGISTRY_TABLE)) {
+			if (table && entry.name == REGISTRY_TABLE) {
 				return;
 			}
-			if (table && ParseFormat4StatsName(entry.name, index_ref)) {
+			if (table && ParseFormat4StatsName(entry.name.GetIdentifierName(), index_ref)) {
 				format4_stats.insert(index_ref);
 				return;
 			}
-			if (!table || !ParseStorageName(entry.name, index_ref)) {
-				foreign.push_back(
-				    malformed(entry.name, StringUtil::Format("%s.%s is not a storage table of this extension",
-				                                             NGRAM_SCHEMA, entry.name)));
+			if (!table || !ParseStorageName(entry.name.GetIdentifierName(), index_ref)) {
+				foreign.push_back(malformed(entry.name.GetIdentifierName(),
+				                            StringUtil::Format("%s.%s is not a storage table of this extension",
+				                                               NGRAM_SCHEMA, entry.name)));
 				return;
 			}
 			storage.insert(index_ref);
@@ -433,11 +439,11 @@ ObservedIndex FindObserved(ClientContext &context, const string &catalog_name, c
 		                            "column)",
 		                            index_ref);
 	}
-	auto database = DatabaseManager::Get(context).GetDatabase(context, catalog_name);
+	auto database = DatabaseManager::Get(context).GetDatabase(context, Identifier(catalog_name));
 	if (!database || !database->GetCatalog().IsDuckCatalog() || !database->HasStorageManager()) {
 		throw CatalogException("ngram: %s is not an attached DuckDB catalog", catalog_name);
 	}
-	for (auto &observed : ObserveCatalog(context, database->GetName())) {
+	for (auto &observed : ObserveCatalog(context, database->GetName().GetIdentifierName())) {
 		if (observed.location.index_ref == index_ref) {
 			return observed;
 		}

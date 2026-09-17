@@ -1,7 +1,9 @@
 #include "ngram/build_sql.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "ngram/fence.hpp"
@@ -115,18 +117,18 @@ idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs) {
 
 int64_t EstimateGramCount(ClientContext &context, TableCatalogEntry &table, const string &column, int64_t min_rowid,
                           int64_t max_rowid, idx_t gram_size) {
-	if (min_rowid < 0 || max_rowid < min_rowid || !table.ColumnExists(column)) {
+	if (min_rowid < 0 || max_rowid < min_rowid || !table.ColumnExists(Identifier(column))) {
 		return 0;
 	}
 	auto rowid_span = max_rowid - min_rowid + 1;
 	auto samples = NumericCast<idx_t>(MinValue<int64_t>(NumericCast<int64_t>(GRAM_ESTIMATE_SAMPLES), rowid_span));
 	auto &duck_table = table.Cast<DuckTableEntry>();
-	auto &column_def = table.GetColumn(column);
+	auto &column_def = table.GetColumn(Identifier(column));
 	auto &transaction = DuckTransaction::Get(context, table.ParentCatalog());
 	vector<StorageIndex> column_ids {duck_table.GetStorageIndex(ColumnIndex(column_def.Logical().index))};
 
 	Vector row_ids(LogicalType::ROW_TYPE, samples);
-	auto ids = FlatVector::GetData<row_t>(row_ids);
+	auto ids = FlatVector::GetDataMutable<row_t>(row_ids);
 	for (idx_t i = 0; i < samples; i++) {
 		auto offset = samples == 1 ? 0 : (rowid_span - 1) * NumericCast<int64_t>(i) / NumericCast<int64_t>(samples - 1);
 		ids[i] = NumericCast<row_t>(min_rowid + offset);
@@ -221,7 +223,7 @@ static string FreshGuardStatements(ClientContext &context, DuckTableEntry &table
 		if (!guard_columns.empty()) {
 			guard_columns += ", ";
 		}
-		guard_columns += Ident(definition.Name());
+		guard_columns += Ident(definition.Name().GetIdentifierName());
 	}
 	script += "CREATE INDEX " + Ident(location.guard_name) + " ON " + base + " USING " + NGRAM_ROWID_GUARD_TYPE + "(" +
 	          guard_columns + ");\n";
@@ -332,8 +334,10 @@ string DropIndexScript(ClientContext &context, const ObservedIndex &index) {
 	ResolvedTarget owner {index.catalog_name, index.schema_name, index.table_name, index.location.column_name, nullptr};
 	auto table_target = owner;
 	table_target.column_name.clear();
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, index.table_name);
-	auto base = Catalog::GetEntry(context, index.catalog_name, index.schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+	                       QualifiedName(Identifier(index.catalog_name), Identifier(index.schema_name),
+	                                     Identifier(index.table_name)));
+	auto base = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 	auto base_exists = base && base->type == CatalogType::TABLE_ENTRY && base->Cast<TableCatalogEntry>().IsDuckTable();
 
 	auto guard_name = index.location.guard_name;

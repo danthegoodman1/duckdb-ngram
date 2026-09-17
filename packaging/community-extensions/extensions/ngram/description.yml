@@ -59,9 +59,9 @@ docs:
     rowid guard: covered updates become delete+append, moving vacuum is
     disabled, and trailing-rowid reuse is latched. A stock DuckDB build can
     read a guarded database, but base-table DML requires `ngram` to be loaded.
-    On pinned v1.5.5, extension-free INSERT/UPDATE fail and DELETE may busy-spin
+    On the pinned host, extension-free INSERT/UPDATE fail and DELETE may busy-spin
     in the unknown-index binder, so treat guarded tables as read-only until
-    `LOAD ngram`. The guard accepts only host-reported v1.5.5 source
+    `LOAD ngram`. The guard accepts only host-reported v2.0.0 source
     `d8cdaa33` (local) or `d8cdaa33fd` (official); other hosts fail closed.
 
     Surface:
@@ -89,7 +89,7 @@ docs:
     that loading the extension changes no plan; rewrites are exhaustive and
     resource-bounded, and exactness is unconditional.
 
-    DuckDB v1.5.5 refuses table/column rename while the physical guard exists;
+    DuckDB refuses table/column rename while the physical guard exists;
     schema moves/renames are host-not-implemented. Save the catalog-qualified
     stable ID, drop by ID, rename, then rebuild. Identifiable catalog corruption
     is listed with a reason, but cleanup fails closed rather than force-dropping

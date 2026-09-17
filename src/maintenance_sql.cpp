@@ -3,8 +3,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "ngram/build_sql.hpp"
-
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"

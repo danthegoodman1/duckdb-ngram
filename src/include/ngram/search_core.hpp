@@ -27,6 +27,11 @@ class TableFilterSet;
 
 namespace ngram {
 
+//! A pushed table filter comparing one scanned column against `value`. Table
+//! filters are expressions, so this wraps the comparison around the
+//! BoundReferenceExpression(0) subject a single-column filter is evaluated on.
+unique_ptr<TableFilter> ConstantComparisonFilter(ExpressionType type, Value value);
+
 //! Initialize a committed + transaction-local storage scan. Equivalent to
 //! DataTable::InitializeScan, except that a table with no committed rows
 //! (e.g. shadow tables created inside the current transaction) initializes

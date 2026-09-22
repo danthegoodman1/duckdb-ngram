@@ -51,3 +51,16 @@ deadlock:SharedCheckpointLock
 # locks into a four-lock cycle whose other three edges are host code. Any
 # scalar that touches the transaction has the same shape.
 deadlock:AcquireMaintenanceFence
+
+# DuckDB 2.0 opens an internal connection for a checkpoint that a client runs,
+# taking the connection manager's lock while the client's context lock is
+# held. The host also calls extension callbacks under the connection manager's
+# lock when a connection closes, and when it is the last one the guard's bind
+# callback (RowIdGuardBindCallback::OnConnectionClosed, src/rowid_guard.cpp)
+# locks that connection's context to bind the guards in a read-only
+# transaction. ThreadSanitizer joins the two orders when one connection
+# checkpoints and later closes. They cannot meet: a connection cannot close
+# while it runs a statement; the callback acts only when the count, read under
+# the same lock, shows no other connection, so no other client can be
+# checkpointing; and a read-only transaction starts no checkpoint of its own.
+deadlock:RowIdGuardBindCallback

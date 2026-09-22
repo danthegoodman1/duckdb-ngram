@@ -208,12 +208,19 @@ jobs:
           do
             grep -Fx -- "$expected" build/ci-debug/CMakeCache.txt
           done
-          ninja -C build/ci-debug -t commands test/unittest | tail -n 1 > "$RUNNER_TEMP/unittest-link.txt"
-          ninja -C build/ci-debug -t commands extension/ngram/ngram_checkpoint_gap_test | tail -n 1 > "$RUNNER_TEMP/race-link.txt"
-          for required in -O0 -DDEBUG -g1 -gsplit-dwarf -fsanitize=address -fsanitize=undefined -fno-sanitize-recover=all extension/ngram/libngram_extension.a
+          # unittest reaches the extension through libduckdb.so, which links the
+          # extension archive; the race harness links the archive itself
+          for target in test/unittest src/libduckdb.so extension/ngram/ngram_checkpoint_gap_test
           do
-            grep -F -- "$required" "$RUNNER_TEMP/unittest-link.txt" >/dev/null
-            grep -F -- "$required" "$RUNNER_TEMP/race-link.txt" >/dev/null
+            ninja -C build/ci-debug -t commands "$target" | tail -n 1 > "$RUNNER_TEMP/link.txt"
+            for required in -O0 -DDEBUG -g1 -gsplit-dwarf -fsanitize=address -fsanitize=undefined -fno-sanitize-recover=all
+            do
+              grep -F -- "$required" "$RUNNER_TEMP/link.txt" >/dev/null
+            done
+            case "$target" in
+              test/unittest) grep -F -- src/libduckdb.so "$RUNNER_TEMP/link.txt" >/dev/null ;;
+              *) grep -F -- extension/ngram/libngram_extension.a "$RUNNER_TEMP/link.txt" >/dev/null ;;
+            esac
           done
           test -x build/ci-debug/test/unittest
           test -x build/ci-debug/extension/ngram/ngram_checkpoint_gap_test
@@ -223,8 +230,11 @@ jobs:
           printf '%s\n' "$unit_ldd" | grep -F 'libubsan.so' >/dev/null
           printf '%s\n' "$race_ldd" | grep -F 'libasan.so' >/dev/null
           printf '%s\n' "$race_ldd" | grep -F 'libubsan.so' >/dev/null
-          race_duckdb="$(printf '%s\n' "$race_ldd" | awk '$1 == "libduckdb.so" {print $3}')"
-          test "$race_duckdb" = "$GITHUB_WORKSPACE/build/ci-debug/src/libduckdb.so"
+          for ldd_output in "$unit_ldd" "$race_ldd"
+          do
+            linked_duckdb="$(printf '%s\n' "$ldd_output" | awk '$1 == "libduckdb.so" {print $3}')"
+            test "$linked_duckdb" = "$GITHUB_WORKSPACE/build/ci-debug/src/libduckdb.so"
+          done
 
       - name: Run focused sanitizer and race gates
         shell: bash

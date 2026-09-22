@@ -1,13 +1,13 @@
 #
 # This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension.
 #
-# Both jobs still name v1.5.5. The distribution pipeline builds against a
-# released DuckDB, and extension-ci-tools publishes no 2.0 line yet, so there is
-# nothing for them to target: DuckDB 2.0 lives only on the v2.0-cyanoptera
-# branch that the duckdb submodule tracks. Until 2.0 tags and extension-ci-tools
-# follows it, these two jobs build the ported sources against 1.5.5 headers and
-# fail. The Correctness and Nightly workflows build the submodule directly and
-# are the lanes that exercise this branch.
+# DuckDB 2.0 has no release tag or extension-ci-tools branch yet. The build job
+# uses extension-ci-tools' main line at a fixed commit: given no duckdb_version,
+# it builds the commit the duckdb submodule records, and duckdb_tag tags that
+# commit v2.0.0 so the host reports the version the rowid guard accepts. When
+# 2.0 tags, name v2.0.0 in duckdb_version and move both jobs to the matching
+# extension-ci-tools branch. The code-quality job runs clang-tidy against the
+# checked-out submodule, which the 1.5.5 tooling does unchanged.
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -24,10 +24,10 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@39ffc46ca8c70021d741c7be2e7bcadf3fd1c503
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
+      ci_tools_version: 39ffc46ca8c70021d741c7be2e7bcadf3fd1c503
+      duckdb_tag: v2.0.0
       extension_name: ngram
       # windows_arm64 is opt_in in extension-ci-tools' distribution matrix, so it
       # builds only when named here; the rest of the matrix is on by default.

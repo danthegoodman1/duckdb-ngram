@@ -32,7 +32,7 @@ END = "<!-- END NGRAM RELEASE EVIDENCE -->"
 
 SCHEMA = 1
 BENCHMARK_ID = "enwik9-current-v1"
-ENGINE_COMMIT = "6fb01c606165dce832d346f3c75198a1b704eefc"
+ENGINE_COMMIT = "bb298db62399c85bb4f098405a11a01824fc8efc"
 DUCKDB_GITLINK = "e366461e30fb95d68c0d53a50f050dd0b043fc71"
 CI_GITLINK = "72e76e99cd7fee45a99739cd118ec2db64e034ec"
 DUCKDB_VERSION = "v2.0.0"
@@ -1419,7 +1419,7 @@ def tests(binary):
         fake.file_size = RAW_BYTES
         expect_failure("unsafe archive member", lambda: validate_archive_member([fake]))
     block_hash = hashlib.sha256(render_block(artifact).encode()).hexdigest()
-    if block_hash != "ded3f2b43327decf474cfb74d73a89890d8cf6e8dc44b00b30775f90e43bf677":
+    if block_hash != "59caa9d758ea985cd2b48816c58043d1a89bfd2e4365d70156f91335daba5491":
         fail("full rendered Markdown golden differs")
     expect_failure("missing marker", lambda: replace_block("plain", BEGIN + END, "fixture"))
     expect_failure("duplicate marker", lambda: replace_block(BEGIN + BEGIN + END, BEGIN + END, "x"))

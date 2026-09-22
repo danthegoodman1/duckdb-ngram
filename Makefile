@@ -15,13 +15,17 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Run the deterministic preprocessing/checkpoint gap harness beside the
 # SQLLogicTests on Linux and macOS. The harness uses POSIX process control and
-# is not built on Windows, whose environment sets OS=Windows_NT for make. The
-# submodule's makefile runs the tests in test_<type>_internal; the newer one the
-# distribution workflow checks out runs them in test_<type>.
+# is not built on Windows, whose environment sets OS=Windows_NT for make, and it
+# follows SKIP_TESTS, which the distribution workflow sets for the pass it makes
+# outside its build container. The submodule's makefile runs the tests in
+# test_<type>_internal; the newer one the distribution workflow checks out runs
+# them in test_<type>.
 ifneq ($(OS),Windows_NT)
+ifneq ($(SKIP_TESTS),1)
 test_release test_release_internal: ngram_checkpoint_gap_release
 test_debug test_debug_internal: ngram_checkpoint_gap_debug
 test_reldebug test_reldebug_internal: ngram_checkpoint_gap_reldebug
+endif
 endif
 
 .PHONY: ngram_checkpoint_gap_release ngram_checkpoint_gap_debug ngram_checkpoint_gap_reldebug

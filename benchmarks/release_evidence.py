@@ -68,8 +68,6 @@ SANITIZED_ENV = {
     "LC_ALL": "C",
     "TZ": "UTC",
     "CCACHE_DISABLE": "1",
-    # the pinned DuckDB branch carries no release tag to describe
-    "OVERRIDE_GIT_DESCRIBE": DUCKDB_VERSION,
 }
 
 POLL_MS = 100

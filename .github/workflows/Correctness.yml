@@ -19,11 +19,11 @@ concurrency:
 # pin. The third job needs no build: it runs the strict evidence check on
 # release tags and manual dispatches.
 #
-# The 2.0 branch carries no release tag, and the shallow checkouts fetch no tags
-# in any case, so DuckDB's CMake cannot git-describe the pinned submodule commit.
-# OVERRIDE_GIT_DESCRIBE names the version instead; the built library then reports
-# v2.0.0 with the commit's abbreviated hash from pragma_version(), which the rowid
-# guard and the C++ harness pin against.
+# DuckDB 2.0's CMake derives no release version from git, so every build names
+# the pinned host through DUCKDB_EXPLICIT_VERSION: the Makefile passes it, and the
+# sanitizer build, which runs CMake directly, passes it below. The built library
+# then reports v2.0.0 with the commit's abbreviated hash from pragma_version(),
+# which the rowid guard and the C++ harness pin against.
 
 jobs:
   release-correctness:
@@ -32,7 +32,6 @@ jobs:
     timeout-minutes: 90
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 3
-      OVERRIDE_GIT_DESCRIBE: v2.0.0
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -139,7 +138,7 @@ jobs:
     timeout-minutes: 150
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
-      OVERRIDE_GIT_DESCRIBE: v2.0.0
+      DUCKDB_EXPLICIT_VERSION: v2.0.0
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -172,7 +171,7 @@ jobs:
           test ! -e build/ci-debug
           timeout 600s cmake -G Ninja \
             -DEXTENSION_STATIC_BUILD=1 \
-            -DOVERRIDE_GIT_DESCRIBE="$OVERRIDE_GIT_DESCRIBE" \
+            -DDUCKDB_EXPLICIT_VERSION="$DUCKDB_EXPLICIT_VERSION" \
             -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
             -DUNITTEST_ROOT_DIRECTORY="$GITHUB_WORKSPACE" \
             -DENABLE_UNITTEST_CPP_TESTS=FALSE \
@@ -196,7 +195,7 @@ jobs:
           set -euo pipefail
           for expected in \
             CMAKE_BUILD_TYPE:STRING=Debug \
-            OVERRIDE_GIT_DESCRIBE:UNINITIALIZED=v2.0.0 \
+            DUCKDB_EXPLICIT_VERSION:UNINITIALIZED=v2.0.0 \
             ENABLE_SANITIZER:BOOL=ON \
             ENABLE_UBSAN:BOOL=ON \
             NGRAM_STRICT_WARNINGS:BOOL=ON \

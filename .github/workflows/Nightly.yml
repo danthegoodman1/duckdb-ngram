@@ -33,7 +33,6 @@ jobs:
     timeout-minutes: 240
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 3
-      OVERRIDE_GIT_DESCRIBE: v2.0.0
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -82,7 +81,7 @@ jobs:
     timeout-minutes: 420
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
-      OVERRIDE_GIT_DESCRIBE: v2.0.0
+      DUCKDB_EXPLICIT_VERSION: v2.0.0
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -114,7 +113,7 @@ jobs:
           set -euo pipefail
           timeout 600s cmake -G Ninja \
             -DEXTENSION_STATIC_BUILD=1 \
-            -DOVERRIDE_GIT_DESCRIBE="$OVERRIDE_GIT_DESCRIBE" \
+            -DDUCKDB_EXPLICIT_VERSION="$DUCKDB_EXPLICIT_VERSION" \
             -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
             -DUNITTEST_ROOT_DIRECTORY="$GITHUB_WORKSPACE" \
             -DENABLE_UNITTEST_CPP_TESTS=FALSE \
@@ -169,7 +168,7 @@ jobs:
     continue-on-error: true
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
-      OVERRIDE_GIT_DESCRIBE: v2.0.0
+      DUCKDB_EXPLICIT_VERSION: v2.0.0
       CC: clang
       CXX: clang++
     steps:
@@ -209,7 +208,7 @@ jobs:
           set -euo pipefail
           timeout 600s cmake -G Ninja \
             -DEXTENSION_STATIC_BUILD=1 \
-            -DOVERRIDE_GIT_DESCRIBE="$OVERRIDE_GIT_DESCRIBE" \
+            -DDUCKDB_EXPLICIT_VERSION="$DUCKDB_EXPLICIT_VERSION" \
             -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
             -DUNITTEST_ROOT_DIRECTORY="$GITHUB_WORKSPACE" \
             -DENABLE_UNITTEST_CPP_TESTS=FALSE \

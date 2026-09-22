@@ -3,13 +3,13 @@
 The extension links DuckDB's internal C++ API and pins one host: the `duckdb`
 submodule at a release tag or release branch, `extension-ci-tools` at the
 matching branch, and the source identity the rowid guard accepts. The extension
-currently tracks the unreleased `v2.0-cyanoptera` branch, which carries no tag,
-so the workflows name the version through `OVERRIDE_GIT_DESCRIBE` (or, in the
-distribution job, `duckdb_tag`), and a local build needs
-`OVERRIDE_GIT_DESCRIBE=v2.0.0` for the guard to accept the host. Every pin lives in one place and
-`scripts/verify_pins.sh` checks the submodules against the gitlinks HEAD
-records; the Correctness workflow and `benchmarks/release_evidence.py` both
-run it.
+currently tracks the unreleased `v2.0-cyanoptera` branch. DuckDB 2.0's CMake
+derives no release version from git, so a build reports `v2.0.0-dev<n>` unless
+it names one, and the guard refuses that host: the Makefile passes
+`DUCKDB_EXPLICIT_VERSION`, as do the CI jobs that run CMake directly. Every pin
+lives in one place and `scripts/verify_pins.sh` checks the submodules against
+the gitlinks HEAD records; the Correctness workflow and
+`benchmarks/release_evidence.py` both run it.
 
 ## Where the pin lives
 
@@ -17,7 +17,8 @@ run it.
 | --- | --- | --- |
 | DuckDB sources | the `duckdb` gitlink | `scripts/verify_pins.sh` |
 | CI tooling | the `extension-ci-tools` gitlink | `scripts/verify_pins.sh` |
-| Workflow versions | the extension-ci-tools commit and `duckdb_tag` of the build job, and the code-quality job's versions, in `.github/workflows/MainDistributionPipeline.yml`; `OVERRIDE_GIT_DESCRIBE` in `Correctness.yml` and `Nightly.yml` | the distribution matrix |
+| Build version | `DUCKDB_EXPLICIT_VERSION` in the `Makefile`, and in `Correctness.yml` and `Nightly.yml` for their direct CMake builds | the harness's `lifecycle/creation-schedules` |
+| Workflow versions | the extension-ci-tools commit of the build job and the code-quality job's versions in `.github/workflows/MainDistributionPipeline.yml` | the distribution matrix |
 | Guard host identity | `DUCKDB_VERSION`, `DUCKDB_SOURCE_COMMIT` and `DUCKDB_SOURCE_ID` in `src/rowid_guard.cpp` | the guard refuses any other host; the harness's `lifecycle/incompatible-guard-quarantine` mutates the recorded source id, and `lifecycle/creation-schedules` requires the pinned host |
 | Documented identity | README "Limitations", `packaging/community-extensions/extensions/ngram/description.yml` | reading |
 | Release evidence | `DUCKDB_GITLINK`, `CI_GITLINK`, `DUCKDB_VERSION` and `DUCKDB_SOURCE` in `benchmarks/release_evidence.py` | `release_evidence.py check` and `test` |
@@ -81,7 +82,7 @@ run it.
    - **`EXPLAIN` names operators in title case**, so the transparent scan reads
      `Ngram Index Scan`.
 4. Update `DUCKDB_VERSION`, `DUCKDB_SOURCE_COMMIT` and `DUCKDB_SOURCE_ID` to
-   the new tag, and the two documented identities. The guard fails closed on
+   the new tag, the build version, and the two documented identities. The guard fails closed on
    any other host, so a wrong pin refuses `create_ngram_index` on a fresh
    database and lists existing indexes `SCAN_ONLY` in the first test run.
 5. Run the whole suite and the harness (`make test`), the fixed-seed drivers

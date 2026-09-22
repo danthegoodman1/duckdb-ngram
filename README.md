@@ -49,8 +49,9 @@ LOAD ngram;
 
 The extension is built against DuckDB **v2.0.0** and links its internal C++
 API, so it must be loaded into a matching DuckDB version. DuckDB 2.0 is not
-released yet: the `duckdb` submodule tracks the `v2.0-cyanoptera` branch, and a
-local build names the version with `OVERRIDE_GIT_DESCRIBE=v2.0.0`.
+released yet: the `duckdb` submodule tracks the `v2.0-cyanoptera` branch, and
+the Makefile names the build v2.0.0, since DuckDB 2.0 builds from source report
+a development version otherwise.
 
 > The community-extensions submission is prepared but not yet merged (see
 > [`packaging/SUBMISSION.md`](packaging/SUBMISSION.md)). Until it is, load the

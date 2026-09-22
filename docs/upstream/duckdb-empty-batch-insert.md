@@ -31,7 +31,7 @@ into the same table can precede.
 ```
 SELECT version(), source_id FROM pragma_version();
 -- v1.5.5, d8cdaa33   (also the official binary form d8cdaa33fd)
--- v2.0.0, e366461e   (the 2.0 branch, built with OVERRIDE_GIT_DESCRIBE)
+-- v2.0.0, e366461e   (the 2.0 branch, built through this repository's Makefile)
 SELECT current_setting('threads');
 -- 24
 ```

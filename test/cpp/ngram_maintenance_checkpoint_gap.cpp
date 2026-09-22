@@ -445,9 +445,8 @@ static void TestCreationSchedules(const string &path) {
 		auto library_version = version->GetValue(0, 0).ToString();
 		auto source_id = version->GetValue(1, 0).ToString();
 		// The extension's pin: v2.0.0 built from this commit, with source_id an
-		// abbreviation of it that has at least seven characters. The 2.0 branch
-		// carries no tag, so the build names the version through
-		// OVERRIDE_GIT_DESCRIBE; without it the host reports v2.0.0-dev<n>.
+		// abbreviation of it that has at least seven characters. The Makefile
+		// names the version; without it the host reports v2.0.0-dev<n>.
 		const string pinned_commit = "e366461e30fb95d68c0d53a50f050dd0b043fc71";
 		bool pinned_source = source_id.size() >= 7 && source_id.size() <= pinned_commit.size() &&
 		                     pinned_commit.compare(0, source_id.size(), source_id) == 0;

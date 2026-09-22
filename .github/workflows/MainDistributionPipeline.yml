@@ -32,6 +32,9 @@ jobs:
       # windows_arm64 is opt_in in extension-ci-tools' distribution matrix, so it
       # builds only when named here; the rest of the matrix is on by default.
       opt_in_archs: "windows_arm64"
+      # Pull requests build the whole matrix too; the tooling's default builds
+      # three architectures for them and skips macOS.
+      reduced_ci_mode: disabled
 
   code-quality-check:
     name: Code Quality Check

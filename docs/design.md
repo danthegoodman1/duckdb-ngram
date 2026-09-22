@@ -153,7 +153,7 @@ reports as the probe's peak (`query/probe-memory-peak` in the harness).
 
 ## Host dependencies
 
-- DuckDB v2.0.0 at source `2d17945c`, pinned by the `duckdb` gitlink and by
+- DuckDB v2.0.0 at source `e366461e`, pinned by the `duckdb` gitlink and by
   the guard, which refuses to trust any other host (`docs/UPDATING.md`).
 - The custom index type: the host lets the guard persist a checkpoint seal and
   refuses guard-touching `ALTER`; a stock host without the extension can read

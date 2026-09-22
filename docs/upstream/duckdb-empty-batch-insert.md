@@ -1,14 +1,16 @@
-# DuckDB v1.5.5: empty batch insert, delete, reinsert leaves a table empty in-process
+# DuckDB: empty batch insert, delete, reinsert leaves a table reading empty
 
-Status: reproduced 2026-09-01 against the pinned host; not yet filed upstream.
+Status: reproduced 2026-09-01 on v1.5.5 and 2026-09-22 on the 2.0 branch at
+`e366461e`; not yet filed upstream.
 
 ## Summary
 
 Inside one transaction, an empty batch `INSERT ... ORDER BY` into table `t`,
 then `DELETE FROM t`, then a batch `INSERT` of at least 122,880 rows into `t`
-leaves `t` reading zero rows for the rest of the process. The rows are in the
-file: reopening it returns them all. The same statements with `threads=1`, or
-without the empty insert, return every row at every stage.
+leaves `t` reading zero rows inside the transaction. On 2.0 the commit repairs
+it; on v1.5.5 the table reads empty for the rest of the process. The rows are
+in the file: reopening it returns them all. The same statements with
+`threads=1`, or without the empty insert, return every row at every stage.
 
 The `ngram` extension hit this through `PRAGMA ngram_refresh` on an index whose
 tail was empty: the generated script appended an empty delta to a per-gram
@@ -29,6 +31,7 @@ into the same table can precede.
 ```
 SELECT version(), source_id FROM pragma_version();
 -- v1.5.5, d8cdaa33   (also the official binary form d8cdaa33fd)
+-- v2.0.0, e366461e   (the 2.0 branch, built with OVERRIDE_GIT_DESCRIBE)
 SELECT current_setting('threads');
 -- 24
 ```
@@ -65,14 +68,15 @@ SELECT count(*) AS after_reopen FROM t;                    -- 200000
 
 ## Observed versus expected
 
-| Stage | Observed (24 threads) | Observed (`SET threads=1`) | Expected |
-| --- | --- | --- | --- |
-| before | 200000 | 200000 | 200000 |
-| in transaction | 0 | 200000 | 200000 |
-| after commit | 0 | 200000 | 200000 |
-| after reopen | 200000 | 200000 | 200000 |
+| Stage | v1.5.5 (24 threads) | v1.5.5 (`SET threads=1`) | 2.0 (24 threads) | Expected |
+| --- | --- | --- | --- | --- |
+| before | 200000 | 200000 | 200000 | 200000 |
+| in transaction | 0 | 200000 | 0 | 200000 |
+| after commit | 0 | 200000 | 200000 | 200000 |
+| after reopen | 200000 | 200000 | 200000 | 200000 |
 
-Variants, each run as above with 24 threads (in transaction / after commit):
+Variants on v1.5.5, each run as above with 24 threads (in transaction / after
+commit):
 
 | Variant | Result |
 | --- | --- |

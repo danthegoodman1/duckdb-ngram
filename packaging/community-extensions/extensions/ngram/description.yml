@@ -61,8 +61,8 @@ docs:
     read a guarded database, but base-table DML requires `ngram` to be loaded.
     On the pinned host, extension-free INSERT/UPDATE fail and DELETE may busy-spin
     in the unknown-index binder, so treat guarded tables as read-only until
-    `LOAD ngram`. The guard accepts only host-reported v2.0.0 source
-    `d8cdaa33` (local) or `d8cdaa33fd` (official); other hosts fail closed.
+    `LOAD ngram`. The guard accepts only host-reported v2.0.0 built from
+    commit `e366461e30…`; other hosts fail closed.
 
     Surface:
 

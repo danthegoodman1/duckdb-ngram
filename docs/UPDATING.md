@@ -4,8 +4,9 @@ The extension links DuckDB's internal C++ API and pins one host: the `duckdb`
 submodule at a release tag or release branch, `extension-ci-tools` at the
 matching branch, and the source identity the rowid guard accepts. The extension
 currently tracks the unreleased `v2.0-cyanoptera` branch, which carries no tag,
-so the workflows name the version through `OVERRIDE_GIT_DESCRIBE` and a local
-build needs `OVERRIDE_GIT_DESCRIBE=v2.0.0` for the guard to accept the host. Every pin lives in one place and
+so the workflows name the version through `OVERRIDE_GIT_DESCRIBE` (or, in the
+distribution job, `duckdb_tag`), and a local build needs
+`OVERRIDE_GIT_DESCRIBE=v2.0.0` for the guard to accept the host. Every pin lives in one place and
 `scripts/verify_pins.sh` checks the submodules against the gitlinks HEAD
 records; the Correctness workflow and `benchmarks/release_evidence.py` both
 run it.
@@ -16,7 +17,7 @@ run it.
 | --- | --- | --- |
 | DuckDB sources | the `duckdb` gitlink | `scripts/verify_pins.sh` |
 | CI tooling | the `extension-ci-tools` gitlink | `scripts/verify_pins.sh` |
-| Workflow versions | `duckdb_version` and `ci_tools_version` in `.github/workflows/MainDistributionPipeline.yml`; `OVERRIDE_GIT_DESCRIBE` in `Correctness.yml` and `Nightly.yml` | the distribution matrix |
+| Workflow versions | the extension-ci-tools commit and `duckdb_tag` of the build job, and the code-quality job's versions, in `.github/workflows/MainDistributionPipeline.yml`; `OVERRIDE_GIT_DESCRIBE` in `Correctness.yml` and `Nightly.yml` | the distribution matrix |
 | Guard host identity | `DUCKDB_VERSION`, `DUCKDB_SOURCE_COMMIT` and `DUCKDB_SOURCE_ID` in `src/rowid_guard.cpp` | the guard refuses any other host; the harness's `lifecycle/incompatible-guard-quarantine` mutates the recorded source id, and `lifecycle/creation-schedules` requires the pinned host |
 | Documented identity | README "Limitations", `packaging/community-extensions/extensions/ngram/description.yml` | reading |
 | Release evidence | `DUCKDB_GITLINK`, `CI_GITLINK`, `DUCKDB_VERSION` and `DUCKDB_SOURCE` in `benchmarks/release_evidence.py` | `release_evidence.py check` and `test` |
@@ -38,8 +39,8 @@ run it.
    (`src/rowid_guard.cpp`), and the pragma preprocessor that expands a
    maintenance pragma into a transaction (`src/pragmas.cpp`).
 
-   Four of these compile clean and fail only at run time, so the suite is what
-   catches them:
+   These compile clean and fail only at run time, so the suite is what catches
+   them:
 
    - **A pushed filter is keyed by its position in the scan's projection**, not
      by the table's column index. Reading it as a column index silently stops
@@ -56,6 +57,29 @@ run it.
    - **Sentinels that became `optional_idx`.** `MAX_TRANSACTION_ID` equals
      `INVALID_INDEX`, so comparing an `optional_idx` against it throws where
      the old `transaction_t` comparison read "no active checkpoint".
+   - **A partition subset belongs to the scan.** The swapped scan declines a
+     `LogicalGet` whose `scan_partition_indices` is set: the optimizer answered
+     the other partitions from statistics, and scanning all of them would count
+     those rows twice.
+
+   The suite leans on host behavior of its own, which 2.0 also changed:
+
+   - **Statistics answer substring filters.** `contains` and `suffix` fold to
+     true or false when a column's min and max prefixes are equal, `prefix`
+     from where the needle falls in that range, and `count(*)` then comes from
+     metadata. A transparent-path test over a column holding one repeated
+     string never reaches the rewrite, so such tables mix two strings. To find tests the host bypasses, log each query where the
+     rewrite fires and diff runs with the functions' prune callbacks on and off.
+   - **Vacuum moves rows only on all-ART tables, in two regimes.** Storage
+     v2.0.0 drops empty row groups in place and remaps rowids when it merges
+     partially deleted ones; older storage renumbers densely once
+     `vacuum_rebuild_indexes` allows a rebuild. A control that proves a moving
+     vacuum needs partially deleted row groups on both sides of an empty one.
+   - **`Connection::Query` runs the query to completion.** A test that
+     interrupts or observes a query mid-stream opens a `QueryResultStream` on
+     `Connection::Submit`.
+   - **`EXPLAIN` names operators in title case**, so the transparent scan reads
+     `Ngram Index Scan`.
 4. Update `DUCKDB_VERSION`, `DUCKDB_SOURCE_COMMIT` and `DUCKDB_SOURCE_ID` to
    the new tag, and the two documented identities. The guard fails closed on
    any other host, so a wrong pin refuses `create_ngram_index` on a fresh

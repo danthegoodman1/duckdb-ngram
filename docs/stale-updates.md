@@ -25,7 +25,8 @@ That is exhaustive if both conditions hold:
 Each table with ngram indexes therefore carries one DuckDB `NGRAM_ROWID_GUARD`
 index. It stores no keys or postings. Its physical column dependencies make
 DuckDB rewrite updates of covered columns as delete plus insert, and its non-ART
-type keeps the host's moving vacuum disabled even under `vacuum_rebuild_indexes`.
+type keeps checkpoint vacuum from moving rows, which DuckDB does only on tables
+whose indexes are all ART.
 The guard persists four facts:
 
 - the greatest append rowid it has observed;
@@ -98,14 +99,17 @@ is to drop and re-create it.
 - Updating an uncovered column may remain in place. That is safe because it
   cannot change an indexed value: every indexed column is covered.
 - Delete alone is safe. Visibility and recheck remove deleted candidates.
-- Any index on a table makes DuckDB skip moving vacuum by default. With
-  `vacuum_rebuild_indexes` enabled, the host moves rows only when every index on
-  the table is an ART it can rebuild; the guard's non-ART type makes
-  `CanRebuildExistingIndexesAfterVacuum` false, so vacuum cannot move a
-  surviving live rowid.
-- DuckDB may still discard fully deleted *trailing* row groups. That moves no
-  live row. If a later committed append reuses any rowid at or below the
-  guard's maximum, `unsafe_reuse` latches before the append becomes visible.
+- DuckDB moves a surviving rowid only when every index on the table is a bound
+  ART. Storage version v2.0.0 then remaps rowids whenever vacuum merges
+  partially deleted row groups; older storage renumbers them densely once
+  `vacuum_rebuild_indexes` allows a rebuild. The guard's non-ART type rules out
+  both, so vacuum keeps every surviving live rowid.
+- DuckDB still discards fully deleted row groups: anywhere in the table under
+  storage v2.0.0, which leaves a gap in the rowid space, and only at the end
+  under older storage. Neither moves a live row. A discarded tail hands its
+  rowids back to the next append; if a later committed append reuses any rowid
+  at or below the guard's maximum, `unsafe_reuse` latches before the append
+  becomes visible.
 
 Guard mutation is not rollback-aware, so the guard tells a reused range from a
 retried one by the checkpoint that reuse requires. Each time an append advances
@@ -131,7 +135,7 @@ the unsafe latch.
 | Entry point | On guard uncertainty |
 | --- | --- |
 | `ngram_search` | one exhaustive live-table scan with the original matching semantics |
-| transparent `NGRAM_INDEX_SCAN` | one ordinary sequential-scan fallback with the original predicate |
+| transparent `Ngram Index Scan` | one ordinary sequential-scan fallback with the original predicate |
 | `ngram_candidates` | every visible rowid at or below the recorded high-water mark; its caller still owns the disjoint tail |
 | `ngram_refresh` / `ngram_compact` | refuse with a rebuild-required error |
 | `ngram_index_stats` | report the reason in `stale_reason` |
@@ -211,7 +215,7 @@ of checkpoint internals is gated by the exact version/source pin.
 - Creation invalidates the reservoir sample and can make overlapping writers
   retry. Quiescing writes around a first build avoids that API cost.
 - The native guard queries the host's built-in `pragma_version()` at load and
-  accepts only DuckDB v2.0.0 reporting an abbreviation of commit `2d17945cff…`
+  accepts only DuckDB v2.0.0 reporting an abbreviation of commit `e366461e30…`
   with seven or more characters. An index written against a different host
   build reads back `SCAN_ONLY` until it is rebuilt. Query and maintenance paths fail closed
   on mismatch; the generic drop validator stays available when the extension

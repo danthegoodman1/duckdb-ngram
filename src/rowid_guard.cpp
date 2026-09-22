@@ -34,12 +34,12 @@ static constexpr const char *DUCKDB_VERSION = "v2.0.0";
 //! The DuckDB commit the guard is pinned to. A host reports an abbreviation of
 //! it as pragma_version().source_id whose length follows the build's git
 //! configuration: eight characters from a full clone, ten in the official binary.
-static constexpr const char *DUCKDB_SOURCE_COMMIT = "2d17945cffee40ea0199d327c0c269c9af243294";
+static constexpr const char *DUCKDB_SOURCE_COMMIT = "e366461e30fb95d68c0d53a50f050dd0b043fc71";
 static constexpr idx_t MIN_SOURCE_ID_LENGTH = 7;
 //! The source tag persisted in every guard's storage options and compared
 //! exactly on read. Guards already on disk carry this literal, so it stays
 //! fixed independently of how the host abbreviates the commit.
-static constexpr const char *DUCKDB_SOURCE_ID = "2d17945c";
+static constexpr const char *DUCKDB_SOURCE_ID = "e366461e";
 static constexpr const char *OPTION_VERSION = "ngram_guard_version";
 static constexpr const char *OPTION_SOURCE = "ngram_duckdb_source_id";
 static constexpr const char *OPTION_CHECKPOINT = "ngram_guard_checkpoint_iteration";

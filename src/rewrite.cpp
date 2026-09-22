@@ -27,10 +27,10 @@ namespace ngram {
 // A post-optimize OptimizerExtension swaps get.function / get.bind_data of a
 // seq_scan LogicalGet whose pushed-down table_filters contain
 // contains(col, 'needle'), LIKE ('~~') or ILIKE ('~~*') over an indexed column
-// for the NGRAM_INDEX_SCAN table function; everything else on the node stays,
+// for the ngram_index_scan table function; everything else on the node stays,
 // so column bindings and EXPLAIN filter rendering are unchanged.
 //
-// NGRAM_INDEX_SCAN runs the search core: candidates from the probe, fetched
+// ngram_index_scan runs the search core: candidates from the probe, fetched
 // and rechecked against ALL pushed filters (TableFilter::ToExpression, so
 // semantics never depend on index normalization), then the tail scan with the
 // same filters applied natively. Fallbacks never re-plan: a dropped index,
@@ -540,7 +540,7 @@ static TableFunction NgramIndexScanFunction() {
 // The optimizer hook
 //===----------------------------------------------------------------------===//
 
-//! Swap a qualifying seq_scan LogicalGet for NGRAM_INDEX_SCAN. Ordinary
+//! Swap a qualifying seq_scan LogicalGet for ngram_index_scan. Ordinary
 //! availability/shape checks decline to the native scan; a present malformed
 //! index object is corruption and propagates.
 static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
@@ -550,8 +550,9 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 	if (!get.table_filters.HasFilters()) {
 		return;
 	}
-	// shapes the swapped scan does not reproduce
-	if (get.extra_info.sample_options || get.ordinality_idx.IsValid()) {
+	// shapes the swapped scan does not reproduce; a partition subset means the
+	// optimizer answered the other partitions from statistics
+	if (get.extra_info.sample_options || get.ordinality_idx.IsValid() || !get.scan_partition_indices.empty()) {
 		return;
 	}
 	auto table = get.GetTable();

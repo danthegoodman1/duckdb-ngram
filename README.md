@@ -147,10 +147,10 @@ decomposition share.
 
 Exhaustiveness is unconditional. Covered-column updates, including changes
 below the high-water mark, become delete-plus-insert; their new rowids are found
-in the tail. Deletes leave harmless false-positive postings. Any index on a
-table blocks DuckDB's moving vacuum by default, and the guard's non-ART type
-keeps it blocked when `vacuum_rebuild_indexes` is enabled. Vacuum may discard
-fully deleted trailing row groups, but the first committed append into their
+in the tail. Deletes leave harmless false-positive postings. DuckDB's
+checkpoint vacuum moves rows only on tables whose indexes are all ART, so the
+guard's non-ART type keeps every live rowid in place. Vacuum may discard fully
+deleted row groups, but the first committed append into a discarded tail's
 reused rowids permanently marks the guard uncertain.
 
 The guard is the only proof of identity. Each index's registry row records the
@@ -164,7 +164,7 @@ Behavior is fail closed:
 
 | State | Explicit search | Transparent predicate | `ngram_candidates` | Maintenance |
 | --- | --- | --- | --- | --- |
-| Guard proves the indexed prefix safe | postings + live recheck + disjoint tail | `NGRAM_INDEX_SCAN` | posting candidates in the prefix | refresh/compact allowed |
+| Guard proves the indexed prefix safe | postings + live recheck + disjoint tail | `Ngram Index Scan` | posting candidates in the prefix | refresh/compact allowed |
 | Guard is missing, replaced, incompatible, unbound with replay, or cannot exclude rowid reuse | one full live-table scan | one sequential-scan fallback | every visible rowid through the recorded mark | refuse; rebuild required |
 
 A registry row this version cannot read (another storage format, corrupt
@@ -499,7 +499,7 @@ probe budget for one query is the smaller of one quarter of `memory_limit` and
 ### Transparent acceleration
 
 With `SET ngram_auto_accelerate = true`, an optimizer pass rewrites qualifying
-scans into `NGRAM_INDEX_SCAN`. It fires for `contains(col, 'lit')`,
+scans into an `Ngram Index Scan`. It fires for `contains(col, 'lit')`,
 `col LIKE '%lit%'`, `col ILIKE '%lit%'` (case-insensitive indexes only),
 `regexp_matches(col, 'literal')`, multi-segment patterns like
 `col LIKE '%a%b%'`, and those combined with other filters via `AND`.
@@ -514,7 +514,7 @@ cannot prove the indexed prefix safe.
 
 ```sql
 EXPLAIN SELECT * FROM logs WHERE message LIKE '%reset%';
--- ... NGRAM_INDEX_SCAN  Table: logs  Ngram Column: message  Ngram Needles: reset
+-- ... Ngram Index Scan  Table: logs  Ngram Column: message  Ngram Needles: reset
 
 EXPLAIN ANALYZE SELECT * FROM logs WHERE message LIKE '%reset%';
 -- ... Ngram Mode: index (<= 1423 candidates, 9012 decoded rowids)
@@ -653,7 +653,7 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
   treat the base table as read-only; DELETE may busy-spin while trying
   to bind the unknown custom index type.
 - The rowid guard is pinned to host-reported DuckDB v2.0.0 built from commit
-  `2d17945cff…`; it accepts any abbreviation of that commit with seven or more
+  `e366461e30…`; it accepts any abbreviation of that commit with seven or more
   characters as `pragma_version().source_id`. An index built against a
   different host build reads back `SCAN_ONLY` until it is rebuilt. Other hosts load only for
   fail-closed inspection and cleanup; create/query/maintenance refuse to trust

@@ -33,10 +33,10 @@ END = "<!-- END NGRAM RELEASE EVIDENCE -->"
 SCHEMA = 1
 BENCHMARK_ID = "enwik9-current-v1"
 ENGINE_COMMIT = "6fb01c606165dce832d346f3c75198a1b704eefc"
-DUCKDB_GITLINK = "2d17945cffee40ea0199d327c0c269c9af243294"
+DUCKDB_GITLINK = "e366461e30fb95d68c0d53a50f050dd0b043fc71"
 CI_GITLINK = "72e76e99cd7fee45a99739cd118ec2db64e034ec"
 DUCKDB_VERSION = "v2.0.0"
-DUCKDB_SOURCE = "2d17945c"
+DUCKDB_SOURCE = "e366461e"
 
 
 def source_id_matches(source_id):
@@ -68,6 +68,8 @@ SANITIZED_ENV = {
     "LC_ALL": "C",
     "TZ": "UTC",
     "CCACHE_DISABLE": "1",
+    # the pinned DuckDB branch carries no release tag to describe
+    "OVERRIDE_GIT_DESCRIBE": DUCKDB_VERSION,
 }
 
 POLL_MS = 100

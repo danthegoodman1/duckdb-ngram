@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 // ngram/search_core.hpp: storage-table access, shadow-table scans, and the fetch/scan/emit state machine shared by
-// ngram_search and NGRAM_INDEX_SCAN.
+// ngram_search and ngram_index_scan.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -123,7 +123,7 @@ struct CandidateQueue {
 };
 
 //! Projection-neutral execution state shared by ngram_search and the
-//! transparent NGRAM_INDEX_SCAN. Policy-specific init supplies layouts,
+//! transparent ngram_index_scan. Policy-specific init supplies layouts,
 //! filters, HWM and an optional admitted probe.
 struct SearchCoreGlobal {
 	DataTable *storage = nullptr;

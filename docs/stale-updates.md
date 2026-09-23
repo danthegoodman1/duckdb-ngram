@@ -63,8 +63,8 @@ ngram index on a table uses this barrier:
    Writers blocked behind the exclusive lock can no longer commit against that
    old storage.
 3. Create the scan-free rowid guard while still holding the exclusive lock. Its
-   build state holds the table append lock from the allocated-row baseline read
-   through `PhysicalCreateIndex::AddIndex`, closing the insert gap between
+   create-index operator holds the table append lock from the allocated-row
+   baseline read through `DataTable::AddIndex`, closing the insert gap between
    baseline and physical installation. The guard mints its own token.
 4. `__ngram_creation_finish` validates the exact fresh guard and replacement
    storage, copies the token, and releases the exclusive lock. The potentially

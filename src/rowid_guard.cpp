@@ -5,8 +5,8 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector/sequence_vector.hpp"
-#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
-#include "duckdb/execution/operator/schema/physical_create_index.hpp"
+#include "duckdb/execution/index/unbound_index.hpp"
+#include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/connection_manager.hpp"
@@ -14,6 +14,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/planner/operator/logical_create_index.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/table/index_entry.hpp"
@@ -330,17 +331,6 @@ private:
 	optional_idx advance_iteration;
 };
 
-class GuardBuildGlobalState final : public IndexBuildGlobalState {
-public:
-	// PhysicalCreateIndex retains this state until after AddIndex. Holding the
-	// table append lock here makes the baseline read and physical installation
-	// one atomic window with respect to committed inserts.
-	TableAppendState append_state;
-	unique_ptr<BoundIndex> index;
-};
-
-class GuardBuildLocalState final : public IndexBuildLocalState {};
-
 void RequirePinnedRuntime() {
 	if (!RowIdGuardRuntimeCompatible()) {
 		throw InvalidInputException("ngram rowid guard requires host DuckDB %s built from commit %s", DUCKDB_VERSION,
@@ -348,44 +338,64 @@ void RequirePinnedRuntime() {
 	}
 }
 
-static unique_ptr<IndexBuildBindData> GuardBuildBind(IndexBuildBindInput &) {
-	return nullptr;
-}
-
-static unique_ptr<IndexBuildGlobalState> GuardBuildGlobalInit(IndexBuildInitGlobalStateInput &input) {
-	RequirePinnedRuntime();
-	if (input.info.constraint_type != IndexConstraintType::NONE || input.storage_ids.empty() ||
-	    input.storage_ids.size() != input.expressions.size()) {
-		throw InvalidInputException("ngram rowid guard requires one or more non-unique physical columns");
+//! CREATE INDEX for the guard. The table's append lock is held from the rowid
+//! baseline read until the guard is in the table's index list, so no committed
+//! insert falls between the two; one call of this source takes and releases it
+//! on one thread. The catalog steps are PhysicalCreateIndex::Finalize's. Both
+//! transactions are looked up before the lock: a lookup can start a
+//! transaction under the host's transaction locks, which a commit holds while
+//! it takes the append lock.
+class PhysicalCreateRowIdGuard final : public PhysicalOperator {
+public:
+	PhysicalCreateRowIdGuard(PhysicalPlan &physical_plan, LogicalCreateIndex &op)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 0),
+	      table(op.table.Cast<DuckTableEntry>()), info(std::move(op.info)),
+	      expressions(std::move(op.unbound_expressions)) {
 	}
-	if (!input.info.options.empty()) {
-		throw InvalidInputException("ngram rowid guard does not accept caller-supplied options");
+
+	DuckTableEntry &table;
+	unique_ptr<CreateIndexInfo> info;
+	vector<unique_ptr<Expression>> expressions;
+
+	bool IsSource() const override {
+		return true;
 	}
-	auto &storage = input.table.GetStorage();
-	auto state = make_uniq<GuardBuildGlobalState>();
-	storage.AppendLock(DuckTransaction::Get(input.context, input.table.ParentCatalog()), state->append_state);
-	auto next_row_id = storage.GetNextRowId();
-	auto max_seen = next_row_id == 0 ? int64_t(-1) : NumericCast<int64_t>(next_row_id - 1);
-	state->index =
-	    make_uniq<RowIdGuard>(input.info.GetIndexName(), input.storage_ids, TableIOManager::Get(storage),
-	                          input.expressions, storage.db, UUID::ToString(UUID::GenerateRandomUUID()), max_seen,
-	                          false, true, optional_idx(), ObservableCheckpointIteration(storage.db));
-	return state;
-}
 
-static unique_ptr<IndexBuildLocalState> GuardBuildLocalInit(IndexBuildInitLocalStateInput &) {
-	return make_uniq<GuardBuildLocalState>();
-}
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &, OperatorSourceInput &) const override {
+		RequirePinnedRuntime();
+		auto &storage_ids = info->column_ids;
+		if (info->constraint_type != IndexConstraintType::NONE || storage_ids.empty() ||
+		    storage_ids.size() != expressions.size()) {
+			throw InvalidInputException("ngram rowid guard requires one or more non-unique physical columns");
+		}
+		if (!info->options.empty()) {
+			throw InvalidInputException("ngram rowid guard does not accept caller-supplied options");
+		}
+		auto &storage = table.GetStorage();
+		auto &schema = table.schema;
+		auto &transaction = DuckTransaction::Get(context.client, table.ParentCatalog());
+		auto catalog_transaction = schema.GetCatalogTransaction(context.client);
+		TableAppendState append_state;
+		storage.AppendLock(transaction, append_state);
+		auto next_row_id = storage.GetNextRowId();
+		auto max_seen = next_row_id == 0 ? int64_t(-1) : NumericCast<int64_t>(next_row_id - 1);
+		unique_ptr<BoundIndex> guard =
+		    make_uniq<RowIdGuard>(info->GetIndexName(), storage_ids, TableIOManager::Get(storage), expressions,
+		                          storage.db, UUID::ToString(UUID::GenerateRandomUUID()), max_seen, false, true,
+		                          optional_idx(), ObservableCheckpointIteration(storage.db));
 
-static void GuardBuildSink(IndexBuildSinkInput &, DataChunk &, DataChunk &) {
-}
-
-static void GuardBuildCombine(IndexBuildCombineInput &) {
-}
-
-static unique_ptr<BoundIndex> GuardBuildFinalize(IndexBuildFinalizeInput &input) {
-	return std::move(input.global_state.Cast<GuardBuildGlobalState>().index);
-}
+		if (schema.GetEntry(catalog_transaction, CatalogType::INDEX_ENTRY, info->GetIndexName())) {
+			if (info->on_conflict != OnCreateConflict::IGNORE_ON_CONFLICT) {
+				throw CatalogException("Index with name %s already exists!", info->GetIndexName());
+			}
+			return SourceResultType::FINISHED;
+		}
+		auto &index = schema.CreateIndex(catalog_transaction, *info, table)->Cast<DuckIndexEntry>();
+		index.initial_index_size = guard->GetInMemorySize();
+		storage.AddIndex(std::move(guard), index.oid);
+		return SourceResultType::FINISHED;
+	}
+};
 
 static unique_ptr<BoundIndex> GuardCreateInstance(CreateIndexInput &input) {
 	if (input.column_ids.empty() || input.column_ids.size() != input.unbound_expressions.size()) {
@@ -397,31 +407,13 @@ static unique_ptr<BoundIndex> GuardCreateInstance(CreateIndexInput &input) {
 	                             stored.protection_compatible, stored.checkpoint_iteration, optional_idx());
 }
 
-static IndexType GuardIndexType();
-
 static PhysicalOperator &GuardCreatePlan(PlanIndexInput &input) {
-	vector<LogicalType> empty_types;
-	for (auto &expression : input.op.expressions) {
-		empty_types.push_back(expression->GetReturnType());
-	}
-	empty_types.push_back(LogicalType::ROW_TYPE);
-	auto &empty = input.planner.Make<PhysicalEmptyResult>(std::move(empty_types), 0);
-	auto &create = input.planner.Make<PhysicalCreateIndex>(
-	    input.op, input.op.table, input.op.info->column_ids, std::move(input.op.info),
-	    std::move(input.op.unbound_expressions), 0, GuardIndexType(), nullptr, std::move(input.op.alter_table_info));
-	create.children.push_back(empty);
-	return create;
+	return input.planner.Make<PhysicalCreateRowIdGuard>(input.op);
 }
 
 static IndexType GuardIndexType() {
 	IndexType result;
 	result.name = NGRAM_ROWID_GUARD_TYPE;
-	result.build_bind = GuardBuildBind;
-	result.build_global_init = GuardBuildGlobalInit;
-	result.build_local_init = GuardBuildLocalInit;
-	result.build_sink = GuardBuildSink;
-	result.build_combine = GuardBuildCombine;
-	result.build_finalize = GuardBuildFinalize;
 	result.create_plan = GuardCreatePlan;
 	result.create_instance = GuardCreateInstance;
 	return result;
@@ -481,9 +473,15 @@ static void BindAllRowIdGuards(ClientContext &context) {
 		if (!db->HasStorageManager() || !db->GetCatalog().IsDuckCatalog()) {
 			continue;
 		}
-		auto &catalog = db->GetCatalog();
-		catalog.ScanSchemas(context, [&](SchemaCatalogEntry &schema) {
-			schema.Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
+		// Each scan holds its CatalogSet lock while its callback runs, and
+		// Scan(context) first looks the transaction up, which can start one under
+		// the host's transaction locks; a commit takes those locks before catalog
+		// set locks. The index sets are therefore scanned after the schema scan
+		// returns.
+		vector<reference<SchemaCatalogEntry>> schemas;
+		db->GetCatalog().ScanSchemas(context, [&](SchemaCatalogEntry &schema) { schemas.push_back(schema); });
+		for (auto &schema : schemas) {
+			schema.get().Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
 				auto &index = entry.Cast<DuckIndexEntry>();
 				if (index.index_type != NGRAM_ROWID_GUARD_TYPE) {
 					return;
@@ -496,11 +494,10 @@ static void BindAllRowIdGuards(ClientContext &context) {
 					tables.push_back({catalog_name, std::move(table_schema), std::move(table_name)});
 				}
 			});
-		});
+		}
 	}
-	// Schema::Scan holds its CatalogSet lock for the callback lifetime. Resolve
-	// and bind only after every scan callback has returned: BindIndexes performs
-	// another catalog lookup and would otherwise self-deadlock.
+	// Resolve and bind only after every scan callback has returned: BindIndexes
+	// performs another catalog lookup and would otherwise self-deadlock.
 	for (auto &name : tables) {
 		try {
 			EntryLookupInfo lookup(

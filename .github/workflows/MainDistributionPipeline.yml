@@ -1,5 +1,13 @@
 #
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
+# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension.
+#
+# DuckDB 2.0 has no release tag or extension-ci-tools branch yet. The build job
+# uses extension-ci-tools' main line at a fixed commit, which builds the commit
+# the duckdb submodule records when given no duckdb_version; the Makefile names
+# that build v2.0.0, the version the rowid guard accepts. When 2.0 tags, name
+# v2.0.0 in duckdb_version and move both jobs to the matching extension-ci-tools
+# branch. The code-quality job runs clang-tidy against the checked-out
+# submodule, which the 1.5.5 tooling does unchanged.
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -16,14 +24,16 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@39ffc46ca8c70021d741c7be2e7bcadf3fd1c503
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
+      ci_tools_version: 39ffc46ca8c70021d741c7be2e7bcadf3fd1c503
       extension_name: ngram
       # windows_arm64 is opt_in in extension-ci-tools' distribution matrix, so it
       # builds only when named here; the rest of the matrix is on by default.
       opt_in_archs: "windows_arm64"
+      # Pull requests build the whole matrix too; the tooling's default builds
+      # three architectures for them and skips macOS.
+      reduced_ci_mode: disabled
 
   code-quality-check:
     name: Code Quality Check
@@ -32,4 +42,9 @@ jobs:
       duckdb_version: v1.5.5
       ci_tools_version: v1.5.5
       extension_name: ngram
-      format_checks: 'format;tidy'
+      # Only tidy here. This job installs the formatter's tools into the system
+      # python, and the 2.0 formatter prepends that interpreter's bin directory
+      # to PATH, which puts the runner's clang-format 14 ahead of the pinned
+      # 11.0.1 and fails its version check. Correctness.yml runs the format
+      # check from a venv, where the pinned tools win.
+      format_checks: 'tidy'

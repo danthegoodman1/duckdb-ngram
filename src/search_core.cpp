@@ -1,15 +1,20 @@
 #include "ngram/search_core.hpp"
-#include "ngram/test_hooks.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/optimistic_data_writer.hpp"
 #include "duckdb/storage/table/row_group.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "duckdb/transaction/local_storage.hpp"
 #include "ngram/catalog.hpp"
+#include "ngram/test_hooks.hpp"
 
 namespace duckdb {
 namespace ngram {
@@ -30,8 +35,9 @@ DuckTableEntry &ResolveExistingTable(ClientContext &context, const string &catal
 
 optional_ptr<DuckTableEntry> TryResolveExistingTable(ClientContext &context, const string &catalog,
                                                      const string &schema, const string &name, const char *what) {
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, name);
-	auto entry = Catalog::GetEntry(context, catalog, schema, lookup, OnEntryNotFound::RETURN_NULL);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+	                       QualifiedName(Identifier(catalog), Identifier(schema), Identifier(name)));
+	auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 	if (!entry) {
 		return nullptr;
 	}
@@ -62,17 +68,23 @@ DuckTableEntry &ResolveBoundBase(ClientContext &context, const string &catalog, 
 
 void AddShadowColumn(DuckTableEntry &entry, const string &column_name, LogicalTypeId expected,
                      vector<StorageIndex> &column_ids, vector<LogicalType> &types) {
-	if (!entry.ColumnExists(column_name)) {
+	if (!entry.ColumnExists(Identifier(column_name))) {
 		throw InvalidInputException("ngram: table %s is missing column %s; the index tables are malformed", entry.name,
 		                            column_name);
 	}
-	auto &col = entry.GetColumn(column_name);
+	auto &col = entry.GetColumn(Identifier(column_name));
 	if (col.Type().id() != expected) {
 		throw InvalidInputException("ngram: column %s of %s has type %s; the index tables are malformed", column_name,
 		                            entry.name, col.Type().ToString());
 	}
 	column_ids.push_back(entry.GetStorageIndex(ColumnIndex(col.Logical().index)));
 	types.push_back(col.Type());
+}
+
+unique_ptr<TableFilter> ConstantComparisonFilter(ExpressionType type, Value value) {
+	auto column_type = value.type();
+	LegacyConstantFilter comparison(type, std::move(value));
+	return ExpressionFilter::FromTableFilter(comparison, column_type);
 }
 
 void InitializeExhaustiveScan(ClientContext &context, DuckTransaction &tx, DataTable &storage, TableScanState &state,
@@ -90,7 +102,7 @@ void InitializeExhaustiveScan(ClientContext &context, DuckTransaction &tx, DataT
 }
 
 void ThrowIfInterrupted(ClientContext &context) {
-	if (context.interrupted.load(std::memory_order_relaxed)) {
+	if (context.IsInterrupted()) {
 		throw InterruptException();
 	}
 }
@@ -157,7 +169,7 @@ idx_t ExtraFetchColumns(const SearchCoreGlobal &state) {
 
 void FinalizeSearchCore(ClientContext &context, SearchCoreGlobal &state) {
 	D_ASSERT(state.storage && state.tx);
-	if (state.scan_filters && state.scan_filters->filters.empty()) {
+	if (state.scan_filters && !state.scan_filters->HasFilters()) {
 		state.scan_filters.reset();
 	}
 	state.tail_start = state.probe && state.hwm >= 0 ? NumericCast<idx_t>(state.hwm) + 1 : 0;
@@ -212,7 +224,7 @@ void FinalizeSearchCore(ClientContext &context, SearchCoreGlobal &state) {
 			state.output_sources.emplace_back(false, NumericCast<idx_t>(extra - state.extra_positions.begin()));
 		}
 	}
-	state.tail_end = state.storage->GetTotalRows();
+	state.tail_end = state.storage->GetNextRowId();
 	state.tail_unit_rows = MaxValue<idx_t>(state.storage->GetRowGroupSize(), 1);
 	state.tail_units = state.tail_start < state.tail_end
 	                       ? (state.tail_end - state.tail_start + state.tail_unit_rows - 1) / state.tail_unit_rows
@@ -374,14 +386,25 @@ static constexpr idx_t RANGE_SCAN_MIN_ROWS = 256;
 idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableScanState &state,
                             const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> filters,
                             idx_t start_row, idx_t end_row) {
-	D_ASSERT(start_row < end_row && end_row <= storage.GetTotalRows());
+	D_ASSERT(start_row < end_row && end_row <= storage.GetNextRowId());
 	state.Initialize(column_ids, &context, filters);
 	auto &collection = *storage.GetRowGroupCollection();
 	auto row_groups = collection.GetRowGroups();
 	auto &scan = state.table_state;
-	auto row_group = row_groups->GetSegment(start_row);
-	D_ASSERT(row_group);
-	auto vector_index = (start_row - row_group->GetRowStart()) / STANDARD_VECTOR_SIZE;
+	// A checkpoint that vacuums whole row groups leaves the surviving rows at
+	// their original row numbers, so the numbering has holes and a lookup of
+	// `start_row` can land in one. Seek to the first row group that ends past
+	// it instead, which is the same row group when the numbering is dense.
+	auto row_group = row_groups->GetRootSegment();
+	while (row_group && row_group->GetRowStart() + row_group->GetCount() <= start_row) {
+		row_group = row_groups->GetNextSegment(*row_group);
+	}
+	if (!row_group) {
+		scan.SetRowGroup(nullptr);
+		return 0;
+	}
+	auto vector_index =
+	    row_group->GetRowStart() >= start_row ? 0 : (start_row - row_group->GetRowStart()) / STANDARD_VECTOR_SIZE;
 	auto span_start = row_group->GetRowStart() + vector_index * STANDARD_VECTOR_SIZE;
 	while (row_group && row_group->GetRowStart() < end_row) {
 		if (RowGroupCollection::InitializeScanInRowGroup(context, scan, collection, *row_group, vector_index,
@@ -391,7 +414,7 @@ idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableSca
 		row_group = row_groups->GetNextSegment(*row_group);
 		vector_index = 0;
 	}
-	scan.row_group = nullptr;
+	scan.SetRowGroup(nullptr);
 	return 0;
 }
 
@@ -403,15 +426,10 @@ static bool StartRangeScan(ClientContext &context, SearchCoreGlobal &global, Sea
 	if (batch_rows < RANGE_SCAN_MIN_ROWS || NumericCast<idx_t>(last - first) + 1 > RANGE_ROWS_PER_FETCH * batch_rows) {
 		return false;
 	}
-	local.range_filters = make_uniq<TableFilterSet>();
-	if (global.scan_filters) {
-		for (auto &entry : global.scan_filters->filters) {
-			local.range_filters->PushFilter(ColumnIndex(entry.first), entry.second->Copy());
-		}
-	}
+	local.range_filters = global.scan_filters ? global.scan_filters->Copy() : make_uniq<TableFilterSet>();
 	local.range_filters->PushFilter(
-	    ColumnIndex(global.fetch_rowid_position),
-	    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::BIGINT(first)));
+	    ProjectionIndex(global.fetch_rowid_position),
+	    ConstantComparisonFilter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::BIGINT(first)));
 	local.range_state = make_uniq<TableScanState>();
 	auto span =
 	    InitializeBoundedScan(context, *global.storage, *local.range_state, global.fetch_column_ids,
@@ -448,15 +466,10 @@ static bool StartTailUnit(ClientContext &context, SearchCoreGlobal &global, Sear
 		// that the previous unit owns, or the indexed rows before the tail
 		auto start = global.tail_start + unit * global.tail_unit_rows;
 		auto end = MinValue<idx_t>(start + global.tail_unit_rows, global.tail_end);
-		local.scan_filters = make_uniq<TableFilterSet>();
-		if (global.scan_filters) {
-			for (auto &entry : global.scan_filters->filters) {
-				local.scan_filters->PushFilter(ColumnIndex(entry.first), entry.second->Copy());
-			}
-		}
+		local.scan_filters = global.scan_filters ? global.scan_filters->Copy() : make_uniq<TableFilterSet>();
 		local.scan_filters->PushFilter(
-		    ColumnIndex(global.fetch_rowid_position),
-		    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::BIGINT(start)));
+		    ProjectionIndex(global.fetch_rowid_position),
+		    ConstantComparisonFilter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::BIGINT(start)));
 		auto span = InitializeBoundedScan(context, *global.storage, *local.scan_state, global.fetch_column_ids,
 		                                  local.scan_filters.get(), start, end);
 		global.tail_rows.fetch_add(span, std::memory_order_relaxed);
@@ -473,12 +486,12 @@ static void SearchCoreEmit(SearchCoreGlobal &global, SearchCoreLocal &local, Dat
 	for (idx_t column = 0; column < global.output_ids.size(); column++) {
 		auto source_id = global.output_ids[column];
 		if (source_id == DConstants::INVALID_INDEX) {
-			output.data[column].Reference(Value::BOOLEAN(true));
+			output.data[column].Reference(Value::BOOLEAN(true), count_t(count));
 		} else {
 			output.data[column].Slice(source.data[source_id], local.sel, count);
 		}
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //! Emit the `count` rows the recheck kept from a per-row fetch: probe
@@ -489,14 +502,14 @@ static void SearchCoreEmitFetched(SearchCoreGlobal &global, SearchCoreLocal &loc
 	for (idx_t column = 0; column < global.output_sources.size(); column++) {
 		auto &source = global.output_sources[column];
 		if (source.second == DConstants::INVALID_INDEX) {
-			output.data[column].Reference(Value::BOOLEAN(true));
+			output.data[column].Reference(Value::BOOLEAN(true), count_t(count));
 		} else if (source.first) {
 			output.data[column].Slice(local.probe_chunk.data[source.second], local.sel, count);
 		} else {
 			output.data[column].Reference(local.extra_chunk.data[source.second]);
 		}
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchCoreGlobal &global,
@@ -546,7 +559,8 @@ void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchC
 				}
 				auto offset = local.candidate_offset;
 				auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, local.candidate_end - offset);
-				Vector rowids(LogicalType::ROW_TYPE, reinterpret_cast<data_ptr_t>(local.candidates->data() + offset));
+				Vector rowids(LogicalType::ROW_TYPE, reinterpret_cast<data_ptr_t>(local.candidates->data() + offset),
+				              count);
 				local.candidate_offset += count;
 				global.storage->Fetch(*global.tx, local.probe_chunk, global.probe_column_ids, rowids, count,
 				                      local.fetch_state);
@@ -564,7 +578,7 @@ void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchC
 					// their rowids, so the kept rows are addressed exactly
 					auto fetched_rowids =
 					    FlatVector::GetData<row_t>(local.probe_chunk.data[global.probe_rowid_position]);
-					auto hit_rowids = FlatVector::GetData<row_t>(local.hit_rowids);
+					auto hit_rowids = FlatVector::GetDataMutable<row_t>(local.hit_rowids);
 					for (idx_t i = 0; i < hits; i++) {
 						hit_rowids[i] = fetched_rowids[local.sel.get_index(i)];
 					}

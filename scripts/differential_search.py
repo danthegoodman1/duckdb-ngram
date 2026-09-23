@@ -263,7 +263,7 @@ def one_trial(trial, rng, rows, transparent):
                 out = run_duckdb(db_path, "\n".join(
                     session_settings +
                     ["EXPLAIN SELECT * FROM corpus WHERE contains(s, %s);" % sql_quote(probe)]))
-                if "NGRAM_INDEX_SCAN" in out:
+                if "Ngram Index Scan" in out:
                     checks += 1
                 else:
                     failures.append("explain: rewrite did not fire for needle %r" % probe)

@@ -33,7 +33,6 @@ jobs:
     timeout-minutes: 240
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 3
-      OVERRIDE_GIT_DESCRIBE: v1.5.5
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -82,7 +81,7 @@ jobs:
     timeout-minutes: 420
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
-      OVERRIDE_GIT_DESCRIBE: v1.5.5
+      DUCKDB_EXPLICIT_VERSION: v2.0.0
       PYTHONHASHSEED: 0
     steps:
       - name: Check out pinned sources
@@ -114,7 +113,7 @@ jobs:
           set -euo pipefail
           timeout 600s cmake -G Ninja \
             -DEXTENSION_STATIC_BUILD=1 \
-            -DOVERRIDE_GIT_DESCRIBE="$OVERRIDE_GIT_DESCRIBE" \
+            -DDUCKDB_EXPLICIT_VERSION="$DUCKDB_EXPLICIT_VERSION" \
             -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
             -DUNITTEST_ROOT_DIRECTORY="$GITHUB_WORKSPACE" \
             -DENABLE_UNITTEST_CPP_TESTS=FALSE \
@@ -162,14 +161,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     # Advisory, as the host's own ThreadSanitizer job is (run_tests_one_by_one
-    # --no-exit): DuckDB v1.5.5's lock orderings produce reports that are not
-    # the extension's to fix, so the lane's log is the deliverable and its
-    # exit code does not fail the nightly. Reports with an extension frame
-    # are suppressed only with the reasoning in test/tsan-suppressions.txt.
+    # --no-exit): which reports appear depends on thread interleaving, so the
+    # lane's log is the deliverable and its exit code does not fail the
+    # nightly. Reports are suppressed only with the reasoning in
+    # test/tsan-suppressions.txt.
     continue-on-error: true
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
-      OVERRIDE_GIT_DESCRIBE: v1.5.5
+      DUCKDB_EXPLICIT_VERSION: v2.0.0
       CC: clang
       CXX: clang++
     steps:
@@ -209,7 +208,7 @@ jobs:
           set -euo pipefail
           timeout 600s cmake -G Ninja \
             -DEXTENSION_STATIC_BUILD=1 \
-            -DOVERRIDE_GIT_DESCRIBE="$OVERRIDE_GIT_DESCRIBE" \
+            -DDUCKDB_EXPLICIT_VERSION="$DUCKDB_EXPLICIT_VERSION" \
             -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
             -DUNITTEST_ROOT_DIRECTORY="$GITHUB_WORKSPACE" \
             -DENABLE_UNITTEST_CPP_TESTS=FALSE \

@@ -156,9 +156,13 @@ RESET ngram_max_grams_per_query;
 # Admission before decode: hard-work and memory policies
 #===----------------------------------------------------------------------===#
 
+# Every row holds each needle once, in one of two layouts. A single layout would
+# give each row group equal min and max prefixes, and DuckDB answers contains()
+# over those from statistics without running the filter.
 statement ok
 CREATE TABLE dense AS
-SELECT i::BIGINT AS id, 'aaaaaaaa common payload'::VARCHAR AS s
+SELECT i::BIGINT AS id,
+       (CASE WHEN i % 2 = 0 THEN 'aaaaaaaa common payload' ELSE 'common payload aaaaaaaa' END)::VARCHAR AS s
 FROM range(250000) t(i);
 
 statement ok
@@ -323,11 +327,13 @@ analyzed_plan	<REGEX>:.*"Ngram Mode": "index \(<= 0 candidates, 0 decoded rowids
 # explicit and transparent paths.
 
 # A resource decline in an earlier segment must not hide structural corruption
-# in a later one. NULL rows make this cross-boundary fixture cheap to build.
+# in a later one. NULL rows make this cross-boundary fixture cheap to build, and
+# two needle-bearing strings keep DuckDB from answering contains() from
+# statistics.
 statement ok
 CREATE TABLE late_bad AS
 SELECT i::INTEGER AS id,
-	CASE WHEN i IN (0, 1, 1048576) THEN 'aaaa'::VARCHAR ELSE NULL::VARCHAR END AS s
+	CASE WHEN i IN (0, 1048576) THEN 'aaaa' WHEN i = 1 THEN 'xaaaa' ELSE NULL::VARCHAR END AS s
 FROM range(1048578) t(i);
 
 statement ok

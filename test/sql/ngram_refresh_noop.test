@@ -52,7 +52,7 @@ SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 query II
 EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # postings_bytes depends on the postings codec, so it only has to be positive
 query IIIIIIIIIIIII
@@ -86,7 +86,7 @@ SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 query II
 EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 query I
 SELECT count(*) FROM (
@@ -125,7 +125,7 @@ SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 query II
 EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 query I
 SELECT (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation || ':' || rowid_count || ':' || min_rowid || ':' || max_rowid, ',' ORDER BY gram_key, segment_no, generation))
@@ -153,7 +153,7 @@ SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 query II
 EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 query I
 SELECT count(*) FROM (
@@ -350,7 +350,7 @@ SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 query II
 EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 query I
 SELECT count(*) FROM (

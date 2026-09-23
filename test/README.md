@@ -78,6 +78,5 @@ ASAN/UBSAN, and the concurrency tests and the query harness under
 ThreadSanitizer with the host's suppressions plus `test/tsan-suppressions.txt`
 (each entry explained in the file). The ThreadSanitizer lane is advisory, as
 the host's own is: its log is reviewed and its exit code does not fail the
-nightly, because DuckDB v1.5.5's lock orderings produce reports the extension
-cannot fix. `MainDistributionPipeline.yml` builds the distributed binaries
+nightly, because which reports appear depends on thread interleaving. `MainDistributionPipeline.yml` builds the distributed binaries
 and runs the suite on each platform.

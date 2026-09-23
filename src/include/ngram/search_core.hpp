@@ -1,6 +1,6 @@
 //===----------------------------------------------------------------------===//
 // ngram/search_core.hpp: storage-table access, shadow-table scans, and the fetch/scan/emit state machine shared by
-// ngram_search and NGRAM_INDEX_SCAN.
+// ngram_search and ngram_index_scan.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -26,6 +26,11 @@ class ExpressionExecutor;
 class TableFilterSet;
 
 namespace ngram {
+
+//! A pushed table filter comparing one scanned column against `value`. Table
+//! filters are expressions, so this wraps the comparison around the
+//! BoundReferenceExpression(0) subject a single-column filter is evaluated on.
+unique_ptr<TableFilter> ConstantComparisonFilter(ExpressionType type, Value value);
 
 //! Initialize a committed + transaction-local storage scan. Equivalent to
 //! DataTable::InitializeScan, except that a table with no committed rows
@@ -118,7 +123,7 @@ struct CandidateQueue {
 };
 
 //! Projection-neutral execution state shared by ngram_search and the
-//! transparent NGRAM_INDEX_SCAN. Policy-specific init supplies layouts,
+//! transparent ngram_index_scan. Policy-specific init supplies layouts,
 //! filters, HWM and an optional admitted probe.
 struct SearchCoreGlobal {
 	DataTable *storage = nullptr;

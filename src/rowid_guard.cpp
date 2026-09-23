@@ -1,14 +1,23 @@
 #include "ngram/rowid_guard.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
-#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
-#include "duckdb/execution/operator/schema/physical_create_index.hpp"
+#include "duckdb/common/vector/sequence_vector.hpp"
+#include "duckdb/execution/index/unbound_index.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/connection_manager.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/planner/operator/logical_create_index.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/index.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
+#include "duckdb/storage/table/index_entry.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -22,16 +31,16 @@ namespace ngram {
 static constexpr const char *OPTION_MAX_SEEN = "ngram_guard_max_seen";
 static constexpr const char *OPTION_UNSAFE = "ngram_guard_unsafe_reuse";
 static constexpr int64_t GUARD_VERSION = 1;
-static constexpr const char *DUCKDB_VERSION = "v1.5.5";
+static constexpr const char *DUCKDB_VERSION = "v2.0.0";
 //! The DuckDB commit the guard is pinned to. A host reports an abbreviation of
 //! it as pragma_version().source_id whose length follows the build's git
 //! configuration: eight characters from a full clone, ten in the official binary.
-static constexpr const char *DUCKDB_SOURCE_COMMIT = "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa";
+static constexpr const char *DUCKDB_SOURCE_COMMIT = "e366461e30fb95d68c0d53a50f050dd0b043fc71";
 static constexpr idx_t MIN_SOURCE_ID_LENGTH = 7;
 //! The source tag persisted in every guard's storage options and compared
 //! exactly on read. Guards already on disk carry this literal, so it stays
 //! fixed independently of how the host abbreviates the commit.
-static constexpr const char *DUCKDB_SOURCE_ID = "d8cdaa33";
+static constexpr const char *DUCKDB_SOURCE_ID = "e366461e";
 static constexpr const char *OPTION_VERSION = "ngram_guard_version";
 static constexpr const char *OPTION_SOURCE = "ngram_duckdb_source_id";
 static constexpr const char *OPTION_CHECKPOINT = "ngram_guard_checkpoint_iteration";
@@ -91,7 +100,7 @@ static optional_idx ObservableCheckpointIteration(AttachedDatabase &db) {
 		return optional_idx();
 	}
 	auto &manager = db.GetTransactionManager().Cast<DuckTransactionManager>();
-	if (manager.GetActiveCheckpoint() != MAX_TRANSACTION_ID) {
+	if (manager.GetActiveCheckpoint().IsValid()) {
 		return optional_idx();
 	}
 	return storage.GetBlockManager().Cast<SingleFileBlockManager>().GetCheckpointIteration();
@@ -146,7 +155,7 @@ StoredGuardState ReadStoredGuardState(const IndexStorageInfo &storage) {
 
 class RowIdGuard final : public BoundIndex {
 public:
-	RowIdGuard(const string &name, const vector<column_t> &column_ids, TableIOManager &io_manager,
+	RowIdGuard(const Identifier &name, const vector<column_t> &column_ids, TableIOManager &io_manager,
 	           const vector<unique_ptr<Expression>> &expressions, AttachedDatabase &db, string token_p,
 	           int64_t max_seen_p, bool unsafe_reuse_p, bool protection_compatible_p,
 	           optional_idx checkpoint_iteration_p, optional_idx advance_iteration_p)
@@ -168,7 +177,7 @@ public:
 				return ErrorData();
 			}
 		}
-		row_ids.Flatten(chunk.size());
+		row_ids.Flatten();
 		auto ids = FlatVector::GetData<row_t>(row_ids);
 		auto first = NumericCast<int64_t>(ids[0]);
 		auto last = first;
@@ -197,7 +206,7 @@ public:
 	void Vacuum(IndexLock &) override {
 	}
 
-	idx_t GetInMemorySize(IndexLock &) override {
+	idx_t GetInMemorySize(IndexLock &) const override {
 		return sizeof(*this) + token.size();
 	}
 
@@ -220,12 +229,12 @@ public:
 		unsafe_reuse = true;
 	}
 
-	string GetConstraintViolationMessage(VerifyExistenceType, idx_t, DataChunk &) override {
+	string GetConstraintViolationMessage(VerifyExistenceType, idx_t, DataChunk &) const override {
 		return "ngram rowid guard has no constraints";
 	}
 
 	IndexStorageInfo SerializeToDisk(QueryContext, const case_insensitive_map_t<Value> &) override {
-		lock_guard<mutex> guard(lock);
+		annotated_lock_guard<annotated_mutex> guard(lock);
 		auto compatible = protection_compatible && RowIdGuardRuntimeCompatible();
 		auto current_iteration = compatible ? CheckpointIteration(db) : 0;
 		if (compatible) {
@@ -238,7 +247,7 @@ public:
 	}
 
 	IndexStorageInfo SerializeToWAL(const case_insensitive_map_t<Value> &) override {
-		lock_guard<mutex> guard(lock);
+		annotated_lock_guard<annotated_mutex> guard(lock);
 		auto compatible = protection_compatible && RowIdGuardRuntimeCompatible();
 		auto current_iteration = compatible ? CheckpointIteration(db) : 0;
 		if (compatible) {
@@ -254,7 +263,7 @@ public:
 	}
 
 	RowIdGuardState GetState(optional_idx current_iteration) {
-		lock_guard<mutex> guard(lock);
+		annotated_lock_guard<annotated_mutex> guard(lock);
 		if (current_iteration.IsValid()) {
 			ApplyCheckpointSeal(current_iteration.GetIndex());
 		}
@@ -322,17 +331,6 @@ private:
 	optional_idx advance_iteration;
 };
 
-class GuardBuildGlobalState final : public IndexBuildGlobalState {
-public:
-	// PhysicalCreateIndex retains this state until after AddIndex. Holding the
-	// table append lock here makes the baseline read and physical installation
-	// one atomic window with respect to committed inserts.
-	TableAppendState append_state;
-	unique_ptr<BoundIndex> index;
-};
-
-class GuardBuildLocalState final : public IndexBuildLocalState {};
-
 void RequirePinnedRuntime() {
 	if (!RowIdGuardRuntimeCompatible()) {
 		throw InvalidInputException("ngram rowid guard requires host DuckDB %s built from commit %s", DUCKDB_VERSION,
@@ -340,44 +338,64 @@ void RequirePinnedRuntime() {
 	}
 }
 
-static unique_ptr<IndexBuildBindData> GuardBuildBind(IndexBuildBindInput &) {
-	return nullptr;
-}
-
-static unique_ptr<IndexBuildGlobalState> GuardBuildGlobalInit(IndexBuildInitGlobalStateInput &input) {
-	RequirePinnedRuntime();
-	if (input.info.constraint_type != IndexConstraintType::NONE || input.storage_ids.empty() ||
-	    input.storage_ids.size() != input.expressions.size()) {
-		throw InvalidInputException("ngram rowid guard requires one or more non-unique physical columns");
+//! CREATE INDEX for the guard. The table's append lock is held from the rowid
+//! baseline read until the guard is in the table's index list, so no committed
+//! insert falls between the two; one call of this source takes and releases it
+//! on one thread. The catalog steps are PhysicalCreateIndex::Finalize's. Both
+//! transactions are looked up before the lock: a lookup can start a
+//! transaction under the host's transaction locks, which a commit holds while
+//! it takes the append lock.
+class PhysicalCreateRowIdGuard final : public PhysicalOperator {
+public:
+	PhysicalCreateRowIdGuard(PhysicalPlan &physical_plan, LogicalCreateIndex &op)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 0),
+	      table(op.table.Cast<DuckTableEntry>()), info(std::move(op.info)),
+	      expressions(std::move(op.unbound_expressions)) {
 	}
-	if (!input.info.options.empty()) {
-		throw InvalidInputException("ngram rowid guard does not accept caller-supplied options");
+
+	DuckTableEntry &table;
+	unique_ptr<CreateIndexInfo> info;
+	vector<unique_ptr<Expression>> expressions;
+
+	bool IsSource() const override {
+		return true;
 	}
-	auto &storage = input.table.GetStorage();
-	auto state = make_uniq<GuardBuildGlobalState>();
-	storage.AppendLock(DuckTransaction::Get(input.context, input.table.ParentCatalog()), state->append_state);
-	auto total_rows = storage.GetTotalRows();
-	auto max_seen = total_rows == 0 ? int64_t(-1) : NumericCast<int64_t>(total_rows - 1);
-	state->index =
-	    make_uniq<RowIdGuard>(input.info.index_name, input.storage_ids, TableIOManager::Get(storage), input.expressions,
-	                          storage.db, UUID::ToString(UUID::GenerateRandomUUID()), max_seen, false, true,
-	                          optional_idx(), ObservableCheckpointIteration(storage.db));
-	return state;
-}
 
-static unique_ptr<IndexBuildLocalState> GuardBuildLocalInit(IndexBuildInitLocalStateInput &) {
-	return make_uniq<GuardBuildLocalState>();
-}
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &, OperatorSourceInput &) const override {
+		RequirePinnedRuntime();
+		auto &storage_ids = info->column_ids;
+		if (info->constraint_type != IndexConstraintType::NONE || storage_ids.empty() ||
+		    storage_ids.size() != expressions.size()) {
+			throw InvalidInputException("ngram rowid guard requires one or more non-unique physical columns");
+		}
+		if (!info->options.empty()) {
+			throw InvalidInputException("ngram rowid guard does not accept caller-supplied options");
+		}
+		auto &storage = table.GetStorage();
+		auto &schema = table.schema;
+		auto &transaction = DuckTransaction::Get(context.client, table.ParentCatalog());
+		auto catalog_transaction = schema.GetCatalogTransaction(context.client);
+		TableAppendState append_state;
+		storage.AppendLock(transaction, append_state);
+		auto next_row_id = storage.GetNextRowId();
+		auto max_seen = next_row_id == 0 ? int64_t(-1) : NumericCast<int64_t>(next_row_id - 1);
+		unique_ptr<BoundIndex> guard =
+		    make_uniq<RowIdGuard>(info->GetIndexName(), storage_ids, TableIOManager::Get(storage), expressions,
+		                          storage.db, UUID::ToString(UUID::GenerateRandomUUID()), max_seen, false, true,
+		                          optional_idx(), ObservableCheckpointIteration(storage.db));
 
-static void GuardBuildSink(IndexBuildSinkInput &, DataChunk &, DataChunk &) {
-}
-
-static void GuardBuildCombine(IndexBuildCombineInput &) {
-}
-
-static unique_ptr<BoundIndex> GuardBuildFinalize(IndexBuildFinalizeInput &input) {
-	return std::move(input.global_state.Cast<GuardBuildGlobalState>().index);
-}
+		if (schema.GetEntry(catalog_transaction, CatalogType::INDEX_ENTRY, info->GetIndexName())) {
+			if (info->on_conflict != OnCreateConflict::IGNORE_ON_CONFLICT) {
+				throw CatalogException("Index with name %s already exists!", info->GetIndexName());
+			}
+			return SourceResultType::FINISHED;
+		}
+		auto &index = schema.CreateIndex(catalog_transaction, *info, table)->Cast<DuckIndexEntry>();
+		index.initial_index_size = guard->GetInMemorySize();
+		storage.AddIndex(std::move(guard), index.oid);
+		return SourceResultType::FINISHED;
+	}
+};
 
 static unique_ptr<BoundIndex> GuardCreateInstance(CreateIndexInput &input) {
 	if (input.column_ids.empty() || input.column_ids.size() != input.unbound_expressions.size()) {
@@ -389,31 +407,13 @@ static unique_ptr<BoundIndex> GuardCreateInstance(CreateIndexInput &input) {
 	                             stored.protection_compatible, stored.checkpoint_iteration, optional_idx());
 }
 
-static IndexType GuardIndexType();
-
 static PhysicalOperator &GuardCreatePlan(PlanIndexInput &input) {
-	vector<LogicalType> empty_types;
-	for (auto &expression : input.op.expressions) {
-		empty_types.push_back(expression->return_type);
-	}
-	empty_types.push_back(LogicalType::ROW_TYPE);
-	auto &empty = input.planner.Make<PhysicalEmptyResult>(std::move(empty_types), 0);
-	auto &create = input.planner.Make<PhysicalCreateIndex>(
-	    input.op, input.op.table, input.op.info->column_ids, std::move(input.op.info),
-	    std::move(input.op.unbound_expressions), 0, GuardIndexType(), nullptr, std::move(input.op.alter_table_info));
-	create.children.push_back(empty);
-	return create;
+	return input.planner.Make<PhysicalCreateRowIdGuard>(input.op);
 }
 
 static IndexType GuardIndexType() {
 	IndexType result;
 	result.name = NGRAM_ROWID_GUARD_TYPE;
-	result.build_bind = GuardBuildBind;
-	result.build_global_init = GuardBuildGlobalInit;
-	result.build_local_init = GuardBuildLocalInit;
-	result.build_sink = GuardBuildSink;
-	result.build_combine = GuardBuildCombine;
-	result.build_finalize = GuardBuildFinalize;
 	result.create_plan = GuardCreatePlan;
 	result.create_instance = GuardCreateInstance;
 	return result;
@@ -429,18 +429,19 @@ bool CanBindRowIdGuards(DuckTableEntry &table, bool require_compatible) {
 	if (require_compatible && !RowIdGuardRuntimeCompatible()) {
 		return false;
 	}
-	for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-		auto &index = *entry.index;
-		if (index.GetIndexType() != NGRAM_ROWID_GUARD_TYPE || index.IsBound()) {
+	for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+		if (entry->GetIndexType() != NGRAM_ROWID_GUARD_TYPE || entry->GetBindState() == IndexBindState::BOUND) {
 			continue;
 		}
-		if (entry.bind_state.load() != IndexBindState::UNBOUND ||
-		    index.GetConstraintType() != IndexConstraintType::NONE) {
+		if (entry->GetBindState() != IndexBindState::UNBOUND) {
 			return false;
 		}
-		auto &unbound = index.Cast<UnboundIndex>();
-		auto &expressions = unbound.GetParsedExpressions();
-		auto &column_ids = index.GetColumnIds();
+		auto unbound = entry->GetReadHandle<UnboundIndex>();
+		if (unbound->GetConstraintType() != IndexConstraintType::NONE) {
+			return false;
+		}
+		auto &expressions = unbound->GetParsedExpressions();
+		auto &column_ids = unbound->GetColumnIds();
 		if (column_ids.empty() || expressions.size() != column_ids.size()) {
 			return false;
 		}
@@ -458,7 +459,7 @@ bool CanBindRowIdGuards(DuckTableEntry &table, bool require_compatible) {
 				return false;
 			}
 		}
-		if (require_compatible && !ReadStoredGuardState(unbound.GetStorageInfo()).protection_compatible) {
+		if (require_compatible && !ReadStoredGuardState(unbound->GetStorageInfo()).protection_compatible) {
 			return false;
 		}
 	}
@@ -472,29 +473,37 @@ static void BindAllRowIdGuards(ClientContext &context) {
 		if (!db->HasStorageManager() || !db->GetCatalog().IsDuckCatalog()) {
 			continue;
 		}
-		auto &catalog = db->GetCatalog();
-		catalog.ScanSchemas(context, [&](SchemaCatalogEntry &schema) {
-			schema.Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
+		// Each scan holds its CatalogSet lock while its callback runs, and
+		// Scan(context) first looks the transaction up, which can start one under
+		// the host's transaction locks; a commit takes those locks before catalog
+		// set locks. The index sets are therefore scanned after the schema scan
+		// returns.
+		vector<reference<SchemaCatalogEntry>> schemas;
+		db->GetCatalog().ScanSchemas(context, [&](SchemaCatalogEntry &schema) { schemas.push_back(schema); });
+		for (auto &schema : schemas) {
+			schema.get().Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
 				auto &index = entry.Cast<DuckIndexEntry>();
 				if (index.index_type != NGRAM_ROWID_GUARD_TYPE) {
 					return;
 				}
-				auto table_schema = index.GetSchemaName();
-				auto table_name = index.GetTableName();
-				auto key = db->GetName() + '\0' + table_schema + '\0' + table_name;
+				auto table_schema = index.GetSchemaName().GetIdentifierName();
+				auto table_name = index.GetTableName().GetIdentifierName();
+				auto &catalog_name = db->GetName().GetIdentifierName();
+				auto key = catalog_name + '\0' + table_schema + '\0' + table_name;
 				if (seen.insert(std::move(key)).second) {
-					tables.push_back({db->GetName(), std::move(table_schema), std::move(table_name)});
+					tables.push_back({catalog_name, std::move(table_schema), std::move(table_name)});
 				}
 			});
-		});
+		}
 	}
-	// Schema::Scan holds its CatalogSet lock for the callback lifetime. Resolve
-	// and bind only after every scan callback has returned: BindIndexes performs
-	// another catalog lookup and would otherwise self-deadlock.
+	// Resolve and bind only after every scan callback has returned: BindIndexes
+	// performs another catalog lookup and would otherwise self-deadlock.
 	for (auto &name : tables) {
 		try {
-			EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, name.table);
-			auto entry = Catalog::GetEntry(context, name.catalog, name.schema, lookup, OnEntryNotFound::RETURN_NULL);
+			EntryLookupInfo lookup(
+			    CatalogType::TABLE_ENTRY,
+			    QualifiedName(Identifier(name.catalog), Identifier(name.schema), Identifier(name.table)));
+			auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 			if (!entry || entry->type != CatalogType::TABLE_ENTRY || !entry->Cast<TableCatalogEntry>().IsDuckTable()) {
 				continue;
 			}
@@ -536,8 +545,9 @@ public:
 	}
 };
 
-RowIdGuardState ReadBoundGuardState(Index &index, optional_idx current_iteration) {
-	return index.Cast<RowIdGuard>().GetState(current_iteration);
+RowIdGuardState ReadBoundGuardState(IndexEntry &entry, optional_idx current_iteration) {
+	auto handle = entry.GetWriteHandle<RowIdGuard>();
+	return handle->GetState(current_iteration);
 }
 
 void RegisterRowIdGuard(ExtensionLoader &loader) {

@@ -1,10 +1,15 @@
 #include "duckdb.hpp"
+#include "duckdb/main/statement_iterator.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/index.hpp"
+#include "duckdb/storage/table/index_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/execution/index/unbound_index.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 #include "duckdb/parser/statement/transaction_statement.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
@@ -30,7 +35,7 @@
 
 using namespace duckdb;
 
-static unique_ptr<MaterializedQueryResult> Query(Connection &con, const string &sql) {
+static unique_ptr<QueryResult> Query(Connection &con, const string &sql) {
 	auto result = con.Query(sql);
 	if (result->HasError()) {
 		throw std::runtime_error(result->GetError() + "\nSQL: " + sql);
@@ -54,22 +59,22 @@ static string IndexHex(Connection &con, const string &table_name, const string &
                        const string &catalog_name = string()) {
 	auto registry = catalog_name.empty() ? string("__ngram.registry") : catalog_name + ".__ngram.registry";
 	return ScalarString(con, "SELECT replace(index_id::VARCHAR, '-', '') FROM " + registry +
-	                             " WHERE table_name=" + KeywordHelper::WriteQuoted(table_name) +
-	                             " AND column_name=" + KeywordHelper::WriteQuoted(column_name));
+	                             " WHERE table_name=" + SQLString::ToString(table_name) +
+	                             " AND column_name=" + SQLString::ToString(column_name));
 }
 
 static string IndexRef(Connection &con, const string &table_name, const string &column_name,
                        const string &catalog_name = string()) {
 	auto registry = catalog_name.empty() ? string("__ngram.registry") : catalog_name + ".__ngram.registry";
 	return ScalarString(con, "SELECT index_id::VARCHAR FROM " + registry +
-	                             " WHERE table_name=" + KeywordHelper::WriteQuoted(table_name) +
-	                             " AND column_name=" + KeywordHelper::WriteQuoted(column_name));
+	                             " WHERE table_name=" + SQLString::ToString(table_name) +
+	                             " AND column_name=" + SQLString::ToString(column_name));
 }
 
 //! `__ngram.registry WHERE <owner>`: the registry row of one index, for reads.
 static string OwnerRow(const string &table_name, const string &column_name) {
-	return "__ngram.registry WHERE table_name=" + KeywordHelper::WriteQuoted(table_name) +
-	       " AND column_name=" + KeywordHelper::WriteQuoted(column_name);
+	return "__ngram.registry WHERE table_name=" + SQLString::ToString(table_name) +
+	       " AND column_name=" + SQLString::ToString(column_name);
 }
 
 static string GuardName(Connection &con, const string &table_name, const string &column_name) {
@@ -78,11 +83,9 @@ static string GuardName(Connection &con, const string &table_name, const string 
 
 //! The ngram_indexes() row of one index; an index the listing lacks is an
 //! error, as the status pragma it replaces made it.
-static unique_ptr<MaterializedQueryResult> StatusByRef(Connection &con, const string &catalog,
-                                                       const string &index_ref) {
-	auto result =
-	    Query(con, "SELECT * FROM ngram_indexes() WHERE database_name = " + KeywordHelper::WriteQuoted(catalog) +
-	                   " AND index_ref = " + KeywordHelper::WriteQuoted(index_ref));
+static unique_ptr<QueryResult> StatusByRef(Connection &con, const string &catalog, const string &index_ref) {
+	auto result = Query(con, "SELECT * FROM ngram_indexes() WHERE database_name = " + SQLString::ToString(catalog) +
+	                             " AND index_ref = " + SQLString::ToString(index_ref));
 	if (result->RowCount() != 1) {
 		throw std::runtime_error("ngram_indexes() lists " + to_string(result->RowCount()) + " rows for " + index_ref +
 		                         " in " + catalog);
@@ -105,8 +108,8 @@ static string StatusReason(Connection &con, const string &catalog, const string 
 }
 
 static void DropByRef(Connection &con, const string &catalog, const string &index_ref) {
-	Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(index_ref) +
-	               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
+	Check(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(index_ref) +
+	               ", catalog = " + SQLString::ToString(catalog) + ")");
 }
 
 static void ExpectStatus(Connection &con, const string &catalog, const string &index_ref, const string &expected) {
@@ -155,10 +158,11 @@ static bool HasRowIdGuard(Connection &con, const string &table_name) {
 	bool found = false;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &table = Catalog::GetEntry<TableCatalogEntry>(
-		                  *con.context, DatabaseManager::GetDefaultDatabase(*con.context), "main", table_name)
+		                  *con.context, QualifiedName(DatabaseManager::GetDefaultDatabase(*con.context), "main",
+		                                              Identifier(table_name)))
 		                  .Cast<DuckTableEntry>();
-		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-			if (entry.index->GetIndexType() == ngram::NGRAM_ROWID_GUARD_TYPE) {
+		for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+			if (entry->GetIndexType() == ngram::NGRAM_ROWID_GUARD_TYPE) {
 				found = true;
 				break;
 			}
@@ -172,17 +176,18 @@ static bool RowIdGuardIsBound(Connection &con, const string &table_name) {
 	bool bound = false;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &table = Catalog::GetEntry<TableCatalogEntry>(
-		                  *con.context, DatabaseManager::GetDefaultDatabase(*con.context), "main", table_name)
+		                  *con.context, QualifiedName(DatabaseManager::GetDefaultDatabase(*con.context), "main",
+		                                              Identifier(table_name)))
 		                  .Cast<DuckTableEntry>();
-		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-			if (entry.index->GetIndexType() != ngram::NGRAM_ROWID_GUARD_TYPE) {
+		for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+			if (entry->GetIndexType() != ngram::NGRAM_ROWID_GUARD_TYPE) {
 				continue;
 			}
 			if (found) {
 				throw std::runtime_error("expected exactly one rowid guard on " + table_name);
 			}
 			found = true;
-			bound = entry.index->IsBound();
+			bound = entry->GetBindState() == IndexBindState::BOUND;
 		}
 	});
 	if (!found) {
@@ -196,16 +201,17 @@ static void SetRowIdGuardBindState(Connection &con, const string &table_name, co
 	bool found = false;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &table = Catalog::GetEntry<TableCatalogEntry>(
-		                  *con.context, DatabaseManager::GetDefaultDatabase(*con.context), "main", table_name)
+		                  *con.context, QualifiedName(DatabaseManager::GetDefaultDatabase(*con.context), "main",
+		                                              Identifier(table_name)))
 		                  .Cast<DuckTableEntry>();
-		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-			if (entry.index->GetIndexName() != guard_name) {
+		for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+			if (entry->GetName() != guard_name) {
 				continue;
 			}
-			if (require_unbound && entry.index->IsBound()) {
+			if (require_unbound && entry->GetBindState() == IndexBindState::BOUND) {
 				throw std::runtime_error("expected an unbound rowid guard on " + table_name);
 			}
-			entry.bind_state.store(state);
+			entry->SetBindState(state);
 			found = true;
 			break;
 		}
@@ -241,11 +247,13 @@ static void ExpectPreparedWriteFailure(Connection &con, PreparedStatement &prepa
 }
 
 static int64_t PreparedScalar(PreparedStatement &prepared) {
-	// Materialize: a streamed result keeps the statement's transaction and
-	// operator states alive until the connection's next statement, which would
-	// block a creation barrier taken by another connection in the meantime.
+	// Complete the result: an unmaterialized one keeps the statement's
+	// transaction and operator states alive until the connection's next
+	// statement, which would block a creation barrier taken by another
+	// connection in the meantime.
 	vector<Value> values;
-	auto result = prepared.Execute(values, false);
+	auto result = prepared.Execute(values);
+	result->Complete();
 	if (result->HasError()) {
 		throw std::runtime_error("prepared query failed: " + result->GetError());
 	}
@@ -265,7 +273,15 @@ static void ExpectPreparedError(PreparedStatement &prepared, const string &needl
 }
 
 static vector<unique_ptr<SQLStatement>> Expand(Connection &con, const string &sql) {
-	auto statements = con.context->ParseStatements(sql);
+	vector<unique_ptr<SQLStatement>> statements;
+	auto iterator = con.context->IterateStatements(sql);
+	while (iterator.Peek()) {
+		auto statement = iterator.GetStatement();
+		if (!statement) {
+			continue;
+		}
+		statements.push_back(std::move(statement));
+	}
 	if (statements.empty() || statements.front()->type != StatementType::TRANSACTION_STATEMENT ||
 	    statements.front()->Cast<TransactionStatement>().info->type != TransactionType::BEGIN_TRANSACTION) {
 		throw std::runtime_error("pragma expansion did not begin with a generated transaction");
@@ -398,14 +414,15 @@ static void MutateGuardOption(Connection &con, const string &table_name, const s
 	auto catalog_name = DatabaseManager::GetDefaultDatabase(*con.context);
 	bool found = false;
 	con.context->RunFunctionInTransaction([&]() {
-		auto &table =
-		    Catalog::GetEntry<TableCatalogEntry>(*con.context, catalog_name, "main", table_name).Cast<DuckTableEntry>();
-		for (auto &entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-			auto &index = *entry.index;
-			if (index.GetIndexName() != guard_name || index.IsBound()) {
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(*con.context,
+		                                                   QualifiedName(catalog_name, "main", Identifier(table_name)))
+		                  .Cast<DuckTableEntry>();
+		for (auto entry : table.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+			if (entry->GetName() != guard_name || entry->GetBindState() == IndexBindState::BOUND) {
 				continue;
 			}
-			auto &storage = const_cast<IndexStorageInfo &>(index.Cast<UnboundIndex>().GetStorageInfo());
+			auto unbound = entry->GetWriteHandle<UnboundIndex>();
+			auto &storage = const_cast<IndexStorageInfo &>(unbound->GetStorageInfo());
 			storage.options[option] = std::move(value);
 			found = true;
 		}
@@ -427,12 +444,13 @@ static void TestCreationSchedules(const string &path) {
 		auto version = Query(host, "SELECT library_version, source_id FROM system.main.pragma_version()");
 		auto library_version = version->GetValue(0, 0).ToString();
 		auto source_id = version->GetValue(1, 0).ToString();
-		// The extension's pin: v1.5.5 built from this commit, with source_id an
-		// abbreviation of it that has at least seven characters.
-		const string pinned_commit = "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa";
+		// The extension's pin: v2.0.0 built from this commit, with source_id an
+		// abbreviation of it that has at least seven characters. The Makefile
+		// names the version; without it the host reports v2.0.0-dev<n>.
+		const string pinned_commit = "e366461e30fb95d68c0d53a50f050dd0b043fc71";
 		bool pinned_source = source_id.size() >= 7 && source_id.size() <= pinned_commit.size() &&
 		                     pinned_commit.compare(0, source_id.size(), source_id) == 0;
-		if (library_version != "v1.5.5" || !pinned_source) {
+		if (library_version != "v2.0.0" || !pinned_source) {
 			throw std::runtime_error("host pragma_version is outside the pinned rowid-guard runtime");
 		}
 	}
@@ -550,8 +568,8 @@ static void TestCreationSchedules(const string &path) {
 	      "INSERT INTO staged_revert SELECT i, CASE WHEN i=0 THEN 'base needle' ELSE 'x' END FROM range(8) t(i)");
 	Check(staged_writer, "BEGIN");
 	Check(staged_writer, "INSERT INTO staged_revert VALUES (8, 'staged needle')");
-	auto &staged_catalog =
-	    Catalog::GetCatalog(*staged_writer.context, ScalarString(staged_writer, "SELECT current_database()"));
+	auto &staged_catalog = Catalog::GetCatalog(*staged_writer.context,
+	                                           Identifier(ScalarString(staged_writer, "SELECT current_database()")));
 	DuckTransaction::Get(*staged_writer.context, staged_catalog).GetLocalStorage().Commit(nullptr);
 	auto staged_create = Expand(staged_creator, "PRAGMA create_ngram_index('staged_revert', 's')");
 	auto staged_next = ExecuteThrough(staged_creator, staged_create, "__ngram_creation_finish");
@@ -595,7 +613,7 @@ static void TestCreationSchedules(const string &path) {
 	ExecuteThrough(fence, fenced_refresh, "__ngram_maintenance_guard");
 	Check(checkpoint, "BEGIN");
 	auto catalog_name = ScalarString(checkpoint, "SELECT current_database()");
-	auto &catalog = Catalog::GetCatalog(*checkpoint.context, catalog_name);
+	auto &catalog = Catalog::GetCatalog(*checkpoint.context, Identifier(catalog_name));
 	auto &manager = DuckTransaction::Get(*checkpoint.context, catalog).GetTransactionManager();
 	auto blocked = manager.TryGetVacuumLock();
 	if (blocked) {
@@ -683,7 +701,7 @@ static void TestSharedGuardAndDrop(const string &path) {
 		Check(con, "DROP INDEX " + guard);
 		if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('drop_cross_owner', 'needle')") != 1 ||
 		    ScalarInt64(con, "SELECT count(*) FROM drop_cross_owner WHERE s LIKE '%needle%'") != 1 ||
-		    Query(con, "EXPLAIN SELECT * FROM drop_cross_owner WHERE s LIKE '%needle%'")->ToString().find("SEQ_SCAN") ==
+		    Query(con, "EXPLAIN SELECT * FROM drop_cross_owner WHERE s LIKE '%needle%'")->ToString().find("Seq Scan") ==
 		        string::npos) {
 			throw std::runtime_error("missing rowid guard did not choose exact explicit/transparent fallback");
 		}
@@ -814,44 +832,57 @@ static void TestSharedGuardAndDrop(const string &path) {
 // SQLLogic's query() can read a runtime-named storage table but deliberately
 // rejects DDL/DML, so the corruption matrix lives here.
 
-static void TestVacuumAndConflict(const string &path) {
+//! Builds three row groups, keeps one row in the first and one in the last,
+//! deletes the rest, checkpoints, and returns the last survivor's rowid. The
+//! partial ends and empty middle let a vacuum that may move rows merge the ends
+//! under either storage regime; one that keeps rowids leaves the survivor at
+//! 2 * DEFAULT_ROW_GROUP_SIZE.
+static int64_t VacuumSurvivorRowId(Connection &con, const string &table, const string &create_index) {
+	auto survivor = to_string(2 * DEFAULT_ROW_GROUP_SIZE);
+	Check(con, "CREATE TABLE " + table + " AS SELECT i id, CASE WHEN i IN (0, " + survivor +
+	               ") THEN 'vacuum needle' ELSE 'x' END s FROM range(" + to_string(3 * DEFAULT_ROW_GROUP_SIZE) +
+	               ") t(i)");
+	Check(con, create_index);
+	Check(con, "DELETE FROM " + table + " WHERE id NOT IN (0, " + survivor + ")");
+	Check(con, "FORCE CHECKPOINT");
+	return ScalarInt64(con, "SELECT rowid FROM " + table + " WHERE id=" + survivor);
+}
+
+static void TestVacuumAndConflict(const string &path, const string &storage_version) {
 	RemoveDatabase(path);
 	DBConfig config;
 	config.SetOptionByName("vacuum_rebuild_indexes", Value::UBIGINT(500000));
+	config.SetOptionByName("storage_compatibility_version", Value(storage_version));
 	DuckDB db(path, &config);
 	LoadNgram(db);
 	Connection con(db);
 	Check(con, "SET checkpoint_threshold='1TB'");
 	Check(con, "SET ngram_auto_accelerate=true");
 
-	// Prove the configured host would move this exact shape with an ART alone;
-	// otherwise the guarded assertion below would not discriminate the branch.
-	Check(con, "CREATE TABLE art_vacuum_control AS SELECT i id FROM range(122881) t(i)");
-	Check(con, "CREATE INDEX art_vacuum_control_idx ON art_vacuum_control(id)");
-	Check(con, "DELETE FROM art_vacuum_control WHERE id < 122880");
-	Check(con, "FORCE CHECKPOINT");
-	if (ScalarInt64(con, "SELECT rowid FROM art_vacuum_control WHERE id=122880") != 0) {
-		throw std::runtime_error("vacuum_rebuild_indexes control did not trigger moving vacuum");
+	// Prove the host moves this shape with an ART alone; otherwise the guarded
+	// assertion below would not discriminate. Storage that persists rowid gaps
+	// remaps an all-ART table's rowids when it merges partial row groups, and
+	// older storage renumbers densely once vacuum_rebuild_indexes allows a
+	// rebuild, so the control moves under both.
+	const auto survivor = NumericCast<int64_t>(2 * DEFAULT_ROW_GROUP_SIZE);
+	if (VacuumSurvivorRowId(con, "art_vacuum_control",
+	                        "CREATE INDEX art_vacuum_control_idx ON art_vacuum_control(id)") == survivor) {
+		throw std::runtime_error("ART-only control did not trigger a moving vacuum");
 	}
 	Check(con, "DROP TABLE art_vacuum_control");
 
-	// A non-ART guard permanently excludes DuckDB's ART-only moving-vacuum
-	// path, even when vacuum_rebuild_indexes would otherwise move live rows.
-	Check(con, "CREATE TABLE vacuum_rows AS SELECT i id, CASE WHEN i=122880 THEN 'vacuum needle' ELSE 'x' END s "
-	           "FROM range(122881) t(i)");
-	Check(con, "PRAGMA create_ngram_index('vacuum_rows', 's')");
-	auto before = ScalarInt64(con, "SELECT rowid FROM vacuum_rows WHERE id=122880");
-	Check(con, "DELETE FROM vacuum_rows WHERE id < 122880");
-	Check(con, "FORCE CHECKPOINT");
-	if (ScalarInt64(con, "SELECT rowid FROM vacuum_rows WHERE id=122880") != before ||
-	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('vacuum_rows', 'vacuum needle')") != 1 ||
+	// A non-ART guard excludes both of DuckDB's ART-only moving paths, so the
+	// same shape keeps every survivor at its rowid and the index stays exact.
+	if (VacuumSurvivorRowId(con, "vacuum_rows", "PRAGMA create_ngram_index('vacuum_rows', 's')") != survivor ||
+	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('vacuum_rows', 'vacuum needle')") != 2 ||
 	    Query(con, "EXPLAIN SELECT * FROM vacuum_rows WHERE s LIKE '%vacuum needle%'")
 	            ->ToString()
-	            .find("NGRAM_INDEX_SCAN") == string::npos) {
-		throw std::runtime_error("non-ART guard did not prevent moving vacuum with rebuild enabled");
+	            .find("Ngram Index Scan") == string::npos) {
+		throw std::runtime_error("non-ART guard did not prevent a moving vacuum");
 	}
 
-	// The checkpoint above reclaimed rowids 122880 and up, so an append into
+	// Both storage regimes drop a deleted tail row group, so the checkpoint
+	// below hands rowids 122880 and up back to the next append. An append into
 	// them is a real reuse even when a later UNIQUE index rejects the commit:
 	// the guard latches before the host rolls the rows back, and exact search
 	// falls back until rebuild. TestRejectedCommitKeepsGuard covers the rejected
@@ -878,7 +909,7 @@ static void TestVacuumAndConflict(const string &path) {
 	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('conflict_rows', 'conflict needle')") != 1 ||
 	    Query(con, "EXPLAIN SELECT * FROM conflict_rows WHERE s LIKE '%conflict needle%'")
 	            ->ToString()
-	            .find("NGRAM_INDEX_SCAN") != string::npos) {
+	            .find("Ngram Index Scan") != string::npos) {
 		throw std::runtime_error("rejected append did not conservatively force exact scan fallback");
 	}
 }
@@ -919,7 +950,7 @@ static void TestRejectedCommitKeepsGuard(const string &path) {
 	}
 	if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('retried', 'needle')") != 2 ||
 	    ScalarInt64(con, "SELECT count(*) FROM retried WHERE s LIKE '%needle%'") != 2 ||
-	    Query(con, "EXPLAIN SELECT * FROM retried WHERE s LIKE '%needle%'")->ToString().find("NGRAM_INDEX_SCAN") ==
+	    Query(con, "EXPLAIN SELECT * FROM retried WHERE s LIKE '%needle%'")->ToString().find("Ngram Index Scan") ==
 	        string::npos) {
 		throw std::runtime_error("index mode was lost after a rejected commit into a fresh rowid range");
 	}
@@ -946,7 +977,7 @@ static void TestConcurrentDropsStrandGuard(const string &path) {
 	auto stranded_guard = GuardName(con, "stranded", "a");
 	auto guard_rows = [](const string &guard_name) {
 		return "SELECT count(*) FROM duckdb_indexes() WHERE table_name='stranded' AND index_name=" +
-		       KeywordHelper::WriteQuoted(guard_name);
+		       SQLString::ToString(guard_name);
 	};
 	const char *prefixed_guards =
 	    "SELECT count(*) FROM duckdb_indexes() WHERE table_name='stranded' AND starts_with(index_name, "
@@ -1112,7 +1143,7 @@ static void TestIncompatibleGuardQuarantine(const string &path) {
 		}
 		if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('max_guard', 'needle')") != 1 ||
 		    ScalarInt64(con, "SELECT count(*) FROM max_guard WHERE s LIKE '%needle%'") != 1 ||
-		    Query(con, "EXPLAIN SELECT * FROM max_guard WHERE s LIKE '%needle%'")->ToString().find("SEQ_SCAN") ==
+		    Query(con, "EXPLAIN SELECT * FROM max_guard WHERE s LIKE '%needle%'")->ToString().find("Seq Scan") ==
 		        string::npos ||
 		    Query(con, "PRAGMA ngram_index_stats('max_guard')")->GetValue(12, 0).ToString().find("not observed") ==
 		        string::npos) {
@@ -1272,7 +1303,7 @@ static void TestStorageCorruption() {
 		throw std::runtime_error("storage without a row was not listed as such");
 	}
 	ExpectError(con, "PRAGMA drop_ngram_index('guarded', 's')", "No ngram index");
-	ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(guarded_ref) + ", catalog = 'memory')",
+	ExpectError(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(guarded_ref) + ", catalog = 'memory')",
 	            "manually");
 	ExpectError(con, "SELECT * FROM ngram_search('guarded', 'tent')", "no ngram index");
 	if (ScalarInt64(con, "SELECT count(*) FROM guarded WHERE s LIKE '%tent%'") != 1) {
@@ -1297,8 +1328,10 @@ static void TestStorageCorruption() {
 	Check(con, "PRAGMA drop_ngram_index('\"Ä\"', 's')");
 
 	// A format version is never guessed at by any reader or maintenance path.
+	// The row without the needle keeps the plan a scan: DuckDB answers a filter
+	// that statistics prove for every row without scanning.
 	Check(con, "CREATE TABLE versioned(s VARCHAR)");
-	Check(con, "INSERT INTO versioned VALUES ('a tent')");
+	Check(con, "INSERT INTO versioned VALUES ('a tent'), ('plain')");
 	Check(con, "PRAGMA create_ngram_index('versioned', 's')");
 	Check(con, "UPDATE __ngram.registry SET format_version=1 WHERE table_name='versioned'");
 	ExpectError(con, "SELECT * FROM ngram_search('versioned', 'tent')", "format 1");
@@ -1306,7 +1339,7 @@ static void TestStorageCorruption() {
 	ExpectError(con, "PRAGMA ngram_compact('versioned')", "format 1");
 	ExpectError(con, "PRAGMA ngram_index_stats('versioned')", "format 1");
 	if (ScalarInt64(con, "SELECT count(*) FROM versioned WHERE s LIKE '%tent%'") != 1 ||
-	    Query(con, "EXPLAIN SELECT count(*) FROM versioned WHERE s LIKE '%tent%'")->ToString().find("SEQ_SCAN") ==
+	    Query(con, "EXPLAIN SELECT count(*) FROM versioned WHERE s LIKE '%tent%'")->ToString().find("Seq Scan") ==
 	        string::npos) {
 		throw std::runtime_error("an unreadable format did not decline transparent acceleration");
 	}
@@ -1407,9 +1440,11 @@ static void TestStorageCorruption() {
 	ExpectError(con, "SELECT count(*) FROM ngram_candidates('bad_hwm', 's', 'aaaa')", "hwm_rowid 36028797018960000");
 
 	// NULL requested rows and impossible capacities remain structural errors,
-	// and a malformed row of another key is never read.
+	// and a malformed row of another key is never read. The damaged tables mix
+	// two strings that both hold the needle: with one string, DuckDB answers
+	// contains() from statistics and the transparent query never reads storage.
 	Check(con, "CREATE TABLE bad_rows(id INTEGER, s VARCHAR)");
-	Check(con, "INSERT INTO bad_rows VALUES (1, 'aaaa'), (2, 'aaaa')");
+	Check(con, "INSERT INTO bad_rows VALUES (1, 'aaaa'), (2, 'xaaaa')");
 	Check(con, "PRAGMA create_ngram_index('bad_rows', 's')");
 	auto bad_rows = StorageTable(con, "bad_rows", "s", "segments");
 	Check(con, "UPDATE " + bad_rows + " SET rowid_count=NULL WHERE gram_key=ngram_gram_key('aaa')");
@@ -1420,7 +1455,7 @@ static void TestStorageCorruption() {
 	ExpectError(con, "SELECT count(*) FROM bad_rows WHERE contains(s, 'aaaa')", "segments table contains NULLs");
 
 	Check(con, "CREATE TABLE bad_capacity(id INTEGER, s VARCHAR)");
-	Check(con, "INSERT INTO bad_capacity VALUES (1, 'aaaa'), (2, 'aaaa')");
+	Check(con, "INSERT INTO bad_capacity VALUES (1, 'aaaa'), (2, 'xaaaa')");
 	Check(con, "PRAGMA create_ngram_index('bad_capacity', 's')");
 	Check(con, "UPDATE " + StorageTable(con, "bad_capacity", "s", "segments") +
 	               " SET rowid_count=3 WHERE gram_key=ngram_gram_key('aaa')");
@@ -1431,7 +1466,7 @@ static void TestStorageCorruption() {
 
 	// Blob corruption reaches the shared decoder on both exact adapters.
 	Check(con, "CREATE TABLE bad_blob(id INTEGER, s VARCHAR)");
-	Check(con, "INSERT INTO bad_blob SELECT i, 'aaaa' FROM range(1000) t(i)");
+	Check(con, "INSERT INTO bad_blob SELECT i, CASE WHEN i % 2 = 0 THEN 'aaaa' ELSE 'xaaaa' END FROM range(1000) t(i)");
 	Check(con, "PRAGMA create_ngram_index('bad_blob', 's')");
 	Check(con, "SET ngram_max_candidate_fraction=1.0");
 	Check(con, "UPDATE " + StorageTable(con, "bad_blob", "s", "segments") + " SET postings=from_hex('626164')");
@@ -1441,7 +1476,7 @@ static void TestStorageCorruption() {
 
 	// Present wrong-kind owned storage is fatal; absence alone may decline.
 	Check(con, "CREATE TABLE wrong_storage(id INTEGER, s VARCHAR)");
-	Check(con, "INSERT INTO wrong_storage VALUES (1, 'aaaa')");
+	Check(con, "INSERT INTO wrong_storage VALUES (1, 'aaaa'), (2, 'xaaaa')");
 	Check(con, "PRAGMA create_ngram_index('wrong_storage', 's')");
 	auto wrong_ref = IndexRef(con, "wrong_storage", "s");
 	auto wrong_table = StorageTable(con, "wrong_storage", "s", "segments");
@@ -1453,8 +1488,8 @@ static void TestStorageCorruption() {
 	DropByRef(con, "memory", wrong_ref);
 
 	// A later-segment corruption cannot hide behind an earlier resource decline.
-	Check(con, "CREATE TABLE late_bad AS SELECT i::INTEGER id, CASE WHEN i IN (0,1,1048576) "
-	           "THEN 'aaaa'::VARCHAR ELSE NULL::VARCHAR END s FROM range(1048578) t(i)");
+	Check(con, "CREATE TABLE late_bad AS SELECT i::INTEGER id, CASE WHEN i IN (0,1048576) THEN 'aaaa' "
+	           "WHEN i=1 THEN 'xaaaa' ELSE NULL::VARCHAR END s FROM range(1048578) t(i)");
 	Check(con, "PRAGMA create_ngram_index('late_bad', 's')");
 	Check(con, "UPDATE " + StorageTable(con, "late_bad", "s", "segments") +
 	               " SET rowid_count=3 WHERE gram_key=ngram_gram_key('aaa') AND segment_no=1");
@@ -1493,14 +1528,14 @@ static void TestRegistryLifecycle(const string &path) {
 		}
 		auto listed = Query(con, "PRAGMA ngram_indexes");
 		auto status = StatusByRef(con, catalog, ref);
-		if (IndexStatus(con, "lifecycle", "s") != "READY" || listed->types[5].id() != LogicalTypeId::BIGINT ||
-		    status->types[5].id() != LogicalTypeId::BIGINT) {
+		if (IndexStatus(con, "lifecycle", "s") != "READY" || listed->GetTypes()[5].id() != LogicalTypeId::BIGINT ||
+		    status->GetTypes()[5].id() != LogicalTypeId::BIGINT) {
 			throw std::runtime_error("list/status schema or READY state changed");
 		}
 		ExpectError(con, "ALTER TABLE lifecycle RENAME TO LIFECYCLE", "Dependency");
 		ExpectError(con, "ALTER TABLE lifecycle RENAME COLUMN s TO S", "Dependency");
-		Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) +
-		               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
+		Check(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) +
+		               ", catalog = " + SQLString::ToString(catalog) + ")");
 		Check(con, "ALTER TABLE lifecycle RENAME TO renamed_lifecycle");
 		Check(con, "PRAGMA create_ngram_index('renamed_lifecycle','s')");
 		if (IndexStatus(con, "renamed_lifecycle", "s") != "READY") {
@@ -1524,8 +1559,8 @@ static void TestRegistryLifecycle(const string &path) {
 		if (IndexStatus(con, "orphaned", "s") != "ORPHAN") {
 			throw std::runtime_error("base drop was not listed ORPHAN");
 		}
-		Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(orphan_ref) +
-		               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
+		Check(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(orphan_ref) +
+		               ", catalog = " + SQLString::ToString(catalog) + ")");
 
 		// A replacement table under the recorded name has no guard: scan-only,
 		// and an ID drop must not touch the replacement or its foreign ART.
@@ -1540,8 +1575,8 @@ static void TestRegistryLifecycle(const string &path) {
 		    ScalarInt64(con, "SELECT count(*) FROM ngram_search('replaced','survives')") != 1) {
 			throw std::runtime_error("CREATE OR REPLACE was not SCAN_ONLY with an exact scan");
 		}
-		Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(replaced_ref) +
-		               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
+		Check(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(replaced_ref) +
+		               ", catalog = " + SQLString::ToString(catalog) + ")");
 		if (ScalarString(con, "SELECT s FROM replaced") != "replacement survives" ||
 		    ScalarInt64(con, "SELECT count(*) FROM duckdb_indexes() WHERE index_name='replacement_art'") != 1) {
 			throw std::runtime_error("orphan cleanup touched a replacement table or foreign ART");
@@ -1549,12 +1584,12 @@ static void TestRegistryLifecycle(const string &path) {
 
 		// Long identifiers exercise raw unsigned length bytes above 127.
 		string long_name(140, 'x');
-		Check(con, "CREATE TABLE " + KeywordHelper::WriteOptionallyQuoted(long_name) + "(s VARCHAR)");
-		Check(con, "PRAGMA create_ngram_index(" + KeywordHelper::WriteQuoted(long_name) + ",'s')");
+		Check(con, "CREATE TABLE " + SQLIdentifier::ToString(long_name) + "(s VARCHAR)");
+		Check(con, "PRAGMA create_ngram_index(" + SQLString::ToString(long_name) + ",'s')");
 		if (IndexStatus(con, long_name, "s") != "READY") {
 			throw std::runtime_error("long owner-key identifier did not round-trip");
 		}
-		Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(long_name) + ",'s')");
+		Check(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(long_name) + ",'s')");
 
 		Check(con, "CREATE TABLE reopen_ready(s VARCHAR, extra INTEGER)");
 		Check(con, "INSERT INTO reopen_ready VALUES ('reopen needle',1)");
@@ -1578,8 +1613,8 @@ static void TestRegistryLifecycle(const string &path) {
 		if (IndexStatus(con, "reopen_ready", "s") != "SCAN_ONLY") {
 			throw std::runtime_error("missing guard after reopen was not SCAN_ONLY");
 		}
-		Check(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(reopen_ref) +
-		               ", catalog = " + KeywordHelper::WriteQuoted(catalog) + ")");
+		Check(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(reopen_ref) +
+		               ", catalog = " + SQLString::ToString(catalog) + ")");
 		if (StorageTableCount(con) != 0) {
 			throw std::runtime_error("scan-only ID drop left storage");
 		}
@@ -1686,8 +1721,8 @@ static void TestRegistryBootstrapAndConflicts() {
 		Check(con, "PRAGMA create_ngram_index('owner_unique','s')");
 		auto ref = IndexRef(con, "owner_unique", "s");
 		Check(con, "CREATE TEMP TABLE rekeyed AS SELECT * FROM " + OwnerRow("owner_unique", "s"));
-		Check(con, "DELETE FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
-		Check(con, "INSERT INTO __ngram.registry SELECT registry_version," + KeywordHelper::WriteQuoted(TestUUID(1)) +
+		Check(con, "DELETE FROM __ngram.registry WHERE index_id=" + SQLString::ToString(ref) + "::UUID");
+		Check(con, "INSERT INTO __ngram.registry SELECT registry_version," + SQLString::ToString(TestUUID(1)) +
 		               "::UUID,owner_key,schema_name,table_name,column_name,format_version,gram_size,"
 		               "case_insensitive,hwm_rowid,guard_name,guard_token FROM rekeyed");
 		if (StatusName(con, "memory", TestUUID(1)) != "MALFORMED" || StatusName(con, "memory", ref) != "MALFORMED") {
@@ -1716,8 +1751,8 @@ static void TestCatalogIdentity(const string &path, const string &clone_path) {
 		DuckDB db(nullptr);
 		LoadNgram(db);
 		Connection con(db);
-		Check(con, "ATTACH " + KeywordHelper::WriteQuoted(path) + " AS leftdb");
-		Check(con, "ATTACH " + KeywordHelper::WriteQuoted(clone_path) + " AS rightdb");
+		Check(con, "ATTACH " + SQLString::ToString(path) + " AS leftdb");
+		Check(con, "ATTACH " + SQLString::ToString(clone_path) + " AS rightdb");
 		if (StatusName(con, "leftdb", index_ref) != "READY" || StatusName(con, "rightdb", index_ref) != "READY" ||
 		    ScalarInt64(con, "SELECT count(*) FROM ngram_search('leftdb.main.docs','needle')") != 1 ||
 		    ScalarInt64(con, "SELECT count(*) FROM ngram_search('rightdb.main.docs','needle')") != 1) {
@@ -1730,17 +1765,17 @@ static void TestCatalogIdentity(const string &path, const string &clone_path) {
 		}
 		Check(con, "DETACH leftdb");
 		Check(con, "DETACH rightdb");
-		Check(con, "ATTACH " + KeywordHelper::WriteQuoted(clone_path) + " AS rebound");
+		Check(con, "ATTACH " + SQLString::ToString(clone_path) + " AS rebound");
 		if (StatusName(con, "rebound", index_ref) != "READY") {
 			throw std::runtime_error("healthy DETACH/ATTACH allocation was not READY");
 		}
 		Check(con, "DETACH rebound");
-		Check(con, "ATTACH " + KeywordHelper::WriteQuoted(clone_path) + " AS ro (READ_ONLY)");
+		Check(con, "ATTACH " + SQLString::ToString(clone_path) + " AS ro (READ_ONLY)");
 		if (StatusName(con, "ro", index_ref) != "READY" ||
 		    ScalarInt64(con, "SELECT count(*) FROM ngram_search('ro.main.docs','needle')") != 1) {
 			throw std::runtime_error("read-only catalog did not list/search a healthy index");
 		}
-		ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(index_ref) + ", catalog = 'ro')",
+		ExpectError(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(index_ref) + ", catalog = 'ro')",
 		            "read-only");
 		ExpectError(con, "PRAGMA create_ngram_index('ro.main.unindexed','s')", "read-only");
 	}
@@ -1763,7 +1798,7 @@ static void TestFormat4Fixture(const string &fixture, const string &path) {
 	DuckDB db(nullptr);
 	LoadNgram(db);
 	Connection con(db);
-	Check(con, "ATTACH " + KeywordHelper::WriteQuoted(path) + " AS f4");
+	Check(con, "ATTACH " + SQLString::ToString(path) + " AS f4");
 	auto listed = Query(con, "PRAGMA ngram_indexes");
 	if (listed->RowCount() != 1 || listed->GetValue(0, 0).ToString() != "f4" ||
 	    listed->GetValue(5, 0).GetValue<int64_t>() != 4 || listed->GetValue(6, 0).ToString() != "MALFORMED" ||
@@ -1801,19 +1836,21 @@ static void TestFormat4Fixture(const string &fixture, const string &path) {
 	RemoveDatabase(path);
 }
 
-//! A database this format wrote, reopened: READY as persisted, exact on both
-//! paths across the persisted tail, maintainable, and droppable.
+//! A database the previous host wrote in this format: SCAN_ONLY because its
+//! guard names DuckDB v1.5.5, exact on both paths across the persisted tail,
+//! refused by maintenance, and restored by the drop-and-create it names.
 static void TestFormat5Fixture(const string &fixture, const string &path) {
 	RemoveDatabase(path);
 	CopyFile(fixture, path);
 	DuckDB db(nullptr);
 	LoadNgram(db);
 	Connection con(db);
-	Check(con, "ATTACH " + KeywordHelper::WriteQuoted(path) + " AS f5");
+	Check(con, "ATTACH " + SQLString::ToString(path) + " AS f5");
 	auto listed = Query(con, "PRAGMA ngram_indexes");
 	if (listed->RowCount() != 1 || listed->GetValue(0, 0).ToString() != "f5" ||
-	    listed->GetValue(5, 0).GetValue<int64_t>() != 5 || listed->GetValue(6, 0).ToString() != "READY") {
-		throw std::runtime_error("format-5 fixture was not listed READY");
+	    listed->GetValue(5, 0).GetValue<int64_t>() != 5 || listed->GetValue(6, 0).ToString() != "SCAN_ONLY" ||
+	    listed->GetValue(7, 0).ToString().find("incompatible with this extension build") == string::npos) {
+		throw std::runtime_error("format-5 fixture from the previous host was not listed SCAN_ONLY");
 	}
 	auto ref = listed->GetValue(1, 0).ToString();
 	auto oracle = FixtureOracle(con, "f5", "tent");
@@ -1822,23 +1859,28 @@ static void TestFormat5Fixture(const string &fixture, const string &path) {
 	}
 	Check(con, "SET ngram_max_candidate_fraction=1");
 	Check(con, "SET ngram_auto_accelerate=true");
-	auto profiled = Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM f5.docs WHERE s ILIKE '%tent%'");
-	if (profiled->GetValue(1, 0).ToString().find("\"Ngram Mode\": \"index") == string::npos ||
-	    ScalarInt64(con, "SELECT count(*) FROM f5.docs WHERE s ILIKE '%tent%'") != oracle) {
-		throw std::runtime_error("format-5 transparent search did not probe exactly after reopen");
+	auto transparent = "SELECT count(*) FROM f5.docs WHERE s ILIKE '%tent%'";
+	if (Query(con, string("EXPLAIN ") + transparent)->ToString().find("Ngram Index Scan") != string::npos ||
+	    ScalarInt64(con, transparent) != oracle) {
+		throw std::runtime_error("format-5 transparent search did not scan exactly after reopen");
 	}
-	Check(con, "SET ngram_auto_accelerate=false");
-	Check(con, "PRAGMA ngram_refresh('f5.main.docs')");
-	if (ScalarInt64(con, "SELECT hwm_rowid FROM f5.__ngram.registry") != 6 ||
-	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('f5.main.docs', 'tent')") != oracle) {
-		throw std::runtime_error("format-5 refresh after reopen did not advance the index exactly");
-	}
+	ExpectError(con, "PRAGMA ngram_refresh('f5.main.docs')", "incompatible with this extension build");
 	DropByRef(con, "f5", ref);
 	if (Query(con, "PRAGMA ngram_indexes")->RowCount() != 0 ||
 	    ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name='f5' AND schema_name='__ngram' "
 	                     "AND table_name <> 'registry'") != 0 ||
-	    ScalarInt64(con, "SELECT count(*) FROM duckdb_indexes() WHERE database_name='f5'") != 0) {
-		throw std::runtime_error("format-5 drop left ngram objects");
+	    ScalarInt64(con, "SELECT count(*) FROM duckdb_indexes() WHERE database_name='f5'") != 0 ||
+	    ScalarInt64(con, "SELECT count(*) FROM f5.docs") != 7) {
+		throw std::runtime_error("format-5 drop left ngram objects or touched the table");
+	}
+	Check(con, "PRAGMA create_ngram_index('f5.main.docs', 's')");
+	auto profiled = Query(con, string("EXPLAIN (ANALYZE, FORMAT JSON) ") + transparent);
+	if (StatusName(con, "f5", IndexRef(con, "docs", "s", "f5")) != "READY" ||
+	    ScalarInt64(con, "SELECT hwm_rowid FROM f5.__ngram.registry") != 6 ||
+	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('f5.main.docs', 'tent')") != oracle ||
+	    profiled->GetValue(1, 0).ToString().find("\"Ngram Mode\": \"index") == string::npos ||
+	    ScalarInt64(con, transparent) != oracle) {
+		throw std::runtime_error("rebuild after the format-5 drop was not READY and exact on both paths");
 	}
 	Check(con, "DETACH f5");
 	RemoveDatabase(path);
@@ -1850,7 +1892,7 @@ static void TestFormat3Fixture(const string &fixture, const string &path) {
 	DuckDB db(nullptr);
 	LoadNgram(db);
 	Connection con(db);
-	Check(con, "ATTACH " + KeywordHelper::WriteQuoted(path) + " AS f3");
+	Check(con, "ATTACH " + SQLString::ToString(path) + " AS f3");
 	auto listed = Query(con, "PRAGMA ngram_indexes");
 	if (listed->RowCount() != 1 || listed->GetValue(0, 0).ToString() != "f3" ||
 	    listed->GetValue(5, 0).GetValue<int64_t>() != 3 || listed->GetValue(6, 0).ToString() != "MALFORMED" ||
@@ -1896,11 +1938,10 @@ static void TestRegistryCorruption() {
 		if (whole_registry) {
 			Check(con, "DROP TABLE __ngram.registry");
 		} else {
-			Check(con, "DELETE FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
+			Check(con, "DELETE FROM __ngram.registry WHERE index_id=" + SQLString::ToString(ref) + "::UUID");
 		}
 		ExpectStatus(con, catalog, ref, "MALFORMED");
-		ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
-		            "manually");
+		ExpectError(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')", "manually");
 		Check(con, "CREATE TABLE unblocked(s VARCHAR)");
 		Check(con, "PRAGMA create_ngram_index('unblocked','s')");
 		Check(con, "PRAGMA drop_ngram_index('unblocked','s')");
@@ -1950,8 +1991,7 @@ static void TestRegistryCorruption() {
 			throw std::runtime_error("malformed global registry poisoned LIKE");
 		}
 		ExpectError(con, "PRAGMA create_ngram_index('unrelated','s')", "ordinary DuckDB table");
-		ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
-		            "manually");
+		ExpectError(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')", "manually");
 	}
 
 	// Row edits are caught against the binary owner key; the row stays
@@ -1967,7 +2007,7 @@ static void TestRegistryCorruption() {
 		Check(con, "PRAGMA create_ngram_index('row_bad','s')");
 		auto ref = IndexRef(con, "row_bad", "s");
 		Check(con, "UPDATE __ngram.registry SET " + field.first + "=" + field.second +
-		               " WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
+		               " WHERE index_id=" + SQLString::ToString(ref) + "::UUID");
 		ExpectStatus(con, catalog, ref, "MALFORMED");
 		Check(con, "CREATE TABLE unblocked(s VARCHAR)");
 		Check(con, "PRAGMA create_ngram_index('unblocked','s')");
@@ -2004,7 +2044,7 @@ static void TestRegistryCorruption() {
 			}
 		} else {
 			ExpectError(con, "PRAGMA create_ngram_index('create_blocked','s')", "noncanonical ID");
-			ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
+			ExpectError(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')",
 			            "manually");
 			if (!HasRowIdGuard(con, "registry_value_bad")) {
 				throw std::runtime_error("noncanonical ID refusal changed the guard");
@@ -2031,8 +2071,7 @@ static void TestRegistryCorruption() {
 		}
 		Check(con, "CREATE VIEW " + table + " AS SELECT 1 AS wrong_kind");
 		ExpectError(con, "SELECT count(*) FROM partial WHERE contains(s,'needle')", "wrong catalog type");
-		ExpectError(con, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
-		            "View");
+		ExpectError(con, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')", "View");
 		Check(con, "DROP VIEW " + table);
 		DropByRef(con, catalog, ref);
 		if (HasRowIdGuard(con, "partial") || StorageTableCount(con) != 0) {
@@ -2088,8 +2127,10 @@ static void TestExecutionIdentityRaces() {
 		LoadNgram(db);
 		Connection con(db);
 		Check(con, "SET ngram_auto_accelerate=true");
+		// The row without the needle keeps DuckDB from answering contains()
+		// from statistics, so the transparent query reaches the index.
 		Check(con, "CREATE TABLE absent_part(s VARCHAR)");
-		Check(con, "INSERT INTO absent_part VALUES ('race needle')");
+		Check(con, "INSERT INTO absent_part VALUES ('race needle'), ('plain row')");
 		Check(con, "PRAGMA create_ngram_index('absent_part','s')");
 		auto exact = con.Prepare("SELECT count(*) FROM ngram_search('absent_part','needle')");
 		auto transparent = con.Prepare("SELECT count(*) FROM absent_part WHERE contains(s,'needle')");
@@ -2112,7 +2153,7 @@ static void TestExecutionIdentityRaces() {
 		Connection setup(db), ddl(db);
 		Check(setup, "SET ngram_auto_accelerate=true");
 		Check(setup, "CREATE TABLE swapped_part(s VARCHAR)");
-		Check(setup, "INSERT INTO swapped_part VALUES ('swap needle')");
+		Check(setup, "INSERT INTO swapped_part VALUES ('swap needle'), ('plain row')");
 		Check(setup, "PRAGMA create_ngram_index('swapped_part','s')");
 		auto table = StorageTable(setup, "swapped_part", "s", part);
 		Check(setup, "CREATE TABLE backup_" + part + " AS SELECT * FROM " + table);
@@ -2213,8 +2254,7 @@ static void TestExecutionIdentityRaces() {
 		if (orphan_first) {
 			Check(ddl, "DROP TABLE base_race");
 		}
-		auto script =
-		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
+		auto script = Expand(planned, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')");
 		if (orphan_first) {
 			Check(ddl, "CREATE TABLE base_race(s VARCHAR)");
 		} else {
@@ -2242,22 +2282,20 @@ static void TestExecutionIdentityRaces() {
 		Check(planned, "PRAGMA create_ngram_index('row_race','s')");
 		auto ref = IndexRef(planned, "row_race", "s");
 		Check(ddl, "CREATE TABLE row_backup AS SELECT * FROM __ngram.registry WHERE index_id=" +
-		               KeywordHelper::WriteQuoted(ref) + "::UUID");
-		auto removed =
-		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
-		Check(ddl, "DELETE FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) + "::UUID");
+		               SQLString::ToString(ref) + "::UUID");
+		auto removed = Expand(planned, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')");
+		Check(ddl, "DELETE FROM __ngram.registry WHERE index_id=" + SQLString::ToString(ref) + "::UUID");
 		auto error = ExecuteRemainingForError(planned, removed);
 		if (error.find("removed after") == string::npos) {
 			throw std::runtime_error("registry-row deletion race did not fail closed: " + error);
 		}
 		Rollback(planned);
-		ExpectError(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')",
+		ExpectError(planned, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')",
 		            "manually");
 		Check(ddl, "INSERT INTO __ngram.registry SELECT * FROM row_backup");
-		auto changed =
-		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
-		Check(ddl, "UPDATE __ngram.registry SET table_name='changed' WHERE index_id=" +
-		               KeywordHelper::WriteQuoted(ref) + "::UUID");
+		auto changed = Expand(planned, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')");
+		Check(ddl,
+		      "UPDATE __ngram.registry SET table_name='changed' WHERE index_id=" + SQLString::ToString(ref) + "::UUID");
 		error = ExecuteRemainingForError(planned, changed);
 		if (error.find("changed after") == string::npos) {
 			throw std::runtime_error("registry-row mutation race did not fail closed: " + error);
@@ -2280,8 +2318,7 @@ static void TestExecutionIdentityRaces() {
 		auto exact = planned.Prepare("SELECT count(*) FROM ngram_search('registry_swap','needle')");
 		auto transparent = planned.Prepare("SELECT count(*) FROM registry_swap WHERE contains(s,'needle')");
 		auto candidate = planned.Prepare("SELECT count(*) FROM ngram_candidates('registry_swap','s','needle')");
-		auto drop =
-		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
+		auto drop = Expand(planned, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')");
 		Check(ddl, "CREATE TABLE registry_backup AS SELECT * FROM __ngram.registry");
 		Check(ddl, "DROP TABLE __ngram.registry");
 		Check(ddl, "CREATE TABLE __ngram.registry(registry_version INTEGER NOT NULL, index_id UUID PRIMARY KEY, "
@@ -2316,8 +2353,7 @@ static void TestExecutionIdentityRaces() {
 		auto ref = IndexRef(planned, "guard_race", "s");
 		auto guard = GuardName(planned, "guard_race", "s");
 		Check(ddl, "DROP INDEX " + guard);
-		auto drop =
-		    Expand(planned, "PRAGMA drop_ngram_index(" + KeywordHelper::WriteQuoted(ref) + ", catalog = 'memory')");
+		auto drop = Expand(planned, "PRAGMA drop_ngram_index(" + SQLString::ToString(ref) + ", catalog = 'memory')");
 		Check(ddl, "CREATE TABLE other_guard(s VARCHAR)");
 		Check(ddl, "CREATE INDEX " + guard + " ON other_guard USING NGRAM_ROWID_GUARD(s)");
 		auto error = ExecuteRemainingForError(planned, drop);
@@ -2326,7 +2362,7 @@ static void TestExecutionIdentityRaces() {
 		}
 		Rollback(planned);
 		if (!HasRowIdGuard(ddl, "other_guard") ||
-		    ScalarInt64(ddl, "SELECT count(*) FROM __ngram.registry WHERE index_id=" + KeywordHelper::WriteQuoted(ref) +
+		    ScalarInt64(ddl, "SELECT count(*) FROM __ngram.registry WHERE index_id=" + SQLString::ToString(ref) +
 		                         "::UUID") != 1) {
 			throw std::runtime_error("failed guard-collision ID drop changed either allocation");
 		}
@@ -2337,8 +2373,10 @@ static void TestRegistryScale() {
 	DuckDB db(nullptr);
 	LoadNgram(db);
 	Connection con(db);
+	// The row without the needle keeps DuckDB from answering the timed
+	// contains() from statistics, so it measures the probe.
 	Check(con, "CREATE TABLE scale_live(s VARCHAR)");
-	Check(con, "INSERT INTO scale_live VALUES ('scale needle')");
+	Check(con, "INSERT INTO scale_live VALUES ('scale needle'), ('plain row')");
 	Check(con, "PRAGMA create_ngram_index('scale_live','s')");
 	auto live_ref = IndexRef(con, "scale_live", "s");
 	// Rows for tables that do not exist, with owner keys that cannot match: all
@@ -2349,9 +2387,8 @@ static void TestRegistryScale() {
 			insert += ",";
 		}
 		auto table = "scale_" + to_string(i);
-		insert += "(2," + KeywordHelper::WriteQuoted(TestUUID(i)) + "::UUID,encode(" +
-		          KeywordHelper::WriteQuoted(table) + "),'main'," + KeywordHelper::WriteQuoted(table) +
-		          ",'s',4,3,true,-1,'g','t')";
+		insert += "(2," + SQLString::ToString(TestUUID(i)) + "::UUID,encode(" + SQLString::ToString(table) +
+		          "),'main'," + SQLString::ToString(table) + ",'s',4,3,true,-1,'g','t')";
 	}
 	Check(con, insert);
 	auto start = std::chrono::steady_clock::now();
@@ -2407,15 +2444,22 @@ static void TestRegistryScale() {
 	          << " indexed_off/on/explicit_ms=" << indexed_off_ms << "/" << indexed_on_ms << "/" << explicit_ms << "\n";
 }
 
+//! Submits `sql` and streams its result, so the engine produces chunks as
+//! they are fetched instead of running the query to completion first.
+static unique_ptr<QueryResultStream> OpenStream(Connection &con, const string &sql, const string &failure) {
+	auto handle = con.Submit(sql);
+	if (handle->HasError()) {
+		throw std::runtime_error(failure + ": " + handle->GetError());
+	}
+	return make_uniq<QueryResultStream>(std::move(handle));
+}
+
 //! Interrupt a query while it is provably running: stream it, hold its
 //! `chunks_before` first chunks, interrupt, and require the rest of the
 //! stream to fail with the interrupt. No timing is involved, so a faster
 //! machine cannot let the query finish before the interrupt lands.
 static void ExpectStreamInterrupted(Connection &con, const string &sql, idx_t chunks_before = 1) {
-	auto stream = con.SendQuery(sql);
-	if (stream->HasError()) {
-		throw std::runtime_error("streaming query failed before its interrupt: " + stream->GetError());
-	}
+	auto stream = OpenStream(con, sql, "streaming query failed before its interrupt");
 	for (idx_t i = 0; i < chunks_before; i++) {
 		auto chunk = stream->Fetch();
 		if (!chunk || chunk->size() == 0) {
@@ -2508,7 +2552,7 @@ static void TestQueryCancellation() {
 	auto expected_matches = ScalarInt64(con, "SELECT count(*) FROM cancel_rows WHERE contains(s, 'aaaa')");
 	for (auto &pragma :
 	     vector<string> {"PRAGMA ngram_compact('cancel_rows')", "PRAGMA ngram_compact('cancel_rows', purge=true)"}) {
-		unique_ptr<MaterializedQueryResult> result;
+		unique_ptr<QueryResult> result;
 		bool purge = pragma.find("purge") != string::npos;
 		idx_t chunks_seen = 0;
 		ngram::GetNgramTestHooks().before_maintenance_append_chunk = [&]() {
@@ -2580,10 +2624,7 @@ static void TestParallelCandidateStreams() {
 		throw std::runtime_error("stream fixture produced " + to_string(expected_rows) + " matches");
 	}
 
-	auto stream = con.SendQuery(search);
-	if (stream->HasError()) {
-		throw std::runtime_error("streaming search failed: " + stream->GetError());
-	}
+	auto stream = OpenStream(con, search, "streaming search failed");
 	// the buffered batch collector orders the stream by batch index, so ids
 	// arrive ascending: candidates in rowid order, then the tail
 	int64_t rows = 0, sum = 0, previous = -1;
@@ -2675,10 +2716,7 @@ static void TestPublicationBarrier() {
 				}
 			}
 		});
-		auto stream = con.SendQuery(search);
-		if (stream->HasError()) {
-			throw std::runtime_error("barrier search failed: " + stream->GetError());
-		}
+		auto stream = OpenStream(con, search, "barrier search failed");
 		int64_t rows = 0, sum = 0, previous = -1;
 		while (true) {
 			auto chunk = stream->Fetch();
@@ -3071,7 +3109,11 @@ int main(int argc, char **argv) {
 		     }},
 		    {"lifecycle", "vacuum-and-conflict",
 		     [&]() {
-			     TestVacuumAndConflict(path("vacuum"));
+			     // storage v2.0.0 persists rowid gaps; v1.5.5 is what databases from
+			     // the previous host carry, and it keeps rowids dense
+			     for (auto storage_version : {"v2.0.0", "v1.5.5"}) {
+				     TestVacuumAndConflict(path("vacuum"), storage_version);
+			     }
 		     }},
 		    {"lifecycle", "rejected-commit-keeps-guard",
 		     [&]() {

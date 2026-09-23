@@ -2,52 +2,23 @@
 # ThreadSanitizer lane appends this file to the host's
 # duckdb/.sanitizer-thread-suppressions.txt.
 #
-# The guard build takes the table's append lock in its global sink state and
-# holds it for the whole build, so that the rowid baseline it records cannot
-# be overtaken by a concurrent append (src/rowid_guard.cpp,
-# GuardBuildGlobalInit). The host creates that state under the pipeline's
-# lock and later takes the same pipeline lock again with the append lock
-# still held, which ThreadSanitizer reports as a lock-order inversion. Both
-# acquisitions are the build's own thread; no other thread ever waits for the
-# append lock under a pipeline lock, so the cycle cannot deadlock. The host
-# suppresses the same report from its own index initialization
-# (deadlock:InitializeIndexes).
-deadlock:GuardBuildGlobalInit
-
 # The host's progress bar reads a hash join's partition mask
 # (JoinHashTable::FinishedPartitionCount, src/execution/join_hashtable.cpp)
 # from the client thread while a worker finalizes the join and sets bits in
 # that mask. The report carries no extension frame; it appears under the
-# EXCEPT ALL comparisons the tests run. DuckDB v1.5.5 behavior, recorded here
-# so the lane keeps reporting races in the extension's own code.
+# EXCEPT ALL comparisons the tests run. Suppressing the host's race keeps the
+# lane reporting races in the extension's own code.
 race:FinishedPartitionCount
 
-# The same append lock is released when the host destroys the create-index
-# plan on the client thread, while the worker that initialized the sink took
-# it; ThreadSanitizer reports the unlock as being by the wrong thread. The
-# host offers no append exclusion whose ownership can move between threads
-# (its own StorageLockKey, held across statements, has the same shape), and
-# glibc's default mutex completes the unlock. Recorded in
-# ngram_review_plan.md as a deferred item.
-mutex:GuardBuildGlobalState
-
-# The creation barrier holds the host's exclusive checkpoint lock, a
-# StorageLockKey, across the statements that invalidate old table storage
-# and install the guard (README, "Staleness and fail-closed recovery"); the
-# key is released by the finish call on whichever thread runs it, and while
-# it is held the next statement takes the client context lock, so
-# ThreadSanitizer reports the release as by the wrong thread and the
-# checkpoint lock and context lock as a lock-order inversion. Both stacks
-# are the host's own lock code; the reports appear only because the barrier
-# spans statements. Recorded with the append lock in ngram_review_plan.md's
-# deferred row 22G.
-mutex:FinishCreation
-deadlock:SharedCheckpointLock
-
-# The maintenance fence looks up the transaction from a scalar function
-# (AcquireMaintenanceFence), which starts the catalog's transaction under the
-# host's meta-transaction lock; ThreadSanitizer joins that with the host's
-# own orderings of the transaction-manager, parallel-scan and client-context
-# locks into a four-lock cycle whose other three edges are host code. Any
-# scalar that touches the transaction has the same shape.
-deadlock:AcquireMaintenanceFence
+# DuckDB 2.0 opens an internal connection for a checkpoint that a client runs,
+# taking the connection manager's lock while the client's context lock is
+# held. The host also calls extension callbacks under the connection manager's
+# lock when a connection closes, and when it is the last one the guard's bind
+# callback (RowIdGuardBindCallback::OnConnectionClosed, src/rowid_guard.cpp)
+# locks that connection's context to bind the guards in a read-only
+# transaction. ThreadSanitizer joins the two orders when one connection
+# checkpoints and later closes. They cannot meet: a connection cannot close
+# while it runs a statement; the callback acts only when the count, read under
+# the same lock, shows no other connection, so no other client can be
+# checkpointing; and a read-only transaction starts no checkpoint of its own.
+deadlock:RowIdGuardBindCallback::OnConnectionClosed

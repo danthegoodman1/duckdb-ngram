@@ -81,6 +81,13 @@ the gitlinks HEAD records; the Correctness workflow and
      `Connection::Submit`.
    - **`EXPLAIN` names operators in title case**, so the transparent scan reads
      `Ngram Index Scan`.
+
+   The guard's create-index operator (`PhysicalCreateRowIdGuard` in
+   `src/rowid_guard.cpp`) repeats the catalog steps of
+   `PhysicalCreateIndex::Finalize`, so that one thread holds the table's
+   append lock from the rowid baseline through `DataTable::AddIndex`. A change
+   to that function compiles clean and can pass the suite, so diff it between
+   the old and new pins and carry any change over.
 4. Update `DUCKDB_VERSION`, `DUCKDB_SOURCE_COMMIT` and `DUCKDB_SOURCE_ID` to
    the new tag, the build version, and the two documented identities. The guard fails closed on
    any other host, so a wrong pin refuses `create_ngram_index` on a fresh

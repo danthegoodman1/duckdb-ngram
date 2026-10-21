@@ -450,6 +450,59 @@ void EncodePostingsCombine(Vector &state_vector, Vector &combined, AggregateInpu
 	}
 }
 
+//! Sort a group's segment offsets and drop repeats. Each thread that updated
+//! the group appended its rowids in scan order, so the offsets arrive as a
+//! few ascending runs, which merge in O(n log runs).
+static void SortOffsets(vector<uint32_t> &offsets, vector<uint32_t> &scratch, vector<idx_t> &runs) {
+	runs.clear();
+	runs.push_back(0);
+	for (idx_t i = 1; i < offsets.size(); i++) {
+		if (offsets[i] < offsets[i - 1]) {
+			runs.push_back(i);
+		}
+	}
+	runs.push_back(offsets.size());
+	while (runs.size() > 2) {
+		scratch.resize(offsets.size());
+		idx_t merged = 0;
+		for (idx_t run = 0; run + 1 < runs.size(); run += 2) {
+			auto begin = offsets.begin() + NumericCast<int64_t>(runs[run]);
+			auto middle = offsets.begin() + NumericCast<int64_t>(runs[run + 1]);
+			auto end = run + 2 < runs.size() ? offsets.begin() + NumericCast<int64_t>(runs[run + 2]) : middle;
+			std::merge(begin, middle, middle, end, scratch.begin() + NumericCast<int64_t>(runs[run]));
+			runs[merged++] = runs[run];
+		}
+		runs[merged++] = offsets.size();
+		runs.resize(merged);
+		offsets.swap(scratch);
+	}
+	offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+}
+
+static void WriteVarint(data_ptr_t &out, uint64_t value) {
+	while (value >= 0x80) {
+		*out++ = static_cast<data_t>((value & 0x7F) | 0x80);
+		value >>= 7;
+	}
+	*out++ = static_cast<data_t>(value);
+}
+
+//! The v1 blob of the sorted, unique rowids base + offsets[i], into `blob`:
+//! the bytes EncodePostings writes for the same rowids.
+static string_t EncodeSortedOffsets(int64_t base, const vector<uint32_t> &offsets, vector<data_t> &blob) {
+	// a format byte, two varints of at most ten bytes, and deltas below 2^20,
+	// three bytes each at most
+	blob.resize(1 + 10 + 10 + 3 * offsets.size());
+	auto out = blob.data();
+	*out++ = POSTINGS_FORMAT_VERSION;
+	WriteVarint(out, offsets.size());
+	WriteVarint(out, static_cast<uint64_t>(base) + offsets[0]);
+	for (idx_t i = 1; i < offsets.size(); i++) {
+		WriteVarint(out, offsets[i] - offsets[i - 1]);
+	}
+	return string_t(const_char_ptr_cast(blob.data()), NumericCast<uint32_t>(out - blob.data()));
+}
+
 void EncodePostingsFinalize(Vector &state_vector, AggregateFinalizeInputData &aggr_input_data, Vector &result,
                             idx_t count, idx_t offset) {
 	UnifiedVectorFormat states_format;
@@ -464,7 +517,10 @@ void EncodePostingsFinalize(Vector &state_vector, AggregateFinalizeInputData &ag
 	auto max_rowid = FlatVector::GetDataMutable<int64_t>(children[3]);
 	auto &mask = FlatVector::ValidityMutable(result);
 
-	vector<int64_t> rowids;
+	vector<uint32_t> offsets;
+	vector<uint32_t> scratch;
+	vector<idx_t> runs;
+	vector<data_t> blob;
 	for (idx_t i = 0; i < count; i++) {
 		auto &state = *states[states_format.sel->get_index(i)];
 		auto row = i + offset;
@@ -477,20 +533,19 @@ void EncodePostingsFinalize(Vector &state_vector, AggregateFinalizeInputData &ag
 			}
 			continue;
 		}
-		rowids.clear();
-		rowids.reserve(state.total);
+		offsets.resize(state.total);
+		idx_t gathered = 0;
 		for (auto block = state.first; block; block = block->next) {
-			for (idx_t r = 0; r < block->count; r++) {
-				rowids.push_back(state.base + block->data[r]);
-			}
+			memcpy(offsets.data() + gathered, block->data, block->count * sizeof(uint32_t));
+			gathered += block->count;
 		}
-		// EncodePostings sorts and dedupes rowids in place, so count/min/max are
-		// read after encoding — the same order the streaming packer uses
-		auto blob = EncodePostings(rowids);
-		postings[row] = StringVector::AddStringOrBlob(postings_child, blob);
-		rowid_count[row] = NumericCast<int64_t>(rowids.size());
-		min_rowid[row] = rowids.front();
-		max_rowid[row] = rowids.back();
+		D_ASSERT(gathered == state.total);
+		// count, min and max describe the deduplicated set the blob encodes
+		SortOffsets(offsets, scratch, runs);
+		postings[row] = StringVector::AddStringOrBlob(postings_child, EncodeSortedOffsets(state.base, offsets, blob));
+		rowid_count[row] = NumericCast<int64_t>(offsets.size());
+		min_rowid[row] = state.base + offsets.front();
+		max_rowid[row] = state.base + offsets.back();
 	}
 }
 

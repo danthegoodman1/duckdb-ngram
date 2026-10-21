@@ -64,17 +64,24 @@ struct ProbeDescriptor {
 //! batch whose candidates fill their span this densely is read as a range
 //! scan, and the admission gate prices a segment at its span over this ratio
 //! when that is below its candidate bound. Measured on enwik9 at one thread
-//! (docs/review/2026-09-09/cost_observations.json, range_threads_1.history
-//! against fetch_threads_1.history): a scattered fetch costs 1.35 us and a
-//! span row 0.29 us, about 4.6 to one; four rounds toward scanning.
+//! by docs/review/2026-09-09/cost_measure.py's method (the needle `history`
+//! clustered against scattered): a scattered fetch costs 1.66 us and a span
+//! row 0.31 us on DuckDB 2.0, about 5.4 to one; four rounds toward scanning.
 constexpr idx_t RANGE_ROWS_PER_FETCH = 4;
 
 //! Candidates are handed to fetch workers in batches of at least this many
 //! rowids (fewer only at a segment's end), so fetch parallelism follows the
 //! candidate count rather than the segment count. A batch runs on to the
-//! next vector-aligned rowid boundary, so it holds fewer than twice this
-//! many.
-constexpr idx_t FETCH_BATCH_ROWS = STANDARD_VECTOR_SIZE;
+//! next vector-aligned rowid boundary. A per-row fetch costs the same at any
+//! batch size, so small batches only spread it: on enwik9 at 24 threads,
+//! 26 thousand candidates in 2048-row batches kept 16 workers busy for 9 ms,
+//! and in 256-row batches 24 workers for 5 ms.
+constexpr idx_t FETCH_BATCH_ROWS = 256;
+
+//! Candidates a batch takes when they fill their span densely enough for a
+//! range scan. Each range scan decodes the column segments it touches from
+//! their start, so range batches stay long.
+constexpr idx_t RANGE_BATCH_ROWS = STANDARD_VECTOR_SIZE;
 
 //! One rowid segment admitted for bounded probing. Its descriptors occupy the
 //! half-open range [descriptor_begin, descriptor_end) in ProbePlan, sorted by

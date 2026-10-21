@@ -226,6 +226,9 @@ static void GramKeyFunction(DataChunk &args, ExpressionState &state, Vector &res
 	});
 }
 
+//! Keys a chunk reserves before its first row, at most: 16 MiB of list.
+static constexpr idx_t MAX_RESERVED_CHUNK_KEYS = idx_t(1) << 20;
+
 //! ngram_gram_keys(text, gram_size, case_insensitive) -> LIST(UHUGEINT): the
 //! keys of the distinct grams of `text`, ascending. The build pipeline unnests
 //! this into its (gram_key, segment_no, rowid) pair stream; deduplicating
@@ -245,10 +248,22 @@ static void GramKeysFunction(DataChunk &args, ExpressionState &state, Vector &re
 	auto &result_validity = FlatVector::ValidityMutable(result);
 	ListVector::SetListSize(result, 0);
 
+	// a row yields at most one gram per byte, so the chunk's bytes bound its
+	// keys; reserving that bound, capped, spares the list from regrowing
+	idx_t input_bytes = 0;
+	for (idx_t row = 0; row < count; row++) {
+		auto input_idx = input_format.sel->get_index(row);
+		if (input_format.validity.RowIsValid(input_idx)) {
+			input_bytes += input_strings[input_idx].GetSize();
+		}
+	}
+	ListVector::Reserve(result, MinValue<idx_t>(input_bytes, MAX_RESERVED_CHUNK_KEYS));
+
 	idx_t total = 0;
 	string scratch;
 	vector<idx_t> offsets;
 	vector<uhugeint_t> keys;
+	vector<uint32_t> narrow_keys;
 	auto mask = CurrentGramKeyMask();
 	for (idx_t row = 0; row < count; row++) {
 		auto input_idx = input_format.sel->get_index(row);
@@ -268,20 +283,48 @@ static void GramKeysFunction(DataChunk &args, ExpressionState &state, Vector &re
 		options.case_insensitive = case_insensitive_flags[ci_idx];
 		auto &input = input_strings[input_idx];
 		keys.clear();
+		uint64_t low_bits = 0;
 		ExtractGrams(input.GetData(), input.GetSize(), options, scratch, offsets,
-		             [&](const char *gram, idx_t gram_len) { keys.push_back(GramKey(gram, gram_len, mask)); });
-		std::sort(keys.begin(), keys.end());
-		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-		if (total + keys.size() > ListVector::GetListCapacity(result)) {
+		             [&](const char *gram, idx_t gram_len) {
+			             auto key = GramKey(gram, gram_len, mask);
+			             low_bits |= (key.upper & 0xFFFFFFFFULL) | key.lower;
+			             keys.push_back(key);
+		             });
+		idx_t distinct;
+		if (low_bits == 0) {
+			// every key lives in its top 32 bits (a gram of at most four
+			// bytes, such as an ASCII trigram), so the keys sort as integers
+			narrow_keys.resize(keys.size());
+			for (idx_t i = 0; i < keys.size(); i++) {
+				narrow_keys[i] = static_cast<uint32_t>(keys[i].upper >> 32);
+			}
+			std::sort(narrow_keys.begin(), narrow_keys.end());
+			distinct = NumericCast<idx_t>(std::unique(narrow_keys.begin(), narrow_keys.end()) - narrow_keys.begin());
+			for (idx_t i = 0; i < distinct; i++) {
+				keys[i] = uhugeint_t(static_cast<uint64_t>(narrow_keys[i]) << 32, 0);
+			}
+		} else {
+			// uhugeint_t's own comparisons are out of line; these inline ones
+			// order the same way
+			std::sort(keys.begin(), keys.end(), [](const uhugeint_t &a, const uhugeint_t &b) {
+				return a.upper < b.upper || (a.upper == b.upper && a.lower < b.lower);
+			});
+			distinct = NumericCast<idx_t>(std::unique(keys.begin(), keys.end(),
+			                                          [](const uhugeint_t &a, const uhugeint_t &b) {
+				                                          return a.upper == b.upper && a.lower == b.lower;
+			                                          }) -
+			                              keys.begin());
+		}
+		if (total + distinct > ListVector::GetListCapacity(result)) {
 			ListVector::SetListSize(result, total);
-			ListVector::Reserve(result, NextPowerOfTwo(total + keys.size()));
+			ListVector::Reserve(result, NextPowerOfTwo(total + distinct));
 		}
 		auto child_keys = FlatVector::GetDataMutable<uhugeint_t>(ListVector::GetChildMutable(result));
-		for (idx_t i = 0; i < keys.size(); i++) {
+		for (idx_t i = 0; i < distinct; i++) {
 			child_keys[total + i] = keys[i];
 		}
-		list_entries[row] = list_entry_t(total, keys.size());
-		total += keys.size();
+		list_entries[row] = list_entry_t(total, distinct);
+		total += distinct;
 	}
 	ListVector::SetListSize(result, total);
 

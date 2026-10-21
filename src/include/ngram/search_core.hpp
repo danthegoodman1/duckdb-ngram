@@ -89,7 +89,7 @@ void ParallelForEachUnit(ClientContext &context, idx_t units, idx_t workers, con
 enum class SearchCorePhase : uint8_t { FETCH, SCAN, DONE };
 
 //! One intersected segment whose candidate rowids are being handed out in
-//! FETCH_BATCH_ROWS batches.
+//! fetch and range batches.
 struct PublishedCandidates {
 	PublishedCandidates(idx_t segment_ordinal_p, shared_ptr<vector<row_t>> rowids_p)
 	    : segment_ordinal(segment_ordinal_p), rowids(std::move(rowids_p)) {
@@ -209,6 +209,8 @@ struct SearchCoreLocal {
 	idx_t candidate_offset = 0;
 	idx_t candidate_end = 0;
 	idx_t segment_ordinal = 0;
+	//! The claim sized the batch for a range scan.
+	bool range_batch = false;
 	ProbeDecodeScratch decode;
 	//! A dense batch in progress as a committed scan bounded to the batch's
 	//! rowid span; the filter excludes the rows before its first rowid. Both

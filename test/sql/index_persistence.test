@@ -63,3 +63,85 @@ query I
 SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND table_name <> 'registry';
 ----
 0
+
+# An index this host wrote reopens READY with a persisted tail: rows appended
+# after the build sit past the high-water mark, both paths probe the index and
+# match a scan across them, and a refresh advances the mark exactly.
+statement ok
+CREATE TABLE tail_docs(id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO tail_docs VALUES (0, 'alpha'), (1, 'Tent pole'), (2, 'CONTENT'), (3, 'beta'), (4, 'gamma');
+
+statement ok
+PRAGMA create_ngram_index('tail_docs', 's');
+
+statement ok
+INSERT INTO tail_docs VALUES (5, 'extent'), (6, 'tentative');
+
+restart
+
+query TTTTTITT
+PRAGMA ngram_indexes;
+----
+ngram_persistence	<REGEX>:[0-9a-f-]{36}	main	tail_docs	s	5	READY	NULL
+
+query I
+SELECT hwm_rowid FROM __ngram.registry WHERE table_name = 'tail_docs';
+----
+4
+
+# Four of seven rows match, so both paths need the whole candidate fraction.
+statement ok
+SET ngram_max_candidate_fraction = 1;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('tail_docs', 'tent');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index .*
+
+query I
+SELECT id FROM ngram_search('tail_docs', 'tent') ORDER BY id;
+----
+1
+2
+5
+6
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM tail_docs WHERE s ILIKE '%tent%';
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "index .*
+
+query I
+SELECT id FROM tail_docs WHERE s ILIKE '%tent%' ORDER BY id;
+----
+1
+2
+5
+6
+
+statement ok
+SET ngram_auto_accelerate = false;
+
+statement ok
+RESET ngram_max_candidate_fraction;
+
+statement ok
+PRAGMA ngram_refresh('tail_docs');
+
+query I
+SELECT hwm_rowid FROM __ngram.registry WHERE table_name = 'tail_docs';
+----
+6
+
+query I
+SELECT id FROM ngram_search('tail_docs', 'tent') ORDER BY id;
+----
+1
+2
+5
+6

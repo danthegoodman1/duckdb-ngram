@@ -1,5 +1,6 @@
 #include "ngram/gram.hpp"
 
+#include "duckdb/common/vector/list_vector.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include <algorithm>
@@ -68,7 +69,7 @@ void NormalizeString(const char *data, idx_t len, const GramOptions &options, st
 		// UTF8ToCodepoint raises an engine exception rather than returning,
 		// so sz is always the positive length of the decoded codepoint here
 		int sz = 0;
-		auto codepoint = Utf8Proc::UTF8ToCodepoint(data + i, sz);
+		auto codepoint = Utf8Proc::UTF8ToCodepoint(data + i, sz, len - i);
 		auto folded = options.case_insensitive ? Utf8Proc::CodepointToLower(codepoint) : codepoint;
 		char utf8_bytes[4];
 		int utf8_sz = 0;
@@ -118,7 +119,7 @@ NeedleShape DecomposeNeedle(ClientContext &context, const char *data, idx_t len,
 		}
 		if (++grams_since_check == GRAMS_PER_INTERRUPT_CHECK) {
 			grams_since_check = 0;
-			if (context.interrupted.load(std::memory_order_relaxed)) {
+			if (context.IsInterrupted()) {
 				throw InterruptException();
 			}
 		}
@@ -137,26 +138,26 @@ static void TrigramsFunction(DataChunk &args, ExpressionState &state, Vector &re
 	auto count = args.size();
 
 	UnifiedVectorFormat input_format;
-	args.data[0].ToUnifiedFormat(count, input_format);
+	args.data[0].ToUnifiedFormat(input_format);
 	auto input_strings = UnifiedVectorFormat::GetData<string_t>(input_format);
 
 	UnifiedVectorFormat gram_format;
 	const int32_t *gram_sizes = nullptr;
 	if (args.ColumnCount() > 1) {
-		args.data[1].ToUnifiedFormat(count, gram_format);
+		args.data[1].ToUnifiedFormat(gram_format);
 		gram_sizes = UnifiedVectorFormat::GetData<int32_t>(gram_format);
 	}
 
 	UnifiedVectorFormat ci_format;
 	const bool *case_insensitive_flags = nullptr;
 	if (args.ColumnCount() > 2) {
-		args.data[2].ToUnifiedFormat(count, ci_format);
+		args.data[2].ToUnifiedFormat(ci_format);
 		case_insensitive_flags = UnifiedVectorFormat::GetData<bool>(ci_format);
 	}
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto list_entries = FlatVector::GetData<list_entry_t>(result);
-	auto &result_validity = FlatVector::Validity(result);
+	auto list_entries = FlatVector::GetDataMutable<list_entry_t>(result);
+	auto &result_validity = FlatVector::ValidityMutable(result);
 	ListVector::SetListSize(result, 0);
 
 	idx_t total_grams = 0;
@@ -202,8 +203,8 @@ static void TrigramsFunction(DataChunk &args, ExpressionState &state, Vector &re
 				             ListVector::SetListSize(result, total_grams);
 				             ListVector::Reserve(result, 2 * ListVector::GetListCapacity(result));
 			             }
-			             auto &child = ListVector::GetEntry(result);
-			             auto child_strings = FlatVector::GetData<string_t>(child);
+			             auto &child = ListVector::GetChildMutable(result);
+			             auto child_strings = FlatVector::GetDataMutable<string_t>(child);
 			             child_strings[total_grams] = StringVector::AddString(child, gram, gram_len);
 			             total_grams++;
 		             });
@@ -232,16 +233,16 @@ static void GramKeyFunction(DataChunk &args, ExpressionState &state, Vector &res
 static void GramKeysFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
 	UnifiedVectorFormat input_format, gram_format, ci_format;
-	args.data[0].ToUnifiedFormat(count, input_format);
-	args.data[1].ToUnifiedFormat(count, gram_format);
-	args.data[2].ToUnifiedFormat(count, ci_format);
+	args.data[0].ToUnifiedFormat(input_format);
+	args.data[1].ToUnifiedFormat(gram_format);
+	args.data[2].ToUnifiedFormat(ci_format);
 	auto input_strings = UnifiedVectorFormat::GetData<string_t>(input_format);
 	auto gram_sizes = UnifiedVectorFormat::GetData<int32_t>(gram_format);
 	auto case_insensitive_flags = UnifiedVectorFormat::GetData<bool>(ci_format);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto list_entries = FlatVector::GetData<list_entry_t>(result);
-	auto &result_validity = FlatVector::Validity(result);
+	auto list_entries = FlatVector::GetDataMutable<list_entry_t>(result);
+	auto &result_validity = FlatVector::ValidityMutable(result);
 	ListVector::SetListSize(result, 0);
 
 	idx_t total = 0;
@@ -275,7 +276,7 @@ static void GramKeysFunction(DataChunk &args, ExpressionState &state, Vector &re
 			ListVector::SetListSize(result, total);
 			ListVector::Reserve(result, NextPowerOfTwo(total + keys.size()));
 		}
-		auto child_keys = FlatVector::GetData<uhugeint_t>(ListVector::GetEntry(result));
+		auto child_keys = FlatVector::GetDataMutable<uhugeint_t>(ListVector::GetChildMutable(result));
 		for (idx_t i = 0; i < keys.size(); i++) {
 			child_keys[total + i] = keys[i];
 		}
@@ -292,17 +293,24 @@ static void GramKeysFunction(DataChunk &args, ExpressionState &state, Vector &re
 void RegisterGram(ExtensionLoader &loader) {
 	auto list_type = LogicalType::LIST(LogicalType::VARCHAR);
 	ScalarFunctionSet trigrams("trigrams");
-	trigrams.AddFunction(ScalarFunction({LogicalType::VARCHAR}, list_type, TrigramsFunction));
-	trigrams.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER}, list_type, TrigramsFunction));
-	trigrams.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN}, list_type,
-	                                    TrigramsFunction));
+	// every overload rejects a gram size below one
+	for (auto &arguments :
+	     vector<vector<LogicalType>> {{LogicalType::VARCHAR},
+	                                  {LogicalType::VARCHAR, LogicalType::INTEGER},
+	                                  {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN}}) {
+		ScalarFunction overload(arguments, list_type, TrigramsFunction);
+		overload.SetFallible();
+		trigrams.AddFunction(overload);
+	}
 	loader.RegisterFunction(trigrams);
 
 	loader.RegisterFunction(
 	    ScalarFunction("ngram_gram_key", {LogicalType::VARCHAR}, LogicalType::UHUGEINT, GramKeyFunction));
-	loader.RegisterFunction(ScalarFunction("ngram_gram_keys",
-	                                       {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN},
-	                                       LogicalType::LIST(LogicalType::UHUGEINT), GramKeysFunction));
+	auto gram_keys =
+	    ScalarFunction("ngram_gram_keys", {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN},
+	                   LogicalType::LIST(LogicalType::UHUGEINT), GramKeysFunction);
+	gram_keys.SetFallible();
+	loader.RegisterFunction(gram_keys);
 }
 
 } // namespace ngram

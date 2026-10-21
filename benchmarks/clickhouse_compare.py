@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = ROOT / ".tmp/clickhouse-phase15/corpus/enwik9.lines.hex.tsv"
 DEFAULT_CLICKHOUSE = ROOT / ".tmp/clickhouse-phase15/bin/clickhouse"
 DEFAULT_DUCKDB = ROOT / "build/release/duckdb"
+# The DuckDB CLI switches to an agent output format when it sees a coding
+# agent's environment variables; the digests cover its normal output.
+COMMAND_ENV = dict(os.environ, DUCKDB_AGENT_MODE="0")
 INPUT_BYTES = 2_071_799_070
 INPUT_SHA256 = "f9e4a271a2350049ba5e6a75d8d32977de65cea995a505d67875a7627b46385c"
 CLICKHOUSE_SHA256 = "d2a2611ed56bc6d1544fafe8ece7e888ae2af6e13ea7095993a5105d8c74d4f3"
@@ -60,7 +63,7 @@ def run(argv, *, input_text=None, stdin_path=None, check=True, timeout=3600):
         result = subprocess.run(
             [str(value) for value in argv], cwd=ROOT, input=input_text,
             stdin=source, text=input_text is not None or source is None,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=COMMAND_ENV,
         )
     finally:
         if source:
@@ -287,7 +290,7 @@ def digest_command(argv, input_text=None):
     with tempfile.TemporaryFile() as output:
         result = subprocess.run(
             [str(value) for value in argv], cwd=ROOT, input=input_text, text=True,
-            stdout=output, stderr=subprocess.PIPE, timeout=3600,
+            stdout=output, stderr=subprocess.PIPE, timeout=3600, env=COMMAND_ENV,
         )
         if result.returncode:
             fail("result-set command failed: %s\n%s" % (argv, result.stderr[-4000:]))

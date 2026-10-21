@@ -2,6 +2,8 @@
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/row_group.hpp"
@@ -120,15 +122,14 @@ struct GramRows {
 //! of one key are contiguous within each generation's key-ordered run, so a
 //! key admits about one segment per run. Alignment keeps two spans from
 //! sharing a vector, so no row is scanned twice; the key filter drops the
-//! rows of other keys inside a span. v1.5.5's own filtered scan skips only
-//! the first excluded segment of a row group (RowGroup::CheckZonemapSegments
-//! takes a segment's relative start for its vector index), so positioned by
-//! the host it reads the whole row group: measured 108,000 rows per key on a
-//! two-row-group table (docs/review/2026-09-09/format_observations.json).
+//! rows of other keys inside a span. The host's filtered scan skips every
+//! excluded segment too (RowGroup::CheckZonemapSegments); these spans were
+//! built when it skipped only the first, and are not yet benchmarked against
+//! it on 2.0.
 static void AdmittedKeySpans(SegmentNode<RowGroup> &row_group, const StorageIndex &key_column, TableFilter &filter,
                              vector<std::pair<idx_t, idx_t>> &spans) {
 	auto &column = row_group.GetNode().GetRawColumnData(key_column);
-	if (column.CheckZonemap(key_column, filter) == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+	if (column.CheckZonemap(nullptr, key_column, filter) == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
 		return;
 	}
 	auto row_group_start = row_group.GetRowStart();
@@ -143,7 +144,8 @@ static void AdmittedKeySpans(SegmentNode<RowGroup> &row_group, const StorageInde
 		ColumnScanState segment_state(nullptr);
 		segment_state.current = segment;
 		segment_state.segment_tree = &tree;
-		if (column.CheckZonemap(segment_state, filter) == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+		optional_ptr<SegmentNode<ColumnSegment>> checked_segment;
+		if (column.CheckZonemap(segment_state, filter, checked_segment) == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
 			continue;
 		}
 		auto offset = segment->GetRowStart();
@@ -194,9 +196,9 @@ static bool CollectGramRows(ClientContext &context, DuckTransaction &tx, DuckTab
 	ParallelForEachUnit(context, keys.size(), workers, [&](idx_t key_index) {
 		auto &rows = per_key[key_index];
 		TableFilterSet filters;
-		filters.PushFilter(ColumnIndex(0),
-		                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::UHUGEINT(keys[key_index])));
-		auto &filter = *filters.filters.at(0);
+		filters.PushFilter(ProjectionIndex(0),
+		                   ConstantComparisonFilter(ExpressionType::COMPARE_EQUAL, Value::UHUGEINT(keys[key_index])));
+		auto &filter = filters.GetFilterByColumnIndexMutable(ProjectionIndex(0));
 		DataChunk chunk;
 		chunk.Initialize(Allocator::Get(context), types);
 		// validates and appends the chunk's rows; false once the plan declines
@@ -209,7 +211,7 @@ static bool CollectGramRows(ClientContext &context, DuckTransaction &tx, DuckTab
 			reservation.Grow(chunk.size() * MANIFEST_BYTES_PER_ROW);
 			UnifiedVectorFormat formats[6];
 			for (idx_t c = 0; c < 6; c++) {
-				chunk.data[c].ToUnifiedFormat(chunk.size(), formats[c]);
+				chunk.data[c].ToUnifiedFormat(formats[c]);
 			}
 			auto key_data = UnifiedVectorFormat::GetData<uhugeint_t>(formats[0]);
 			auto segment_data = UnifiedVectorFormat::GetData<int64_t>(formats[1]);
@@ -642,7 +644,7 @@ static void DecodeDescriptorRange(ClientContext &context, DuckTransaction &tx, P
 		scratch.initialized = true;
 	}
 	auto &chunk = scratch.chunk;
-	auto rowid_data = FlatVector::GetData<row_t>(scratch.rowids);
+	auto rowid_data = FlatVector::GetDataMutable<row_t>(scratch.rowids);
 	for (idx_t offset = begin; offset < end; offset += STANDARD_VECTOR_SIZE) {
 		ThrowIfInterrupted(context);
 		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, end - offset);
@@ -659,10 +661,10 @@ static void DecodeDescriptorRange(ClientContext &context, DuckTransaction &tx, P
 			throw InvalidInputException("ngram: a manifest posting row vanished; the index is malformed");
 		}
 		UnifiedVectorFormat key_format, segment_format, blob_format, count_format;
-		chunk.data[0].ToUnifiedFormat(count, key_format);
-		chunk.data[1].ToUnifiedFormat(count, segment_format);
-		chunk.data[2].ToUnifiedFormat(count, blob_format);
-		chunk.data[3].ToUnifiedFormat(count, count_format);
+		chunk.data[0].ToUnifiedFormat(key_format);
+		chunk.data[1].ToUnifiedFormat(segment_format);
+		chunk.data[2].ToUnifiedFormat(blob_format);
+		chunk.data[3].ToUnifiedFormat(count_format);
 		auto key_data = UnifiedVectorFormat::GetData<uhugeint_t>(key_format);
 		auto segment_data = UnifiedVectorFormat::GetData<int64_t>(segment_format);
 		auto blob_data = UnifiedVectorFormat::GetData<string_t>(blob_format);

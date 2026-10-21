@@ -103,9 +103,17 @@ SELECT count(*) FROM t WHERE contains(s, reverse(getvariable('long_needle')));
 statement ok
 SET ngram_auto_accelerate=false;
 
-# far longer needles stay linear: 128 KiB decomposes and declines promptly
+# far longer needles stay linear: 128 KiB decomposes and declines promptly.
+# Building the needle is setup, not the case under test, and the aggregation
+# does not fit in the limit the search runs under.
+statement ok
+SET memory_limit='64MB';
+
 statement ok
 SET VARIABLE huge_needle = (SELECT string_agg(chr(97 + (hash(i * 15485863) % 26)::INTEGER), '' ORDER BY i) FROM range(131072) r(i));
+
+statement ok
+SET memory_limit='16MB';
 
 query I
 SELECT count(*) FROM ngram_search('t', getvariable('huge_needle'));

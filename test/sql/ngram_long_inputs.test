@@ -67,7 +67,7 @@ SELECT count(*) FROM longs WHERE s ILIKE '%istanbul%';
 query II
 EXPLAIN SELECT count(*) FROM longs WHERE contains(s, 'needle');
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # a 128 KiB needle of varied content: every gram is distinct, so the needle
 # carries tens of thousands of keys; both paths answer it exactly and the
@@ -131,7 +131,7 @@ SELECT count(*) FROM ngram_search('longs', getvariable('big_needle'));
 query II
 EXPLAIN SELECT count(*) FROM longs WHERE contains(s, getvariable('big_needle'));
 ----
-physical_plan	<!REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 query I
 SELECT count(*) FROM longs WHERE contains(s, getvariable('big_needle'));

@@ -14,6 +14,9 @@ import subprocess
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DUCKDB = os.path.join(REPO, "build", "release", "duckdb")
+# The CLI switches to an agent output format when it sees a coding agent's
+# environment variables; the drivers parse its normal output.
+CLI_ENV = dict(os.environ, DUCKDB_AGENT_MODE="0")
 FORMAT_VERSION = "5"
 UUID_V4 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 LISTING_COLUMNS = 8
@@ -67,7 +70,7 @@ class Cli:
     def run(self, db_path, script, allow_error=False, timeout=None, attached=True):
         """(exit code, stdout, stderr) of the script in CSV mode without headers."""
         proc = subprocess.run([self.binary] + ([db_path] if attached else []),
-                              input=".headers off\n.mode csv\n" + script,
+                              input=".headers off\n.mode csv\n" + script, env=CLI_ENV,
                               capture_output=True, text=True, timeout=timeout or self.timeout)
         if proc.returncode != 0 and not allow_error:
             raise RuntimeError("duckdb failed on %s:\n%s\n--- script ---\n%s"

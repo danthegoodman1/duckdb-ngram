@@ -72,7 +72,7 @@ Dependency Error
 statement error
 ALTER TABLE lifecycle_docs SET SCHEMA information_schema;
 ----
-Not implemented
+syntax error at or near "SCHEMA"
 
 statement error
 ALTER SCHEMA main RENAME TO renamed_main;
@@ -234,20 +234,16 @@ read-only
 statement ok
 DETACH f4;
 
-# A database this format wrote reopens READY: both paths probe it and agree
-# with the fallback over the persisted tail rows past the high-water mark.
+# A database the previous host wrote in this format reopens SCAN_ONLY: its
+# guard names DuckDB v1.5.5, so both paths scan exactly across the persisted
+# tail, and maintenance refuses with the rebuild that restores the index.
 statement ok
 ATTACH 'test/fixtures/format5.duckdb' AS f5 (READ_ONLY);
 
 query TTTTTITT
 PRAGMA ngram_indexes;
 ----
-f5	4e5f9ee4-ae63-40b0-b2e5-4fb40ba40865	main	docs	s	5	READY	NULL
-
-query I
-SELECT count(*) FROM ngram_search('f5.main.docs', 'tent');
-----
-4
+f5	4e5f9ee4-ae63-40b0-b2e5-4fb40ba40865	main	docs	s	5	SCAN_ONLY	<REGEX>:.*recorded rowid guard is incompatible with this extension build.*
 
 query I
 SELECT id FROM ngram_search('f5.main.docs', 'tent') ORDER BY id;
@@ -264,9 +260,9 @@ statement ok
 SET ngram_auto_accelerate = true;
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM f5.docs WHERE s ILIKE '%tent%';
+EXPLAIN SELECT count(*) FROM f5.docs WHERE s ILIKE '%tent%';
 ----
-analyzed_plan	<REGEX>:.*"Ngram Mode": "index .*
+physical_plan	<!REGEX>:.*Ngram Index Scan.*
 
 query I
 SELECT id FROM f5.docs WHERE s ILIKE '%tent%' ORDER BY id;
@@ -285,7 +281,7 @@ RESET ngram_max_candidate_fraction;
 statement error
 PRAGMA ngram_refresh('f5.main.docs');
 ----
-read-only
+drop_ngram_index('docs', 's') then PRAGMA create_ngram_index('docs', 's')
 
 statement ok
 DETACH f5;

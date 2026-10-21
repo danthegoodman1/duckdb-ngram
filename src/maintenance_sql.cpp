@@ -3,8 +3,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "ngram/build_sql.hpp"
-
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
@@ -102,7 +103,7 @@ static string RegistryRow(const ResolvedTarget &target, const MaintenanceColumn 
 // of a key) and advances the mark; the constant rowid filter lets zone maps
 // skip row groups below it. With max_rows the call stops partway, commits, and
 // reports remaining_tail for the caller's loop: one call is one transaction,
-// because the statement preprocessor wraps a whole expansion or nothing.
+// because the host runs a whole expansion in one transaction or none.
 // Updates of guard-covered columns are delete+insert, so their replacements
 // sit in this tail like appends.
 //===----------------------------------------------------------------------===//
@@ -256,9 +257,10 @@ string RefreshScript(ClientContext &context, const ResolvedTarget &target, const
 		summary_rows.push_back(RefreshSummaryRow(target, column));
 	}
 	script += "DROP TABLE " + fence + ";\n";
-	// The pragma's only output, one progress row per index, placed last so
-	// that the preprocessor's BEGIN/COMMIT around the still multi-statement
-	// expansion, the crash atomicity this pragma rests on, stays in place.
+	// The pragma's only output, one progress row per index, placed last: the
+	// host serves an expansion's last statement as its result and runs the
+	// whole expansion in one transaction, the crash atomicity this pragma
+	// rests on.
 	script += StringUtil::Join(summary_rows, " UNION ALL ") + " ORDER BY column_name;\n";
 	return script;
 }

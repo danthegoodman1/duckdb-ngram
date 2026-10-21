@@ -87,7 +87,7 @@ SET ngram_auto_accelerate = true;
 query II
 EXPLAIN SELECT count(*) FROM updated WHERE s LIKE '%phase11%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 query I
 SELECT count(*) FROM updated WHERE s LIKE '%phase11%';
@@ -151,7 +151,7 @@ SELECT id FROM ngram_search('reused', 'reuse needle');
 query II
 EXPLAIN SELECT count(*) FROM reused WHERE s LIKE '%reuse needle%';
 ----
-physical_plan	<REGEX>:.*NGRAM_INDEX_SCAN.*
+physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 statement ok
 INSERT INTO reused
@@ -182,7 +182,7 @@ WHERE c.rowid > m.hwm_rowid;
 query II
 EXPLAIN SELECT count(*) FROM reused WHERE s LIKE '%reuse needle%';
 ----
-physical_plan	<REGEX>:.*SEQ_SCAN.*
+physical_plan	<REGEX>:.*Seq Scan.*
 
 query I
 SELECT count(*) FROM reused WHERE s LIKE '%reuse needle%';

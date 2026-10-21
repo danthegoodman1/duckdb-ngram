@@ -47,8 +47,10 @@ INSTALL ngram FROM community;
 LOAD ngram;
 ```
 
-The extension is built against DuckDB **v1.5.5** and links its internal C++
-API, so it must be loaded into a matching DuckDB version.
+The extension is built against DuckDB **v2.0.0** and links its internal C++
+API, so it must be loaded into a matching DuckDB version. The `duckdb` submodule
+is pinned at the v2.0.0 release tag, and the Makefile names the build v2.0.0,
+since DuckDB 2.0 builds from source report a development version otherwise.
 
 > The community-extensions submission is prepared but not yet merged (see
 > [`packaging/SUBMISSION.md`](packaging/SUBMISSION.md)). Until it is, load the
@@ -145,10 +147,10 @@ decomposition share.
 
 Exhaustiveness is unconditional. Covered-column updates, including changes
 below the high-water mark, become delete-plus-insert; their new rowids are found
-in the tail. Deletes leave harmless false-positive postings. Any index on a
-table blocks DuckDB's moving vacuum by default, and the guard's non-ART type
-keeps it blocked when `vacuum_rebuild_indexes` is enabled. Vacuum may discard
-fully deleted trailing row groups, but the first committed append into their
+in the tail. Deletes leave harmless false-positive postings. DuckDB's
+checkpoint vacuum moves rows only on tables whose indexes are all ART, so the
+guard's non-ART type keeps every live rowid in place. Vacuum may discard fully
+deleted row groups, but the first committed append into a discarded tail's
 reused rowids permanently marks the guard uncertain.
 
 The guard is the only proof of identity. Each index's registry row records the
@@ -162,7 +164,7 @@ Behavior is fail closed:
 
 | State | Explicit search | Transparent predicate | `ngram_candidates` | Maintenance |
 | --- | --- | --- | --- | --- |
-| Guard proves the indexed prefix safe | postings + live recheck + disjoint tail | `NGRAM_INDEX_SCAN` | posting candidates in the prefix | refresh/compact allowed |
+| Guard proves the indexed prefix safe | postings + live recheck + disjoint tail | `Ngram Index Scan` | posting candidates in the prefix | refresh/compact allowed |
 | Guard is missing, replaced, incompatible, unbound with replay, or cannot exclude rowid reuse | one full live-table scan | one sequential-scan fallback | every visible rowid through the recorded mark | refuse; rebuild required |
 
 A registry row this version cannot read (another storage format, corrupt
@@ -198,7 +200,7 @@ removes before it builds; a drop concurrent with a create on the same table can
 yield an index that is `SCAN_ONLY` from birth, whose remedy is to drop and
 re-create it.
 
-Load the extension before writing a guarded table. Stock v1.5.5 can SELECT it,
+Load the extension before writing a guarded table. A stock host can SELECT it,
 but INSERT/UPDATE fail on the unknown index type, DELETE may busy-spin in the
 host binder, and guard-touching ALTER is refused. An unrelated ADD COLUMN is
 safe. An extension-free or context-free checkpoint is detected by the durable
@@ -423,7 +425,7 @@ drops in the current database unless `catalog` names another attached one:
 copied attached databases may hold the same reference, so the catalog is part
 of the identity.
 
-DuckDB v1.5.5 refuses table and indexed-column rename while the physical guard
+DuckDB refuses table and indexed-column rename while the physical guard
 exists, including case-only rename. Moving a table between schemas and renaming
 a schema are host-not-implemented. The supported workflow is therefore:
 
@@ -497,7 +499,7 @@ probe budget for one query is the smaller of one quarter of `memory_limit` and
 ### Transparent acceleration
 
 With `SET ngram_auto_accelerate = true`, an optimizer pass rewrites qualifying
-scans into `NGRAM_INDEX_SCAN`. It fires for `contains(col, 'lit')`,
+scans into an `Ngram Index Scan`. It fires for `contains(col, 'lit')`,
 `col LIKE '%lit%'`, `col ILIKE '%lit%'` (case-insensitive indexes only),
 `regexp_matches(col, 'literal')`, multi-segment patterns like
 `col LIKE '%a%b%'`, and those combined with other filters via `AND`.
@@ -512,7 +514,7 @@ cannot prove the indexed prefix safe.
 
 ```sql
 EXPLAIN SELECT * FROM logs WHERE message LIKE '%reset%';
--- ... NGRAM_INDEX_SCAN  Table: logs  Ngram Column: message  Ngram Needles: reset
+-- ... Ngram Index Scan  Table: logs  Ngram Column: message  Ngram Needles: reset
 
 EXPLAIN ANALYZE SELECT * FROM logs WHERE message LIKE '%reset%';
 -- ... Ngram Mode: index (<= 1423 candidates, 9012 decoded rowids)
@@ -584,25 +586,25 @@ Same-machine observations; queries are warm-cache for a **non-default case-sensi
 index** over nonempty line-per-row `enwik9`. These are not cold-cache, large-scale, or
 shipped-default claims. Raw evidence: [`benchmarks/artifacts/enwik9-current-v1.json`](benchmarks/artifacts/enwik9-current-v1.json).
 
-- Engine commit: `6fb01c606165`; build commit: `6fb01c606165`; DuckDB v1.5.5 / source d8cdaa33;
+- Engine commit: `bd2b0c957278`; build commit: `6cdbb6e7020e`; DuckDB v2.0.0 / source d54cbbe3;
   static-extension release CLI. The numbers describe the engine commit's `src/**` and are
   re-collected on release; later commits keep this block until the next collection.
 - Corpus: 10,920,423 rows, 0.919 GiB of UTF-8 text; three fresh load/build pairs.
 - Timed load—fresh CLI and absent DB through create, hex decode, insert, CHECKPOINT—was
-  2.066 s median (1.981–2.138 s). Timed index build—fresh CLI through create-index and
-  CHECKPOINT—was 7.554 s median (7.477–8.880 s), 124.59 MiB/s of source text.
+  4.408 s median (3.943–5.249 s). Timed index build—fresh CLI through create-index and
+  CHECKPOINT—was 7.321 s median (6.587–7.597 s), 128.55 MiB/s of source text.
 - Paired whole-database size increase: 0.992 GiB apparent, 0.992 GiB allocated
-  (median); 1.080× source bytes. This whole-DB effect includes allocator/checkpoint effects.
-- Build-process max RSS: 7.920 GiB median. Sampled peak temp apparent file bytes: 0.000 GiB
+  (median); 1.079× source bytes. This whole-DB effect includes allocator/checkpoint effects.
+- Build-process max RSS: 5.363 GiB median. Sampled peak temp apparent file bytes: 0.000 GiB
   median, polled every 100 ms; zero means none observed, not proof that no brief spill occurred.
   Acquisition, normalization, relation/stat checks, EXPLAIN, and parity are untimed. Loads may
   read cached transport pages; builds follow relation identity and may read cached source pages.
 
 | needle class | ngram_search mode | exact matches | candidates | ngram_search p50 / p95 / range | scan p50 / p95 / range | scan ÷ search p50 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| rare | index | 1 | 12 | 1 / 2 ms / 0–4 ms | 42 / 43 ms / 40–45 ms | 42.00× |
-| moderate | index | 26,068 | 26,381 | 6 / 7 ms / 5–8 ms | 28 / 30 ms / 26–31 ms | 4.67× |
-| dense | full-scan-fallback | 1,963,067 | 1,963,067 | 37 / 40 ms / 36–43 ms | 37 / 39 ms / 36–45 ms | 1.00× |
+| rare | index | 1 | 12 | 2 / 3 ms / 1–4 ms | 64 / 73 ms / 59–74 ms | 32.00× |
+| moderate | index | 26,068 | 26,381 | 10 / 12 ms / 8–13 ms | 41 / 48 ms / 37–51 ms | 4.10× |
+| dense | full-scan-fallback | 1,963,067 | 1,963,067 | 58 / 63 ms / 53–66 ms | 56 / 60 ms / 52–65 ms | 0.97× |
 
 The timed campaign adds one warmup per variant after untimed parity/EXPLAIN executions, then
 twenty-one measured observations per variant using a fixed-seed interleaving on one connection.
@@ -648,18 +650,19 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
 - No fuzzy or similarity ranking, and no general regular-expression support —
   only regexes that are a plain literal reduce to an indexable substring.
 - Guarded tables require `ngram` to be loaded for supported DML. Without it,
-  treat the base table as read-only; v1.5.5 DELETE may busy-spin while trying
+  treat the base table as read-only; DELETE may busy-spin while trying
   to bind the unknown custom index type.
-- The rowid guard is pinned to host-reported DuckDB v1.5.5 built from commit
-  `d8cdaa33fd…`; it accepts any abbreviation of that commit with seven or more
-  characters as `pragma_version().source_id` (`d8cdaa33` from a local build,
-  `d8cdaa33fd` from the official binary). Other hosts load only for
+- The rowid guard is pinned to DuckDB v2.0.0 built from commit `d54cbbe3df…`:
+  `pragma_version()` must report v2.0.0, or a pre-release label of it such as
+  DuckDB's staged builds carry, and any abbreviation of that commit with seven
+  or more characters as `source_id`. An index built against a
+  different host build reads back `SCAN_ONLY` until it is rebuilt. Other hosts load only for
   fail-closed inspection and cleanup; create/query/maintenance refuse to trust
   the custom index internals.
 - A first build invalidates DuckDB's reservoir sample and may make overlapping
   writers retry. Guard dependencies restrict column/table rename and dependent
-  DROP/ALTER operations until the ngram index is dropped. On v1.5.5, table
-  schema moves and schema rename are not implemented; use stable-ID drop,
+  DROP/ALTER operations until the ngram index is dropped. Table schema moves
+  and schema rename are not implemented by the host; use stable-ID drop,
   rename, then rebuild.
 - One index per (table, column). Multi-column indexes do not exist; build one
   index per column you search.
@@ -675,7 +678,7 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
 ## Platform support
 
 The distribution matrix (`.github/workflows/MainDistributionPipeline.yml`)
-builds DuckDB v1.5.5 with the extension on Linux (x86_64, arm64), macOS
+builds DuckDB v2.0.0 with the extension on Linux (x86_64, arm64), macOS
 (x86_64, arm64), Windows (x86_64 MSVC, x86_64 MinGW, arm64) and Wasm (mvp,
 eh, threads), and runs the SQL suite on the targets that can execute it; the
 C++ harness runs on Linux and macOS. The latest matrix run is recorded in
@@ -696,7 +699,7 @@ GEN=ninja make debug        # DEBUG + AddressSanitizer build
 
 The loadable binary is
 `build/release/extension/ngram/ngram.duckdb_extension`; load it into a stock
-DuckDB v1.5.5 with:
+DuckDB v2.0.0 with:
 
 ```sh
 duckdb -unsigned -c "LOAD '/path/to/ngram.duckdb_extension';"

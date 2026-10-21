@@ -12,7 +12,7 @@ namespace duckdb {
 
 class AttachedDatabase;
 class DuckTableEntry;
-class Index;
+class IndexEntry;
 
 namespace ngram {
 
@@ -33,6 +33,10 @@ void RegisterRowIdGuard(ExtensionLoader &loader);
 bool RowIdGuardRuntimeCompatible();
 void RequirePinnedRuntime();
 string HostRuntimeMismatchReason();
+//! True when a host's pragma_version().library_version names the pinned
+//! release: the release itself, or a pre-release label of it that DuckDB's
+//! staged and unversioned builds of the pinned commit report.
+bool HostVersionNamesPinnedRelease(const string &version);
 
 //! The header checkpoint iteration of `db` (0 for an in-memory database).
 uint64_t CheckpointIteration(AttachedDatabase &db);
@@ -57,8 +61,9 @@ struct RowIdGuardState {
 };
 
 //! The live state of a bound guard, applying its pending persisted seal
-//! against `current_iteration` when one is given.
-RowIdGuardState ReadBoundGuardState(Index &index, optional_idx current_iteration);
+//! against `current_iteration` when one is given. Applying the seal mutates the
+//! guard, so this takes the entry's exclusive handle.
+RowIdGuardState ReadBoundGuardState(IndexEntry &entry, optional_idx current_iteration);
 
 //! Whether every unbound guard on `table` is well-formed enough to bind.
 //! DuckDB's v1.5.5 bind state stays poisoned by a malformed expression, so

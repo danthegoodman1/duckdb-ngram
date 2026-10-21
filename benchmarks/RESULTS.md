@@ -7,25 +7,25 @@ Same-machine observations; queries are warm-cache for a **non-default case-sensi
 index** over nonempty line-per-row `enwik9`. These are not cold-cache, large-scale, or
 shipped-default claims. Raw evidence: [`benchmarks/artifacts/enwik9-current-v1.json`](artifacts/enwik9-current-v1.json).
 
-- Engine commit: `5df679f4e64f`; build commit: `699a36a99758`; DuckDB v2.0.0 / source e366461e;
+- Engine commit: `bd2b0c957278`; build commit: `6cdbb6e7020e`; DuckDB v2.0.0 / source d54cbbe3;
   static-extension release CLI. The numbers describe the engine commit's `src/**` and are
   re-collected on release; later commits keep this block until the next collection.
 - Corpus: 10,920,423 rows, 0.919 GiB of UTF-8 text; three fresh load/build pairs.
 - Timed load—fresh CLI and absent DB through create, hex decode, insert, CHECKPOINT—was
-  4.053 s median (3.223–4.909 s). Timed index build—fresh CLI through create-index and
-  CHECKPOINT—was 7.199 s median (7.171–7.438 s), 130.73 MiB/s of source text.
+  4.408 s median (3.943–5.249 s). Timed index build—fresh CLI through create-index and
+  CHECKPOINT—was 7.321 s median (6.587–7.597 s), 128.55 MiB/s of source text.
 - Paired whole-database size increase: 0.992 GiB apparent, 0.992 GiB allocated
   (median); 1.079× source bytes. This whole-DB effect includes allocator/checkpoint effects.
-- Build-process max RSS: 8.360 GiB median. Sampled peak temp apparent file bytes: 0.000 GiB
+- Build-process max RSS: 5.363 GiB median. Sampled peak temp apparent file bytes: 0.000 GiB
   median, polled every 100 ms; zero means none observed, not proof that no brief spill occurred.
   Acquisition, normalization, relation/stat checks, EXPLAIN, and parity are untimed. Loads may
   read cached transport pages; builds follow relation identity and may read cached source pages.
 
 | needle class | ngram_search mode | exact matches | candidates | ngram_search p50 / p95 / range | scan p50 / p95 / range | scan ÷ search p50 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| rare | index | 1 | 12 | 2 / 3 ms / 2–3 ms | 55 / 57 ms / 53–64 ms | 27.50× |
-| moderate | index | 26,068 | 26,381 | 8 / 11 ms / 6–11 ms | 36 / 37 ms / 34–38 ms | 4.50× |
-| dense | full-scan-fallback | 1,963,067 | 1,963,067 | 50 / 52 ms / 49–53 ms | 49 / 50 ms / 47–50 ms | 0.98× |
+| rare | index | 1 | 12 | 2 / 3 ms / 1–4 ms | 64 / 73 ms / 59–74 ms | 32.00× |
+| moderate | index | 26,068 | 26,381 | 10 / 12 ms / 8–13 ms | 41 / 48 ms / 37–51 ms | 4.10× |
+| dense | full-scan-fallback | 1,963,067 | 1,963,067 | 58 / 63 ms / 53–66 ms | 56 / 60 ms / 52–65 ms | 0.97× |
 
 The timed campaign adds one warmup per variant after untimed parity/EXPLAIN executions, then
 twenty-one measured observations per variant using a fixed-seed interleaving on one connection.

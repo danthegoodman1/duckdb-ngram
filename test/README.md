@@ -31,7 +31,7 @@ selectable:
 | --- | --- |
 | `lifecycle` | index creation schedules, the shared rowid guard, drop, vacuum, WAL replay and a stock host, checkpoint seals, quarantine, storage corruption |
 | `registry` | registry rows, bootstrap, catalog identity across copies, corruption, execution-time identity races, a 10,000-row registry |
-| `fixtures` | the persisted format-3, format-4 and format-5 databases in `test/fixtures` (see its README) |
+| `fixtures` | the persisted format-3, format-4 and format-5 databases in `test/fixtures` (see its README), each refused until rebuilt |
 | `query` | cancellation through a streamed result and through the maintenance append hook, ordered candidate streams, the publication barrier, the probe's memory peak, same-size key collisions |
 
 ```bash
@@ -53,11 +53,16 @@ and macOS; Windows runs the SQL suite only.
 
 ## Python drivers: `scripts/`
 
-Randomized, seeded runs that take minutes rather than seconds:
+Randomized, seeded runs that take minutes rather than seconds. The
+differential driver picks `ngram` or `sparse` per trial unless `--tokenizer`
+fixes it; `sparse_grams_check.py` compares the sparse extractor with a
+brute-force reading of the definition.
 
 ```bash
 python3 scripts/differential_search.py --trials 8 --seed 12345            # explicit functions against brute force
 python3 scripts/differential_search.py --transparent --trials 8 --seed 12345
+python3 scripts/differential_search.py --tokenizer sparse --trials 8 --seed 12345
+python3 scripts/sparse_grams_check.py --cases 3000 --seed 1               # sparse_grams() against the definition
 python3 scripts/churn_maintenance.py --rounds 40 --seed 12345             # interleaved DML, checkpoints and maintenance
 python3 scripts/crash_maintenance.py --seed 12345                         # SIGKILL during maintenance, then reopen
 ```

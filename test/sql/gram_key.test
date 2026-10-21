@@ -67,33 +67,54 @@ SELECT ngram_gram_key(NULL);
 ----
 NULL
 
-# ngram_gram_keys(text, gram_size, case_insensitive) is the build pipeline's
-# emitter: the keys of the distinct normalized grams, ascending
+# ngram_gram_keys(text, tokenizer, min_gram, max_gram, case_insensitive) is
+# the build pipeline's emitter: the keys of the distinct normalized grams,
+# ascending
 query I
-SELECT ngram_gram_keys('Aba abA', 3, true) =
+SELECT ngram_gram_keys('Aba abA', 'ngram', 3, 3, true) =
        list_sort(list_distinct(list_transform(trigrams('Aba abA', 3, true), lambda g: ngram_gram_key(g))));
 ----
 true
 
 query I
-SELECT length(ngram_gram_keys('abcabc', 3, false));
+SELECT length(ngram_gram_keys('abcabc', 'ngram', 3, 3, false));
 ----
 3
 
 query I
-SELECT ngram_gram_keys('ab', 3, false);
+SELECT ngram_gram_keys('ab', 'ngram', 3, 3, false);
 ----
 []
 
 query I
-SELECT ngram_gram_keys(NULL, 3, true);
+SELECT ngram_gram_keys(NULL, 'ngram', 3, 3, true);
 ----
 NULL
 
 statement error
-SELECT ngram_gram_keys('abc', 0, true);
+SELECT ngram_gram_keys('abc', 'ngram', 0, 0, true);
 ----
 at least 1
+
+statement error
+SELECT ngram_gram_keys('abc', 'ngram', 3, 4, true);
+----
+one gram size
+
+statement error
+SELECT ngram_gram_keys('abc', 'trigram', 3, 3, true);
+----
+tokenizer must be 'ngram' or 'sparse'
+
+# A sparse tokenizer keys its min_gram grams exactly, as an ngram tokenizer
+# does, and every longer gram into a bucket above every exact key
+query II
+SELECT list_filter(keys, lambda k: format('{:032x}', k) NOT LIKE 'fffffffffffffffe%') =
+           ngram_gram_keys('Hello world', 'ngram', 3, 3, true),
+       length(list_filter(keys, lambda k: format('{:032x}', k) LIKE 'fffffffffffffffe0000000000%')) > 0
+FROM (SELECT ngram_gram_keys('Hello world', 'sparse', 3, 8, true) AS keys);
+----
+true	true
 
 # Collision widening: two grams forced onto one key merge their postings, and
 # a query for either gram still finds every matching row because recheck

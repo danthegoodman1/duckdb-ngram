@@ -188,7 +188,7 @@ static unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunction
 //! indexed rows (rowid <= the index high-water mark). Output is a superset of
 //! the true matches among indexed rows; callers must recheck and must cover
 //! rows past the high-water mark themselves. A needle with fewer than
-//! gram_size codepoints cannot be probed: candidates degrade to every indexed
+//! min_gram codepoints cannot be probed: candidates degrade to every indexed
 //! rowid ("all rowids" semantics), i.e. callers fall back to a full scan.
 static unique_ptr<FunctionData> CandidatesBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
@@ -370,7 +370,7 @@ static unique_ptr<GlobalTableFunctionState> SearchInitGlobal(ClientContext &cont
 	} else if (shape == NeedleShape::TOO_SHORT) {
 		// the index cannot be probed; the tail scan becomes a full scan, which
 		// is still exhaustive
-		state->fallback_reason = "needle shorter than gram size";
+		state->fallback_reason = "needle shorter than min_gram";
 		state->core.hwm = -1;
 	} else if (shape == NeedleShape::OVER_BUDGET) {
 		state->fallback_reason = OVER_BUDGET_REASON;
@@ -452,10 +452,17 @@ static void SearchGetMetrics(TableFunctionGetMetricsInput &input) {
 	}
 	auto &state = input.global_state->Cast<SearchGlobalState>();
 	metrics.AddExtraInfo("Ngram Storage Columns", StringUtil::Join(state.fetched_columns, ", "));
+	metrics.AddExtraInfo("Ngram Tokenizer", TokenizerSpec(state.options));
 	if (state.core.probe) {
 		metrics.AddExtraInfo("Ngram Mode", StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
 		                                                      state.core.probe->candidate_upper_bound,
 		                                                      state.core.probe->decoded_rowids.load()));
+		if (input.bind_data) {
+			auto &bind = input.bind_data->Cast<QueryBindData>();
+			metrics.AddExtraInfo(
+			    "Ngram Probe Grams",
+			    StringUtil::Join(GramTexts(state.options, {bind.needle}, state.core.probe->keys), ", "));
+		}
 		metrics.AddExtraInfo("Ngram Manifest Rows Scanned", to_string(state.core.probe->manifest_rows_scanned));
 		metrics.AddExtraInfo("Ngram Manifest Rows Visited", to_string(state.core.probe->manifest_rows_visited));
 		metrics.AddExtraInfo("Ngram Admission Rows", to_string(state.core.probe->admission_rows));

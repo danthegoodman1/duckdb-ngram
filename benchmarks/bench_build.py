@@ -26,22 +26,18 @@ from common import (bench_path, free_disk_gb, gb, log, ngram_index_ref, ngram_re
                     ngram_storage_table, require_duckdb, run_sql, write_json)
 from gen_corpus import DEFAULT_SEED, SOURCE_DB, replica_select  # noqa: E402
 
-#! postings, encoded bytes, segment rows, stats rows. The last is one row per
-#! (gram, generation) — it equals the distinct-gram count only after a
-#! compaction has rebuilt stats, and is reported as `distinct_grams` for
-#! historical reasons.
+#! postings, encoded bytes, segment rows, distinct gram keys.
 INDEX_SIZE_SQL = """
 SELECT coalesce(sum(rowid_count), 0)::BIGINT,
        coalesce(sum(octet_length(postings)), 0)::BIGINT,
        count(*)::BIGINT,
-       (SELECT count(*) FROM {stats})::BIGINT
+       count(DISTINCT gram_key)::BIGINT
 FROM {segments};
 """
 
 
 def index_size_sql(index_ref):
-    return INDEX_SIZE_SQL.format(segments=ngram_storage_table(index_ref, "segments"),
-                                 stats=ngram_storage_table(index_ref, "stats"))
+    return INDEX_SIZE_SQL.format(segments=ngram_storage_table(index_ref, "segments"))
 
 CORPUS_SIZE_SQL = "SELECT count(*)::BIGINT, coalesce(sum(strlen(s)), 0)::BIGINT FROM docs;"
 
@@ -78,7 +74,10 @@ def main():
     parser.add_argument("--replicas", type=int, default=1, help="enwik9 replicas (~0.92 GiB of text each)")
     parser.add_argument("--chunk", type=int, default=5, help="replicas appended+indexed per step")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--gram", type=int, default=3)
+    parser.add_argument("--tokenizer", choices=["ngram", "sparse"], default="ngram")
+    parser.add_argument("--gram", type=int, default=3,
+                        help="an ngram index's gram length; a sparse index's min_gram")
+    parser.add_argument("--max-gram", type=int, default=8, help="a sparse index's max_gram")
     parser.add_argument("--case-insensitive", default="true", choices=["true", "false"])
     parser.add_argument("--threads", type=int, default=24)
     parser.add_argument("--memory-limit", default="48GB")
@@ -129,8 +128,12 @@ def main():
         if args.keep_corpus_only:
             continue
         if chunk_no == 0:
-            index_sql = "PRAGMA create_ngram_index('docs', 's', gram = %d, case_insensitive = %s);" % (
-                args.gram, args.case_insensitive)
+            if args.tokenizer == "ngram":
+                options = "gram = %d" % args.gram
+            else:
+                options = "tokenizer = 'sparse', min_gram = %d, max_gram = %d" % (args.gram, args.max_gram)
+            index_sql = "PRAGMA create_ngram_index('docs', 's', %s, case_insensitive = %s);" % (
+                options, args.case_insensitive)
             label = "create index"
         else:
             index_sql = "PRAGMA ngram_refresh('docs', col = 's');"
@@ -197,32 +200,30 @@ def main():
 def verify(db, settings, count, gram_size, case_insensitive):
     """Decoded posting lists must equal brute force, exactly.
 
-    The same gate Phase 2 used: pick grams spread over the frequency range and
-    compare the distinct rowids their segments decode to against the rows a
-    plain `contains` scan finds at or below the high-water mark.
+    Samples grams of gram_size codepoints from the corpus, which both
+    tokenizers key exactly, and compares the distinct rowids their segments
+    decode to against the rows a plain `contains` scan finds at or below the
+    high-water mark.
     """
     ref = ngram_index_ref(db, "docs", "s", settings)
-    segments, stats, registry = (ngram_storage_table(ref, "segments"), ngram_storage_table(ref, "stats"),
-                                 ngram_registry_row(ref))
+    segments, registry = ngram_storage_table(ref, "segments"), ngram_registry_row(ref)
     fold = "lower(s)" if case_insensitive else "s"
     picks = run_sql(db, """
-SELECT gram FROM (
-  SELECT gram, row_count, row_number() OVER (ORDER BY row_count) AS lo,
-         count(*) OVER () AS n
-  FROM {stats}
-) WHERE lo IN (1, (n/2)::BIGINT, n) LIMIT {count};
-""".format(stats=stats, count=count), settings=settings).rows
+SELECT DISTINCT g FROM (
+  SELECT unnest(trigrams(s, {size}, {ci})) AS g FROM docs USING SAMPLE {count} ROWS
+) ORDER BY g LIMIT {count};
+""".format(size=gram_size, ci="true" if case_insensitive else "false", count=count),
+                    settings=settings, timeout=86400).rows
     grams = [row[0] for row in picks]
     results = []
     for gram in grams:
-        # the stats table stores grams already folded by the index's own
-        # normalization, so the brute-force side folds the column and compares
-        # the gram as stored
+        # trigrams() folds the way the index does, so the brute-force side
+        # folds the column and compares the gram as extracted
         literal = "'" + gram.replace("'", "''") + "'"
         sql = """
 SELECT (SELECT count(DISTINCT r) FROM (
           SELECT unnest(ngram_decode_postings(postings)) AS r
-          FROM {segments} WHERE gram = {g}))::BIGINT AS decoded,
+          FROM {segments} WHERE gram_key = ngram_gram_key({g})))::BIGINT AS decoded,
        (SELECT count(*) FROM docs
          WHERE rowid <= (SELECT hwm_rowid FROM {registry})
            AND contains({fold}, {g}))::BIGINT AS brute;

@@ -58,10 +58,10 @@ SELECT count(*) FROM ngram_search('t', 'tent');
 1
 
 # and nothing reports the index as stale
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('t');
 ----
-s	3	true	1	1	0	9	9	0	1	9	27	NULL
+s	ngram	3	3	true	1	1	0	9	9	0	1	9	27	NULL
 
 statement ok
 PRAGMA ngram_refresh('t');

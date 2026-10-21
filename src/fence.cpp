@@ -354,7 +354,9 @@ static void CheckPreparedMaintenance(ClientContext &context, const PreparedMaint
 	auto target = ResolveTarget(context, prepared.target.Qualified(), column_name, true);
 	auto column = ResolveMaintenanceColumn(context, prepared.fn.c_str(), target, prepared.location);
 	if (column.meta.hwm_rowid != prepared.meta.hwm_rowid ||
-	    column.meta.options.gram_size != prepared.meta.options.gram_size ||
+	    column.meta.options.tokenizer != prepared.meta.options.tokenizer ||
+	    column.meta.options.min_gram != prepared.meta.options.min_gram ||
+	    column.meta.options.max_gram != prepared.meta.options.max_gram ||
 	    column.meta.options.case_insensitive != prepared.meta.options.case_insensitive) {
 		throw InvalidInputException(
 		    "%s: the index on %s.%s changed while the statement was being prepared; run it again", prepared.fn,

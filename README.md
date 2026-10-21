@@ -1,7 +1,7 @@
 # ngram — exhaustive substring search for DuckDB
 
-`ngram` gives DuckDB a durable trigram index that accelerates substring search
-over large text columns:
+`ngram` gives DuckDB a durable n-gram index, of trigrams or of variable-length
+sparse grams, that accelerates substring search over large text columns:
 
 ```sql
 LOAD ngram;   -- from the built binary today; INSTALL ngram FROM community once the submission merges (see Installing)
@@ -28,6 +28,7 @@ read it, but guarded-table DML is unsupported without the custom index type.
 
 - [Installing](#installing)
 - [Quick start](#quick-start)
+- [Choosing a tokenizer](#choosing-a-tokenizer)
 - [The correctness contract](#the-correctness-contract)
 - [Staleness and fail-closed recovery](#staleness-and-fail-closed-recovery)
 - [Maintenance](#maintenance)
@@ -95,12 +96,59 @@ PRAGMA ngram_index_stats('logs');
 
 ---
 
+## Choosing a tokenizer
+
+An index cuts text into grams one of two ways, chosen when it is built:
+
+```sql
+PRAGMA create_ngram_index('logs', 'message');                          -- ngram(3), the default
+PRAGMA create_ngram_index('logs', 'message', gram = 4);                -- ngram(4)
+PRAGMA create_ngram_index('logs', 'message', tokenizer = 'sparse');    -- sparse(3, 8)
+PRAGMA create_ngram_index('logs', 'message', tokenizer = 'sparse', min_gram = 3, max_gram = 16);
+```
+
+- **`ngram`** stores every window of `gram` characters. It builds fastest and
+  stays smallest, about the size of the text.
+- **`sparse`** stores every window of `min_gram` characters plus longer
+  grams, up to `max_gram` characters, whose inner character pairs all hash
+  lower than the pairs at their two ends. A query probes the rarest of the
+  needle's covering grams, those no longer gram of the needle contains, so
+  `history` can probe the rare `istory` where a trigram index has only `his`,
+  `ist`, `sto`, `tor` and `ory` to choose from.
+
+On enwik9 (10.9 million lines, `docs/sparse-grams.md`):
+
+| | `ngram(3)` | `sparse(3, 8)` |
+| --- | ---: | ---: |
+| Build | 5.2 s | 16.0 s |
+| Index size | 0.93 GiB | 2.30 GiB |
+| `history` | 117 ms (scan) | 14 ms |
+| `the United States` | 130 ms (scan) | 10 ms |
+| `References` | 17 ms | 9 ms |
+| `supercalifragilistic` | 1 ms | 2 ms |
+
+Choose `sparse` when needles are words, phrases or identifiers built from
+common pieces, the needles a trigram index answers by scanning; keep `ngram`
+when index size or build time matters more, or when needles are already rare
+at the trigram level. Both tokenizers answer exactly. Changing tokenizer
+means dropping and rebuilding the index.
+
+`ngram_indexes()` and `ngram_index_stats()` report each index's tokenizer;
+`EXPLAIN ANALYZE` prints `Ngram Tokenizer` and the grams it probed (`Ngram
+Probe Grams`); `sparse_grams('text')` shows the grams a sparse index stores.
+[`benchmarks/CLICKHOUSE_SPARSE.md`](benchmarks/CLICKHOUSE_SPARSE.md) compares
+`sparse(3, 8)` with ClickHouse's `sparseGrams(3, 8)` text index.
+
+---
+
 ## The correctness contract
 
-A row that contains `needle` necessarily contains every trigram of `needle`.
-Intersecting the posting lists of those trigrams therefore yields a **superset**
-of the true matches. Everything the index does to go faster — probing only the
-rarest few trigrams, skipping segments, letting the index lag behind the table —
+A row that contains `needle` necessarily contains every gram of `needle`: every
+trigram, and for a sparse index every sparse gram, because whether a substring
+is a sparse gram depends only on its own characters. Intersecting the posting
+lists of those grams therefore yields a **superset** of the true matches.
+Everything the index does to go faster — probing only the rarest few grams,
+skipping segments, letting the index lag behind the table —
 can only make that superset larger, never smaller.
 
 The answer is then narrowed to exactly the truth by four mechanisms:
@@ -124,8 +172,8 @@ The answer is then narrowed to exactly the truth by four mechanisms:
    durable state is uncertain, explicit and transparent search perform one
    full scan instead of trusting postings.
 
-Short needles (fewer characters than the gram size, 3 by default) cannot be
-probed at all. Those queries fall back to a full scan — slower, still exact.
+Short needles (fewer characters than the index's shortest gram, 3 by default)
+cannot be probed at all. Those queries fall back to a full scan — slower, still exact.
 
 ### Case sensitivity
 
@@ -356,7 +404,7 @@ is the storage aggregation to read before deciding on maintenance.
 
 | Column | Meaning |
 | --- | --- |
-| `column_name`, `gram_size`, `case_insensitive` | the options the index was built with |
+| `column_name`, `tokenizer`, `min_gram`, `max_gram`, `case_insensitive` | the options the index was built with; an `ngram` index has `min_gram = max_gram` |
 | `hwm_rowid` | the highest rowid the index covers |
 | `table_max_rowid` | the highest committed live rowid of the table; below `hwm_rowid` once deletes have emptied the end of the indexed range |
 | `remaining_tail` | committed rows past `hwm_rowid`: what the tail scan actually reads, and what a refresh would index (the rowid gap counts deleted rows, this does not) |
@@ -376,6 +424,7 @@ is the storage aggregation to read before deciding on maintenance.
 ```sql
 PRAGMA create_ngram_index('table', 'column');
 PRAGMA create_ngram_index('table', 'column', gram = 3, case_insensitive = true);
+PRAGMA create_ngram_index('table', 'column', tokenizer = 'sparse', min_gram = 3, max_gram = 8);
 PRAGMA drop_ngram_index('table', 'column');
 PRAGMA drop_ngram_index('index_ref');                          -- in the current database
 PRAGMA drop_ngram_index('index_ref', catalog = 'database_name');
@@ -386,14 +435,25 @@ PRAGMA ngram_indexes;                   -- the same rows, ordered
 
 `ngram_indexes()` is the cheap lifecycle listing: one row per registry row or
 stray storage object, with `database_name`, `index_ref`, `schema_name`,
-`table_name`, `column_name`, `format_version`, `status` and `reason`, observed
+`table_name`, `column_name`, `tokenizer` (`ngram(3)`, `sparse(3, 8)`),
+`format_version`, `status` and `reason`, observed
 when the statement executes. It composes like any table function, so
 `SELECT * FROM ngram_indexes() WHERE index_ref = ...` is the status of one
 index and `... WHERE status <> 'READY'` the list of what needs attention.
 
-`gram` is the number of characters per gram (default 3). Larger grams are more
-selective but cannot answer needles shorter than themselves; smaller grams
-accept shorter needles but propose far more candidates.
+The named options choose how the index cuts text into grams
+([Choosing a tokenizer](#choosing-a-tokenizer)):
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `tokenizer` | `'ngram'` | `'ngram'` or `'sparse'`, case-insensitively |
+| `gram` | `3` | an `ngram` index's characters per gram. Larger grams are more selective but cannot answer needles shorter than themselves; smaller grams accept shorter needles but propose far more candidates |
+| `min_gram`, `max_gram` | `3`, `8` | a `sparse` index's shortest and longest gram, `3 <= min_gram <= max_gram <= 64`. `min_gram` is the shortest needle the index answers |
+| `case_insensitive` | `true` | fold case before extracting grams ([Case sensitivity](#case-sensitivity)) |
+
+`gram` belongs to `ngram` and `min_gram`/`max_gram` to `sparse`; naming the
+other tokenizer's option is an error. Changing any option means dropping and
+rebuilding the index.
 
 Indexes are supported on `VARCHAR` columns of DuckDB base tables. Views,
 temporary tables, tables in foreign catalogs (SQLite, Postgres, …), tables with
@@ -402,7 +462,10 @@ generated columns, and tables with a user column named `rowid` are rejected.
 Each new index receives a canonical UUIDv4 `index_ref`. Its metadata is one
 row of `__ngram.registry`; its postings are the table `__ngram.segments_<id>`,
 named by the id without dashes and sorted by a fixed-width key of each gram
-(`ngram_gram_key`). A query reads the segment rows of every gram of its needle
+(`ngram_gram_key`). A sparse index keys each gram longer than `min_gram` by one
+of 2^20 hash buckets instead, which bounds the rows its many rare long grams
+add; a bucket's postings are a superset that the intersection and the recheck
+narrow. A query reads the segment rows of every gram of its needle
 to pick the rarest ones, so the index keeps no separate statistics. Use the
 catalog-qualified drop form whenever the base table or indexed column has
 disappeared; copied attached databases may legitimately contain the same
@@ -506,8 +569,8 @@ scans into an `Ngram Index Scan`. It fires for `contains(col, 'lit')`,
 
 It declines — leaving an ordinary sequential scan — for `_` wildcards, `ESCAPE`
 clauses, anchored/prefix/suffix patterns, `NOT LIKE`, `OR`-ed predicates,
-expressions over the column (`lower(col) LIKE …`), needles shorter than the gram
-size, tables with no index on that column, and any state where the rowid guard
+expressions over the column (`lower(col) LIKE …`), needles shorter than the
+index's `min_gram`, tables with no index on that column, and any state where the rowid guard
 cannot prove the indexed prefix safe.
 
 `EXPLAIN` shows which happened:
@@ -517,7 +580,9 @@ EXPLAIN SELECT * FROM logs WHERE message LIKE '%reset%';
 -- ... Ngram Index Scan  Table: logs  Ngram Column: message  Ngram Needles: reset
 
 EXPLAIN ANALYZE SELECT * FROM logs WHERE message LIKE '%reset%';
+-- ... Ngram Tokenizer: ngram(3)
 -- ... Ngram Mode: index (<= 1423 candidates, 9012 decoded rowids)
+-- ... Ngram Probe Grams: 'res', 'ese', 'set'
 -- or   Ngram Mode: full scan fallback: candidate fraction exceeded
 ```
 
@@ -526,15 +591,17 @@ Two kill switches: `SET ngram_auto_accelerate = false`, and DuckDB's own
 
 ### Diagnostic helpers
 
-These expose the pieces the index is built from. `trigrams` is a general text
-helper; the rest are for inspecting an index, reproducing its build steps, and
-tests. `ngram_candidates` above belongs to the same family.
+These expose the pieces the index is built from. `trigrams` and `sparse_grams`
+are general text helpers; the rest are for inspecting an index, reproducing its
+build steps, and tests. `ngram_candidates` above belongs to the same family.
 
 ```sql
 SELECT trigrams('hello');                     -- ['hel', 'ell', 'llo']
 SELECT trigrams('Hello', 4, false);           -- gram size 4, case-sensitive
+SELECT sparse_grams('Hello World');           -- the grams a sparse(3, 8) index stores
+SELECT sparse_grams('Hello', 3, 16, false);   -- min_gram, max_gram, case-sensitive
 SELECT ngram_gram_key('hel');                 -- the storage key of one normalized gram
-SELECT ngram_gram_keys('Hello', 3, true);     -- keys of a text's distinct grams, ascending
+SELECT ngram_gram_keys('Hello', 'sparse', 3, 8, true);  -- keys of a text's distinct grams, ascending
 SELECT ngram_encode_postings([1, 2, 5]);      -- posting blob codec
 SELECT ngram_decode_postings(blob);
 SELECT ngram_pack_segment(rowid) FROM t;      -- the build's aggregate: one segment's postings row
@@ -550,7 +617,7 @@ SELECT * FROM ngram_unpack_postings(           -- every (gram_key, segment_no, r
 | --- | --- | --- |
 | `ngram_auto_accelerate` | `false` | Whether plain `LIKE`/`contains`/`ILIKE` may be rewritten to use the index. Rewrites are exhaustive and resource-bounded, including guard-, work-, memory-, and density-driven full-scan fallback. It remains opt-in so enabling the extension does not silently change query plans. |
 | `ngram_max_candidate_fraction` | `0.02` | A full-result ngram query scans instead of probing when its fetch-equivalent candidate bound exceeds this fraction of the indexed rows. The bound counts each candidate of a scattered segment as one fetch, discounts a segment whose candidates could be read as range scans to its rowid span over four, and multiplies by one plus the projected columns beyond the recheck's, charged per candidate because the match rate is unknown at planning and every such column is one more fetch per kept row. The raw candidate API does not use this fetch-versus-scan policy. The default is the measured break-even on enwik9 (`docs/review/2026-09-09`): a scattered fetch costs 0.8 to 1.5 µs of CPU at one thread and 0.22 to 0.29 µs of wall time at 24 threads against 92 ns and 6.3 ns for a scanned row; a needle with a 3.2% candidate bound still beats the scan at every thread count, one at 3.6% loses at 24 threads, and 2% rounds toward scanning. |
-| `ngram_max_grams_per_query` | `3` | How many of the needle's rarest grams to probe. Each extra gram costs another posting-list decode but can narrow the candidate set; the default balances those costs for natural-language text. |
+| `ngram_max_grams_per_query` | `3` | How many of the needle's rarest grams to probe; for a sparse index, the rarest of its covering grams. Each extra gram costs another posting-list decode but can narrow the candidate set; the default balances those costs for natural-language text. |
 | `ngram_max_probe_rowids` | `100000000` | Hard upper bound on posting rowids decoded by one query. Exact query paths scan instead when the estimate exceeds it; `ngram_candidates` returns a resource-limit error. |
 | `ngram_build_partitions` | `0` | How many rowid-range partitions `create_ngram_index`, `ngram_refresh` and `ngram_compact` split their packing pass into. Build and refresh size zero from `memory_limit` using a sample; compact instead uses fine segment-aligned ranges without sampling the base. Because range width is rounded down to whole segments, auto can emit up to nearly twice its 4096-range request. An explicit value overrides either policy. Raise it if a build runs out of memory on unusually long rows, or lower it to pack in fewer passes. The index it produces is identical whatever you set. |
 
@@ -567,7 +634,7 @@ Worth tuning by hand if your data is unusual:
 
 - **A small alphabet** (hex dumps, base64, DNA) makes every gram dense, so the
   intersection needs more grams to bite. Try `ngram_max_grams_per_query = 4`
-  or higher, and consider `gram = 4` at build time.
+  or higher, and consider `gram = 4` or `tokenizer = 'sparse'` at build time.
 - **Long, highly distinctive needles** get nothing from extra grams — the first
   few may already isolate the answer, so raising the probe budget can add work
   without narrowing the candidate set.
@@ -645,8 +712,8 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
 
 ## Limitations
 
-- Needles shorter than the gram size cannot use the index (they fall back to a
-  full scan, still exact).
+- Needles shorter than the index's `min_gram` cannot use the index (they fall
+  back to a full scan, still exact).
 - No fuzzy or similarity ranking, and no general regular-expression support —
   only regexes that are a plain literal reduce to an indexable substring.
 - Guarded tables require `ngram` to be loaded for supported DML. Without it,

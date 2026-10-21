@@ -315,7 +315,7 @@ PRAGMA create_ngram_index('rg100', 's', case_insensitive=false);
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('rg100', 'ne');
 ----
-analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: needle shorter than gram size".*
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: needle shorter than min_gram".*
 
 query I
 SELECT count(*) = (SELECT count(*) FROM rg100 WHERE contains(s, 'ne')) FROM ngram_search('rg100', 'ne');

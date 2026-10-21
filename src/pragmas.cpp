@@ -64,26 +64,54 @@ static void ParseRefreshParameters(const FunctionParameters &parameters, string 
 	}
 }
 
-//! Gram size and case flag from create_ngram_index's named parameters.
+//! The tokenizer, its gram lengths and the case flag from create_ngram_index's
+//! named parameters: `gram` sizes an ngram index, `min_gram` and `max_gram`
+//! bound a sparse one.
 static GramOptions ParseCreateOptions(const FunctionParameters &parameters) {
-	int32_t gram_size = 3;
 	GramOptions options;
+	optional_idx gram;
+	optional_idx min_gram;
+	optional_idx max_gram;
+	auto length = [](const char *name, const Value &value) {
+		auto size = value.GetValue<int32_t>();
+		if (size < 1) {
+			throw InvalidInputException("create_ngram_index: %s must be at least 1, got %d", name, size);
+		}
+		return optional_idx(NumericCast<idx_t>(size));
+	};
 	for (auto &entry : parameters.named_parameters) {
 		if (entry.second.IsNull()) {
 			throw BinderException("create_ngram_index: parameter %s cannot be NULL", entry.first);
 		}
-		if (entry.first == "gram") {
-			gram_size = entry.second.GetValue<int32_t>();
+		if (entry.first == "tokenizer") {
+			options.tokenizer = ParseTokenizer(entry.second.ToString(), "create_ngram_index");
+		} else if (entry.first == "gram") {
+			gram = length("gram", entry.second);
+		} else if (entry.first == "min_gram") {
+			min_gram = length("min_gram", entry.second);
+		} else if (entry.first == "max_gram") {
+			max_gram = length("max_gram", entry.second);
 		} else if (entry.first == "case_insensitive") {
 			options.case_insensitive = entry.second.GetValue<bool>();
 		} else {
 			throw BinderException("create_ngram_index: unknown named parameter %s", entry.first);
 		}
 	}
-	if (gram_size < 1) {
-		throw InvalidInputException("create_ngram_index: gram must be at least 1, got %d", gram_size);
+	if (options.tokenizer == GramTokenizer::NGRAM) {
+		if (min_gram.IsValid() || max_gram.IsValid()) {
+			throw BinderException("create_ngram_index: min_gram and max_gram apply to a sparse index (tokenizer = "
+			                      "'sparse'); an ngram index takes gram");
+		}
+		options.min_gram = options.max_gram = gram.IsValid() ? gram.GetIndex() : 3;
+	} else {
+		if (gram.IsValid()) {
+			throw BinderException("create_ngram_index: gram applies to an ngram index; a sparse index takes min_gram "
+			                      "and max_gram");
+		}
+		options.min_gram = min_gram.IsValid() ? min_gram.GetIndex() : DEFAULT_SPARSE_MIN_GRAM;
+		options.max_gram = max_gram.IsValid() ? max_gram.GetIndex() : DEFAULT_SPARSE_MAX_GRAM;
 	}
-	options.gram_size = NumericCast<idx_t>(gram_size);
+	ValidateGramOptions(options, "create_ngram_index");
 	return options;
 }
 
@@ -185,7 +213,8 @@ static string IndexStatsSelect(ClientContext &context, const string &table_input
 		// Rows this transaction appended carry provisional rowids past
 		// MAX_ROW_ID and are in neither.
 		rows +=
-		    "SELECT m.index_id::VARCHAR AS index_ref, m.column_name, m.gram_size, m.case_insensitive, "
+		    "SELECT m.index_id::VARCHAR AS index_ref, m.column_name, m.tokenizer, m.min_gram, m.max_gram, "
+		    "m.case_insensitive, "
 		    "m.hwm_rowid, " +
 		    subquery("coalesce(" + SystemFunction("max") + "(rowid), -1)::BIGINT FROM " + base + " WHERE true" +
 		             committed) +
@@ -203,7 +232,8 @@ static string IndexStatsSelect(ClientContext &context, const string &table_input
 		    " m WHERE m.index_id = " + Lit(location.index_ref) + "::UUID";
 	}
 	// the guard verdict of every index from one observation of the listing
-	return "SELECT s.column_name, s.gram_size, s.case_insensitive, s.hwm_rowid, s.table_max_rowid, "
+	return "SELECT s.column_name, s.tokenizer, s.min_gram, s.max_gram, s.case_insensitive, s.hwm_rowid, "
+	       "s.table_max_rowid, "
 	       "s.remaining_tail, s.distinct_grams, s.segments, s.fragmented_keys, s.generations, s.posting_entries, "
 	       "s.postings_bytes, i.reason AS stale_reason FROM (" +
 	       rows + ") s LEFT JOIN " + SystemFunction("ngram_indexes") +
@@ -240,10 +270,11 @@ struct IndexesGlobalState : public GlobalTableFunctionState {
 
 static unique_ptr<FunctionData> IndexesBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
-	names = {"database_name", "index_ref",      "schema_name", "table_name",
-	         "column_name",   "format_version", "status",      "reason"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR};
+	names = {"database_name", "index_ref",      "schema_name", "table_name", "column_name",
+	         "tokenizer",     "format_version", "status",      "reason"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR};
 	return make_uniq<TableFunctionData>();
 }
 
@@ -279,10 +310,11 @@ static void IndexesFunction(ClientContext &context, TableFunctionInput &data, Da
 		output.data[2].SetValue(i, text(row.schema_name));
 		output.data[3].SetValue(i, text(row.table_name));
 		output.data[4].SetValue(i, text(row.location.column_name));
-		output.data[5].SetValue(i, row.format_version < 0 ? Value(LogicalType::BIGINT)
+		output.data[5].SetValue(i, text(row.tokenizer));
+		output.data[6].SetValue(i, row.format_version < 0 ? Value(LogicalType::BIGINT)
 		                                                  : Value::BIGINT(row.format_version));
-		output.data[6].SetValue(i, Value(row.status));
-		output.data[7].SetValue(i, text(row.reason));
+		output.data[7].SetValue(i, Value(row.status));
+		output.data[8].SetValue(i, text(row.reason));
 	}
 	state.offset += count;
 	output.SetChildCardinality(count);
@@ -332,7 +364,11 @@ void RegisterPragmas(ExtensionLoader &loader) {
 	auto create_fun = PragmaFunction::PragmaCall("create_ngram_index", CreateNgramIndexQuery,
 	                                             {LogicalType::VARCHAR, LogicalType::VARCHAR});
 	create_fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
-		options.Add("gram", LogicalType::INTEGER).Add("case_insensitive", LogicalType::BOOLEAN);
+		options.Add("tokenizer", LogicalType::VARCHAR)
+		    .Add("gram", LogicalType::INTEGER)
+		    .Add("min_gram", LogicalType::INTEGER)
+		    .Add("max_gram", LogicalType::INTEGER)
+		    .Add("case_insensitive", LogicalType::BOOLEAN);
 	});
 	loader.RegisterFunction(create_fun);
 

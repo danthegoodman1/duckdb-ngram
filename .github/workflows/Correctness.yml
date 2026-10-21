@@ -96,12 +96,15 @@ jobs:
           timeout 600s python3 benchmarks/release_evidence.py check
           timeout 600s python3 benchmarks/release_evidence.py test --binary build/release/duckdb
 
-      - name: Run fixed-seed differential and churn gates
+      - name: Run fixed-seed sparse-gram, differential and churn gates
         shell: bash
         run: |
           set -euo pipefail
-          timeout 600s python3 scripts/differential_search.py --duckdb build/release/duckdb --trials 2 --rows 5000 --seed 20261314
-          timeout 600s python3 scripts/differential_search.py --duckdb build/release/duckdb --transparent --trials 2 --rows 5000 --seed 20261315
+          timeout 600s python3 scripts/sparse_grams_check.py --duckdb build/release/duckdb --cases 3000 --seed 1
+          timeout 600s python3 scripts/differential_search.py --duckdb build/release/duckdb --tokenizer ngram --trials 2 --rows 5000 --seed 20261314
+          timeout 600s python3 scripts/differential_search.py --duckdb build/release/duckdb --tokenizer ngram --transparent --trials 2 --rows 5000 --seed 20261315
+          timeout 600s python3 scripts/differential_search.py --duckdb build/release/duckdb --tokenizer sparse --trials 2 --rows 5000 --seed 20261320
+          timeout 600s python3 scripts/differential_search.py --duckdb build/release/duckdb --tokenizer sparse --transparent --trials 2 --rows 5000 --seed 20261321
           timeout 600s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 20 --rows 4000 --seed 20261316
           timeout 600s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 20 --rows 4000 --seed 20261318 --no-stale-expected
 

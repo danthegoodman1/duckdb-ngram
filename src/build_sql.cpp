@@ -87,7 +87,8 @@ string PackRangesStatements(const string &packed, const ResolvedTarget &target, 
                             const GramOptions &options, const vector<pair<int64_t, int64_t>> &ranges) {
 	auto column = Ident(column_name);
 	auto keys = SystemFunction("unnest") + "(" + SystemFunction("ngram_gram_keys") + "(" + column + ", " +
-	            to_string(options.gram_size) + ", " + (options.case_insensitive ? "true" : "false") + ")) AS gram_key";
+	            Lit(TokenizerName(options.tokenizer)) + ", " + to_string(options.min_gram) + ", " +
+	            to_string(options.max_gram) + ", " + (options.case_insensitive ? "true" : "false") + ")) AS gram_key";
 	string script;
 	for (idx_t i = 0; i < ranges.size(); i++) {
 		script += PackPartitionStatement(
@@ -116,7 +117,7 @@ idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs) {
 }
 
 int64_t EstimateGramCount(ClientContext &context, TableCatalogEntry &table, const string &column, int64_t min_rowid,
-                          int64_t max_rowid, idx_t gram_size) {
+                          int64_t max_rowid, const GramOptions &options) {
 	if (min_rowid < 0 || max_rowid < min_rowid || !table.ColumnExists(Identifier(column))) {
 		return 0;
 	}
@@ -148,9 +149,10 @@ int64_t EstimateGramCount(ClientContext &context, TableCatalogEntry &table, cons
 		}
 		// byte length rather than character length: a row of multi-byte text
 		// yields fewer grams than it has bytes, and overestimating only costs
-		// partitions
+		// partitions. A sparse tokenizer yields at most two grams per window.
 		auto length = NumericCast<int64_t>(StringValue::Get(value).size());
-		sampled_grams += MaxValue<int64_t>(length - NumericCast<int64_t>(gram_size) + 1, 0);
+		auto windows = MaxValue<int64_t>(length - NumericCast<int64_t>(options.min_gram) + 1, 0);
+		sampled_grams += options.tokenizer == GramTokenizer::SPARSE ? 2 * windows : windows;
 	}
 	// rows deleted since they were written drop out of the fetch but still
 	// count in the span, which biases the estimate upwards again
@@ -249,7 +251,8 @@ static string RegistryInsertStatement(const ResolvedTarget &target, const IndexL
 	       Lit(location.index_ref) + "::UUID, " + SystemFunction("from_hex") + "(" +
 	       Lit(Hex(OwnerKey(target.schema_name, target.table_name, location.column_name))) + "), " +
 	       Lit(target.schema_name) + ", " + Lit(target.table_name) + ", " + Lit(location.column_name) + ", " +
-	       to_string(NGRAM_FORMAT_VERSION) + ", " + to_string(options.gram_size) + ", " +
+	       to_string(NGRAM_FORMAT_VERSION) + ", " + Lit(TokenizerName(options.tokenizer)) + ", " +
+	       to_string(options.min_gram) + ", " + to_string(options.max_gram) + ", " +
 	       (options.case_insensitive ? "true" : "false") + ", " + committed_hwm + ", " + Lit(location.guard_name) +
 	       ", (SELECT guard_token FROM " + fence + "));\n";
 }
@@ -258,6 +261,9 @@ string CreateIndexScript(ClientContext &context, const ResolvedTarget &target, c
 	optional_ptr<TableCatalogEntry> entry = target.entry;
 	auto &table = entry->Cast<DuckTableEntry>();
 	auto registry = ReadRegistryForCreate(context, target.catalog_name);
+	// an empty registry of an older shape is dropped and bootstrapped anew
+	auto replaces_registry = registry.shape != RegistryShape::CURRENT;
+	auto registry_oid = replaces_registry ? 0 : registry.oid;
 	auto table_target = target;
 	table_target.column_name.clear();
 	auto siblings = Locations(registry, table_target, false);
@@ -297,25 +303,30 @@ string CreateIndexScript(ClientContext &context, const ResolvedTarget &target, c
 	prepared.fn = "create_ngram_index";
 	prepared.target = target;
 	prepared.location = location;
-	prepared.location.registry_oid = registry.oid;
-	prepared.bootstrap = !registry.oid;
+	prepared.location.registry_oid = registry_oid;
+	prepared.bootstrap = !registry_oid;
 	script += "CREATE TEMP TABLE " + fence + " AS SELECT " +
 	          PreparedMaintenanceCall(context, NewMaintenanceGroup(context), std::move(prepared)) + " AS ignored, " +
 	          (siblings.empty() ? string("NULL::VARCHAR") : Lit(location.guard_token)) + " AS guard_token;\n";
 	if (siblings.empty()) {
 		script += FreshGuardStatements(context, table, target, location, fence);
 	}
-	if (!registry.oid) {
+	if (replaces_registry) {
+		script += "DROP TABLE " + Registry(target.catalog_name) + ";\n";
+	}
+	if (!registry_oid) {
 		script += "CREATE SCHEMA IF NOT EXISTS " + Ident(target.catalog_name) + "." + Ident(NGRAM_SCHEMA) + ";\n";
-		script += "CREATE TABLE " + Registry(target.catalog_name) +
-		          "(registry_version INTEGER NOT NULL, index_id UUID PRIMARY KEY, owner_key BLOB UNIQUE NOT NULL, "
-		          "schema_name VARCHAR NOT NULL, table_name VARCHAR NOT NULL, column_name VARCHAR NOT NULL, "
-		          "format_version BIGINT NOT NULL, gram_size BIGINT NOT NULL, case_insensitive BOOLEAN NOT NULL, "
-		          "hwm_rowid BIGINT NOT NULL, guard_name VARCHAR NOT NULL, guard_token VARCHAR NOT NULL);\n";
+		script +=
+		    "CREATE TABLE " + Registry(target.catalog_name) +
+		    "(registry_version INTEGER NOT NULL, index_id UUID PRIMARY KEY, owner_key BLOB UNIQUE NOT NULL, "
+		    "schema_name VARCHAR NOT NULL, table_name VARCHAR NOT NULL, column_name VARCHAR NOT NULL, "
+		    "format_version BIGINT NOT NULL, tokenizer VARCHAR NOT NULL, min_gram BIGINT NOT NULL, max_gram BIGINT "
+		    "NOT NULL, case_insensitive BOOLEAN NOT NULL, "
+		    "hwm_rowid BIGINT NOT NULL, guard_name VARCHAR NOT NULL, guard_token VARCHAR NOT NULL);\n";
 	}
 	script += RegistryInsertStatement(target, location, options, fence);
 	auto partitions = BuildPartitionCount(
-	    context, EstimateGramCount(context, table, location.column_name, 0, total_rows - 1, options.gram_size));
+	    context, EstimateGramCount(context, table, location.column_name, 0, total_rows - 1, options));
 	script += PackRangesStatements(packed, target, location.column_name, options,
 	                               SegmentAlignedRanges(0, total_rows - 1, partitions));
 	// key order is what makes the probe's `gram_key = ?` filter prune row groups
@@ -344,7 +355,8 @@ string DropIndexScript(ClientContext &context, const ObservedIndex &index) {
 	auto guard_name = index.location.guard_name;
 	auto guard_token = index.location.guard_token;
 	vector<string> storage;
-	if (index.legacy) {
+	auto legacy = index.registry_shape == RegistryShape::IDENTITY_ONLY;
+	if (legacy) {
 		// Registry version 1 (format 3) kept meta, segments and stats in a schema
 		// named by the index id and gave every index its own guard. This is the
 		// only place that layout is known.
@@ -369,12 +381,18 @@ string DropIndexScript(ClientContext &context, const ObservedIndex &index) {
 			auto hex = StringUtil::Replace(index_ref, "-", "");
 			storage.push_back("DROP TABLE IF EXISTS " + StorageTable(index.catalog_name, "stats_" + hex) + ";\n");
 		}
+		// a registry of an earlier layout goes with its last row, so the next
+		// create starts a current one
+		if (index.registry_shape != RegistryShape::CURRENT &&
+		    ReadRegistry(context, index.catalog_name).rows.size() == 1) {
+			storage.push_back("DROP TABLE " + Registry(index.catalog_name) + ";\n");
+		}
 	}
 	// The guard goes with the last index that records it, once the exact
 	// incarnation (name, type, table, token) is proven at execution time. An
 	// absent guard is fine; a same-named guard of another incarnation blocks.
 	auto drop_guard = base_exists && !guard_name.empty() &&
-	                  (index.legacy || OtherGuardReferences(context, table_target, guard_name, index_ref) == 0);
+	                  (legacy || OtherGuardReferences(context, table_target, guard_name, index_ref) == 0);
 
 	string script;
 	auto fence = ScratchName("fence");

@@ -118,18 +118,32 @@ PARITY_COLUMNS = ("index_minus_scan", "scan_minus_index")
 EXPLAIN_TEMPLATE = "EXPLAIN ANALYZE " + SEARCH_TEMPLATE
 
 STATS_COLUMNS = tuple(
-    "column_name gram_size case_insensitive hwm_rowid table_max_rowid remaining_tail "
+    "column_name tokenizer min_gram max_gram case_insensitive hwm_rowid table_max_rowid remaining_tail "
     "distinct_grams segments fragmented_keys generations posting_entries postings_bytes stale_reason".split()
 )
 REGISTRY_COLUMNS = tuple(
+    "database_name index_ref schema_name table_name column_name tokenizer format_version status reason".split()
+)
+#! Artifacts collected under storage formats 3 and 5 recorded these shapes.
+#! They stay verifiable until the corpus is re-collected under format 6.
+FORMAT5_STATS_COLUMNS = tuple(
+    "column_name gram_size case_insensitive hwm_rowid table_max_rowid remaining_tail "
+    "distinct_grams segments fragmented_keys generations posting_entries postings_bytes stale_reason".split()
+)
+FORMAT5_REGISTRY_COLUMNS = tuple(
     "database_name index_ref schema_name table_name column_name format_version status reason".split()
 )
-#! Artifacts collected under storage format 3 recorded this listing shape. They
-#! stay verifiable until the corpus is re-collected under the current format.
 FORMAT3_REGISTRY_COLUMNS = tuple(
     "database_name kind index_ref schema_name table_name column_name storage_schema "
     "format_version status reason".split()
 )
+#! format -> (stats columns, listing columns), keyed by what a collection recorded.
+LAYOUTS = {
+    6: (STATS_COLUMNS, REGISTRY_COLUMNS),
+    5: (FORMAT5_STATS_COLUMNS, FORMAT5_REGISTRY_COLUMNS),
+    3: (FORMAT5_STATS_COLUMNS, FORMAT3_REGISTRY_COLUMNS),
+}
+INDEX_FORMAT = 6
 MACHINE_KEYS = (
     "os kernel architecture cpu_model logical_cpus memory_bytes governors filesystem mount "
     "device_model rotational c_compiler c_flags cxx_compiler cxx_flags compiler_launcher linker "
@@ -468,7 +482,7 @@ def integer_list(value, length, where):
         fail("%s must be an integer list of length %d" % (where, length))
     for index, item in enumerate(value):
         integer(item, "%s[%d]" % (where, index))
-def validate_run(record, pair, stage, corpus, registry_columns):
+def validate_run(record, pair, stage, corpus, index_format):
     exact(record, RUN_KEYS, "run")
     if record["pair"] != pair or record["stage"] != stage:
         fail("run pairing/order differs")
@@ -491,38 +505,57 @@ def validate_run(record, pair, stage, corpus, registry_columns):
         if state != expected:
             fail("relation/corpus mismatch")
         return
-    if type(state) is not list or len(state) != 14:
+    stats_columns, registry_columns = LAYOUTS[index_format]
+    if type(state) is not list or len(state) != len(stats_columns) + 1:
         fail("invalid build-state shape")
-    if state[:2] != ["text", 3] or type(state[2]) is not bool or state[2]:
+    stats = dict(zip(stats_columns, state))
+    if index_format >= 6:
+        settings = [stats["tokenizer"], stats["min_gram"], stats["max_gram"]]
+        if settings != ["ngram", 3, 3]:
+            fail("index settings mismatch")
+    elif stats["gram_size"] != 3 or type(stats["gram_size"]) is not int:
         fail("index settings mismatch")
-    for index in range(1, 12):
-        if index != 2:
-            integer(state[index], "build.state[%d]" % index)
-    expected = [corpus["rows"] - 1, corpus["rows"] - 1, 0]
-    registry = state[13]
+    if stats["column_name"] != "text" or type(stats["case_insensitive"]) is not bool or stats["case_insensitive"]:
+        fail("index settings mismatch")
+    counts = ("hwm_rowid table_max_rowid remaining_tail distinct_grams segments fragmented_keys generations "
+              "posting_entries postings_bytes").split()
+    for name in counts:
+        integer(stats[name], "build.state.%s" % name)
+    registry = state[-1]
     if type(registry) is not list or len(registry) != len(registry_columns):
         fail("invalid registry evidence")
     row = dict(zip(registry_columns, registry))
     if any(type(row[name]) is not str for name in registry_columns if name not in ("format_version", "reason")):
         fail("invalid registry strings")
     integer(row["format_version"], "registry.format", 1)
-    if state[3:6] != expected or state[9] != 1 or state[12] is not None:
+    expected = [corpus["rows"] - 1, corpus["rows"] - 1, 0]
+    if ([stats["hwm_rowid"], stats["table_max_rowid"], stats["remaining_tail"]] != expected
+            or stats["generations"] != 1 or stats["stale_reason"] is not None):
         fail("index maintenance gate failed")
     if [row["schema_name"], row["table_name"], row["column_name"]] != ["main", "docs", "text"]:
         fail("registry identity mismatch")
     if row["database_name"] != "run-%d" % pair:
         fail("registry database mismatch")
-    format3 = registry_columns == FORMAT3_REGISTRY_COLUMNS
-    if row["status"] != "READY" or row["reason"] is not None or row["format_version"] != (3 if format3 else 5):
+    if row["status"] != "READY" or row["reason"] is not None or row["format_version"] != index_format:
         fail("registry status/format mismatch")
+    if index_format >= 6 and row["tokenizer"] != "ngram(3)":
+        fail("registry tokenizer mismatch")
     if not INDEX_REF.fullmatch(row["index_ref"]):
         fail("registry allocation mismatch")
-    if format3 and (row["kind"] != "registered"
-                    or row["storage_schema"] != "__ngram_idx_" + row["index_ref"].replace("-", "_")):
+    if index_format == 3 and (row["kind"] != "registered"
+                              or row["storage_schema"] != "__ngram_idx_" + row["index_ref"].replace("-", "_")):
         fail("registry allocation mismatch")
-    for index in (6, 7, 10, 11):
-        if state[index] < 1:
+    for name in ("distinct_grams", "segments", "posting_entries", "postings_bytes"):
+        if stats[name] < 1:
             fail("nonpositive index stats")
+def artifact_format(protocol):
+    """The index format whose stats and listing shapes the collection recorded."""
+    if type(protocol) is dict:
+        for index_format, (stats_columns, registry_columns) in LAYOUTS.items():
+            if (protocol.get("stats_columns") == list(stats_columns)
+                    and protocol.get("registry_columns") == list(registry_columns)):
+                return index_format
+    return INDEX_FORMAT
 def validate_artifact(artifact, *, provenance=False, source=False, binary=None):
     """`provenance` adds the gitlink and ancestry checks; `source` adds the
     working-tree digest and tool hash checks on top of them."""
@@ -533,10 +566,11 @@ def validate_artifact(artifact, *, provenance=False, source=False, binary=None):
     fixed_top = {"schema": SCHEMA, "benchmark_id": BENCHMARK_ID}
     pinned(artifact, fixed_top, "artifact")
     protocol = artifact["protocol"]
-    registry_columns = REGISTRY_COLUMNS
-    if type(protocol) is dict and protocol.get("registry_columns") == list(FORMAT3_REGISTRY_COLUMNS):
-        registry_columns = FORMAT3_REGISTRY_COLUMNS
-    frozen(protocol, dict(PROTOCOL, registry_columns=list(registry_columns)), "protocol")
+    index_format = artifact_format(protocol)
+    stats_columns, registry_columns = LAYOUTS[index_format]
+    frozen(protocol, dict(PROTOCOL, stats_columns=list(stats_columns),
+                          build_state_columns=[*stats_columns, "registry_row"],
+                          registry_columns=list(registry_columns)), "protocol")
     timestamp = string(artifact["created_utc"], "created_utc", UTC)
     try:
         parsed = time.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
@@ -580,11 +614,11 @@ def validate_artifact(artifact, *, provenance=False, source=False, binary=None):
         fail("expected three run pairs")
     expected_runs = [(pair, stage) for pair in range(1, 4) for stage in ("load", "build")]
     for record, (pair, stage) in zip(runs, expected_runs):
-        validate_run(record, pair, stage, corpus, registry_columns)
-    build_states = [record["state"][:13] for record in runs[1::2]]
+        validate_run(record, pair, stage, corpus, index_format)
+    build_states = [record["state"][:-1] for record in runs[1::2]]
     if any(state != build_states[0] for state in build_states[1:]):
         fail("build states differ")
-    if build_states[0][8] != 0:
+    if dict(zip(stats_columns, build_states[0]))["fragmented_keys"] != 0:
         fail("fresh build is fragmented")
     cells, cell_map = artifact["query_cells"], {}
     if type(cells) is not list or len(cells) != len(NEEDLES):
@@ -982,28 +1016,14 @@ def index_state(binary, database):
     observed = registry[0]
     if (
         not INDEX_REF.fullmatch(observed["index_ref"])
-        or observed["format_version"] != 5
+        or observed["format_version"] != INDEX_FORMAT
         or observed["status"] != "READY"
         or observed["reason"] is not None
     ):
         fail("registry contract mismatch")
-    row = stats[0]
-    return [
-        row["column_name"],
-        row["gram_size"],
-        row["case_insensitive"],
-        row["hwm_rowid"],
-        row["table_max_rowid"],
-        row["remaining_tail"],
-        row["distinct_grams"],
-        row["segments"],
-        row["fragmented_keys"],
-        row["generations"],
-        int(row["posting_entries"]),
-        int(row["postings_bytes"]),
-        row["stale_reason"],
-        [observed[name] for name in REGISTRY_COLUMNS],
-    ]
+    row = dict(stats[0], posting_entries=int(stats[0]["posting_entries"]),
+               postings_bytes=int(stats[0]["postings_bytes"]))
+    return [row[name] for name in STATS_COLUMNS] + [[observed[name] for name in REGISTRY_COLUMNS]]
 def clean_build():
     build_root = ROOT / "build"
     target = build_root / "release"
@@ -1251,7 +1271,8 @@ def collect(args):
     temporary.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n")
     os.replace(temporary, artifact_path)
     print("wrote", artifact_path)
-def fixture():
+def fixture(index_format=INDEX_FORMAT):
+    """A synthetic artifact in the shapes `index_format` recorded."""
     runs = []
     for pair in range(1, 4):
         common = dict(
@@ -1263,8 +1284,13 @@ def fixture():
                  state=[10, 0, 9, 10, 1000, "3" * 64])
         )
         ref = "11111111-1111-4111-8111-111111111111"
-        registry = ["run-%d" % pair, ref, "main", "docs", "text", 5, "READY", None]
-        index_state_fixture = ["text", 3, False, 9, 9, 0, 8, 20, 0, 1, 100, 500, None, registry]
+        if index_format >= 6:
+            registry = ["run-%d" % pair, ref, "main", "docs", "text", "ngram(3)", 6, "READY", None]
+            settings = ["text", "ngram", 3, 3, False]
+        else:
+            registry = ["run-%d" % pair, ref, "main", "docs", "text", 5, "READY", None]
+            settings = ["text", 3, False]
+        index_state_fixture = settings + [9, 9, 0, 8, 20, 0, 1, 100, 500, None, registry]
         runs.append(
             dict(common, stage="build", storage=[2000 + pair, 8192, 0, 0], state=index_state_fixture)
         )
@@ -1288,10 +1314,15 @@ def fixture():
         }
     machine_info = {name: "fixture" for name in MACHINE_KEYS}
     machine_info.update(logical_cpus=24, memory_bytes=48 * 1024**3, rotational=False)
-    return make_artifact(
+    artifact = make_artifact(
         "2026-08-12T00:00:00Z", engine, corpus, machine_info,
         dict(FIXED_SETTINGS), runs, cells, samples,
     )
+    stats_columns, registry_columns = LAYOUTS[index_format]
+    artifact["protocol"] = dict(PROTOCOL, stats_columns=list(stats_columns),
+                                build_state_columns=[*stats_columns, "registry_row"],
+                                registry_columns=list(registry_columns))
+    return artifact
 def expect_failure(label, function):
     try:
         function()
@@ -1316,7 +1347,7 @@ def cli_smoke(binary):
             fail("real CLI relation digest smoke differs")
         run([str(binary), str(database)], stdin=BUILD_SQL)
         state = index_state(binary, database)
-        if state[:3] != ["text", 3, False] or state[13][6] != "READY":
+        if state[:5] != ["text", "ngram", 3, 3, False] or state[-1][7] != "READY":
             fail("real CLI index metadata smoke differs")
         exact_parity(binary, database, b"alpha".hex())
         samples = query_campaign(binary, database)
@@ -1325,6 +1356,11 @@ def cli_smoke(binary):
 def tests(binary):
     artifact = fixture()
     validate_artifact(artifact)
+    # the committed artifact may predate format 6; its shapes stay verifiable
+    format5 = fixture(5)
+    validate_artifact(format5)
+    format5["runs"][1]["state"][1] = 4
+    expect_failure("format-5 gram size", lambda: validate_artifact(format5))
     missing = object()
     def strict_load(text):
         return json.loads(
@@ -1350,8 +1386,11 @@ def tests(binary):
         ("parity", ("query_samples", 0, 3), 2),
         ("candidate", ("query_cells", 0, "candidates"), 0),
         ("result", ("query_cells", 0, "parity", 0), 1),
-        ("metadata", ("runs", 1, "state", 5), 1),
-        ("registry", ("runs", 1, "state", 13, 2), 7),
+        ("metadata", ("runs", 1, "state", 7), 1),
+        ("tokenizer", ("runs", 1, "state", 1), "sparse"),
+        ("bounds", ("runs", 1, "state", 3), 8),
+        ("registry", ("runs", 1, "state", 15, 2), 7),
+        ("registry tokenizer", ("runs", 1, "state", 15, 5), "sparse(3, 8)"),
     )
     for label, path, replacement in mutations:
         changed = json.loads(json.dumps(artifact))
@@ -1367,10 +1406,10 @@ def tests(binary):
     malformed_plan["query_cells"][0].update(mode="full-scan-fallback", explain="arbitrary plan")
     expect_failure("malformed EXPLAIN", lambda: validate_artifact(malformed_plan))
     mixed_build = json.loads(json.dumps(artifact))
-    mixed_build["runs"][3]["state"][6] += 1
+    mixed_build["runs"][3]["state"][8] += 1
     expect_failure("mixed build stats", lambda: validate_artifact(mixed_build))
     fragmented = json.loads(json.dumps(artifact))
-    for run_record in fragmented["runs"][1::2]: run_record["state"][8] = 1
+    for run_record in fragmented["runs"][1::2]: run_record["state"][10] = 1
     expect_failure("fragmented fresh build", lambda: validate_artifact(fragmented))
     expect_failure("noncanonical render", lambda: canonical_artifact(TOOL))
     expect_failure("full missing commit", lambda: missing_commit_policy(False, False, "engine"))

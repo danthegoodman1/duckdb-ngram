@@ -17,9 +17,9 @@ DEFAULT_DUCKDB = os.path.join(REPO, "build", "release", "duckdb")
 # The CLI switches to an agent output format when it sees a coding agent's
 # environment variables; the drivers parse its normal output.
 CLI_ENV = dict(os.environ, DUCKDB_AGENT_MODE="0")
-FORMAT_VERSION = "5"
+FORMAT_VERSION = "6"
 UUID_V4 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
-LISTING_COLUMNS = 8
+LISTING_COLUMNS = 9
 
 
 def sql_quote(text):
@@ -90,7 +90,7 @@ class Cli:
         catalog = self.rows(db_path, "SELECT current_database();")[0][0]
         rows = [row for row in self.rows(db_path, "PRAGMA ngram_indexes;")
                 if len(row) == LISTING_COLUMNS and row[0] == catalog
-                and row[2:5] == ["main", table, column] and row[5] == FORMAT_VERSION and row[6] in statuses]
+                and row[2:5] == ["main", table, column] and row[6] == FORMAT_VERSION and row[7] in statuses]
         if len(rows) != 1:
             raise RuntimeError("expected one format-%s %s.%s index in %s, found %d"
                                % (FORMAT_VERSION, table, column, ", ".join(statuses), len(rows)))

@@ -55,10 +55,10 @@ EXPLAIN SELECT count(*) FROM t WHERE s LIKE '%noop needle%';
 physical_plan	<REGEX>:.*Ngram Index Scan.*
 
 # postings_bytes depends on the postings codec, so it only has to be positive
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('t');
 ----
-s	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
+s	ngram	3	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
 
 # Byte-exact fingerprint of the segments table. A no-op call must leave it
 # equal to this; an emptied table hashes to NULL and fails the equality below.
@@ -171,10 +171,10 @@ SELECT (SELECT md5(string_agg(gram_key || ':' || segment_no || ':' || generation
 true
 
 # the same stats the build reported, after every in-process no-op call
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('t');
 ----
-s	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
+s	ngram	3	3	true	149999	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
 
 #===----------------------------------------------------------------------===#
 # the no-op shortcuts: a refresh with nothing past the mark and a merge of
@@ -369,10 +369,10 @@ true
 
 # the same stats the build reported, after the checkpointed round; the mark
 # stays at the last allocated rowid while the highest live rowid is 149999
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('t');
 ----
-s	3	true	150019	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
+s	ngram	3	3	true	150019	149999	0	262123	262123	0	1	5699477	<REGEX>:[1-9][0-9]*	NULL
 
 #===----------------------------------------------------------------------===#
 # the host's empty-batch-insert shape, assembled across calls in one user

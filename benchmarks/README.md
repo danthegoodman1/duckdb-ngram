@@ -17,8 +17,13 @@ that produce it. Two kinds of evidence live here:
   predates the current query and build engine; not a universal database
   ranking. Its artifacts record their own tool and binary digests and stay
   valid as a record of that source; the numbers are not the current release's.
+- **The sparse-gram comparison** (`artifacts/enwik9-clickhouse-sparse-vs-sparse-v1.json`,
+  [`CLICKHOUSE_SPARSE.md`](CLICKHOUSE_SPARSE.md)): the same harness with
+  `--tokenizer sparse`, DuckDB's `sparse(3, 8)` index against ClickHouse's
+  `text(tokenizer = sparseGrams(3, 8))`, measured on 2026-10-21 on DuckDB
+  v2.0.0 with the storage format 6 source that introduced sparse indexes.
 
-Both campaigns used:
+The trigram campaigns used:
 
 - The same 1 GB enwik9-derived line corpus: 10,920,423 rows and 986,852,975
   text bytes.
@@ -119,6 +124,26 @@ Values are medians with the three-sample range in parentheses.
 See the [detailed case-insensitive report](CLICKHOUSE_CASE_INSENSITIVE.md) and
 [raw case-insensitive artifact](artifacts/enwik9-clickhouse-text-ci-vs-ngram-v1.json).
 
+## Case-sensitive sparse grams
+
+DuckDB used `tokenizer='sparse', min_gram=3, max_gram=8, case_insensitive=false`.
+ClickHouse used `TYPE text(tokenizer = sparseGrams(3, 8))` with an exact `LIKE`
+recheck. The campaign otherwise follows the list above, on DuckDB v2.0.0.
+
+| Engine | Load median | Index build median | Index delta |
+| --- | ---: | ---: | ---: |
+| DuckDB | 4.126 s | 16.712 s | 2.411 GiB |
+| ClickHouse | 1.521 s | 104.377 s | 2.853 GiB |
+
+| Needle | Matches | DuckDB warm search | ClickHouse warm search | DuckDB cold search | ClickHouse cold search |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Rare | 1 | 2.0 ms | 5.9 ms | 9.0 ms | 25.1 ms |
+| Moderate | 26,068 | 6.0 ms | 71.4 ms | 121.0 ms | 143.5 ms |
+| Common | 1,963,067 | 55.0 ms | 104.6 ms | 128.0 ms | 248.7 ms |
+
+DuckDB built its sparse index 6.25x faster and stored it in 1.18x less space;
+ClickHouse loaded 2.71x faster. See the [detailed report](CLICKHOUSE_SPARSE.md).
+
 ## Reproducing the comparison
 
 The compact standard-library harness is
@@ -135,6 +160,13 @@ python3 benchmarks/clickhouse_compare.py collect --case-insensitive \
 python3 benchmarks/clickhouse_compare.py render \
   --artifact benchmarks/artifacts/enwik9-clickhouse-text-ci-vs-ngram-v1.json \
   --output benchmarks/CLICKHOUSE_CASE_INSENSITIVE.md
+
+python3 benchmarks/clickhouse_compare.py collect --tokenizer sparse \
+  --work .tmp/clickhouse-quick-sparse-run \
+  --output benchmarks/artifacts/enwik9-clickhouse-sparse-vs-sparse-v1.json
+python3 benchmarks/clickhouse_compare.py render \
+  --artifact benchmarks/artifacts/enwik9-clickhouse-sparse-vs-sparse-v1.json \
+  --output benchmarks/CLICKHOUSE_SPARSE.md
 ```
 
 The broader checked DuckDB-only benchmark and its provenance are documented in

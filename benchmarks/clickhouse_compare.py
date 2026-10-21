@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Small same-machine DuckDB ngram vs ClickHouse text-index benchmark."""
+"""Small same-machine DuckDB ngram vs ClickHouse text-index benchmark.
+
+`--tokenizer ngram` compares trigram indexes; `--tokenizer sparse` compares
+DuckDB's sparse(3, 8) index with ClickHouse's sparseGrams(3, 8) tokenizer.
+"""
 
 import argparse
 import hashlib
@@ -47,6 +51,7 @@ use_skip_indexes=0, use_skip_indexes_on_data_read=0,
 query_plan_direct_read_from_text_index=0, query_plan_text_index_add_hint=0,
 use_text_index_like_evaluation_by_dictionary_scan=0""".replace("\n", " ")
 TIMER = re.compile(r"Run Time \(s\): real (\d+)\.(\d{3})")
+SPARSE_BOUNDS = (3, 8)
 
 
 class BenchError(RuntimeError):
@@ -213,18 +218,24 @@ CHECKPOINT;
     return timed(lambda: run([binary, database], input_text=sql))
 
 
-def duck_build(binary, database, case_insensitive=False):
+def duck_index_options(case_insensitive=False, tokenizer="ngram"):
+    grams = "gram=3" if tokenizer == "ngram" else "tokenizer='sparse', min_gram=%d, max_gram=%d" % SPARSE_BOUNDS
+    return "%s, case_insensitive=%s" % (grams, str(case_insensitive).lower())
+
+
+def duck_build(binary, database, case_insensitive=False, tokenizer="ngram"):
     sql = DUCK_SETTINGS + """PRAGMA create_ngram_index(
- 'docs', 'text', gram=3, case_insensitive=%s);
+ 'docs', 'text', %s);
 CHECKPOINT;
-""" % str(case_insensitive).lower()
+""" % duck_index_options(case_insensitive, tokenizer)
     return timed(lambda: run([binary, database], input_text=sql))
 
 
-def ch_index_type(case_insensitive=False):
+def ch_index_type(case_insensitive=False, tokenizer="ngram"):
+    tokens = "ngrams(3)" if tokenizer == "ngram" else "sparseGrams(%d, %d)" % SPARSE_BOUNDS
     if case_insensitive:
-        return "text(tokenizer = ngrams(3), preprocessor = lowerUTF8(text))"
-    return "text(tokenizer = ngrams(3))"
+        return "text(tokenizer = %s, preprocessor = lowerUTF8(text))" % tokens
+    return "text(tokenizer = %s)" % tokens
 
 
 def ch_table_sql(with_index=False, case_insensitive=False):
@@ -242,10 +253,10 @@ FROM input('id UInt64, payload String') FORMAT TabSeparated"""
     return timed(lambda: server.query(insert, stdin_path=normalized))
 
 
-def ch_build(server, case_insensitive=False):
+def ch_build(server, case_insensitive=False, tokenizer="ngram"):
     sql = """ALTER TABLE docs ADD INDEX text_ngram text TYPE %s;
 ALTER TABLE docs MATERIALIZE INDEX text_ngram SETTINGS mutations_sync=2;"""
-    sql %= ch_index_type(case_insensitive)
+    sql %= ch_index_type(case_insensitive, tokenizer)
     return timed(lambda: server.query(sql))
 
 
@@ -480,7 +491,7 @@ def collect(args):
             if engine == "duckdb":
                 load_ns = duck_load(duckdb, duck_db, normalized)
                 base = file_size(duck_db)
-                build_ns = duck_build(duckdb, duck_db, args.case_insensitive)
+                build_ns = duck_build(duckdb, duck_db, args.case_insensitive, args.tokenizer)
                 indexed = file_size(duck_db)
                 stages.append({"repetition": repetition, "engine": engine, "load_ns": load_ns,
                                "build_ns": build_ns, "base_bytes": base["apparent_bytes"],
@@ -500,7 +511,7 @@ def collect(args):
                     load_ns = ch_load(server, normalized)
                     base_logical = ch_sizes(server)
                     base = tree_size(ch_root / "data")
-                    build_ns = ch_build(server, args.case_insensitive)
+                    build_ns = ch_build(server, args.case_insensitive, args.tokenizer)
                     indexed_logical = ch_sizes(server)
                     indexed = tree_size(ch_root / "data")
                     stages.append({"repetition": repetition, "engine": engine, "load_ns": load_ns,
@@ -551,8 +562,8 @@ def collect(args):
         if sets[0]["rows"] != next(iter(counts)):
             fail("result-set row count differs for %s" % query_id)
     artifact = {
-        "schema": ("duckdb-ngram-clickhouse-text-ci-quick-v1" if args.case_insensitive else
-                   "duckdb-ngram-clickhouse-text-quick-v1"),
+        "schema": "duckdb-ngram-clickhouse-%s%s-quick-v1" % (
+            "text" if args.tokenizer == "ngram" else "sparse", "-ci" if args.case_insensitive else ""),
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "scope": "same-machine point of reference; %d fresh load/build reps and %d warm query samples" %
                  (args.repetitions, args.samples),
@@ -568,9 +579,9 @@ def collect(args):
                     "logical_cpus": os.cpu_count()},
         "settings": {"threads": 24, "memory_limit": "48GiB",
                      "case_insensitive": args.case_insensitive,
-                     "clickhouse_index": ch_index_type(args.case_insensitive),
-                     "duckdb_index": "gram=3, case_insensitive=%s" %
-                                     str(args.case_insensitive).lower(),
+                     "tokenizer": args.tokenizer,
+                     "clickhouse_index": ch_index_type(args.case_insensitive, args.tokenizer),
+                     "duckdb_index": duck_index_options(args.case_insensitive, args.tokenizer),
                      "query_samples": args.samples, "cold_samples": args.repetitions,
                      "cold_preparation": "sync + POSIX_FADV_DONTNEED; metadata may remain cached",
                      "repetitions": args.repetitions},
@@ -608,17 +619,27 @@ def verdict(values, labels=("DuckDB", "ClickHouse")):
 def render(args):
     artifact = json.loads(Path(args.artifact).read_text())
     stages = artifact["stages"]
-    case_insensitive = artifact["settings"].get("case_insensitive", False)
+    settings = artifact["settings"]
+    case_insensitive = settings.get("case_insensitive", False)
+    sparse = settings.get("tokenizer", "ngram") == "sparse"
     qualifier = "case-insensitive " if case_insensitive else ""
-    index_description = (["ClickHouse used `ngrams(3)` with `lowerUTF8(text)` preprocessing;",
-                          "DuckDB used its native case-insensitive trigram index."]
-                         if case_insensitive else
-                         ["ClickHouse used `TYPE text(tokenizer = ngrams(3))`; DuckDB used its",
-                          "native case-sensitive trigram index."])
-    lines = ["# DuckDB ngram vs ClickHouse %stext index" % qualifier, "",
+    if sparse:
+        title = "# DuckDB sparse-gram index vs ClickHouse %ssparseGrams text index" % qualifier
+        grams = "%ssparse grams of 3 to 8 characters" % qualifier
+        index_description = ["ClickHouse used `TYPE %s`; DuckDB used" % settings["clickhouse_index"],
+                             "`create_ngram_index(..., %s)`." % settings["duckdb_index"]]
+    else:
+        title = "# DuckDB ngram vs ClickHouse %stext index" % qualifier
+        grams = "%s3-grams" % qualifier
+        index_description = (["ClickHouse used `ngrams(3)` with `lowerUTF8(text)` preprocessing;",
+                              "DuckDB used its native case-insensitive trigram index."]
+                             if case_insensitive else
+                             ["ClickHouse used `TYPE text(tokenizer = ngrams(3))`; DuckDB used its",
+                              "native case-sensitive trigram index."])
+    lines = [title, "",
              "This is a bounded same-machine point of reference, not an exhaustive tuning study.",
              "Both engines used 24 threads, a 48 GiB memory setting, the same 1 GB enwik9-derived",
-             "line corpus, %s3-grams, and exact substring rechecks." % qualifier, "",
+             "line corpus, %s, and exact substring rechecks." % grams, "",
              *index_description,
              "DuckDB retained its production adaptive scan fallback for dense terms.", "",
              "## Load, build, and storage", "",
@@ -704,6 +725,7 @@ def main():
     collect_parser.add_argument("--repetitions", type=int, default=3)
     collect_parser.add_argument("--samples", type=int, default=10)
     collect_parser.add_argument("--case-insensitive", action="store_true")
+    collect_parser.add_argument("--tokenizer", choices=["ngram", "sparse"], default="ngram")
     collect_parser.set_defaults(function=collect)
     render_parser = sub.add_parser("render")
     render_parser.add_argument("--artifact", default=ROOT / "benchmarks/artifacts/enwik9-clickhouse-text-vs-ngram-v1.json")

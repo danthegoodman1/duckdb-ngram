@@ -209,9 +209,9 @@ class Churn:
             return False
         stale = []
         for row in csv.reader(out.splitlines()):
-            if len(row) == 13 and row[12] not in ("", "NULL"):
-                stale.append(row[12])
-                self.reasons[row[12][:60]] = self.reasons.get(row[12][:60], 0) + 1
+            if len(row) == 15 and row[14] not in ("", "NULL"):
+                stale.append(row[14])
+                self.reasons[row[14][:60]] = self.reasons.get(row[14][:60], 0) + 1
         if stale:
             if self.strict:
                 self.failures.append("false alarm: ngram_index_stats reports %r on an index nothing invalidated"

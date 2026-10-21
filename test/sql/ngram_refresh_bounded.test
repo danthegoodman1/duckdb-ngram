@@ -562,10 +562,10 @@ PRAGMA create_ngram_index('watched', 's');
 statement ok
 INSERT INTO watched SELECT i, 'row ' || i || ' tent tail' FROM range(10, 25) t(i);
 
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('watched');
 ----
-s	3	true	9	24	15	35	35	0	1	80	150	NULL
+s	ngram	3	3	true	9	24	15	35	35	0	1	80	150	NULL
 
 query IIII
 PRAGMA ngram_refresh('watched', 5);
@@ -574,10 +574,10 @@ s	5	14	10
 
 # the same tail, seen from outside the call. A pragma cannot be wrapped in a
 # subquery, so the row is pinned whole.
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('watched');
 ----
-s	3	true	14	24	10	50	61	11	2	150	272	NULL
+s	ngram	3	3	true	14	24	10	50	61	11	2	150	272	NULL
 
 #===----------------------------------------------------------------------===#
 # arguments the bound refuses
@@ -717,10 +717,10 @@ UPDATE guarded SET s = 'mutated in the tail' WHERE rowid = 999;
 
 # The guarded update is re-appended at rowid 1000. It is still in the tail and
 # the tail scan reads it live.
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('guarded');
 ----
-s	3	true	149	1000	850	280	341	61	2	1640	2368	NULL
+s	ngram	3	3	true	149	1000	850	280	341	61	2	1640	2368	NULL
 
 # and the loop keeps going
 query IIII

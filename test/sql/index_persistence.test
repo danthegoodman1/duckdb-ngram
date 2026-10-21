@@ -15,10 +15,10 @@ INSERT INTO docs VALUES ('Hello world'), ('hello DUCK'), (NULL), ('connection re
 statement ok
 PRAGMA create_ngram_index('docs', 's');
 
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-s	3	true	3	3	0	35	35	0	1	39	109	NULL
+s	ngram	3	3	true	3	3	0	35	35	0	1	39	109	NULL
 
 restart
 
@@ -40,10 +40,10 @@ SELECT count(*) FROM (
 ----
 0
 
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-s	3	true	3	3	0	35	35	0	1	39	109	NULL
+s	ngram	3	3	true	3	3	0	35	35	0	1	39	109	NULL
 
 # the base table stays fully usable alongside the index
 statement ok
@@ -81,10 +81,10 @@ INSERT INTO tail_docs VALUES (5, 'extent'), (6, 'tentative');
 
 restart
 
-query TTTTTITT
+query TTTTTTITT
 PRAGMA ngram_indexes;
 ----
-ngram_persistence	<REGEX>:[0-9a-f-]{36}	main	tail_docs	s	5	READY	NULL
+ngram_persistence	<REGEX>:[0-9a-f-]{36}	main	tail_docs	s	ngram(3)	6	READY	NULL
 
 query I
 SELECT hwm_rowid FROM __ngram.registry WHERE table_name = 'tail_docs';

@@ -235,9 +235,9 @@ string RefreshScript(ClientContext &context, const ResolvedTarget &target, const
 		// committed between this script being generated and being run, so the
 		// high-water mark the UPDATE below records never runs ahead of what was
 		// indexed. Bounded, they stop at bound_end and so does the mark.
-		auto partitions = BuildPartitionCount(context, EstimateGramCount(context, *entry, column.column_name,
-		                                                                 column.meta.hwm_rowid + 1, range_end,
-		                                                                 column.meta.options.gram_size));
+		auto partitions =
+		    BuildPartitionCount(context, EstimateGramCount(context, *entry, column.column_name,
+		                                                   column.meta.hwm_rowid + 1, range_end, column.meta.options));
 		script +=
 		    PackRangesStatements(packed, target, column.column_name, column.meta.options,
 		                         SegmentAlignedRanges(column.meta.hwm_rowid + 1, range_end, partitions, !stops_short));

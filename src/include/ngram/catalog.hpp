@@ -22,15 +22,15 @@ constexpr int64_t SEGMENT_SHIFT = 20;
 //! The schema holding the registry and every index's segments table.
 constexpr const char *NGRAM_SCHEMA = "__ngram";
 constexpr const char *REGISTRY_TABLE = "registry";
-constexpr int32_t REGISTRY_VERSION = 2;
+constexpr int32_t REGISTRY_VERSION = 3;
 //! Generated rowid guards are named by the id of the index that created them.
 constexpr const char *GUARD_PREFIX = "__ngram_guard_";
 
 //! Storage layout this extension version writes and reads: the registry row
-//! carries the metadata, and postings live in one segments table named by the
-//! index id, keyed by the fixed-width gram key (GramKey). Every reader lists
-//! other versions as drop-only.
-constexpr int64_t NGRAM_FORMAT_VERSION = 5;
+//! carries the metadata, the tokenizer included, and postings live in one
+//! segments table named by the index id, keyed by the fixed-width gram key
+//! (GramKey). Every reader lists other versions as drop-only.
+constexpr int64_t NGRAM_FORMAT_VERSION = 6;
 
 struct ResolvedTarget {
 	string catalog_name;
@@ -85,11 +85,21 @@ struct RegistryRow {
 	string error;
 };
 
+//! The registry layouts this extension recognizes. Rows of an earlier layout
+//! are listed and drop-only; nothing else reads them.
+enum class RegistryShape : uint8_t {
+	//! Registry version 3: the tokenizer and its gram lengths (format 6).
+	CURRENT,
+	//! Registry version 2: one gram size (formats 4 and 5).
+	GRAM_SIZE,
+	//! Registry version 1: the six identity columns, metadata in a schema per
+	//! index (format 3).
+	IDENTITY_ONLY
+};
+
 struct RegistrySnapshot {
 	idx_t oid = 0;
-	//! Registry version 1 (format 3) had only the six identity columns. Its
-	//! rows are listed and drop-only; nothing else reads that layout.
-	bool legacy_shape = false;
+	RegistryShape shape = RegistryShape::CURRENT;
 	vector<RegistryRow> rows;
 };
 
@@ -113,8 +123,9 @@ struct RegistrySelector {
 RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name,
                               const RegistrySelector &selector = RegistrySelector());
 
-//! The registry as create_ngram_index needs it: absent (bootstrap) or in the
-//! current shape. A registry version 1 database must be emptied by id first.
+//! The registry as create_ngram_index needs it: absent, empty, or in the
+//! current shape. An empty registry of an older shape is replaced, like an
+//! absent one; one with rows must be emptied by id first.
 RegistrySnapshot ReadRegistryForCreate(ClientContext &context, const string &catalog_name);
 
 //! A registry row owned by a target: its location and the metadata every read
@@ -151,6 +162,9 @@ void RequireUniqueIndexColumns(const vector<IndexLocation> &indexes);
 idx_t OtherGuardReferences(ClientContext &context, const ResolvedTarget &target, const string &guard_name,
                            const string &except_ref);
 
+//! Raises unless the registry still matches the one create planned against:
+//! the same current table, or none to bootstrap, where an empty older-shape
+//! registry counts as none.
 void ValidateRegistryForCreate(ClientContext &context, const string &catalog_name, idx_t expected_registry_oid,
                                bool expected_bootstrap);
 

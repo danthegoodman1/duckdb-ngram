@@ -125,11 +125,15 @@ published candidate bytes the plan reserves. The harness forces the order
 through `src/include/ngram/test_hooks.hpp` (`query/publication-barrier`) and
 proves it with an in-order stream.
 
-A batch of at least 256 candidates whose rowids fill at least a quarter of
-their span is read by one bounded scan with the predicate pushed down as a
-table filter; smaller or sparser batches fetch row by row. Both read the
-recheck columns first and fetch the remaining projected columns only for the
-rows that passed, so a wide table costs the probe what its kept rows cost.
+Workers claim a published segment's candidates in batches. When the next
+2,048 candidates fill at least a quarter of their span, the batch takes them
+all and one bounded scan reads it with the predicate pushed down as a table
+filter (a segment's last batch qualifies from 256 candidates). Otherwise the
+batch takes 256 candidates and fetches them row by row: a fetch costs the
+same at any batch size, so small batches only spread the work across more
+workers. Both read the recheck columns first and fetch the remaining
+projected columns only for the rows that passed, so a wide table costs the
+probe what its kept rows cost.
 
 ## Memory and work accounting
 

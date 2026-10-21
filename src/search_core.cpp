@@ -21,7 +21,22 @@ namespace ngram {
 
 //! Batch indexes: every fetch chunk of an admitted segment precedes every
 //! storage batch, so ordered sinks restore candidate-then-tail order.
-static constexpr idx_t FETCH_BATCHES_PER_SEGMENT = (idx_t(1) << SEGMENT_SHIFT) / STANDARD_VECTOR_SIZE;
+static constexpr idx_t FETCH_BATCHES_PER_SEGMENT = (idx_t(1) << SEGMENT_SHIFT) / FETCH_BATCH_ROWS;
+
+//! A batch of at least this many candidates that fill at least one part in
+//! RANGE_ROWS_PER_FETCH of their span is read with one committed scan bounded
+//! to that span instead of a fetch per row: the scan decompresses whole
+//! vectors and evaluates the scan filters natively, while DataTable::Fetch
+//! locks the row-group tree for every row and decodes compressed strings one
+//! at a time.
+static constexpr idx_t RANGE_SCAN_MIN_ROWS = 256;
+
+//! Whether candidates [begin, end) are dense enough to range-scan.
+static bool RangeScanPays(const vector<row_t> &rowids, idx_t begin, idx_t end) {
+	auto rows = end - begin;
+	return rows >= RANGE_SCAN_MIN_ROWS &&
+	       NumericCast<idx_t>(rowids[end - 1] - rowids[begin]) + 1 <= RANGE_ROWS_PER_FETCH * rows;
+}
 
 DuckTableEntry &ResolveExistingTable(ClientContext &context, const string &catalog, const string &schema,
                                      const string &name, const char *what) {
@@ -309,7 +324,13 @@ static BatchClaim ClaimCandidateBatch(ClientContext &context, TableFunctionInput
 				local.candidates = front.rowids;
 				local.segment_ordinal = front.segment_ordinal;
 				local.candidate_offset = front.next_offset;
-				local.candidate_end = MinValue<idx_t>(front.next_offset + FETCH_BATCH_ROWS, rowids.size());
+				// a range batch when its next RANGE_BATCH_ROWS candidates are
+				// dense, a fetch batch of FETCH_BATCH_ROWS otherwise
+				auto range_end = MinValue<idx_t>(front.next_offset + RANGE_BATCH_ROWS, rowids.size());
+				local.range_batch = RangeScanPays(rowids, front.next_offset, range_end);
+				local.candidate_end = local.range_batch
+				                          ? range_end
+				                          : MinValue<idx_t>(front.next_offset + FETCH_BATCH_ROWS, rowids.size());
 				// A batch runs on through the candidates that share the last
 				// one's vector-aligned rowid block, so the next batch starts at
 				// a vector boundary and a range scan never reads a vector an
@@ -367,22 +388,6 @@ static BatchClaim ClaimCandidateBatch(ClientContext &context, TableFunctionInput
 	}
 }
 
-//! A claimed batch whose rowids fill at least one part in RANGE_ROWS_PER_FETCH
-//! of their span is read with one committed scan bounded to that span instead
-//! of a fetch per row: the scan decompresses whole vectors and evaluates the
-//! scan filters natively, while DataTable::Fetch locks the row-group tree for
-//! every row and decodes compressed strings one at a time (measured on enwik9
-//! at one thread, docs/review/2026-09-09: a scattered fetch 1.35 us, a span
-//! row 0.29 us). The same ratio prices spans in the admission gate. The scan
-//! starts at the vector holding the first candidate and stops after the last,
-//! so it visits the batch's row groups only; the rowid filter excludes the
-//! rows of that vector before the first candidate, which an earlier batch
-//! owns. Every row the span holds lies below the high-water mark, and the
-//! ones that are not candidates lack a gram of the needle, so the filters or
-//! the recheck reject them. The scan carries the global scan filters, so its
-//! chunks come out natively filtered, like the tail's.
-static constexpr idx_t RANGE_SCAN_MIN_ROWS = 256;
-
 idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableScanState &state,
                             const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> filters,
                             idx_t start_row, idx_t end_row) {
@@ -421,14 +426,22 @@ idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableSca
 	return 0;
 }
 
+//! Read a range batch with one committed scan when it is still dense after
+//! running on to its vector boundary. The scan starts at the vector holding
+//! the first candidate and stops after the last, so it visits the batch's row
+//! groups only; the rowid filter excludes the rows of that vector before the
+//! first candidate, which an earlier batch owns. Every row the span holds
+//! lies below the high-water mark, and the ones that are not candidates lack
+//! a gram of the needle, so the filters or the recheck reject them. The scan
+//! carries the global scan filters, so its chunks come out natively filtered,
+//! like the tail's.
 static bool StartRangeScan(ClientContext &context, SearchCoreGlobal &global, SearchCoreLocal &local) {
 	auto &rowids = *local.candidates;
-	auto batch_rows = local.candidate_end - local.candidate_offset;
-	auto first = rowids[local.candidate_offset];
-	auto last = rowids[local.candidate_end - 1];
-	if (batch_rows < RANGE_SCAN_MIN_ROWS || NumericCast<idx_t>(last - first) + 1 > RANGE_ROWS_PER_FETCH * batch_rows) {
+	if (!local.range_batch || !RangeScanPays(rowids, local.candidate_offset, local.candidate_end)) {
 		return false;
 	}
+	auto first = rowids[local.candidate_offset];
+	auto last = rowids[local.candidate_end - 1];
 	local.range_filters = global.scan_filters ? global.scan_filters->Copy() : make_uniq<TableFilterSet>();
 	local.range_filters->PushFilter(
 	    ProjectionIndex(global.fetch_rowid_position),
@@ -554,8 +567,8 @@ void ExecuteSearchCore(ClientContext &context, TableFunctionInput &data, SearchC
 					}
 					// every chunk of the batch, fetched or range-scanned, carries
 					// the batch's index; one thread emits them in order
-					local.batch_index = local.segment_ordinal * FETCH_BATCHES_PER_SEGMENT +
-					                    local.candidate_offset / STANDARD_VECTOR_SIZE;
+					local.batch_index =
+					    local.segment_ordinal * FETCH_BATCHES_PER_SEGMENT + local.candidate_offset / FETCH_BATCH_ROWS;
 					if (StartRangeScan(context, global, local)) {
 						continue;
 					}

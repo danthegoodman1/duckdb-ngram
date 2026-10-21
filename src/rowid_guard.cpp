@@ -58,6 +58,33 @@ static bool SourceIdMatchesPinnedCommit(const string &source) {
 	       commit.compare(0, source.size(), source) == 0;
 }
 
+//! DUCKDB_VERSION, or DUCKDB_VERSION with a pre-release label (-alpha<N>,
+//! -rc<N> or -dev<N>). DuckDB's staged builds of a commit, which
+//! extension-ci-tools links, and source builds that name no version carry such
+//! a label; the source commit identifies the code.
+bool HostVersionNamesPinnedRelease(const string &version) {
+	const string release(DUCKDB_VERSION);
+	if (version == release) {
+		return true;
+	}
+	if (!StringUtil::StartsWith(version, release + "-")) {
+		return false;
+	}
+	auto label = version.substr(release.size() + 1);
+	for (const string prefix : {"alpha", "rc", "dev"}) {
+		if (!StringUtil::StartsWith(label, prefix) || label.size() == prefix.size()) {
+			continue;
+		}
+		for (idx_t i = prefix.size(); i < label.size(); i++) {
+			if (!StringUtil::CharacterIsDigit(label[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
 void InitializeRowIdGuardHostRuntime(ExtensionLoader &loader) {
 	bool compatible = false;
 	try {
@@ -69,7 +96,7 @@ void InitializeRowIdGuardHostRuntime(ExtensionLoader &loader) {
 			auto &rows = result->Collection();
 			auto version = rows.GetValue(0, 0).ToString();
 			auto source = rows.GetValue(1, 0).ToString();
-			compatible = version == DUCKDB_VERSION && SourceIdMatchesPinnedCommit(source);
+			compatible = HostVersionNamesPinnedRelease(version) && SourceIdMatchesPinnedCommit(source);
 		}
 	} catch (std::exception &) {
 	}

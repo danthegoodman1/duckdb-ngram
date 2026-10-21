@@ -652,9 +652,10 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
 - Guarded tables require `ngram` to be loaded for supported DML. Without it,
   treat the base table as read-only; DELETE may busy-spin while trying
   to bind the unknown custom index type.
-- The rowid guard is pinned to host-reported DuckDB v2.0.0 built from commit
-  `d54cbbe3df…`; it accepts any abbreviation of that commit with seven or more
-  characters as `pragma_version().source_id`. An index built against a
+- The rowid guard is pinned to DuckDB v2.0.0 built from commit `d54cbbe3df…`:
+  `pragma_version()` must report v2.0.0, or a pre-release label of it such as
+  DuckDB's staged builds carry, and any abbreviation of that commit with seven
+  or more characters as `source_id`. An index built against a
   different host build reads back `SCAN_ONLY` until it is rebuilt. Other hosts load only for
   fail-closed inspection and cleanup; create/query/maintenance refuse to trust
   the custom index internals.

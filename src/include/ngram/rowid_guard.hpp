@@ -33,6 +33,10 @@ void RegisterRowIdGuard(ExtensionLoader &loader);
 bool RowIdGuardRuntimeCompatible();
 void RequirePinnedRuntime();
 string HostRuntimeMismatchReason();
+//! True when a host's pragma_version().library_version names the pinned
+//! release: the release itself, or a pre-release label of it that DuckDB's
+//! staged and unversioned builds of the pinned commit report.
+bool HostVersionNamesPinnedRelease(const string &version);
 
 //! The header checkpoint iteration of `db` (0 for an in-memory database).
 uint64_t CheckpointIteration(AttachedDatabase &db);

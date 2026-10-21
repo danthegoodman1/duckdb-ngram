@@ -355,12 +355,16 @@ static void RemoveDatabase(const string &path) {
 	std::remove((path + ".wal").c_str());
 }
 
-static void LoadNgram(DuckDB &db) {
-	db.LoadStaticExtension<NgramExtension>();
-}
-
 static void LoadCoreFunctions(DuckDB &db) {
 	db.LoadStaticExtension<CoreFunctionsExtension>();
+}
+
+//! Loads the core functions first, which the generated maintenance SQL calls:
+//! a harness linked against DuckDB's prebuilt static library registers no
+//! extension at startup. Loading an extension twice is a no-op.
+static void LoadNgram(DuckDB &db) {
+	LoadCoreFunctions(db);
+	db.LoadStaticExtension<NgramExtension>();
 }
 
 static void StockWriteChild(const string &path, const string &kind) {
@@ -459,12 +463,24 @@ static void TestCreationSchedules(const string &path) {
 		auto source_id = version->Collection().GetValue(1, 0).ToString();
 		// The extension's pin: v2.0.0 built from this commit, with source_id an
 		// abbreviation of it that has at least seven characters. The Makefile
-		// names the version; without it the host reports v2.0.0-dev<n>.
+		// names the version; DuckDB's staged library, which extension-ci-tools
+		// links, reports a pre-release label of it.
 		const string pinned_commit = "d54cbbe3df17e8e5ce68312f483b4155836112aa";
 		bool pinned_source = source_id.size() >= 7 && source_id.size() <= pinned_commit.size() &&
 		                     pinned_commit.compare(0, source_id.size(), source_id) == 0;
-		if (library_version != "v2.0.0" || !pinned_source) {
+		if (!ngram::HostVersionNamesPinnedRelease(library_version) || !pinned_source) {
 			throw std::runtime_error("host pragma_version is outside the pinned rowid-guard runtime");
+		}
+		for (auto accepted : {"v2.0.0", "v2.0.0-alpha49307", "v2.0.0-rc1", "v2.0.0-dev3147"}) {
+			if (!ngram::HostVersionNamesPinnedRelease(accepted)) {
+				throw std::runtime_error(string("guard refused the pinned release label ") + accepted);
+			}
+		}
+		for (auto refused :
+		     {"v2.0.1", "v2.0.0-", "v2.0.0-alpha", "v2.0.0-alpha1x", "v2.0.0-beta1", "v2.0.00", "v2.0", ""}) {
+			if (ngram::HostVersionNamesPinnedRelease(refused)) {
+				throw std::runtime_error(string("guard accepted the foreign version ") + refused);
+			}
 		}
 	}
 	LoadNgram(db);

@@ -53,10 +53,14 @@ add_executable(ngram_checkpoint_gap_test EXCLUDE_FROM_ALL
                test/cpp/ngram_maintenance_checkpoint_gap.cpp)
 target_include_directories(ngram_checkpoint_gap_test
                            PRIVATE duckdb/extension/core_functions/include)
-# DuckDB 2.0 links no static extension into its engine library, so the harness
-# links the core functions it loads.
-target_link_libraries(ngram_checkpoint_gap_test duckdb ngram_extension
-                      core_functions_extension)
+# A source build links the shared library, which the sanitizer lanes check; a
+# build against DuckDB's prebuilt static library, which extension-ci-tools uses,
+# has only duckdb_static. DuckDB 2.0 links no static extension into its engine
+# library, so the harness links the core functions it loads. DuckDB defines its
+# targets after this file, so the choice waits for generation.
+target_link_libraries(
+  ngram_checkpoint_gap_test $<IF:$<TARGET_EXISTS:duckdb>,duckdb,duckdb_static>
+  ngram_extension core_functions_extension)
 set(NGRAM_CHECKPOINT_GAP_DB
     "${CMAKE_CURRENT_BINARY_DIR}/ngram_checkpoint_gap_test.db")
 add_custom_target(

@@ -19,6 +19,9 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DUCKDB = os.environ.get("NGRAM_DUCKDB", os.path.join(REPO, "build", "release", "duckdb"))
+# The CLI switches to an agent output format when it sees a coding agent's
+# environment variables; the benchmarks parse its normal output.
+CLI_ENV = dict(os.environ, DUCKDB_AGENT_MODE="0")
 BENCH_DIR = os.environ.get("NGRAM_BENCH_DIR", os.path.expanduser("~/duckdb-ngram-bench"))
 
 
@@ -111,7 +114,7 @@ def run_sql(db_path, sql, timeout=None, settings=None, check=True, meter=True):
         sampler = SpillSampler(db_path + ".tmp")
         sampler.start()
     start = time.time()
-    proc = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=timeout, env=CLI_ENV)
     seconds = time.time() - start
     peak_spill = 0
     if sampler:

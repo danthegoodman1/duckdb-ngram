@@ -63,7 +63,7 @@ SELECT gram, ngram_pack_segment(r::BIGINT) FILTER (WHERE r > 100) AS s
 FROM (VALUES ('lo', 1), ('hi', 200)) t(gram, r)
 GROUP BY gram ORDER BY gram;
 ----
-hi	{'postings': \x01\x01\xC8\x01, 'rowid_count': 1, 'min_rowid': 200, 'max_rowid': 200}
+hi	{'postings': '\\x01\\x01\\xC8\\x01', 'rowid_count': 1, 'min_rowid': 200, 'max_rowid': 200}
 lo	NULL
 
 # empty input yields no groups

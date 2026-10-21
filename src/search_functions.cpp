@@ -629,7 +629,8 @@ void RegisterSearchFunctions(ExtensionLoader &loader) {
 		result.emplace(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN));
 		return result;
 	};
-	search.named_parameters["col"] = LogicalType::VARCHAR;
+	search.GetSignature().WithTypedKwargs("options",
+	                                      [](TypedKwargs &options) { options.Add("col", LogicalType::VARCHAR); });
 	loader.RegisterFunction(search);
 }
 

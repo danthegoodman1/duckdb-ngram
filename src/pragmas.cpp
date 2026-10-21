@@ -215,7 +215,7 @@ static string IndexStatsSelect(ClientContext &context, const string &table_input
 //! the call at bind, so it composes in FROM clauses and joins.
 static unique_ptr<TableRef> IndexStatsBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	auto table_input = RequireStringParam(input.inputs[0], "ngram_index_stats", "table");
-	Parser parser(context.GetParserOptions());
+	Parser parser(context);
 	parser.ParseQuery(IndexStatsSelect(context, table_input));
 	D_ASSERT(parser.statements.size() == 1 && parser.statements[0]->type == StatementType::SELECT_STATEMENT);
 	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
@@ -331,8 +331,9 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 void RegisterPragmas(ExtensionLoader &loader) {
 	auto create_fun = PragmaFunction::PragmaCall("create_ngram_index", CreateNgramIndexQuery,
 	                                             {LogicalType::VARCHAR, LogicalType::VARCHAR});
-	create_fun.named_parameters["gram"] = LogicalType::INTEGER;
-	create_fun.named_parameters["case_insensitive"] = LogicalType::BOOLEAN;
+	create_fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("gram", LogicalType::INTEGER).Add("case_insensitive", LogicalType::BOOLEAN);
+	});
 	loader.RegisterFunction(create_fun);
 
 	// drop_ngram_index(table, column) and drop_ngram_index(index_ref, catalog = 'db')
@@ -340,7 +341,8 @@ void RegisterPragmas(ExtensionLoader &loader) {
 	for (auto &arguments :
 	     vector<vector<LogicalType>> {{LogicalType::VARCHAR}, {LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
 		auto drop = PragmaFunction::PragmaCall("drop_ngram_index", DropNgramIndexQuery, arguments);
-		drop.named_parameters["catalog"] = LogicalType::VARCHAR;
+		drop.GetSignature().WithTypedKwargs("options",
+		                                    [](TypedKwargs &options) { options.Add("catalog", LogicalType::VARCHAR); });
 		drop_set.AddFunction(std::move(drop));
 	}
 	loader.RegisterFunction(std::move(drop_set));
@@ -362,15 +364,17 @@ void RegisterPragmas(ExtensionLoader &loader) {
 	for (auto &arguments :
 	     vector<vector<LogicalType>> {{LogicalType::VARCHAR}, {LogicalType::VARCHAR, LogicalType::BIGINT}}) {
 		auto refresh = PragmaFunction::PragmaCall("ngram_refresh", RefreshNgramIndexQuery, arguments);
-		refresh.named_parameters["col"] = LogicalType::VARCHAR;
-		refresh.named_parameters["max_rows"] = LogicalType::BIGINT;
+		refresh.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+			options.Add("col", LogicalType::VARCHAR).Add("max_rows", LogicalType::BIGINT);
+		});
 		refresh_set.AddFunction(std::move(refresh));
 	}
 	loader.RegisterFunction(std::move(refresh_set));
 
 	auto compact = PragmaFunction::PragmaCall("ngram_compact", CompactNgramIndexQuery, {LogicalType::VARCHAR});
-	compact.named_parameters["col"] = LogicalType::VARCHAR;
-	compact.named_parameters["purge"] = LogicalType::BOOLEAN;
+	compact.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("col", LogicalType::VARCHAR).Add("purge", LogicalType::BOOLEAN);
+	});
 	loader.RegisterFunction(compact);
 }
 

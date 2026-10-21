@@ -544,7 +544,7 @@ static TableFunction NgramIndexScanFunction() {
 //! availability/shape checks decline to the native scan; a present malformed
 //! index object is corruption and propagates.
 static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
-	if (get.function.name != "seq_scan") {
+	if (get.function.GetName() != "seq_scan") {
 		return;
 	}
 	if (!get.table_filters.HasFilters()) {
@@ -632,7 +632,7 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 		}
 		bind->table = table;
 
-		get.function = NgramIndexScanFunction();
+		get.function = BoundTableFunction(NgramIndexScanFunction());
 		get.bind_data = std::move(bind);
 		// row-group ordering hints (RowGroupPruner, ORDER BY ... LIMIT shapes)
 		// are performance-only whenever the scan carries filters — the pruner

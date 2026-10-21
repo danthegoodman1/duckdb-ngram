@@ -540,8 +540,8 @@ SELECT (SELECT hwm_rowid FROM (SELECT * FROM __ngram.registry WHERE replace(inde
 #===----------------------------------------------------------------------===#
 # a refresh is one transaction, whoever owns it
 #
-# The pragma expands to several statements, which the preprocessor wraps in
-# BEGIN/COMMIT of its own when there is no user transaction; inside one, the
+# The pragma expands to several statements, which the host runs in one
+# transaction of its own when there is no user transaction; inside one, the
 # statements simply join it. Either way the segment append and the high-water
 # mark move together.
 #===----------------------------------------------------------------------===#

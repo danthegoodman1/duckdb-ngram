@@ -3,13 +3,14 @@
 The extension links DuckDB's internal C++ API and pins one host: the `duckdb`
 submodule at a release tag or release branch, `extension-ci-tools` at the
 matching branch, and the source identity the rowid guard accepts. The extension
-currently tracks the unreleased `v2.0-cyanoptera` branch. DuckDB 2.0's CMake
-derives no release version from git, so a build reports `v2.0.0-dev<n>` unless
-it names one, and the guard refuses that host: the Makefile passes
-`DUCKDB_EXPLICIT_VERSION`, as do the CI jobs that run CMake directly. Every pin
-lives in one place and `scripts/verify_pins.sh` checks the submodules against
-the gitlinks HEAD records; the Correctness workflow and
-`benchmarks/release_evidence.py` both run it.
+currently pins the v2.0.0 tag and extension-ci-tools' `v2.0-cyanoptera` branch,
+the 2.0 LTS line of both. DuckDB 2.0's CMake derives no release version from
+git, even at a tag, so a build reports `v2.0.0-dev<n>` unless it names one, and
+the guard refuses that host: the Makefile passes `DUCKDB_EXPLICIT_VERSION`, as
+do the CI jobs that run CMake directly. Every pin lives in one place and
+`scripts/verify_pins.sh` checks the submodules against the gitlinks HEAD
+records; the Correctness workflow and `benchmarks/release_evidence.py` both run
+it.
 
 ## Where the pin lives
 
@@ -18,7 +19,7 @@ the gitlinks HEAD records; the Correctness workflow and
 | DuckDB sources | the `duckdb` gitlink | `scripts/verify_pins.sh` |
 | CI tooling | the `extension-ci-tools` gitlink | `scripts/verify_pins.sh` |
 | Build version | `DUCKDB_EXPLICIT_VERSION` in the `Makefile`, and in `Correctness.yml` and `Nightly.yml` for their direct CMake builds | the harness's `lifecycle/creation-schedules` |
-| Workflow versions | the extension-ci-tools commit of the build job and the code-quality job's versions in `.github/workflows/MainDistributionPipeline.yml` | the distribution matrix |
+| Workflow versions | both jobs' extension-ci-tools commit and the build job's `duckdb_version` in `.github/workflows/MainDistributionPipeline.yml` | the distribution matrix |
 | Guard host identity | `DUCKDB_VERSION`, `DUCKDB_SOURCE_COMMIT` and `DUCKDB_SOURCE_ID` in `src/rowid_guard.cpp` | the guard refuses any other host; the harness's `lifecycle/incompatible-guard-quarantine` mutates the recorded source id, and `lifecycle/creation-schedules` requires the pinned host |
 | Documented identity | README "Limitations", `packaging/community-extensions/extensions/ngram/description.yml` | reading |
 | Release evidence | `DUCKDB_GITLINK`, `CI_GITLINK`, `DUCKDB_VERSION` and `DUCKDB_SOURCE` in `benchmarks/release_evidence.py` | `release_evidence.py check` and `test` |
@@ -55,9 +56,18 @@ the gitlinks HEAD records; the Correctness workflow and
      vacuums whole row groups leaves the survivors at their original row
      numbers, so the numbering has holes: seek to a row group rather than
      looking a row number up, and bound the tail with `GetNextRowId()`.
-   - **Sentinels that became `optional_idx`.** `MAX_TRANSACTION_ID` equals
-     `INVALID_INDEX`, so comparing an `optional_idx` against it throws where
-     the old `transaction_t` comparison read "no active checkpoint".
+   - **Sentinels that became `optional_idx`.** A host field that used
+     `MAX_TRANSACTION_ID` for "none" is an `optional_idx`, so test it with
+     `IsValid()`. `MAX_TRANSACTION_ID` equals `INVALID_INDEX`, which
+     `optional_idx` holds as an ordinary value: comparing against it reads
+     "active" where the old `transaction_t` comparison read "no active
+     checkpoint".
+   - **A positioned scan carries its own row-group tree.**
+     `RowGroupCollection::InitializeScanInRowGroup` leaves
+     `CollectionScanState::row_groups` alone, so the bounded scan sets it; a
+     scan that crosses into a second row group otherwise dereferences a null
+     tree. The suite reaches that through a checkpoint between an index's
+     generations.
    - **A partition subset belongs to the scan.** The swapped scan declines a
      `LogicalGet` whose `scan_partition_indices` is set: the optimizer answered
      the other partitions from statistics, and scanning all of them would count
@@ -81,6 +91,22 @@ the gitlinks HEAD records; the Correctness workflow and
      `Connection::Submit`.
    - **`EXPLAIN` names operators in title case**, so the transparent scan reads
      `Ngram Index Scan`.
+   - **A statement that expands into several runs as one query.** The host
+     expands a pragma in a transaction of its own, then runs the generated
+     statements in one fresh transaction, refuses transaction statements among
+     them, and serves only the last statement's rows. The statement iterator
+     no longer expands pragmas, so the harness expands them through
+     `StatementPreprocessor::ExpandStatement` and wraps the result in
+     `BEGIN`/`COMMIT` to act between statements.
+   - **The CLI has an agent mode.** It changes the output format when a
+     coding agent's environment variables (`CLAUDECODE`, `AGENT`, `CODEX_*`,
+     ...) are set and stdout is not a terminal, so every script that runs the
+     CLI passes `DUCKDB_AGENT_MODE=0`; `release_evidence.py` runs it in a
+     scrubbed environment.
+   - **Static extensions link only on request.** DuckDB links into its shell
+     and `unittest` only the extensions a config names with
+     `duckdb_extension_statically_link`, so `extension_config.cmake` names
+     `ngram`, and the harness links `core_functions_extension` itself.
 
    The guard's create-index operator (`PhysicalCreateRowIdGuard` in
    `src/rowid_guard.cpp`) repeats the catalog steps of

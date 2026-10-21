@@ -231,9 +231,9 @@ SELECT count(*) FROM ngram_candidates('gaps', 's', 'local');
 # an increment is one transaction, whoever owns it
 #
 # The expansion is several statements plus the progress select, which the
-# preprocessor still wraps in a BEGIN/COMMIT of its own; inside a user's
-# transaction the statements simply join it, and the increment goes away with
-# a ROLLBACK exactly as the whole refresh does.
+# host runs in one transaction of its own; inside a user's transaction the
+# statements simply join it, and the increment goes away with a ROLLBACK
+# exactly as the whole refresh does.
 #===----------------------------------------------------------------------===#
 
 statement ok

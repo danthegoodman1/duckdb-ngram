@@ -122,11 +122,10 @@ struct GramRows {
 //! of one key are contiguous within each generation's key-ordered run, so a
 //! key admits about one segment per run. Alignment keeps two spans from
 //! sharing a vector, so no row is scanned twice; the key filter drops the
-//! rows of other keys inside a span. v1.5.5's own filtered scan skips only
-//! the first excluded segment of a row group (RowGroup::CheckZonemapSegments
-//! takes a segment's relative start for its vector index), so positioned by
-//! the host it reads the whole row group: measured 108,000 rows per key on a
-//! two-row-group table (docs/review/2026-09-09/format_observations.json).
+//! rows of other keys inside a span. The host's filtered scan skips every
+//! excluded segment too (RowGroup::CheckZonemapSegments); these spans were
+//! built when it skipped only the first, and are not yet benchmarked against
+//! it on 2.0.
 static void AdmittedKeySpans(SegmentNode<RowGroup> &row_group, const StorageIndex &key_column, TableFilter &filter,
                              vector<std::pair<idx_t, idx_t>> &spans) {
 	auto &column = row_group.GetNode().GetRawColumnData(key_column);

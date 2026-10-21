@@ -45,7 +45,7 @@ import sys
 import tempfile
 import time
 
-from ngram_harness import Cli, DEFAULT_DUCKDB, multiset_mismatch, sql_quote
+from ngram_harness import CLI_ENV, Cli, DEFAULT_DUCKDB, multiset_mismatch, sql_quote
 
 WORDS = ["tent", "ten", "cent", "often", "entered", "content", "connection",
          "reset", "peer", "needle", "haystack", "gram", "index", "duck", "row"]
@@ -109,7 +109,7 @@ def timed_pragma(db, pragma):
 def kill_during(db, pragma, delay):
     """Start the pragma in a child process and SIGKILL it after `delay`."""
     proc = subprocess.Popen([CLI.binary, db], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, text=True)
+                            stderr=subprocess.DEVNULL, text=True, env=CLI_ENV)
     proc.stdin.write(pragma + "\n")
     proc.stdin.flush()
     time.sleep(delay)

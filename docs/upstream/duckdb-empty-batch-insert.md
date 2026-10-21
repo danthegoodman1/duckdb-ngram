@@ -1,7 +1,7 @@
 # DuckDB: empty batch insert, delete, reinsert leaves a table reading empty
 
-Status: reproduced 2026-09-01 on v1.5.5 and 2026-09-22 on the 2.0 branch at
-`e366461e`; not yet filed upstream.
+Status: reproduced 2026-09-01 on v1.5.5 and 2026-10-21 on v2.0.0
+(`d54cbbe3`); not yet filed upstream.
 
 ## Summary
 
@@ -31,7 +31,7 @@ into the same table can precede.
 ```
 SELECT version(), source_id FROM pragma_version();
 -- v1.5.5, d8cdaa33   (also the official binary form d8cdaa33fd)
--- v2.0.0, e366461e   (the 2.0 branch, built through this repository's Makefile)
+-- v2.0.0, d54cbbe3df (the release tag, built through this repository's Makefile)
 SELECT current_setting('threads');
 -- 24
 ```
@@ -68,7 +68,7 @@ SELECT count(*) AS after_reopen FROM t;                    -- 200000
 
 ## Observed versus expected
 
-| Stage | v1.5.5 (24 threads) | v1.5.5 (`SET threads=1`) | 2.0 (24 threads) | Expected |
+| Stage | v1.5.5 (24 threads) | v1.5.5 (`SET threads=1`) | v2.0.0 (24 threads) | Expected |
 | --- | --- | --- | --- | --- |
 | before | 200000 | 200000 | 200000 | 200000 |
 | in transaction | 0 | 200000 | 0 | 200000 |

@@ -391,6 +391,9 @@ idx_t InitializeBoundedScan(ClientContext &context, DataTable &storage, TableSca
 	auto &collection = *storage.GetRowGroupCollection();
 	auto row_groups = collection.GetRowGroups();
 	auto &scan = state.table_state;
+	// the scan follows this tree past the first row group; the host sets it
+	// only on the scans it initializes itself
+	scan.row_groups = row_groups;
 	// A checkpoint that vacuums whole row groups leaves the surviving rows at
 	// their original row numbers, so the numbering has holes and a lookup of
 	// `start_row` can land in one. Seek to the first row group that ends past

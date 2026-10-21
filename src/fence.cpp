@@ -43,10 +43,10 @@ private:
 	};
 
 	struct Handle {
-		//! The transaction that expanded the pragma. The preprocessor expands
-		//! every pragma of one query string in one transaction, so a
-		//! registration from a later transaction means the earlier scripts have
-		//! run or never will, and it drops their leftovers.
+		//! The transaction that expanded the pragma. The host expands each
+		//! statement when it is submitted, after the statements before it ran,
+		//! so a registration from a later transaction means the earlier scripts
+		//! have run or never will, and it drops their leftovers.
 		transaction_t expansion_id;
 		//! The script the handle belongs to: the handles one pragma callback
 		//! registers (one per column of a refresh or compact) run in one

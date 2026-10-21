@@ -1,5 +1,4 @@
 #include "duckdb.hpp"
-#include "duckdb/main/statement_iterator.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/index.hpp"
 #include "duckdb/storage/table/index_entry.hpp"
@@ -11,6 +10,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/query_result_stream.hpp"
 #include "duckdb/parser/statement/transaction_statement.hpp"
+#include "duckdb/planner/statement_preprocessor.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/local_storage.hpp"
@@ -48,11 +48,11 @@ static void Check(Connection &con, const string &sql) {
 }
 
 static int64_t ScalarInt64(Connection &con, const string &sql) {
-	return Query(con, sql)->GetValue(0, 0).GetValue<int64_t>();
+	return Query(con, sql)->Collection().GetValue(0, 0).GetValue<int64_t>();
 }
 
 static string ScalarString(Connection &con, const string &sql) {
-	return Query(con, sql)->GetValue(0, 0).ToString();
+	return Query(con, sql)->Collection().GetValue(0, 0).ToString();
 }
 
 static string IndexHex(Connection &con, const string &table_name, const string &column_name,
@@ -95,16 +95,16 @@ static unique_ptr<QueryResult> StatusByRef(Connection &con, const string &catalo
 
 static string IndexStatus(Connection &con, const string &table_name, const string &column_name) {
 	auto catalog = ScalarString(con, "SELECT current_database()");
-	return StatusByRef(con, catalog, IndexRef(con, table_name, column_name))->GetValue(6, 0).ToString();
+	return StatusByRef(con, catalog, IndexRef(con, table_name, column_name))->Collection().GetValue(6, 0).ToString();
 }
 
 static string StatusName(Connection &con, const string &catalog, const string &index_ref) {
-	return StatusByRef(con, catalog, index_ref)->GetValue(6, 0).ToString();
+	return StatusByRef(con, catalog, index_ref)->Collection().GetValue(6, 0).ToString();
 }
 
 static string StatusReason(Connection &con, const string &catalog, const string &index_ref) {
 	auto result = StatusByRef(con, catalog, index_ref);
-	return result->GetValue(7, 0).IsNull() ? string() : result->GetValue(7, 0).ToString();
+	return result->Collection().GetValue(7, 0).IsNull() ? string() : result->Collection().GetValue(7, 0).ToString();
 }
 
 static void DropByRef(Connection &con, const string &catalog, const string &index_ref) {
@@ -272,20 +272,33 @@ static void ExpectPreparedError(PreparedStatement &prepared, const string &needl
 	}
 }
 
+//! Expands a maintenance pragma as submitting it would, in a transaction of
+//! its own, and returns the generated statements unexecuted between BEGIN and
+//! COMMIT. Submission runs a statement that expands into several in one fresh
+//! transaction; the explicit one lets a schedule act between its statements.
 static vector<unique_ptr<SQLStatement>> Expand(Connection &con, const string &sql) {
-	vector<unique_ptr<SQLStatement>> statements;
-	auto iterator = con.context->IterateStatements(sql);
-	while (iterator.Peek()) {
-		auto statement = iterator.GetStatement();
-		if (!statement) {
-			continue;
+	if (con.context->transaction.HasActiveTransaction()) {
+		throw std::runtime_error("pragma expansion needs an autocommit connection: " + sql);
+	}
+	vector<unique_ptr<SQLStatement>> generated;
+	auto parsed = con.ExtractStatements(sql);
+	con.context->RunFunctionInTransaction([&]() {
+		for (auto &statement : parsed) {
+			auto expanded = StatementPreprocessor(*con.context).ExpandStatement(std::move(statement));
+			for (auto &entry : expanded.statements) {
+				generated.push_back(std::move(entry));
+			}
 		}
-		statements.push_back(std::move(statement));
+	});
+	if (generated.size() < 2) {
+		throw std::runtime_error("pragma expansion generated no multi-statement script: " + sql);
 	}
-	if (statements.empty() || statements.front()->type != StatementType::TRANSACTION_STATEMENT ||
-	    statements.front()->Cast<TransactionStatement>().info->type != TransactionType::BEGIN_TRANSACTION) {
-		throw std::runtime_error("pragma expansion did not begin with a generated transaction");
+	auto statements = con.ExtractStatements("BEGIN");
+	for (auto &entry : generated) {
+		statements.push_back(std::move(entry));
 	}
+	auto commit = con.ExtractStatements("COMMIT");
+	statements.push_back(std::move(commit[0]));
 	return statements;
 }
 
@@ -442,12 +455,12 @@ static void TestCreationSchedules(const string &path) {
 	{
 		Connection host(db);
 		auto version = Query(host, "SELECT library_version, source_id FROM system.main.pragma_version()");
-		auto library_version = version->GetValue(0, 0).ToString();
-		auto source_id = version->GetValue(1, 0).ToString();
+		auto library_version = version->Collection().GetValue(0, 0).ToString();
+		auto source_id = version->Collection().GetValue(1, 0).ToString();
 		// The extension's pin: v2.0.0 built from this commit, with source_id an
 		// abbreviation of it that has at least seven characters. The Makefile
 		// names the version; without it the host reports v2.0.0-dev<n>.
-		const string pinned_commit = "e366461e30fb95d68c0d53a50f050dd0b043fc71";
+		const string pinned_commit = "d54cbbe3df17e8e5ce68312f483b4155836112aa";
 		bool pinned_source = source_id.size() >= 7 && source_id.size() <= pinned_commit.size() &&
 		                     pinned_commit.compare(0, source_id.size(), source_id) == 0;
 		if (library_version != "v2.0.0" || !pinned_source) {
@@ -905,7 +918,7 @@ static void TestVacuumAndConflict(const string &path, const string &storage_vers
 		                         (rejected->HasError() ? rejected->GetError() : rejected->ToString()));
 	}
 	auto stats = Query(con, "PRAGMA ngram_index_stats('conflict_rows')");
-	if (stats->GetValue(12, 0).ToString().find("cannot exclude reuse") == string::npos ||
+	if (stats->Collection().GetValue(12, 0).ToString().find("cannot exclude reuse") == string::npos ||
 	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('conflict_rows', 'conflict needle')") != 1 ||
 	    Query(con, "EXPLAIN SELECT * FROM conflict_rows WHERE s LIKE '%conflict needle%'")
 	            ->ToString()
@@ -945,8 +958,9 @@ static void TestRejectedCommitKeepsGuard(const string &path) {
 	// commit consumed.
 	Check(con, "INSERT INTO retried VALUES (1001, 'retried needle')");
 	auto stats = Query(con, "PRAGMA ngram_index_stats('retried')");
-	if (!stats->GetValue(12, 0).IsNull()) {
-		throw std::runtime_error("rejected commit latched the guard: " + stats->GetValue(12, 0).ToString());
+	if (!stats->Collection().GetValue(12, 0).IsNull()) {
+		throw std::runtime_error("rejected commit latched the guard: " +
+		                         stats->Collection().GetValue(12, 0).ToString());
 	}
 	if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('retried', 'needle')") != 2 ||
 	    ScalarInt64(con, "SELECT count(*) FROM retried WHERE s LIKE '%needle%'") != 2 ||
@@ -1054,7 +1068,7 @@ static void TestWALAndStock(const string &executable, const string &path) {
 		auto stats = Query(con, "PRAGMA ngram_index_stats('wal_rows')");
 		if (ScalarInt64(con, "SELECT count(*) FROM wal_rows") != 125002 ||
 		    ScalarInt64(con, "SELECT count(*) FROM ngram_search('wal_rows', 'wal needle')") != 3 ||
-		    !stats->GetValue(12, 0).IsNull()) {
+		    !stats->Collection().GetValue(12, 0).IsNull()) {
 			throw std::runtime_error("CREATE WAL state did not distinguish creator-local and later appends");
 		}
 		Check(con, "DELETE FROM wal_rows WHERE rowid >= 122880");
@@ -1063,7 +1077,7 @@ static void TestWALAndStock(const string &executable, const string &path) {
 		           "FROM range(5000) t(i)");
 		stats = Query(con, "PRAGMA ngram_index_stats('wal_rows')");
 		if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('wal_rows', 'wal needle')") != 2 ||
-		    stats->GetValue(12, 0).ToString().find("cannot exclude reuse") == string::npos) {
+		    stats->Collection().GetValue(12, 0).ToString().find("cannot exclude reuse") == string::npos) {
 			throw std::runtime_error("trailing rowid reuse did not latch unsafe after WAL replay");
 		}
 		Check(con, "FORCE CHECKPOINT");
@@ -1138,15 +1152,18 @@ static void TestIncompatibleGuardQuarantine(const string &path) {
 			}
 		}
 		auto stats = Query(con, "PRAGMA ngram_index_stats('bad_guard')");
-		if (stats->GetValue(12, 0).ToString().find("incompatible") == string::npos) {
+		if (stats->Collection().GetValue(12, 0).ToString().find("incompatible") == string::npos) {
 			throw std::runtime_error("incompatible guard was not visible in ngram_index_stats");
 		}
 		if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('max_guard', 'needle')") != 1 ||
 		    ScalarInt64(con, "SELECT count(*) FROM max_guard WHERE s LIKE '%needle%'") != 1 ||
 		    Query(con, "EXPLAIN SELECT * FROM max_guard WHERE s LIKE '%needle%'")->ToString().find("Seq Scan") ==
 		        string::npos ||
-		    Query(con, "PRAGMA ngram_index_stats('max_guard')")->GetValue(12, 0).ToString().find("not observed") ==
-		        string::npos) {
+		    Query(con, "PRAGMA ngram_index_stats('max_guard')")
+		            ->Collection()
+		            .GetValue(12, 0)
+		            .ToString()
+		            .find("not observed") == string::npos) {
 			throw std::runtime_error("max-behind guard did not choose and report exact fallback");
 		}
 		ExpectError(con, "PRAGMA ngram_refresh('max_guard')", "not observed");
@@ -1165,8 +1182,11 @@ static void TestIncompatibleGuardQuarantine(const string &path) {
 		Connection con(db);
 		for (idx_t i = 0; i < 2; i++) {
 			if (ScalarInt64(con, "SELECT count(*) FROM ngram_search('bad_guard', 'updated')") != 1 ||
-			    Query(con, "PRAGMA ngram_index_stats('bad_guard')")->GetValue(12, 0).ToString().find("incompatible") ==
-			        string::npos) {
+			    Query(con, "PRAGMA ngram_index_stats('bad_guard')")
+			            ->Collection()
+			            .GetValue(12, 0)
+			            .ToString()
+			            .find("incompatible") == string::npos) {
 				throw std::runtime_error("quarantine state did not survive reopen without a bind spin");
 			}
 		}
@@ -1195,7 +1215,7 @@ static void TestUnboundCheckpointSeal(const string &executable, const string &pa
 		// it. A checkpoint must latch the mismatch before writing a fresh seal.
 		Check(con, "FORCE CHECKPOINT");
 		auto stats = Query(con, "PRAGMA ngram_index_stats('wal_rows')");
-		if (stats->GetValue(12, 0).ToString().find("cannot exclude reuse") == string::npos ||
+		if (stats->Collection().GetValue(12, 0).ToString().find("cannot exclude reuse") == string::npos ||
 		    ScalarInt64(con, "SELECT count(*) FROM ngram_search('wal_rows', 'seal needle')") != 2) {
 			throw std::runtime_error("unbound checkpoint did not fail closed through the iteration seal");
 		}
@@ -1231,7 +1251,7 @@ static void TestCleanShutdownSeal(const string &path) {
 		LoadNgram(db);
 		Connection con(db);
 		auto stats = Query(con, "PRAGMA ngram_index_stats('guarded')");
-		if (!stats->GetValue(12, 0).IsNull() ||
+		if (!stats->Collection().GetValue(12, 0).IsNull() ||
 		    ScalarInt64(con, "SELECT count(*) FROM ngram_search('guarded', 'needle')") != 1) {
 			throw std::runtime_error("ordinary clean shutdown conservatively invalidated an untouched guard");
 		}
@@ -1257,7 +1277,7 @@ static void TestCleanShutdownSeal(const string &path) {
 		DuckDB db(path);
 		LoadNgram(db);
 		Connection con(db);
-		if (!Query(con, "PRAGMA ngram_index_stats('guarded')")->GetValue(12, 0).IsNull()) {
+		if (!Query(con, "PRAGMA ngram_index_stats('guarded')")->Collection().GetValue(12, 0).IsNull()) {
 			throw std::runtime_error("contextful checkpoint failed to reseal an untouched guard");
 		}
 	}
@@ -1275,7 +1295,7 @@ static void TestCleanShutdownSeal(const string &path) {
 		DuckDB db(path);
 		LoadNgram(db);
 		Connection con(db);
-		if (!Query(con, "PRAGMA ngram_index_stats('guarded')")->GetValue(12, 0).IsNull()) {
+		if (!Query(con, "PRAGMA ngram_index_stats('guarded')")->Collection().GetValue(12, 0).IsNull()) {
 			throw std::runtime_error("last-close eager bind failed to reseal an untouched guard");
 		}
 	}
@@ -1390,7 +1410,8 @@ static void TestStorageCorruption() {
 		throw std::runtime_error("manifest decline changed exact results");
 	}
 	if (Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('wide_manifest', 'aaaa')")
-	        ->GetValue(1, 0)
+	        ->Collection()
+	        .GetValue(1, 0)
 	        .ToString()
 	        .find("full scan fallback: segment manifest exceeds query memory budget") == string::npos) {
 		throw std::runtime_error("a manifest past the budget did not decline the probe");
@@ -1800,12 +1821,13 @@ static void TestFormat4Fixture(const string &fixture, const string &path) {
 	Connection con(db);
 	Check(con, "ATTACH " + SQLString::ToString(path) + " AS f4");
 	auto listed = Query(con, "PRAGMA ngram_indexes");
-	if (listed->RowCount() != 1 || listed->GetValue(0, 0).ToString() != "f4" ||
-	    listed->GetValue(5, 0).GetValue<int64_t>() != 4 || listed->GetValue(6, 0).ToString() != "MALFORMED" ||
-	    listed->GetValue(7, 0).ToString().find("index format 4") == string::npos) {
+	if (listed->RowCount() != 1 || listed->Collection().GetValue(0, 0).ToString() != "f4" ||
+	    listed->Collection().GetValue(5, 0).GetValue<int64_t>() != 4 ||
+	    listed->Collection().GetValue(6, 0).ToString() != "MALFORMED" ||
+	    listed->Collection().GetValue(7, 0).ToString().find("index format 4") == string::npos) {
 		throw std::runtime_error("format-4 fixture was not listed MALFORMED with its format");
 	}
-	auto ref = listed->GetValue(1, 0).ToString();
+	auto ref = listed->Collection().GetValue(1, 0).ToString();
 	if (ScalarInt64(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name='f4' AND schema_name='__ngram' "
 	                     "AND table_name LIKE 'stats_%'") != 1) {
 		throw std::runtime_error("format-4 fixture lacks the statistics table this test removes");
@@ -1847,12 +1869,13 @@ static void TestFormat5Fixture(const string &fixture, const string &path) {
 	Connection con(db);
 	Check(con, "ATTACH " + SQLString::ToString(path) + " AS f5");
 	auto listed = Query(con, "PRAGMA ngram_indexes");
-	if (listed->RowCount() != 1 || listed->GetValue(0, 0).ToString() != "f5" ||
-	    listed->GetValue(5, 0).GetValue<int64_t>() != 5 || listed->GetValue(6, 0).ToString() != "SCAN_ONLY" ||
-	    listed->GetValue(7, 0).ToString().find("incompatible with this extension build") == string::npos) {
+	if (listed->RowCount() != 1 || listed->Collection().GetValue(0, 0).ToString() != "f5" ||
+	    listed->Collection().GetValue(5, 0).GetValue<int64_t>() != 5 ||
+	    listed->Collection().GetValue(6, 0).ToString() != "SCAN_ONLY" ||
+	    listed->Collection().GetValue(7, 0).ToString().find("incompatible with this extension build") == string::npos) {
 		throw std::runtime_error("format-5 fixture from the previous host was not listed SCAN_ONLY");
 	}
-	auto ref = listed->GetValue(1, 0).ToString();
+	auto ref = listed->Collection().GetValue(1, 0).ToString();
 	auto oracle = FixtureOracle(con, "f5", "tent");
 	if (oracle != 4 || ScalarInt64(con, "SELECT count(*) FROM ngram_search('f5.main.docs', 'tent')") != oracle) {
 		throw std::runtime_error("format-5 explicit search disagreed with the oracle after reopen");
@@ -1878,7 +1901,7 @@ static void TestFormat5Fixture(const string &fixture, const string &path) {
 	if (StatusName(con, "f5", IndexRef(con, "docs", "s", "f5")) != "READY" ||
 	    ScalarInt64(con, "SELECT hwm_rowid FROM f5.__ngram.registry") != 6 ||
 	    ScalarInt64(con, "SELECT count(*) FROM ngram_search('f5.main.docs', 'tent')") != oracle ||
-	    profiled->GetValue(1, 0).ToString().find("\"Ngram Mode\": \"index") == string::npos ||
+	    profiled->Collection().GetValue(1, 0).ToString().find("\"Ngram Mode\": \"index") == string::npos ||
 	    ScalarInt64(con, transparent) != oracle) {
 		throw std::runtime_error("rebuild after the format-5 drop was not READY and exact on both paths");
 	}
@@ -1894,12 +1917,13 @@ static void TestFormat3Fixture(const string &fixture, const string &path) {
 	Connection con(db);
 	Check(con, "ATTACH " + SQLString::ToString(path) + " AS f3");
 	auto listed = Query(con, "PRAGMA ngram_indexes");
-	if (listed->RowCount() != 1 || listed->GetValue(0, 0).ToString() != "f3" ||
-	    listed->GetValue(5, 0).GetValue<int64_t>() != 3 || listed->GetValue(6, 0).ToString() != "MALFORMED" ||
-	    listed->GetValue(7, 0).ToString().find("format 3") == string::npos) {
+	if (listed->RowCount() != 1 || listed->Collection().GetValue(0, 0).ToString() != "f3" ||
+	    listed->Collection().GetValue(5, 0).GetValue<int64_t>() != 3 ||
+	    listed->Collection().GetValue(6, 0).ToString() != "MALFORMED" ||
+	    listed->Collection().GetValue(7, 0).ToString().find("format 3") == string::npos) {
 		throw std::runtime_error("format-3 fixture was not listed MALFORMED with its format");
 	}
-	auto ref = listed->GetValue(1, 0).ToString();
+	auto ref = listed->Collection().GetValue(1, 0).ToString();
 	ExpectError(con, "PRAGMA create_ngram_index('f3.main.docs', 't')", "predates format 5");
 	// The token-checked drop removes the guard, the row, the old storage schema
 	// and, with the last row, the old registry; the table is untouched and a
@@ -2032,7 +2056,7 @@ static void TestRegistryCorruption() {
 			Check(con, "UPDATE __ngram.registry SET index_id='00000000-0000-1000-8000-000000000001'::UUID");
 		}
 		auto listed = Query(con, "PRAGMA ngram_indexes");
-		if (listed->RowCount() == 0 || listed->GetValue(6, 0).ToString() != "MALFORMED") {
+		if (listed->RowCount() == 0 || listed->Collection().GetValue(6, 0).ToString() != "MALFORMED") {
 			throw std::runtime_error("bad registry version/UUID was not listed MALFORMED");
 		}
 		Check(con, "CREATE TABLE create_blocked(s VARCHAR)");
@@ -2110,7 +2134,7 @@ static void TestRegistryCorruption() {
 		auto listed = Query(con, "PRAGMA ngram_indexes");
 		idx_t malformed = 0;
 		for (idx_t row = 0; row < listed->RowCount(); row++) {
-			malformed += listed->GetValue(6, row).ToString() == "MALFORMED";
+			malformed += listed->Collection().GetValue(6, row).ToString() == "MALFORMED";
 		}
 		if (listed->RowCount() != 4 || malformed != 3) {
 			throw std::runtime_error("foreign objects in the reserved schema were not listed individually");
@@ -2401,7 +2425,7 @@ static void TestRegistryScale() {
 	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	idx_t ready = 0, malformed = 0;
 	for (idx_t row = 0; row < listed->RowCount(); row++) {
-		auto status = listed->GetValue(6, row).ToString();
+		auto status = listed->Collection().GetValue(6, row).ToString();
 		ready += status == "READY";
 		malformed += status == "MALFORMED";
 	}
@@ -2446,12 +2470,12 @@ static void TestRegistryScale() {
 
 //! Submits `sql` and streams its result, so the engine produces chunks as
 //! they are fetched instead of running the query to completion first.
-static unique_ptr<QueryResultStream> OpenStream(Connection &con, const string &sql, const string &failure) {
+static unique_ptr<QueryResultStream<>> OpenStream(Connection &con, const string &sql, const string &failure) {
 	auto handle = con.Submit(sql);
 	if (handle->HasError()) {
 		throw std::runtime_error(failure + ": " + handle->GetError());
 	}
-	return make_uniq<QueryResultStream>(std::move(handle));
+	return make_uniq<QueryResultStream<>>(std::move(handle));
 }
 
 //! Interrupt a query while it is provably running: stream it, hold its
@@ -2501,7 +2525,8 @@ static void TestQueryCancellation() {
 	for (auto needle : vector<string> {"aaaa", "bbbb"}) {
 		auto profile = Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('cancel_rows', '" +
 		                              needle + "')")
-		                   ->GetValue(1, 0)
+		                   ->Collection()
+		                   .GetValue(1, 0)
 		                   .ToString();
 		if (profile.find("\"Ngram Mode\": \"index") == string::npos) {
 			throw std::runtime_error("cancellation fixture was not admitted for " + needle);
@@ -2618,8 +2643,8 @@ static void TestParallelCandidateStreams() {
 	Check(con, "PRAGMA create_ngram_index('stream_rows', 's', case_insensitive=false)");
 	const string search = "SELECT id FROM ngram_search('stream_rows', 'abcdefgh')";
 	auto expected = Query(con, "SELECT count(*), sum(id) FROM stream_rows WHERE contains(s, 'abcdefgh')");
-	auto expected_rows = expected->GetValue(0, 0).GetValue<int64_t>();
-	auto expected_sum = expected->GetValue(1, 0).GetValue<int64_t>();
+	auto expected_rows = expected->Collection().GetValue(0, 0).GetValue<int64_t>();
+	auto expected_sum = expected->Collection().GetValue(1, 0).GetValue<int64_t>();
 	if (expected_rows != 1065717) {
 		throw std::runtime_error("stream fixture produced " + to_string(expected_rows) + " matches");
 	}
@@ -2656,8 +2681,8 @@ static void TestParallelCandidateStreams() {
 	for (idx_t chunks_before : vector<idx_t> {1, 8, 64}) {
 		ExpectStreamInterrupted(con, search, chunks_before);
 		auto again = Query(con, "SELECT count(*), sum(id) FROM (" + search + ")");
-		if (again->GetValue(0, 0).GetValue<int64_t>() != expected_rows ||
-		    again->GetValue(1, 0).GetValue<int64_t>() != expected_sum) {
+		if (again->Collection().GetValue(0, 0).GetValue<int64_t>() != expected_rows ||
+		    again->Collection().GetValue(1, 0).GetValue<int64_t>() != expected_sum) {
 			throw std::runtime_error("parallel search after an interrupt at chunk " + to_string(chunks_before) +
 			                         " returned wrong rows");
 		}
@@ -2693,8 +2718,8 @@ static void TestPublicationBarrier() {
 	Check(con, "PRAGMA create_ngram_index('barrier_rows', 's', case_insensitive=false)");
 	const string search = "SELECT id FROM ngram_search('barrier_rows', 'abcdefgh')";
 	auto expected = Query(con, "SELECT count(*), sum(id) FROM barrier_rows WHERE contains(s, 'abcdefgh')");
-	auto expected_rows = expected->GetValue(0, 0).GetValue<int64_t>();
-	auto expected_sum = expected->GetValue(1, 0).GetValue<int64_t>();
+	auto expected_rows = expected->Collection().GetValue(0, 0).GetValue<int64_t>();
+	auto expected_sum = expected->Collection().GetValue(1, 0).GetValue<int64_t>();
 
 	std::mutex lock;
 	std::condition_variable reached;
@@ -2793,8 +2818,8 @@ static void TestPublicationBarrier() {
 		                         ", timed out: " + string(interrupt_timed_out ? "yes" : "no") + ")");
 	}
 	auto again = Query(con, "SELECT count(*), sum(id) FROM (" + search + ")");
-	if (again->GetValue(0, 0).GetValue<int64_t>() != expected_rows ||
-	    again->GetValue(1, 0).GetValue<int64_t>() != expected_sum) {
+	if (again->Collection().GetValue(0, 0).GetValue<int64_t>() != expected_rows ||
+	    again->Collection().GetValue(1, 0).GetValue<int64_t>() != expected_sum) {
 		throw std::runtime_error("barrier search after the decode-time interrupt returned wrong rows");
 	}
 }
@@ -2831,7 +2856,7 @@ static void TestProbeMemoryPeak() {
 			string query = transparent ? "SELECT count(*) FROM peak_rows WHERE contains(s, 'abcdefgh')"
 			                           : "SELECT count(*) FROM ngram_search('peak_rows', 'abcdefgh')";
 			auto profiled = Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) " + query);
-			auto profile = profiled->GetValue(1, 0).ToString();
+			auto profile = profiled->Collection().GetValue(1, 0).ToString();
 			if (profile.find("\"Ngram Mode\": \"index") == string::npos) {
 				throw std::runtime_error("probe was not admitted at memory_limit " + memory_limit + ": " + profile);
 			}
@@ -2881,7 +2906,7 @@ static void ExpectCollisionExact(Connection &con, Connection &oracle, const stri
 	}
 	for (auto &query : vector<string> {"SELECT count(*) FROM ngram_search('" + table + "', " + needle + ")",
 	                                   "SELECT count(*) FROM " + table + " WHERE contains(s, " + needle + ")"}) {
-		auto profile = Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) " + query)->GetValue(1, 0).ToString();
+		auto profile = Query(con, "EXPLAIN (ANALYZE, FORMAT JSON) " + query)->Collection().GetValue(1, 0).ToString();
 		if (profile.find("\"Ngram Mode\": \"index") == string::npos) {
 			throw std::runtime_error("collision query did not run through the index: " + query);
 		}

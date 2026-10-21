@@ -276,15 +276,16 @@ string CreateIndexScript(ClientContext &context, const ResolvedTarget &target, c
 	auto segments = StorageTable(target.catalog_name, location.SegmentsTable());
 	auto total_rows = TableTotalRows(table);
 
-	// No BEGIN/COMMIT here: the statement preprocessor wraps a multi-statement
-	// pragma expansion in a transaction itself. The build runs through DuckDB's
-	// engine, so it is parallel and can spill: one statement per rowid-range
-	// partition groups that partition's (gram_key, segment_no, rowid) pairs into
-	// segment rows with ngram_pack_segment, the partitions land in a temp table,
-	// and that table is written to the segments table in key order. Segments
-	// are bucketed by rowid range, which lets a rowid-range partition hold whole
-	// keys. The segments table is the whole index: a probe reads each needle
-	// key's rows to rank the grams, so no separate statistics are kept.
+	// No BEGIN/COMMIT here: the host runs a pragma that expands into several
+	// statements in one transaction and refuses transaction statements inside
+	// it. The build runs through DuckDB's engine, so it is parallel and can
+	// spill: one statement per rowid-range partition groups that partition's
+	// (gram_key, segment_no, rowid) pairs into segment rows with
+	// ngram_pack_segment, the partitions land in a temp table, and that table is
+	// written to the segments table in key order. Segments are bucketed by rowid
+	// range, which lets a rowid-range partition hold whole keys. The segments
+	// table is the whole index: a probe reads each needle key's rows to rank the
+	// grams, so no separate statistics are kept.
 	string script;
 	string fence = ScratchName("fence");
 	string packed = ScratchName("build_packed");

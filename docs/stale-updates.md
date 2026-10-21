@@ -215,7 +215,7 @@ of checkpoint internals is gated by the exact version/source pin.
 - Creation invalidates the reservoir sample and can make overlapping writers
   retry. Quiescing writes around a first build avoids that API cost.
 - The native guard queries the host's built-in `pragma_version()` at load and
-  accepts only DuckDB v2.0.0 reporting an abbreviation of commit `e366461e30…`
+  accepts only DuckDB v2.0.0 reporting an abbreviation of commit `d54cbbe3df…`
   with seven or more characters. An index written against a different host
   build reads back `SCAN_ONLY` until it is rebuilt. Query and maintenance paths fail closed
   on mismatch; the generic drop validator stays available when the extension

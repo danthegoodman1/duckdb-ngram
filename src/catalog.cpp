@@ -82,14 +82,40 @@ int64_t TableTotalRows(TableCatalogEntry &table) {
 	return NumericCast<int64_t>(table.Cast<DuckTableEntry>().GetStorage().GetTotalRows());
 }
 
-static const array<const char *, 12> REGISTRY_COLUMNS = {
+static const array<const char *, 14> REGISTRY_COLUMNS = {
+    "registry_version", "index_id", "owner_key", "schema_name",      "table_name", "column_name", "format_version",
+    "tokenizer",        "min_gram", "max_gram",  "case_insensitive", "hwm_rowid",  "guard_name",  "guard_token"};
+static const array<LogicalType, 14> REGISTRY_TYPES = {
+    LogicalType::INTEGER, LogicalType::UUID,   LogicalType::BLOB,    LogicalType::VARCHAR, LogicalType::VARCHAR,
+    LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
+    LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR};
+//! Registry version 2 kept one gram size where version 3 keeps the tokenizer.
+static const array<const char *, 12> GRAM_SIZE_REGISTRY_COLUMNS = {
     "registry_version", "index_id",  "owner_key",        "schema_name", "table_name", "column_name",
     "format_version",   "gram_size", "case_insensitive", "hwm_rowid",   "guard_name", "guard_token"};
-static const array<LogicalType, 12> REGISTRY_TYPES = {LogicalType::INTEGER, LogicalType::UUID,    LogicalType::BLOB,
-                                                      LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-                                                      LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN,
-                                                      LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR};
+static const array<LogicalType, 12> GRAM_SIZE_REGISTRY_TYPES = {
+    LogicalType::INTEGER, LogicalType::UUID,    LogicalType::BLOB,    LogicalType::VARCHAR,
+    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
+    LogicalType::BOOLEAN, LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR};
 static constexpr idx_t IDENTITY_COLUMNS = 6;
+
+//! Fill `options` from a registry row's tokenizer columns; the reason the
+//! row is unusable, or empty.
+static string ReadRegistryOptions(const string &tokenizer, int64_t min_gram, int64_t max_gram, GramOptions &options) {
+	try {
+		options.tokenizer = ParseTokenizer(tokenizer, "ngram");
+		if (min_gram < 1 || max_gram < 1) {
+			throw InvalidInputException("gram lengths must be positive");
+		}
+		options.min_gram = NumericCast<idx_t>(min_gram);
+		options.max_gram = NumericCast<idx_t>(max_gram);
+		ValidateGramOptions(options, "ngram");
+	} catch (InvalidInputException &) {
+		return StringUtil::Format("registry row records tokenizer %s with gram lengths %lld to %lld", tokenizer,
+		                          min_gram, max_gram);
+	}
+	return string();
+}
 
 RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name, const RegistrySelector &selector) {
 	RegistrySnapshot result;
@@ -105,8 +131,15 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 	}
 	auto &table = entry->Cast<DuckTableEntry>();
 	auto columns = table.GetColumns().Logical();
-	result.legacy_shape = columns.Size() == IDENTITY_COLUMNS;
-	if (columns.Size() != REGISTRY_COLUMNS.size() && !result.legacy_shape) {
+	const char *const *expected_names = REGISTRY_COLUMNS.data();
+	const LogicalType *expected_types = REGISTRY_TYPES.data();
+	if (columns.Size() == IDENTITY_COLUMNS) {
+		result.shape = RegistryShape::IDENTITY_ONLY;
+	} else if (columns.Size() == GRAM_SIZE_REGISTRY_COLUMNS.size()) {
+		result.shape = RegistryShape::GRAM_SIZE;
+		expected_names = GRAM_SIZE_REGISTRY_COLUMNS.data();
+		expected_types = GRAM_SIZE_REGISTRY_TYPES.data();
+	} else if (columns.Size() != REGISTRY_COLUMNS.size()) {
 		throw InvalidInputException("ngram: registry has %llu columns; expected %llu", columns.Size(),
 		                            REGISTRY_COLUMNS.size());
 	}
@@ -114,7 +147,7 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 	vector<LogicalType> types;
 	idx_t i = 0;
 	for (auto &column : columns) {
-		if (column.Name() != REGISTRY_COLUMNS[i] || column.Type() != REGISTRY_TYPES[i] || column.Generated()) {
+		if (column.Name() != expected_names[i] || column.Type() != expected_types[i] || column.Generated()) {
 			throw InvalidInputException("ngram: registry column %llu has the wrong name or type", i + 1);
 		}
 		column_ids.push_back(table.GetStorageIndex(ColumnIndex(column.Logical().index)));
@@ -177,7 +210,7 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 			if (!IsCanonicalUUID(row.index_ref)) {
 				throw InvalidInputException("ngram: registry row has a noncanonical ID");
 			}
-			if (result.legacy_shape) {
+			if (result.shape == RegistryShape::IDENTITY_ONLY) {
 				row.format_version = 3;
 				row.error =
 				    StringUtil::Format("index format 3 (registry version %d) predates format %lld; drop it with "
@@ -187,11 +220,22 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 				continue;
 			}
 			row.format_version = chunk.GetValue(6, r).GetValue<int64_t>();
-			auto gram_size = chunk.GetValue(7, r).GetValue<int64_t>();
-			row.meta.options.case_insensitive = chunk.GetValue(8, r).GetValue<bool>();
-			row.meta.hwm_rowid = chunk.GetValue(9, r).GetValue<int64_t>();
-			row.meta.guard_name = StringValue::Get(chunk.GetValue(10, r));
-			row.meta.guard_token = StringValue::Get(chunk.GetValue(11, r));
+			if (result.shape == RegistryShape::GRAM_SIZE) {
+				row.meta.guard_name = StringValue::Get(chunk.GetValue(10, r));
+				row.meta.guard_token = StringValue::Get(chunk.GetValue(11, r));
+				row.error = StringUtil::Format("index format %lld (registry version %d) predates format %lld; drop "
+				                               "it with drop_ngram_index(index_ref, catalog = ...) and rebuild it",
+				                               row.format_version, version, NGRAM_FORMAT_VERSION);
+				result.rows.push_back(std::move(row));
+				continue;
+			}
+			auto tokenizer = StringValue::Get(chunk.GetValue(7, r));
+			auto min_gram = chunk.GetValue(8, r).GetValue<int64_t>();
+			auto max_gram = chunk.GetValue(9, r).GetValue<int64_t>();
+			row.meta.options.case_insensitive = chunk.GetValue(10, r).GetValue<bool>();
+			row.meta.hwm_rowid = chunk.GetValue(11, r).GetValue<int64_t>();
+			row.meta.guard_name = StringValue::Get(chunk.GetValue(12, r));
+			row.meta.guard_token = StringValue::Get(chunk.GetValue(13, r));
 			if (version != REGISTRY_VERSION) {
 				row.error = StringUtil::Format("unsupported registry row version %d", version);
 			} else if (row.owner_key != OwnerKey(row.schema_name, row.table_name, row.column_name)) {
@@ -201,12 +245,10 @@ RegistrySnapshot ReadRegistry(ClientContext &context, const string &catalog_name
 				    StringUtil::Format("index format %lld is not readable by this extension, which uses format "
 				                       "%lld; drop it with drop_ngram_index(index_ref, catalog = ...) and rebuild it",
 				                       row.format_version, NGRAM_FORMAT_VERSION);
-			} else if (gram_size < 1) {
-				row.error = StringUtil::Format("registry row records gram_size %lld", gram_size);
 			} else if (row.meta.hwm_rowid < -1 || row.meta.hwm_rowid >= MAX_ROW_ID) {
 				row.error = StringUtil::Format("registry row records hwm_rowid %lld", row.meta.hwm_rowid);
 			} else {
-				row.meta.options.gram_size = NumericCast<idx_t>(gram_size);
+				row.error = ReadRegistryOptions(tokenizer, min_gram, max_gram, row.meta.options);
 			}
 			result.rows.push_back(std::move(row));
 		}
@@ -327,7 +369,7 @@ vector<string> PrefixedGuardNames(ClientContext &context, DuckTableEntry &table)
 
 RegistrySnapshot ReadRegistryForCreate(ClientContext &context, const string &catalog_name) {
 	auto registry = ReadRegistry(context, catalog_name);
-	if (registry.legacy_shape) {
+	if (registry.shape != RegistryShape::CURRENT && !registry.rows.empty()) {
 		throw InvalidInputException("create_ngram_index: the ngram registry in %s predates format %lld; drop each "
 		                            "listed index with drop_ngram_index(index_ref, catalog = ...) and rebuild it",
 		                            catalog_name, NGRAM_FORMAT_VERSION);
@@ -338,7 +380,8 @@ RegistrySnapshot ReadRegistryForCreate(ClientContext &context, const string &cat
 void ValidateRegistryForCreate(ClientContext &context, const string &catalog_name, idx_t expected_registry_oid,
                                bool expected_bootstrap) {
 	auto registry = ReadRegistryForCreate(context, catalog_name);
-	if (!registry.oid != expected_bootstrap || registry.oid != expected_registry_oid) {
+	auto oid = registry.shape == RegistryShape::CURRENT ? registry.oid : 0;
+	if (!oid != expected_bootstrap || oid != expected_registry_oid) {
 		throw InvalidInputException("create_ngram_index: registry changed after the operation was prepared");
 	}
 }

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Property-based differential harness for the ngram explicit query path.
 
-For each trial, builds a randomized corpus (alphabet, size, gram size, case
-sensitivity, NULL/empty fractions all randomized), indexes it, and checks that
+For each trial, builds a randomized corpus (alphabet, size, tokenizer and gram
+lengths, case sensitivity, NULL/empty fractions all randomized), indexes it,
+and checks that
 
     SELECT * FROM ngram_search(t, needle) == SELECT * FROM t WHERE <recheck predicate>
 
@@ -29,8 +30,11 @@ so the comparison can never go vacuously green. The candidate-fraction gate
 is randomized per trial (default 0.05 vs 1.0) to exercise both the index
 path and the in-scan fallback.
 
+--tokenizer picks the index kind: ngram, sparse, or (the default) either,
+chosen per trial.
+
 Usage: python3 scripts/differential_search.py [--trials N] [--rows N] [--seed S]
-                                              [--transparent]
+                                              [--transparent] [--tokenizer KIND]
 Exit code 0 iff every check passes.
 """
 
@@ -81,17 +85,19 @@ def make_row(rng, alphabet_name, rows):
     return "".join(rng.choice(alphabet) for _ in range(n))
 
 
-def make_needles(rng, corpus, gram_size, count):
+def make_needles(rng, corpus, gram_size, max_gram, count):
     needles = set()
     non_null = [s for s in corpus if s]
     # substrings of real rows: guaranteed matches at assorted lengths,
-    # including exactly gram_size-1 (short-needle fallback) and gram_size
+    # including exactly gram_size-1 (short-needle fallback), gram_size, and
+    # lengths past max_gram, whose covering grams a sparse probe reads
     for _ in range(count):
         s = rng.choice(non_null)
         cps = list(s)
         if not cps:
             continue
-        for length in (gram_size - 1, gram_size, gram_size + 1, rng.randint(1, 12)):
+        for length in (gram_size - 1, gram_size, gram_size + 1, rng.randint(1, 12),
+                       max_gram, max_gram + 1, rng.randint(gram_size, 3 * max_gram)):
             if length < 1 or length > len(cps):
                 continue
             start = rng.randint(0, len(cps) - length)
@@ -211,22 +217,33 @@ def check_output(out, label, failures):
     return ok
 
 
-def one_trial(trial, rng, rows, transparent):
+def one_trial(trial, rng, rows, transparent, tokenizer):
     alphabet = rng.choice(list(ALPHABETS))
-    gram_size = rng.choice([2, 3, 3, 4])
+    if tokenizer == "mixed":
+        tokenizer = rng.choice(["ngram", "sparse"])
+    if tokenizer == "ngram":
+        gram_size = max_gram = rng.choice([2, 3, 3, 4])
+        options = "gram = %d" % gram_size
+        label = "ngram(%d)" % gram_size
+    else:
+        gram_size = rng.choice([3, 3, 4])
+        max_gram = rng.choice([gram_size, gram_size + 1, 5, 8, 16])
+        max_gram = max(max_gram, gram_size)
+        options = "tokenizer = 'sparse', min_gram = %d, max_gram = %d" % (gram_size, max_gram)
+        label = "sparse(%d, %d)" % (gram_size, max_gram)
     case_insensitive = rng.random() < 0.6
     n_rows = rng.randint(max(rows // 4, 200), rows)
     # transparent mode randomizes the candidate-fraction gate: the default
     # (0.05) trips often on small corpora (exercising the in-scan fallback),
     # 1.0 keeps the index path hot
     gate = rng.choice(["default", "off"]) if transparent else None
-    print("trial %d: alphabet=%s gram=%d case_insensitive=%s rows=%d%s"
-          % (trial, alphabet, gram_size, case_insensitive, n_rows,
+    print("trial %d: alphabet=%s %s case_insensitive=%s rows=%d%s"
+          % (trial, alphabet, label, case_insensitive, n_rows,
              " transparent(gate=%s)" % gate if transparent else ""), flush=True)
 
     corpus = [make_row(rng, alphabet, n_rows) for _ in range(n_rows)]
     tail = [make_row(rng, alphabet, n_rows) for _ in range(n_rows // 3)]
-    needles = make_needles(rng, corpus, gram_size, 25)
+    needles = make_needles(rng, corpus, gram_size, max_gram, 25)
 
     failures = []
     checks = 0
@@ -244,8 +261,8 @@ def one_trial(trial, rng, rows, transparent):
             % (sql_quote(csv_path), sql_quote(NULL_SENTINEL)),
         ]
         run_duckdb(db_path, "\n".join(setup))
-        run_duckdb(db_path, "PRAGMA create_ngram_index('corpus', 's', gram = %d, case_insensitive = %s);"
-                   % (gram_size, "true" if case_insensitive else "false"))
+        run_duckdb(db_path, "PRAGMA create_ngram_index('corpus', 's', %s, case_insensitive = %s);"
+                   % (options, "true" if case_insensitive else "false"))
         ref = index_ref(db_path)
 
         if transparent:
@@ -331,6 +348,8 @@ def main():
     ap.add_argument("--transparent", action="store_true",
                     help="exercise the Phase 4 optimizer rewrite (plain LIKE/contains/ILIKE queries, "
                          "accelerated vs disabled_optimizers='extension') instead of the explicit functions")
+    ap.add_argument("--tokenizer", choices=["ngram", "sparse", "mixed"], default="mixed",
+                    help="index kind per trial; mixed picks ngram or sparse at random")
     ap.add_argument("--duckdb", default=DEFAULT_DUCKDB, help="duckdb binary to run (e.g. a DEBUG build)")
     args = ap.parse_args()
     set_duckdb_binary(args.duckdb)
@@ -342,7 +361,7 @@ def main():
     total_checks = 0
     all_failures = []
     for trial in range(args.trials):
-        checks, failures = one_trial(trial, rng, args.rows, args.transparent)
+        checks, failures = one_trial(trial, rng, args.rows, args.transparent, args.tokenizer)
         total_checks += checks
         all_failures.extend(failures)
         print("  %d checks, %d failures" % (checks, len(failures)), flush=True)

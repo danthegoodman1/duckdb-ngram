@@ -400,13 +400,16 @@ vector<ObservedIndex> ObserveCatalog(ClientContext &context, const string &catal
 		observed.table_name = row.table_name;
 		observed.location = LocationOf(row, registry.oid);
 		observed.format_version = row.format_version;
-		observed.legacy = registry.legacy_shape;
+		observed.registry_shape = registry.shape;
 		// The row consumes its storage entries; whatever remains in storage
 		// afterwards has no registry row. A format-4 row owns its statistics
 		// table too, so the pair lists and drops as one index.
 		bool storage_present = storage.erase(row.index_ref) > 0;
 		if (row.format_version == 4) {
 			format4_stats.erase(row.index_ref);
+		}
+		if (row.error.empty()) {
+			observed.tokenizer = TokenizerSpec(row.meta.options);
 		}
 		if (!row.error.empty()) {
 			observed.status = "MALFORMED";

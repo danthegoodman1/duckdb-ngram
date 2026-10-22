@@ -391,10 +391,10 @@ INSERT INTO docs VALUES (9, 'tent for the stats');
 # rowid the deleted row left behind is a gap rather than work);
 # fragmented_keys and generations are the signal for compaction. A pragma
 # cannot be wrapped in a subquery, so the row is pinned whole.
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-s	3	true	7	8	1	39	39	0	1	48	126	NULL
+s	ngram	3	3	true	7	8	1	39	39	0	1	48	126	NULL
 
 #===----------------------------------------------------------------------===#
 # two indexed columns refresh independently
@@ -897,12 +897,12 @@ statement ok
 PRAGMA create_ngram_index('pair', 'u'); PRAGMA create_ngram_index('pair', 'v');
 
 # no stale_reason: every index is READY
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('pair');
 ----
-s	3	true	1	1	0	12	12	0	1	16	40	NULL
-u	3	true	1	1	0	10	10	0	1	15	35	NULL
-v	3	true	1	1	0	12	12	0	1	16	40	NULL
+s	ngram	3	3	true	1	1	0	12	12	0	1	16	40	NULL
+u	ngram	3	3	true	1	1	0	10	10	0	1	15	35	NULL
+v	ngram	3	3	true	1	1	0	12	12	0	1	16	40	NULL
 
 query III
 SELECT (SELECT count(*) FROM ngram_search('pair', 'alpha', col := 's')),
@@ -917,12 +917,12 @@ INSERT INTO pair VALUES ('alpha again', 'delta again', 'omega again');
 statement ok
 PRAGMA ngram_refresh('pair', col = 'u'); PRAGMA ngram_refresh('pair', col = 'v');
 
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('pair');
 ----
-s	3	true	1	2	1	12	12	0	1	16	40	NULL
-u	3	true	2	2	0	15	19	4	2	24	62	NULL
-v	3	true	2	2	0	17	21	4	2	25	67	NULL
+s	ngram	3	3	true	1	2	1	12	12	0	1	16	40	NULL
+u	ngram	3	3	true	2	2	0	15	19	4	2	24	62	NULL
+v	ngram	3	3	true	2	2	0	17	21	4	2	25	67	NULL
 
 # the refreshed indexes answer from their postings, the other from its tail scan
 query IIII
@@ -936,10 +936,10 @@ SELECT (SELECT count(*) FROM ngram_candidates('pair', 'u', 'again')),
 statement ok
 PRAGMA drop_ngram_index('pair', 'u'); PRAGMA drop_ngram_index('pair', 'v');
 
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('pair');
 ----
-s	3	true	1	2	1	12	12	0	1	16	40	NULL
+s	ngram	3	3	true	1	2	1	12	12	0	1	16	40	NULL
 
 query III
 SELECT (SELECT count(*) FROM __ngram.registry WHERE table_name = 'pair'),

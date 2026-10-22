@@ -1,6 +1,6 @@
 extension:
   name: ngram
-  description: Durable trigram index for exhaustive substring search — LIKE '%needle%' over large text columns, every matching row, always
+  description: Durable trigram or sparse-gram index for exhaustive substring search — LIKE '%needle%' over large text columns, every matching row, always
   version: 0.1.0
   language: C++
   build: cmake
@@ -45,8 +45,11 @@ docs:
     `ILIKE`, and literal `regexp_matches` — over large `VARCHAR` columns, and
     returns **every** matching row.
 
-    A row containing the needle contains every trigram of the needle, so
-    intersecting posting lists yields a superset of the true matches; each
+    An index holds trigrams by default, or sparse grams: every trigram plus
+    longer grams chosen by a fixed hash of their character pairs, which make
+    word- and phrase-length needles more selective. A row containing the
+    needle contains every gram of the needle, so intersecting posting lists
+    yields a superset of the true matches; each
     candidate is then fetched and rechecked against the original predicate.
     Consequences: false positives are impossible in every state the index can
     be in, and the index is an optimization rather than a correctness
@@ -66,7 +69,8 @@ docs:
 
     Surface:
 
-    * `PRAGMA create_ngram_index(table, column[, gram, case_insensitive])`,
+    * `PRAGMA create_ngram_index(table, column[, tokenizer, gram, min_gram,
+      max_gram, case_insensitive])`,
       `PRAGMA drop_ngram_index(table, column)`
     * `ngram_indexes()` — the lifecycle listing, one row per index or stray
       storage object, and `PRAGMA drop_ngram_index(index_ref[, catalog])` —
@@ -95,7 +99,8 @@ docs:
     is listed with a reason, but cleanup fails closed rather than force-dropping
     objects whose ownership or guard identity cannot be proved.
 
-    Expect the index to be roughly the size of the text it indexes, which is
-    the usual range for an exhaustive trigram index. Not a fuzzy-matching or
+    Expect a trigram index to be roughly the size of the text it indexes, the
+    usual range for an exhaustive trigram index, and a sparse index about
+    2.5 times that. Not a fuzzy-matching or
     ranking extension; for scored full-text search over tokenized documents,
     use `fts`.

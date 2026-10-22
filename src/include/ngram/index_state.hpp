@@ -84,7 +84,11 @@ struct ObservedIndex {
 	string reason;
 	IndexLocation location;
 	int64_t format_version = -1;
-	bool legacy = false;
+	//! The tokenizer spelled as TokenizerSpec does, or empty when the registry
+	//! row is unreadable.
+	string tokenizer;
+	//! The layout of the registry the row was read from.
+	RegistryShape registry_shape = RegistryShape::CURRENT;
 };
 
 //! Every index and stray storage object of one DuckDB catalog.

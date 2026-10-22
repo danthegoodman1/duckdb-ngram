@@ -233,6 +233,9 @@ struct NgramScanGlobalState final : public GlobalTableFunctionState {
 	NgramScanMode mode = NgramScanMode::FULL_SCAN;
 	//! Why mode is FULL_SCAN; rendered by dynamic_to_string (EXPLAIN ANALYZE).
 	string fallback_reason;
+	//! The index's options, once its registry row was read.
+	optional_ptr<const GramOptions> options;
+	GramOptions index_options;
 	idx_t candidate_count = 0;
 	vector<string> fetched_columns;
 
@@ -313,6 +316,8 @@ static bool TryProbeIndex(ClientContext &context, const NgramScanBindData &bind,
 		return false;
 	}
 	auto &info = verdict.meta;
+	state.index_options = info.options;
+	state.options = &state.index_options;
 	// a matching row must contain every needle, hence every gram of every
 	// needle: one intersection over the union of gram sets is exactly the
 	// per-needle candidate-set intersection, and any subset of that union
@@ -492,10 +497,21 @@ static void NgramScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	}
 	auto &state = input.global_state->Cast<NgramScanGlobalState>();
 	metrics.AddExtraInfo("Ngram Storage Columns", StringUtil::Join(state.fetched_columns, ", "));
+	if (state.options) {
+		metrics.AddExtraInfo("Ngram Tokenizer", TokenizerSpec(*state.options));
+	}
 	if (state.mode == NgramScanMode::INDEX) {
 		metrics.AddExtraInfo("Ngram Mode",
 		                     StringUtil::Format("index (<= %llu candidates, %llu decoded rowids)",
 		                                        state.candidate_count, state.core.probe->decoded_rowids.load()));
+		if (input.bind_data && state.options) {
+			vector<string> needles;
+			for (auto &needle : input.bind_data->Cast<NgramScanBindData>().needles) {
+				needles.push_back(needle.text);
+			}
+			metrics.AddExtraInfo("Ngram Probe Grams",
+			                     StringUtil::Join(GramTexts(*state.options, needles, state.core.probe->keys), ", "));
+		}
 		metrics.AddExtraInfo("Ngram Manifest Rows Scanned", to_string(state.core.probe->manifest_rows_scanned));
 		metrics.AddExtraInfo("Ngram Manifest Rows Visited", to_string(state.core.probe->manifest_rows_visited));
 		metrics.AddExtraInfo("Ngram Admission Rows", to_string(state.core.probe->admission_rows));

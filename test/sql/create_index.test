@@ -31,11 +31,11 @@ WHERE schema_name = '__ngram' AND table_name = 'segments_' || getvariable('docs_
 1
 
 # options round-trip through the registry row
-query IIIIII
-SELECT format_version, schema_name, table_name, column_name, gram_size, case_insensitive
+query IIIIIIII
+SELECT format_version, schema_name, table_name, column_name, tokenizer, min_gram, max_gram, case_insensitive
 FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('docs_s_id'));
 ----
-5	main	docs	s	3	true
+6	main	docs	s	ngram	3	3	true
 
 # hwm covers all rows at build time
 query I
@@ -132,11 +132,11 @@ SELECT (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND t
 ----
 2	1
 
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-s	3	true	5	11	6	44	44	0	1	48	136	NULL
-t	2	false	11	11	0	12	12	0	1	72	96	NULL
+s	ngram	3	3	true	5	11	6	44	44	0	1	48	136	NULL
+t	ngram	2	2	false	11	11	0	12	12	0	1	72	96	NULL
 
 # dropping one column's index leaves the other and the shared guard intact
 statement ok
@@ -148,10 +148,10 @@ SELECT (SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__ngram' AND t
 ----
 1	1
 
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('docs');
 ----
-t	2	false	11	11	0	12	12	0	1	72	96	NULL
+t	ngram	2	2	false	11	11	0	12	12	0	1	72	96	NULL
 
 # dropping the last index removes its segments table and the table's guard
 statement ok
@@ -248,7 +248,7 @@ SET VARIABLE empty_id = (SELECT replace(index_id::VARCHAR, '-', '')
 
 query III
 SELECT hwm_rowid,
-       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('empty_id'))), gram_size
+       (SELECT count(*) FROM query('SELECT * FROM __ngram.segments_' || getvariable('empty_id'))), min_gram
 FROM (SELECT * FROM __ngram.registry WHERE replace(index_id::VARCHAR, '-', '') = getvariable('empty_id'));
 ----
 -1	0	3
@@ -305,11 +305,11 @@ PRAGMA create_ngram_index('"my.table"', 'select');
 statement ok
 PRAGMA create_ngram_index('"my.table"', 'sträße');
 
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('"my.table"');
 ----
-select	3	true	0	0	0	9	9	0	1	9	27	NULL
-sträße	3	true	0	0	0	7	7	0	1	7	21	NULL
+select	ngram	3	3	true	0	0	0	9	9	0	1	9	27	NULL
+sträße	ngram	3	3	true	0	0	0	7	7	0	1	7	21	NULL
 
 statement ok
 PRAGMA drop_ngram_index('"my.table"', 'select');
@@ -348,10 +348,10 @@ PRAGMA create_ngram_index('a.b_c', 's');
 statement ok
 PRAGMA create_ngram_index('a_b.c', 's');
 
-query IIIIIIIIIIIII
+query IIIIIIIIIIIIIII
 PRAGMA ngram_index_stats('a.b_c');
 ----
-s	3	true	0	0	0	9	9	0	1	9	27	NULL
+s	ngram	3	3	true	0	0	0	9	9	0	1	9	27	NULL
 
 query I
 SELECT count(DISTINCT index_id) FROM __ngram.registry
@@ -543,3 +543,39 @@ query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 'temp' AND table_name LIKE '__ngram_%';
 ----
 0
+
+# an empty registry of an older layout, which an earlier release leaves after
+# its last index is dropped, is replaced by the next create
+statement ok
+ATTACH ':memory:' AS old_layout;
+
+statement ok
+CREATE SCHEMA old_layout.__ngram;
+
+statement ok
+CREATE TABLE old_layout.__ngram.registry(registry_version INTEGER NOT NULL, index_id UUID PRIMARY KEY,
+	owner_key BLOB UNIQUE NOT NULL, schema_name VARCHAR NOT NULL, table_name VARCHAR NOT NULL,
+	column_name VARCHAR NOT NULL, format_version BIGINT NOT NULL, gram_size BIGINT NOT NULL,
+	case_insensitive BOOLEAN NOT NULL, hwm_rowid BIGINT NOT NULL, guard_name VARCHAR NOT NULL,
+	guard_token VARCHAR NOT NULL);
+
+statement ok
+CREATE TABLE old_layout.docs AS SELECT 'old layout needle ' || i AS s FROM range(10) t(i);
+
+statement ok
+PRAGMA create_ngram_index('old_layout.main.docs', 's', tokenizer = 'sparse');
+
+query TTIT
+SELECT tokenizer, status, format_version, (SELECT count(*) FROM duckdb_columns()
+	WHERE database_name = 'old_layout' AND schema_name = '__ngram' AND table_name = 'registry')::VARCHAR
+FROM ngram_indexes() WHERE database_name = 'old_layout';
+----
+sparse(3, 8)	READY	6	14
+
+query I
+SELECT count(*) FROM ngram_search('old_layout.main.docs', 'layout needle 7');
+----
+1
+
+statement ok
+DETACH old_layout;

@@ -19,19 +19,19 @@ SELECT count(*), count(DISTINCT owner_key), count(DISTINCT index_id) FROM __ngra
 1	1	1
 
 # The registry row is the metadata row; the guard is named by the first index.
-query IIIIIIIIIII
+query IIIIIIIIIIIII
 SELECT registry_version, typeof(index_id), typeof(owner_key), schema_name, table_name, column_name,
-       format_version, gram_size, case_insensitive, hwm_rowid,
+       format_version, tokenizer, min_gram, max_gram, case_insensitive, hwm_rowid,
        guard_name = '__ngram_guard_' || replace(index_id::VARCHAR, '-', '')
 FROM __ngram.registry;
 ----
-2	UUID	BLOB	main	lifecycle_docs	s	5	3	true	1	true
+3	UUID	BLOB	main	lifecycle_docs	s	6	ngram	3	3	true	1	true
 
 query I
 SELECT count(*) FROM duckdb_columns()
 WHERE schema_name = '__ngram' AND table_name = 'registry' AND NOT is_nullable;
 ----
-12
+14
 
 # Postings live in one segments table named by the index id.
 query I
@@ -41,10 +41,10 @@ WHERE t.schema_name = '__ngram'
 ----
 1
 
-query TTTTTITT
+query TTTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	<REGEX>:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}	main	lifecycle_docs	s	5	READY	NULL
+memory	<REGEX>:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}	main	lifecycle_docs	s	ngram(3)	6	READY	NULL
 
 query I
 SELECT count(*) FROM ngram_search('lifecycle_docs', 'hell');
@@ -102,10 +102,10 @@ SELECT count(*) FROM ngram_search('lifecycle_docs', 'second', col := 't');
 statement ok
 PRAGMA drop_ngram_index('LIFECYCLE_DOCS', 'T');
 
-query TTTTTITT
+query TTTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	5	READY	NULL
+memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	ngram(3)	6	READY	NULL
 
 query II
 SELECT (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'lifecycle_docs'),
@@ -118,10 +118,10 @@ SELECT (SELECT count(*) FROM duckdb_indexes() WHERE table_name = 'lifecycle_docs
 statement ok
 DROP TABLE lifecycle_docs;
 
-query TTTTTITT
+query TTTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	5	ORPHAN	<REGEX>:.*base table is missing.*
+memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	ngram(3)	6	ORPHAN	<REGEX>:.*base table is missing.*
 
 # SCAN_ONLY: a new table under the recorded name has no guard, so every exact
 # query scans it and maintenance refuses.
@@ -131,10 +131,10 @@ CREATE TABLE lifecycle_docs(s VARCHAR, t VARCHAR);
 statement ok
 INSERT INTO lifecycle_docs VALUES ('hello again', 'x');
 
-query TTTTTITT
+query TTTTTTITT
 PRAGMA ngram_indexes;
 ----
-memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	5	SCAN_ONLY	<REGEX>:.*rowid guard is missing.*
+memory	<REGEX>:[0-9a-f-]{36}	main	lifecycle_docs	s	ngram(3)	6	SCAN_ONLY	<REGEX>:.*rowid guard is missing.*
 
 query I
 SELECT count(*) FROM ngram_search('lifecycle_docs', 'hell');
@@ -163,10 +163,10 @@ SELECT (SELECT count(*) FROM lifecycle_docs),
 statement ok
 ATTACH 'test/fixtures/format3.duckdb' AS f3 (READ_ONLY);
 
-query TTTTTITT
+query TTTTTTITT
 PRAGMA ngram_indexes;
 ----
-f3	a03b02be-5f8a-4c43-92c9-5969ea3e178f	main	docs	s	3	MALFORMED	<REGEX>:index format 3 .*predates format 5.*drop_ngram_index.*
+f3	a03b02be-5f8a-4c43-92c9-5969ea3e178f	main	docs	s	NULL	3	MALFORMED	<REGEX>:index format 3 .*predates format 6.*drop_ngram_index.*
 
 statement ok
 SET ngram_auto_accelerate = true;
@@ -184,7 +184,7 @@ drop it with drop_ngram_index
 statement error
 PRAGMA create_ngram_index('f3.main.docs', 't');
 ----
-predates format 5
+predates format 6
 
 statement error
 PRAGMA drop_ngram_index('a03b02be-5f8a-4c43-92c9-5969ea3e178f', catalog = 'f3');
@@ -194,16 +194,17 @@ read-only
 statement ok
 DETACH f3;
 
-# A database a format-4 build wrote lists the same way; its queries stay exact
-# through the fallback paths and the drop needs a writable catalog (the C++
-# harness performs that drop and checks the statistics table goes with it).
+# Databases format-4 and format-5 builds wrote list the same way; their
+# queries stay exact through the fallback paths and the drop needs a writable
+# catalog (the C++ harness performs those drops and checks every storage
+# object goes with them).
 statement ok
 ATTACH 'test/fixtures/format4.duckdb' AS f4 (READ_ONLY);
 
-query TTTTTITT
+query TTTTTTITT
 PRAGMA ngram_indexes;
 ----
-f4	52986603-69de-433a-92bc-17b8347ea5c6	main	docs	s	4	MALFORMED	<REGEX>:index format 4 is not readable.*drop_ngram_index.*
+f4	52986603-69de-433a-92bc-17b8347ea5c6	main	docs	s	NULL	4	MALFORMED	<REGEX>:index format 4 .*predates format 6.*drop_ngram_index.*
 
 statement ok
 SET ngram_auto_accelerate = true;
@@ -224,7 +225,7 @@ drop it with drop_ngram_index
 statement error
 PRAGMA create_ngram_index('f4.main.docs', 's');
 ----
-index format 4
+predates format 6
 
 statement error
 PRAGMA drop_ngram_index('52986603-69de-433a-92bc-17b8347ea5c6', catalog = 'f4');
@@ -234,27 +235,13 @@ read-only
 statement ok
 DETACH f4;
 
-# A database the previous host wrote in this format reopens SCAN_ONLY: its
-# guard names DuckDB v1.5.5, so both paths scan exactly across the persisted
-# tail, and maintenance refuses with the rebuild that restores the index.
 statement ok
 ATTACH 'test/fixtures/format5.duckdb' AS f5 (READ_ONLY);
 
-query TTTTTITT
+query TTTTTTITT
 PRAGMA ngram_indexes;
 ----
-f5	4e5f9ee4-ae63-40b0-b2e5-4fb40ba40865	main	docs	s	5	SCAN_ONLY	<REGEX>:.*recorded rowid guard is incompatible with this extension build.*
-
-query I
-SELECT id FROM ngram_search('f5.main.docs', 'tent') ORDER BY id;
-----
-1
-2
-5
-6
-
-statement ok
-SET ngram_max_candidate_fraction = 1;
+f5	4e5f9ee4-ae63-40b0-b2e5-4fb40ba40865	main	docs	s	NULL	5	MALFORMED	<REGEX>:index format 5 .*predates format 6.*drop_ngram_index.*
 
 statement ok
 SET ngram_auto_accelerate = true;
@@ -275,13 +262,15 @@ SELECT id FROM f5.docs WHERE s ILIKE '%tent%' ORDER BY id;
 statement ok
 SET ngram_auto_accelerate = false;
 
-statement ok
-RESET ngram_max_candidate_fraction;
+statement error
+SELECT count(*) FROM ngram_search('f5.main.docs', 'tent');
+----
+drop it with drop_ngram_index
 
 statement error
 PRAGMA ngram_refresh('f5.main.docs');
 ----
-drop_ngram_index('docs', 's') then PRAGMA create_ngram_index('docs', 's')
+drop it with drop_ngram_index
 
 statement ok
 DETACH f5;

@@ -59,7 +59,7 @@ idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs);
 //! counted), because too many partitions costs a little time and too few costs
 //! an out-of-memory error.
 int64_t EstimateGramCount(ClientContext &context, TableCatalogEntry &table, const string &column, int64_t min_rowid,
-                          int64_t max_rowid, idx_t gram_size);
+                          int64_t max_rowid, const GramOptions &options);
 
 //! The script that builds an index on `target`'s column with `options`.
 string CreateIndexScript(ClientContext &context, const ResolvedTarget &target, const GramOptions &options);

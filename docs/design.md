@@ -13,12 +13,15 @@ DuckDB objects the extension creates and drops through SQL:
 
 | Object | Name | Holds |
 | --- | --- | --- |
-| registry row | `__ngram.registry` | `registry_version`, `index_id` (UUIDv4), the owner (schema, table, column, and `owner_key`, a length-prefixed lowercase concatenation of the three names), `format_version`, gram options, `hwm_rowid`, the guard's name and random token |
+| registry row | `__ngram.registry` | `registry_version`, `index_id` (UUIDv4), the owner (schema, table, column, and `owner_key`, a length-prefixed lowercase concatenation of the three names), `format_version`, the gram options (`tokenizer`, `min_gram`, `max_gram`, `case_insensitive`), `hwm_rowid`, the guard's name and random token |
 | segments table | `__ngram.segments_<id>` | one row per (`gram_key`, `segment_no`, `generation`): `postings` BLOB, `rowid_count`, `min_rowid`, `max_rowid`, sorted by key within each generation |
 | rowid guard | `__ngram_guard_<hex>` on the base table, named by the index that created it and shared by every index of the table | no postings; the physical dependency that turns covered updates into delete plus append, keeps the moving vacuum off, and records the checkpoint seal and the reuse latch |
 
 A `gram_key` is a fixed-width UHUGEINT of the normalized gram's codepoints
-(`ngram_gram_key`), so keys sort and compare without decoding text. A
+(`ngram_gram_key`), so keys sort and compare without decoding text. A sparse
+index keys its `min_gram` grams the same way and each longer gram by one of
+2^20 hash buckets under a reserved upper half, so its rare long grams share
+rows instead of adding one per gram and segment (`docs/sparse-grams.md`). A
 `segment_no` is `rowid >> 20`: a segment is 2^20 rowids. The row's
 `postings` blob is the codec's delta run (`ngram_encode_postings`); the pack
 aggregate that produces it holds each posting as a 32-bit offset from the
@@ -84,7 +87,9 @@ insert for its sorted runs.
 ## The probe and its budgets
 
 A needle is decomposed into distinct gram keys (the transparent path does so
-at planning and again at execution); needles longer than sixteen bytes per
+at planning and again at execution): every gram for an `ngram` index, the
+covering grams, those no longer gram of the needle contains, for a `sparse`
+one. Needles longer than sixteen bytes (four for a sparse index) per
 admissible key are declined before any gram is extracted.
 The manifest scan reads the segments rows of every key of the needle (a
 positioned scan per key over the sorted runs, pruned by zone maps) and keeps

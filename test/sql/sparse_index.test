@@ -1,0 +1,264 @@
+# name: test/sql/sparse_index.test
+# description: sparse-gram indexes: sparse_grams(), the tokenizer options, exact search on both query paths, maintenance, and what the observers report
+# group: [sql]
+
+require ngram
+
+#===----------------------------------------------------------------------===#
+# sparse_grams(): the grams a sparse index stores for one string
+#===----------------------------------------------------------------------===#
+
+query I
+SELECT sparse_grams('Hello World');
+----
+[hel, ell, llo, 'lo ', o w, o wo, ' wo', wor, orl, orld, rld]
+
+# case folding is on unless the fourth argument turns it off
+query I
+SELECT sparse_grams('Hello World', 3, 8, false);
+----
+[Hel, Hell, Hello, ell, llo, 'lo ', o W, ' Wo', ' Wor', Wor, orl, orld, rld]
+
+# fewer than min_gram codepoints yield no grams; NULL stays NULL
+query III
+SELECT sparse_grams('ab'), sparse_grams(''), sparse_grams(NULL);
+----
+[]	[]	NULL
+
+# every min_gram window is a sparse gram, in order, so a sparse index holds
+# everything an ngram index of min_gram does; every gram respects the bounds
+query II
+SELECT count(*) FILTER (WHERE list_filter(sparse_grams(s, 3, 16), lambda g: length(g) = 3) <> trigrams(s)),
+       count(*) FILTER (WHERE len(list_filter(sparse_grams(s, 3, 16), lambda g: length(g) NOT BETWEEN 3 AND 16)) > 0)
+FROM (SELECT md5(i::VARCHAR) || ' ' || repeat(chr((97 + i % 5)::INTEGER), (i % 9)::INTEGER) || 'Straße ' || i AS s FROM range(500) t(i));
+----
+0	0
+
+statement error
+SELECT sparse_grams('abc', 2, 8);
+----
+min_gram must be at least 3 for the sparse tokenizer, got 2
+
+statement error
+SELECT sparse_grams('abc', 3, 65);
+----
+max_gram must lie between min_gram (3) and 64, got 65
+
+statement error
+SELECT sparse_grams('abc', 5, 4);
+----
+max_gram must lie between min_gram (5) and 64, got 4
+
+#===----------------------------------------------------------------------===#
+# create_ngram_index: tokenizer = 'sparse' and its bounds
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE docs(id INTEGER, s VARCHAR);
+
+# repeated phrases, NULLs, empty strings, and folds that change byte length
+statement ok
+INSERT INTO docs SELECT i, CASE i % 7
+	WHEN 0 THEN 'the quick brown fox ' || i
+	WHEN 1 THEN 'Hello World ' || i
+	WHEN 2 THEN NULL
+	WHEN 3 THEN ''
+	WHEN 4 THEN 'Straße tent ' || i
+	WHEN 5 THEN 'chester the cat'
+	ELSE 'lazy dog jumps over ' || i END
+FROM range(1000) t(i);
+
+statement error
+PRAGMA create_ngram_index('docs', 's', tokenizer = 'trigram');
+----
+tokenizer must be 'ngram' or 'sparse', got 'trigram'
+
+statement error
+PRAGMA create_ngram_index('docs', 's', tokenizer = 'sparse', gram = 4);
+----
+gram applies to an ngram index; a sparse index takes min_gram and max_gram
+
+statement error
+PRAGMA create_ngram_index('docs', 's', min_gram = 3, max_gram = 8);
+----
+min_gram and max_gram apply to a sparse index (tokenizer = 'sparse'); an ngram index takes gram
+
+statement error
+PRAGMA create_ngram_index('docs', 's', tokenizer = 'sparse', min_gram = 2);
+----
+min_gram must be at least 3 for the sparse tokenizer, got 2
+
+statement error
+PRAGMA create_ngram_index('docs', 's', tokenizer = 'sparse', max_gram = 65);
+----
+max_gram must lie between min_gram (3) and 64, got 65
+
+statement error
+PRAGMA create_ngram_index('docs', 's', tokenizer = 'sparse', min_gram = 6, max_gram = 5);
+----
+max_gram must lie between min_gram (6) and 64, got 5
+
+# the tokenizer name is case-insensitive; the bounds default to 3 and 8
+statement ok
+PRAGMA create_ngram_index('docs', 's', tokenizer = 'SPARSE');
+
+query TTTI
+SELECT table_name, column_name, tokenizer, format_version FROM ngram_indexes();
+----
+docs	s	sparse(3, 8)	6
+
+query TTIIIIII
+SELECT column_name, tokenizer, min_gram, max_gram, case_insensitive::INTEGER, hwm_rowid, remaining_tail,
+       generations
+FROM ngram_index_stats('docs');
+----
+s	sparse	3	8	1	999	0	1
+
+#===----------------------------------------------------------------------===#
+# exact search on the explicit and transparent paths
+#===----------------------------------------------------------------------===#
+
+statement ok
+SET ngram_max_candidate_fraction=1;
+
+statement ok
+SET ngram_auto_accelerate=true;
+
+statement ok
+CREATE TABLE needles(id INTEGER, n VARCHAR);
+
+# needles shorter than, equal to, and longer than the gram bounds, absent
+# splices of present grams, and folds
+statement ok
+INSERT INTO needles SELECT row_number() OVER () - 1, n FROM (VALUES ('he'), ('hel'), ('hello world 1'),
+	('HELLO WORLD 10'), ('quick brown fox 7'), ('straße'), ('STRASSE'), ('chester the cat'), ('the cat'),
+	('dog jumps over 1'), ('fox jumps'), ('lazy dog jumps over 999'), ('world 1000'), ('ß tent 9'), ('xyz')) v(n);
+
+loop i 0 15
+
+statement ok
+SET VARIABLE needle = (SELECT n FROM needles WHERE id = {i});
+
+query II
+SELECT (SELECT count(*) FROM ngram_search('docs', getvariable('needle'))) - brute,
+       (SELECT count(*) FROM docs WHERE s ILIKE '%' || getvariable('needle') || '%') - brute
+FROM (SELECT count(*) AS brute FROM docs WHERE contains(lower(s), lower(getvariable('needle'))));
+----
+0	0
+
+endloop
+
+query I
+SELECT count(*) FROM ngram_search('docs', 'hello world 1');
+----
+16
+
+query I
+SELECT count(*) FROM docs WHERE s ILIKE '%hello world 1%';
+----
+16
+
+# the probe reads covering grams: a long gram in place of the trigrams inside it
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('docs', 'hello world 1');
+----
+analyzed_plan	<REGEX>:.*"Ngram Tokenizer": "sparse\(3, 8\)".*"Ngram Mode": "index .*"Ngram Probe Grams": "[^"]*'world 1'[^"]*".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM docs WHERE s ILIKE '%hello world 1%';
+----
+analyzed_plan	<REGEX>:.*"Ngram Tokenizer": "sparse\(3, 8\)".*"Ngram Mode": "index .*
+
+# a needle shorter than min_gram scans
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('docs', 'he');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: needle shorter than min_gram".*
+
+#===----------------------------------------------------------------------===#
+# refresh and compact keep the tokenizer
+#===----------------------------------------------------------------------===#
+
+statement ok
+INSERT INTO docs SELECT 1000 + i, 'Hello World tail ' || i FROM range(300) t(i);
+
+statement ok
+PRAGMA ngram_refresh('docs');
+
+query I
+SELECT count(*) FROM ngram_search('docs', 'world tail 2');
+----
+111
+
+query I
+SELECT count(*) FROM docs WHERE contains(lower(s), 'world tail 2');
+----
+111
+
+statement ok
+PRAGMA ngram_compact('docs');
+
+query TIII
+SELECT tokenizer, min_gram, max_gram, generations FROM ngram_index_stats('docs');
+----
+sparse	3	8	1
+
+loop i 0 15
+
+statement ok
+SET VARIABLE needle = (SELECT n FROM needles WHERE id = {i});
+
+query I
+SELECT (SELECT count(*) FROM ngram_search('docs', getvariable('needle'))) -
+       (SELECT count(*) FROM docs WHERE contains(lower(s), lower(getvariable('needle'))));
+----
+0
+
+endloop
+
+#===----------------------------------------------------------------------===#
+# explicit bounds and case-sensitive matching
+#===----------------------------------------------------------------------===#
+
+statement ok
+PRAGMA drop_ngram_index('docs', 's');
+
+statement ok
+PRAGMA create_ngram_index('docs', 's', tokenizer = 'sparse', min_gram = 4, max_gram = 16, case_insensitive = false);
+
+query T
+SELECT tokenizer FROM ngram_indexes();
+----
+sparse(4, 16)
+
+loop i 0 15
+
+statement ok
+SET VARIABLE needle = (SELECT n FROM needles WHERE id = {i});
+
+query II
+SELECT (SELECT count(*) FROM ngram_search('docs', getvariable('needle'))) - brute,
+       (SELECT count(*) FROM docs WHERE s LIKE '%' || getvariable('needle') || '%') - brute
+FROM (SELECT count(*) AS brute FROM docs WHERE contains(s, getvariable('needle')));
+----
+0	0
+
+endloop
+
+# a three-codepoint needle is shorter than this index's min_gram
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ngram_search('docs', 'hel');
+----
+analyzed_plan	<REGEX>:.*"Ngram Mode": "full scan fallback: needle shorter than min_gram".*
+
+# an ngram index on the same column reports its own tokenizer
+statement ok
+PRAGMA drop_ngram_index('docs', 's');
+
+statement ok
+PRAGMA create_ngram_index('docs', 's', gram = 4);
+
+query TTII
+SELECT tokenizer, (SELECT tokenizer FROM ngram_indexes()), min_gram, max_gram FROM ngram_index_stats('docs');
+----
+ngram	ngram(4)	4	4

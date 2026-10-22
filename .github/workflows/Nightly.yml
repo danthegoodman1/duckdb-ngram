@@ -74,6 +74,7 @@ jobs:
           timeout 1800s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 60 --rows 6000 --seed 20261318 --no-stale-expected | tail -n 5 | tee -a "$GITHUB_STEP_SUMMARY"
           timeout 1800s python3 scripts/differential_search.py --duckdb build/release/duckdb --trials 8 --rows 8000 --seed 20261314 | tail -n 3 | tee -a "$GITHUB_STEP_SUMMARY"
           timeout 1800s python3 scripts/differential_search.py --duckdb build/release/duckdb --transparent --trials 8 --rows 8000 --seed 20261315 | tail -n 3 | tee -a "$GITHUB_STEP_SUMMARY"
+          timeout 1800s python3 scripts/sparse_grams_check.py --duckdb build/release/duckdb --cases 20000 --seed "$GITHUB_RUN_ID" | tee -a "$GITHUB_STEP_SUMMARY"
 
   debug-sanitizers-full:
     name: Whole suite and harness under ASAN and UBSAN

@@ -38,15 +38,27 @@ struct ObservedIndex;
 //! the recorded mark exact; a bounded refresh passes false to stop at `hi`.
 vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_t partitions, bool open_ended = true);
 
-//! One statement filling `packed` (gram_key, segment_no, postings, rowid_count,
+//! The statements that return the allocator's cached free memory to the
+//! operating system between the phases of a script.
+string ReleaseMemoryStatements();
+
+//! The statement filling `packed` (gram_key, segment_no, postings, rowid_count,
 //! min_rowid, max_rowid) from `pair_source`, a SELECT of (gram_key, segment_no, r).
 //! The first partition creates the table, the rest append to it.
 string PackPartitionStatement(const string &packed, bool first, const string &pair_source);
 
 //! The packing statements for the non-NULL values of `column_name` in each of
-//! `ranges`, one PackPartitionStatement per range.
+//! `ranges`: a PackPartitionStatement per range, each followed by
+//! ReleaseMemoryStatements.
 string PackRangesStatements(const string &packed, const ResolvedTarget &target, const string &column_name,
                             const GramOptions &options, const vector<pair<int64_t, int64_t>> &ranges);
+
+//! The statements that create `segments` from `packed` in key order, which is
+//! what makes the probe's `gram_key = ?` filter prune row groups and column
+//! segments by zone map. Up to `key_ranges` contiguous key ranges are sorted
+//! one after another, so a sort holds about one range of the packed rows
+//! rather than all of them; `row_group_size` is the segments table's.
+string SortedSegmentsStatements(const string &segments, const string &packed, idx_t key_ranges, idx_t row_group_size);
 
 //! How many partitions a pair stream of `estimated_pairs` should be split into
 //! for its grouping pass to fit the session's memory limit. Honours the
@@ -60,6 +72,8 @@ idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs);
 //! an out-of-memory error.
 int64_t EstimateGramCount(ClientContext &context, TableCatalogEntry &table, const string &column, int64_t min_rowid,
                           int64_t max_rowid, const GramOptions &options);
+
+void RegisterBuild(ExtensionLoader &loader);
 
 //! The script that builds an index on `target`'s column with `options`.
 string CreateIndexScript(ClientContext &context, const ResolvedTarget &target, const GramOptions &options);

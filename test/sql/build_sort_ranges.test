@@ -1,0 +1,130 @@
+# name: test/sql/build_sort_ranges.test
+# description: a build that sorts its packed rows in key ranges writes the one-partition segments table, in key order, with row groups a checkpoint leaves alone
+# group: [sql]
+
+require ngram
+
+# 2,048-row row groups let a modest table fill many of them per key range, and
+# three rowid segments let a three-partition build sort in three ranges
+statement ok
+ATTACH '{TEST_DIR}/build_sort_ranges.db' AS sr (ROW_GROUP_SIZE 2048);
+
+statement ok
+CREATE TABLE sr.t AS SELECT CASE WHEN i % 30 = 0 THEN md5(i::VARCHAR)[:20] END AS s FROM range(3145728) t(i);
+
+statement ok
+SET ngram_build_partitions = 1;
+
+statement ok
+PRAGMA create_ngram_index('sr.main.t', 's', tokenizer = 'sparse');
+
+statement ok
+SET VARIABLE sr_id = (SELECT replace(index_id::VARCHAR, '-', '') FROM sr.__ngram.registry);
+
+statement ok
+CREATE TABLE one AS FROM query('SELECT * FROM sr.__ngram.segments_' || getvariable('sr_id'));
+
+statement ok
+PRAGMA drop_ngram_index('sr.main.t', 's');
+
+statement ok
+SET ngram_build_partitions = 3;
+
+# the range bounds sit at fractional quantiles whatever division the session uses
+statement ok
+SET integer_division = true;
+
+statement ok
+PRAGMA create_ngram_index('sr.main.t', 's', tokenizer = 'sparse');
+
+statement ok
+RESET integer_division;
+
+statement ok
+SET VARIABLE sr_id = (SELECT replace(index_id::VARCHAR, '-', '') FROM sr.__ngram.registry);
+
+# every column of every segment row, both directions
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM one EXCEPT ALL SELECT * FROM query('SELECT * FROM sr.__ngram.segments_' || getvariable('sr_id')))
+	UNION ALL
+	(SELECT * FROM query('SELECT * FROM sr.__ngram.segments_' || getvariable('sr_id')) EXCEPT ALL SELECT * FROM one));
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT (gram_key, segment_no) < lag((gram_key, segment_no)) OVER (ORDER BY rowid) AS out_of_order
+	FROM query('SELECT gram_key, segment_no, rowid FROM sr.__ngram.segments_' || getvariable('sr_id')))
+WHERE out_of_order;
+----
+0
+
+# Each range ends in a partial row group. A checkpoint merges adjacent row
+# groups whose rows fit in at most three full ones, so partial row groups at
+# least three full ones apart are never rewritten.
+query II
+SELECT count(*) >= 2, bool_and(gap >= 4) FROM (
+	SELECT row_group_id - lag(row_group_id) OVER (ORDER BY row_group_id) AS gap
+	FROM (SELECT row_group_id, max(count) AS c
+	      FROM pragma_storage_info('sr.__ngram.segments_' || getvariable('sr_id')) GROUP BY ALL)
+	WHERE c < 2048);
+----
+true	true
+
+statement ok
+PRAGMA drop_ngram_index('sr.main.t', 's');
+
+# About 12,000 packed rows: three ranges would span two row groups each, close
+# enough for a checkpoint to merge their partial row groups, so the build keeps
+# one range and only the table's last row group is partial.
+statement ok
+CREATE TABLE sr.small AS SELECT CASE WHEN i % 50 = 0 THEN md5(((i // 50) % 4000)::VARCHAR)[:8] END AS s FROM range(3145728) t(i);
+
+statement ok
+PRAGMA create_ngram_index('sr.main.small', 's');
+
+statement ok
+SET VARIABLE small_id = (SELECT replace(index_id::VARCHAR, '-', '') FROM sr.__ngram.registry);
+
+query III
+SELECT count(*) >= 5, count(*) FILTER (WHERE c < 2048), max(row_group_id) = max(row_group_id) FILTER (WHERE c < 2048)
+FROM (SELECT row_group_id, max(count) AS c
+      FROM pragma_storage_info('sr.__ngram.segments_' || getvariable('small_id')) GROUP BY ALL);
+----
+true	1	true
+
+statement ok
+PRAGMA drop_ngram_index('sr.main.small', 's');
+
+# A purging compaction deletes and reinserts every segment row; in the build's
+# transaction it still finds them all.
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA create_ngram_index('sr.main.t', 's', tokenizer = 'sparse');
+
+statement ok
+PRAGMA ngram_compact('sr.main.t', purge = true);
+
+foreach needle a1b2 0000 ffe abcdef
+
+query I
+SELECT count(*) FROM (
+	(SELECT s FROM ngram_search('sr.main.t', '{needle}') EXCEPT ALL SELECT s FROM sr.t WHERE contains(s, '{needle}'))
+	UNION ALL
+	(SELECT s FROM sr.t WHERE contains(s, '{needle}') EXCEPT ALL SELECT s FROM ngram_search('sr.main.t', '{needle}')));
+----
+0
+
+endloop
+
+statement ok
+COMMIT;
+
+statement ok
+RESET ngram_build_partitions;
+
+statement ok
+DROP TABLE one;

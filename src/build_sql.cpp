@@ -3,6 +3,9 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/storage/block_allocator.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -19,15 +22,15 @@ namespace ngram {
 //===----------------------------------------------------------------------===//
 
 //! Aggregate-state bytes one pair costs while its partition is being grouped:
-//! four for the in-segment offset plus block slack, the hash table's group
-//! entries, and the copy each thread keeps of a group before the tables are
-//! combined. Measured whole-process on enwik9 as 10.4 bytes per posting
-//! (6.88 GiB peak RSS packing 711 M postings on 24 threads in one partition,
-//! the base table's buffers included; 13.3 before the offsets shrank,
-//! docs/review/2026-09-09/build_observations.json) and about 33 bytes per
-//! pair for a million single-posting groups, where the group entry and the
-//! first block dominate. Thirty-two covers the small-group case; sizing from
-//! the emitted distinct keys rather than the pair count is still open.
+//! its share of the encoded offsets and of the partial-state rows each
+//! thread's hash table keeps before the tables are combined. Measured
+//! whole-process on enwik9 with the base table's buffers included, an
+//! ngram(3) build costs 5.6 bytes per posting (3.7 GiB peak packing 711 M
+//! postings on 24 threads in one partition) and a sparse(3, 8) partition 9.2
+//! (5.6 GiB for 656 M). A stream of single-posting groups costs about 70 bytes
+//! per pair, every pair its own hash table row, so thirty-two keeps text well
+//! inside the budget and such a stream at about the memory limit. Sizing from the
+//! emitted distinct keys rather than the pair count is still open.
 constexpr int64_t PAIR_STATE_BYTES = 32;
 
 //! Share of `memory_limit` the grouping pass may claim. The rest goes to the
@@ -44,6 +47,18 @@ constexpr idx_t GRAM_ESTIMATE_SAMPLES = 512;
 //! terminate: past this many partitions the estimate is not to be trusted and
 //! the memory limit is simply too small for the corpus.
 constexpr idx_t MAX_BUILD_PARTITIONS = 4096;
+
+//! The final sort scans the packed table once per key range.
+constexpr idx_t MAX_SORT_RANGES = 8;
+
+//! Packed rows sampled to place the key-range bounds.
+constexpr idx_t SORT_BOUND_SAMPLE_ROWS = 20000;
+
+//! The fewest row groups a key range of the final sort may span. A checkpoint
+//! merges adjacent row groups whose rows fit in at most three full ones, so the
+//! partial row group each range ends in must lie at least three full ones from
+//! the next.
+constexpr idx_t MIN_SORT_RANGE_ROW_GROUPS = 3;
 
 vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_t partitions, bool open_ended) {
 	vector<pair<int64_t, int64_t>> result;
@@ -72,6 +87,31 @@ vector<pair<int64_t, int64_t>> SegmentAlignedRanges(int64_t lo, int64_t hi, idx_
 	return result;
 }
 
+//! __ngram_release_memory() returns the memory the allocator caches for freed
+//! allocations to the operating system. DuckDB keeps freed memory cached up to
+//! `memory_limit`, and the phases of a build reuse only part of what the phase
+//! before them freed, so without a release a build's resident memory grows by
+//! most of each partition's grouping state. Compaction packs one segment per
+//! partition and gains nothing from it: there the release only makes the next
+//! partition fault its memory back in.
+static constexpr const char *NGRAM_RELEASE_MEMORY = "__ngram_release_memory";
+
+static void ReleaseMemoryFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	BlockAllocator::Get(DatabaseInstance::GetDatabase(state.GetContext())).FlushAll();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto output = FlatVector::GetDataMutable<bool>(result);
+	for (idx_t row = 0; row < args.size(); row++) {
+		output[row] = true;
+	}
+}
+
+string ReleaseMemoryStatements() {
+	// a pragma's expansion may return rows only from its last statement
+	auto released = ScratchName("released");
+	return "CREATE TEMP TABLE " + released + " AS SELECT " + SystemFunction(NGRAM_RELEASE_MEMORY) +
+	       "() AS released;\nDROP TABLE " + released + ";\n";
+}
+
 string PackPartitionStatement(const string &packed, bool first, const string &pair_source) {
 	string statement = first ? "CREATE TEMP TABLE " + packed + " AS " : "INSERT INTO " + packed + " ";
 	return statement + "SELECT gram_key, segment_no, " + SystemFunction("struct_extract") +
@@ -96,8 +136,60 @@ string PackRangesStatements(const string &packed, const ResolvedTarget &target, 
 		    "SELECT rowid AS r, rowid >> " + to_string(SEGMENT_SHIFT) + " AS segment_no, " + keys + " FROM " +
 		        target.Qualified() + " WHERE rowid >= " + to_string(ranges[i].first) +
 		        " AND rowid <= " + to_string(ranges[i].second) + " AND " + column + " IS NOT NULL");
+		script += ReleaseMemoryStatements();
 	}
 	return script;
+}
+
+string SortedSegmentsStatements(const string &segments, const string &packed, idx_t key_ranges, idx_t row_group_size) {
+	auto columns =
+	    "SELECT gram_key, segment_no, 0 AS generation, postings, rowid_count, min_rowid, max_rowid FROM " + packed;
+	auto order = " ORDER BY gram_key, segment_no";
+	if (key_ranges <= 1) {
+		return "CREATE TABLE " + segments + " AS " + columns + order + ";\n";
+	}
+	// Candidate bounds at the sampled row quantiles, non-decreasing, and NULL
+	// when the sample is empty.
+	auto sampled = ScratchName("sampled");
+	auto bounds = ScratchName("bounds");
+	auto count = to_string(key_ranges);
+	string quantiles;
+	for (idx_t bound = 1; bound < key_ranges; bound++) {
+		// decimal literals divide as doubles whatever `integer_division` says
+		quantiles += (bound == 1 ? "" : ", ") + to_string(bound) + ".0 / " + count + ".0";
+	}
+	string script = "CREATE TEMP TABLE " + sampled + " AS SELECT " + SystemFunction("quantile_disc") + "(gram_key, [" +
+	                quantiles + "]) AS q FROM (SELECT gram_key FROM " + packed + " USING SAMPLE " +
+	                to_string(SORT_BOUND_SAMPLE_ROWS) + " ROWS);\n";
+	// Every range ends in a partial row group, so a bound survives only
+	// between ranges of at least MIN_SORT_RANGE_ROW_GROUPS row groups; c lists
+	// the rows below each candidate, from zero to the table's count.
+	string below = "[0";
+	for (idx_t bound = 1; bound < key_ranges; bound++) {
+		below += ", " + SystemFunction("count") + "(*) FILTER (WHERE p.gram_key < s.q[" + to_string(bound) + "])";
+	}
+	below += ", " + SystemFunction("count") + "(*)]";
+	auto min_rows = to_string(MIN_SORT_RANGE_ROW_GROUPS * row_group_size);
+	script += "CREATE TEMP TABLE " + bounds + " AS SELECT [q[i] FOR i IN " + SystemFunction("range") + "(1, " + count +
+	          ") IF c[i + 1] - c[i] >= " + min_rows + " AND c[i + 2] - c[i + 1] >= " + min_rows +
+	          "] AS q FROM (SELECT " + SystemFunction("any_value") + "(s.q) AS q, " + below + " AS c FROM " + packed +
+	          " p, " + sampled + " s);\n";
+	script += "DROP TABLE " + sampled + ";\n";
+	// One statement writes the ranges in order: under an order-preserving
+	// insert DuckDB runs a UNION ALL's inputs one after another and numbers
+	// their batches in sequence. It also keeps empty ranges from becoming
+	// empty batch inserts into the segments table, which a later purge in the
+	// same transaction would trip over (docs/upstream/duckdb-empty-batch-insert.md).
+	// Past the last surviving bound the lower bounds are NULL, so those ranges
+	// are empty and the last nonempty one runs to the end of the key space.
+	script += "CREATE TABLE " + segments + " AS ";
+	for (idx_t range = 0; range < key_ranges; range++) {
+		auto lower = "gram_key >= (SELECT q[" + to_string(range) + "] FROM " + bounds + ")";
+		auto upper = "(gram_key >= (SELECT q[" + to_string(range + 1) + "] FROM " + bounds + ")) IS NOT TRUE";
+		auto filter = range == 0 ? upper : range + 1 == key_ranges ? lower : lower + " AND " + upper;
+		script += string(range == 0 ? "" : " UNION ALL ") + "(" + columns + " WHERE " + filter + order + ")";
+	}
+	return script + ";\nDROP TABLE " + bounds + ";\n";
 }
 
 idx_t BuildPartitionCount(ClientContext &context, int64_t estimated_pairs) {
@@ -327,15 +419,10 @@ string CreateIndexScript(ClientContext &context, const ResolvedTarget &target, c
 	script += RegistryInsertStatement(target, location, options, fence);
 	auto partitions = BuildPartitionCount(
 	    context, EstimateGramCount(context, table, location.column_name, 0, total_rows - 1, options));
-	script += PackRangesStatements(packed, target, location.column_name, options,
-	                               SegmentAlignedRanges(0, total_rows - 1, partitions));
-	// key order is what makes the probe's `gram_key = ?` filter prune row groups
-	// and column segments by zone map, so the segments table is written sorted
-	// even though the partitions produced their rows in rowid order
-	script += "CREATE TABLE " + segments +
-	          " AS "
-	          "SELECT gram_key, segment_no, 0 AS generation, postings, rowid_count, min_rowid, max_rowid FROM " +
-	          packed + " ORDER BY gram_key, segment_no;\n";
+	auto ranges = SegmentAlignedRanges(0, total_rows - 1, partitions);
+	script += PackRangesStatements(packed, target, location.column_name, options, ranges);
+	script += SortedSegmentsStatements(segments, packed, MinValue<idx_t>(ranges.size(), MAX_SORT_RANGES),
+	                                   table.GetStorage().GetRowGroupSize());
 	script += "DROP TABLE " + packed + ";\n";
 	script += "DROP TABLE " + fence + ";\n";
 	return script;
@@ -416,6 +503,12 @@ string DropIndexScript(ClientContext &context, const ObservedIndex &index) {
 	}
 	script += "DROP TABLE " + fence + ";\n";
 	return script;
+}
+
+void RegisterBuild(ExtensionLoader &loader) {
+	auto release = ScalarFunction(NGRAM_RELEASE_MEMORY, {}, LogicalType::BOOLEAN, ReleaseMemoryFunction);
+	release.SetStability(FunctionStability::VOLATILE);
+	loader.RegisterFunction(release);
 }
 
 } // namespace ngram

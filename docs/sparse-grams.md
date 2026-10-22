@@ -104,14 +104,14 @@ while the sparse(3, 16) index shrank from 4.6 to 2.9 GB.
 ## Measurements
 
 Same machine, enwik9 split into 10.9 million nonempty lines (0.92 GiB of
-text), 24 threads, case-insensitive indexes, three alternating builds per
-variant:
+text), 24 threads, a 48 GiB memory limit, case-insensitive indexes, medians
+of three alternating builds per variant:
 
 | Index | Build | Build RSS | Index size |
 | --- | ---: | ---: | ---: |
-| `ngram(3)` | 5.2 s | 5.4 GiB | 0.93 GiB |
-| `sparse(3, 8)` | 16.0 s | 10.5 GiB | 2.30 GiB |
-| `sparse(3, 16)` | 20.1 s | 12.6 GiB | 2.72 GiB |
+| `ngram(3)` | 5.1 s | 3.6 GiB | 0.93 GiB |
+| `sparse(3, 8)` | 14.0 s | 6.4 GiB | 2.30 GiB |
+| `sparse(3, 16)` | 16.8 s | 7.4 GiB | 2.72 GiB |
 
 Warm `ngram_search` medians over fourteen interleaved runs per cell, with the
 rows each probe fetched (`scan` marks a candidate-fraction fallback). Other
@@ -144,7 +144,7 @@ under either index.
 `min_gram` is the shortest needle the index answers, and every `min_gram`
 window is a gram, so it plays the part `gram` plays for an `ngram` index;
 three suits most text. `max_gram` caps the long grams: raising it from 8 to 16
-made the enwik9 index 18% larger and its build 26% slower and changed no
+made the enwik9 index 18% larger and its build 20% slower and changed no
 needle's fetches by more than a few rows. Code or identifiers with long
 distinctive runs may reward a larger cap.
 

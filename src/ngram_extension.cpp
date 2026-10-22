@@ -2,6 +2,7 @@
 
 #include "ngram_extension.hpp"
 #include "duckdb.hpp"
+#include "ngram/build_sql.hpp"
 #include "ngram/fence.hpp"
 #include "ngram/gram.hpp"
 #include "ngram/postings.hpp"
@@ -16,6 +17,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ngram::RegisterRowIdGuard(loader);
 	ngram::RegisterGram(loader);
 	ngram::RegisterPostings(loader);
+	ngram::RegisterBuild(loader);
 	ngram::RegisterFence(loader);
 	ngram::RegisterPragmas(loader);
 	ngram::RegisterSearchFunctions(loader);

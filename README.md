@@ -120,7 +120,7 @@ On enwik9 (10.9 million lines, `docs/sparse-grams.md`):
 
 | | `ngram(3)` | `sparse(3, 8)` |
 | --- | ---: | ---: |
-| Build | 5.2 s | 16.0 s |
+| Build | 5.1 s | 14.0 s |
 | Index size | 0.93 GiB | 2.30 GiB |
 | `history` | 117 ms (scan) | 14 ms |
 | `the United States` | 130 ms (scan) | 10 ms |

@@ -326,74 +326,199 @@ static OperatorResultType UnpackPostingsFunction(ExecutionContext &context, Tabl
 //! and deduplicates before encoding: arrival order and repeated rowids cannot
 //! change a byte of it.
 //!
-//! Rowids accumulate in a linked list of blocks taken from the aggregate's
-//! arena, which is buffer-manager backed, so the memory is accounted and a
-//! partition too large for `memory_limit` raises OutOfMemory rather than
-//! taking the process down.
+//! A group's rowids accumulate as offsets within its segment, since every
+//! rowid of a group shares segment_no = rowid >> SEGMENT_SHIFT by construction
+//! of the pack statement and an offset is below 2^20. The offsets are stored
+//! as a stream of varint deltas: the rowids a thread feeds one state ascend in
+//! scan order, so the dense groups that hold most postings spend one or two
+//! bytes on each. The first bytes of a state's stream live in the state itself
+//! and the rest in a linked list of blocks taken from the aggregate's arena,
+//! which is buffer-manager backed, so the memory is accounted and a partition
+//! too large for `memory_limit` raises OutOfMemory rather than taking the
+//! process down.
+//!
+//! Most states are small: each thread's hash table abandons its groups when it
+//! fills, so a common gram leaves one partial state per thread per table
+//! generation. In the first partition of an enwik9 sparse(3, 8) build, half of
+//! the 44 million states held one rowid and nine in ten held at most sixteen,
+//! against 5.8 million groups.
 
 namespace {
 
-//! One block of a state's rowid buffer: offsets within the group's segment,
-//! four bytes each, since every rowid of a group shares segment_no =
-//! rowid >> SEGMENT_SHIFT by construction of the pack statement and an
-//! offset is below 2^20. Header and payload come from a single arena
-//! allocation, so appending a block is one bump.
+static void WriteVarint(data_ptr_t &out, uint64_t value) {
+	while (value >= 0x80) {
+		*out++ = static_cast<data_t>((value & 0x7F) | 0x80);
+		value >>= 7;
+	}
+	*out++ = static_cast<data_t>(value);
+}
+
+idx_t VarintSize(uint32_t value) {
+	return value < (1U << 7) ? 1 : value < (1U << 14) ? 2 : value < (1U << 21) ? 3 : value < (1U << 28) ? 4 : 5;
+}
+
+//! One block of a state's stream. The bytes follow the header in the same
+//! arena allocation, so appending a block is one bump.
 struct RowidBlock {
 	RowidBlock *next;
-	idx_t count;
-	idx_t capacity;
-	uint32_t *data;
-};
+	uint32_t size;
+	uint32_t capacity;
 
-struct EncodePostingsState {
+	data_ptr_t Data() {
+		return reinterpret_cast<data_ptr_t>(this + 1);
+	}
+};
+static_assert(sizeof(RowidBlock) == 16, "the stream follows a 16-byte header");
+
+struct RowidBlockList {
 	RowidBlock *first;
 	RowidBlock *last;
-	idx_t total;
-	//! The group's segment start, taken from its first rowid.
-	int64_t base;
 };
 
-//! Block sizes grow geometrically so that the millions of tiny groups (a rare
-//! gram in one segment) waste a few entries while a dense gram pays a handful
-//! of allocations, and are capped so the largest groups do not reserve far
-//! past what they use. Unused capacity is bounded by the data itself.
-constexpr idx_t FIRST_BLOCK_ROWIDS = 16;
-constexpr idx_t MAX_BLOCK_ROWIDS = 65536;
+//! Stream bytes a state holds before it allocates blocks.
+constexpr idx_t INLINE_BYTES = 16;
+
+//! The inline size of a state whose stream has moved to blocks.
+constexpr uint32_t IN_BLOCKS = std::numeric_limits<uint32_t>::max();
+
+//! Each stretch of a stream (the inline bytes, or one block) starts from
+//! offset zero, so a stretch decodes on its own and a block list moves between
+//! states whole. Within a stretch each offset is coded as its delta from the
+//! last plus one; the code zero restarts from offset zero, which lets offsets
+//! arrive in any order, as they do when combine appends one state to another.
+struct EncodePostingsState {
+	//! The group's segment start, taken from its first rowid.
+	int64_t base;
+	//! The last offset appended, which the next delta is taken from.
+	uint32_t last;
+	//! Stream bytes held inline, or IN_BLOCKS.
+	uint32_t inline_size;
+	union {
+		data_t bytes[INLINE_BYTES];
+		RowidBlockList blocks;
+	} storage;
+
+	bool Empty() const {
+		return inline_size == 0;
+	}
+	bool InBlocks() const {
+		return inline_size == IN_BLOCKS;
+	}
+};
+static_assert(sizeof(EncodePostingsState) == 32, "the inline stream shares the block list's space");
+
+//! Block capacities double from FIRST_BLOCK_BYTES up to MAX_BLOCK_BYTES, so a
+//! state reserves at most one block past what it uses. The sizes make 64-byte
+//! to 1 KiB allocations.
+constexpr idx_t FIRST_BLOCK_BYTES = 48;
+constexpr idx_t MAX_BLOCK_BYTES = 1008;
 
 struct EncodePostingsOp {
 	template <class STATE>
 	static void Initialize(STATE &state) {
-		state.first = nullptr;
-		state.last = nullptr;
-		state.total = 0;
 		state.base = 0;
+		state.last = 0;
+		state.inline_size = 0;
 	}
 };
+
+RowidBlock *NewBlock(ArenaAllocator &allocator, idx_t capacity) {
+	auto block = reinterpret_cast<RowidBlock *>(allocator.AllocateAligned(sizeof(RowidBlock) + capacity));
+	block->next = nullptr;
+	block->size = 0;
+	block->capacity = NumericCast<uint32_t>(capacity);
+	return block;
+}
+
+//! The code of `offset` after `last`: the delta plus one, after a zero byte
+//! that restarts the stretch from offset zero when `offset` descends.
+void WriteOffsetCode(data_ptr_t &out, uint32_t last, uint32_t offset) {
+	if (offset < last) {
+		*out++ = 0;
+		last = 0;
+	}
+	WriteVarint(out, offset - last + 1);
+}
+
+idx_t OffsetCodeSize(uint32_t last, uint32_t offset) {
+	return offset < last ? 1 + VarintSize(offset + 1) : VarintSize(offset - last + 1);
+}
+
+//! Calls `emit(offset)` for each offset in a stretch of `size` stream bytes.
+template <class EMIT>
+void DecodeStretch(const_data_ptr_t data, idx_t size, EMIT &&emit) {
+	uint32_t offset = 0;
+	for (idx_t pos = 0; pos < size;) {
+		uint32_t code = 0;
+		idx_t shift = 0;
+		data_t byte;
+		do {
+			byte = data[pos++];
+			code |= static_cast<uint32_t>(byte & 0x7F) << shift;
+			shift += 7;
+		} while (byte & 0x80);
+		if (code == 0) {
+			offset = 0;
+			continue;
+		}
+		offset += code - 1;
+		emit(offset);
+	}
+}
+
+//! Calls `emit(offset)` for each offset of the state, a stretch at a time.
+template <class EMIT>
+void ForEachOffset(EncodePostingsState &state, EMIT &&emit) {
+	if (!state.InBlocks()) {
+		DecodeStretch(state.storage.bytes, state.inline_size, emit);
+		return;
+	}
+	for (auto block = state.storage.blocks.first; block; block = block->next) {
+		DecodeStretch(block->Data(), block->size, emit);
+	}
+}
+
+void AppendOffset(ArenaAllocator &allocator, EncodePostingsState &state, uint32_t offset) {
+	if (!state.InBlocks()) {
+		if (state.inline_size + OffsetCodeSize(state.last, offset) <= INLINE_BYTES) {
+			auto out = state.storage.bytes + state.inline_size;
+			WriteOffsetCode(out, state.last, offset);
+			state.inline_size = NumericCast<uint32_t>(out - state.storage.bytes);
+			state.last = offset;
+			return;
+		}
+		// the inline stream moves into the first block before the list overwrites it
+		auto block = NewBlock(allocator, FIRST_BLOCK_BYTES);
+		memcpy(block->Data(), state.storage.bytes, state.inline_size);
+		block->size = state.inline_size;
+		state.storage.blocks = {block, block};
+		state.inline_size = IN_BLOCKS;
+	}
+	auto &tail = state.storage.blocks.last;
+	if (tail->size + OffsetCodeSize(state.last, offset) > tail->capacity) {
+		auto block = NewBlock(allocator, MinValue<idx_t>(idx_t(tail->capacity) * 2, MAX_BLOCK_BYTES));
+		tail->next = block;
+		tail = block;
+		// a block's stretch starts from offset zero
+		state.last = 0;
+	}
+	auto out = tail->Data() + tail->size;
+	WriteOffsetCode(out, state.last, offset);
+	tail->size = NumericCast<uint32_t>(out - tail->Data());
+	state.last = offset;
+}
 
 void AppendRowid(ArenaAllocator &allocator, EncodePostingsState &state, int64_t rowid) {
 	if (rowid < 0) {
 		throw InvalidInputException("ngram_pack_segment: rowids must not be negative");
 	}
 	auto base = (rowid >> SEGMENT_SHIFT) << SEGMENT_SHIFT;
-	if (!state.first) {
+	if (state.Empty()) {
 		state.base = base;
 	} else if (base != state.base) {
 		throw InvalidInputException("ngram_pack_segment: the rowids of one group must lie in one segment");
 	}
-	if (!state.last || state.last->count == state.last->capacity) {
-		auto capacity =
-		    state.last ? MinValue<idx_t>(state.last->capacity * 2, MAX_BLOCK_ROWIDS) : idx_t(FIRST_BLOCK_ROWIDS);
-		auto memory = allocator.AllocateAligned(sizeof(RowidBlock) + capacity * sizeof(uint32_t));
-		auto block = reinterpret_cast<RowidBlock *>(memory);
-		block->next = nullptr;
-		block->count = 0;
-		block->capacity = capacity;
-		block->data = reinterpret_cast<uint32_t *>(memory + sizeof(RowidBlock));
-		(state.last ? state.last->next : state.first) = block;
-		state.last = block;
-	}
-	state.last->data[state.last->count++] = static_cast<uint32_t>(rowid - base);
-	state.total++;
+	AppendOffset(allocator, state, static_cast<uint32_t>(rowid - base));
 }
 
 void EncodePostingsUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &state_vector,
@@ -425,28 +550,39 @@ void EncodePostingsCombine(Vector &state_vector, Vector &combined, AggregateInpu
 	for (idx_t i = 0; i < count; i++) {
 		auto &source = *states[states_format.sel->get_index(i)];
 		auto &target = *targets[i];
-		if (source.total == 0) {
+		if (source.Empty()) {
 			continue;
 		}
-		if (target.first && target.base != source.base) {
+		if (target.Empty()) {
+			target.base = source.base;
+		} else if (target.base != source.base) {
 			throw InvalidInputException("ngram_pack_segment: the rowids of one group must lie in one segment");
 		}
-		if (aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE) {
+		auto &allocator = aggr_input_data.allocator;
+		auto append = [&](uint32_t offset) {
+			AppendOffset(allocator, target, offset);
+		};
+		if (source.InBlocks() && aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE) {
 			// the source's blocks live in an arena the hash table keeps alive, so
-			// the target adopts them whole; the source is emptied so that a later
-			// combine or finalize of it cannot count them twice
-			(target.last ? target.last->next : target.first) = source.first;
-			target.last = source.last;
-			target.total += source.total;
-			target.base = source.base;
+			// the target adopts them whole, appending after the source's last
+			// offset; the source is emptied so that a later combine or finalize
+			// of it cannot count them twice
+			if (target.InBlocks()) {
+				target.storage.blocks.last->next = source.storage.blocks.first;
+				target.storage.blocks.last = source.storage.blocks.last;
+				target.last = source.last;
+			} else {
+				// the target's few inline offsets join the adopted list
+				auto inline_state = target;
+				target.storage = source.storage;
+				target.inline_size = IN_BLOCKS;
+				target.last = source.last;
+				ForEachOffset(inline_state, append);
+			}
 			EncodePostingsOp::Initialize(source);
 			continue;
 		}
-		for (auto block = source.first; block; block = block->next) {
-			for (idx_t r = 0; r < block->count; r++) {
-				AppendRowid(aggr_input_data.allocator, target, source.base + block->data[r]);
-			}
-		}
+		ForEachOffset(source, append);
 	}
 }
 
@@ -477,14 +613,6 @@ static void SortOffsets(vector<uint32_t> &offsets, vector<uint32_t> &scratch, ve
 		offsets.swap(scratch);
 	}
 	offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
-}
-
-static void WriteVarint(data_ptr_t &out, uint64_t value) {
-	while (value >= 0x80) {
-		*out++ = static_cast<data_t>((value & 0x7F) | 0x80);
-		value >>= 7;
-	}
-	*out++ = static_cast<data_t>(value);
 }
 
 //! The v1 blob of the sorted, unique rowids base + offsets[i], into `blob`:
@@ -524,7 +652,7 @@ void EncodePostingsFinalize(Vector &state_vector, AggregateFinalizeInputData &ag
 	for (idx_t i = 0; i < count; i++) {
 		auto &state = *states[states_format.sel->get_index(i)];
 		auto row = i + offset;
-		if (state.total == 0) {
+		if (state.Empty()) {
 			// no rows reached this group (only possible through a FILTER clause);
 			// there is no segment to describe
 			mask.SetInvalid(row);
@@ -533,13 +661,8 @@ void EncodePostingsFinalize(Vector &state_vector, AggregateFinalizeInputData &ag
 			}
 			continue;
 		}
-		offsets.resize(state.total);
-		idx_t gathered = 0;
-		for (auto block = state.first; block; block = block->next) {
-			memcpy(offsets.data() + gathered, block->data, block->count * sizeof(uint32_t));
-			gathered += block->count;
-		}
-		D_ASSERT(gathered == state.total);
+		offsets.clear();
+		ForEachOffset(state, [&](uint32_t value) { offsets.push_back(value); });
 		// count, min and max describe the deduplicated set the blob encodes
 		SortOffsets(offsets, scratch, runs);
 		postings[row] = StringVector::AddStringOrBlob(postings_child, EncodeSortedOffsets(state.base, offsets, blob));

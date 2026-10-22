@@ -143,17 +143,30 @@ probe what its kept rows cost.
 ## Memory and work accounting
 
 Build, refresh and compaction pack postings through one aggregate over
-(`gram_key`, `segment_no`) groups whose state stores 32-bit offsets. The
-build's and the refresh's packing passes are split into rowid-range
-partitions sized from `memory_limit` (`ngram_build_partitions` overrides the
-count) so that the aggregate's hash table fits; compaction packs at the
-finest partition count. The packed rows are copied once into the segments
-table in key order so that each generation is one sorted run. On
-the enwik9 corpus (10.9M rows, 0.92 GiB of text) a case-insensitive build
-peaks at 6.9 GiB of process memory at 24 threads
-(`docs/review/2026-09-09/build_observations.json`), and the release block in
-the README reports the case-sensitive index it measures; an index is about
-the size of its text.
+(`gram_key`, `segment_no`) groups. Its state holds a group's offsets within
+the segment as varint deltas, the first sixteen bytes inside the state and
+the rest in arena blocks, because most partial states hold a few rowids:
+each thread's hash table abandons its groups as it fills, so a common gram
+leaves a partial state per thread per table generation. The build's and the
+refresh's packing passes are split into rowid-range partitions sized from
+`memory_limit` (`ngram_build_partitions` overrides the count) so that the
+aggregate's hash table fits; compaction packs at the finest partition count.
+After each partition the build and the refresh return the allocator's cached
+free memory to the operating system, since DuckDB keeps freed memory up to
+`memory_limit` and the next phase reuses only part of it.
+
+The packed rows are copied once into the segments table in key order so that
+each generation is one sorted run. The build sorts them in up to as many key
+ranges as it had partitions (at most eight), placed at quantiles of a sample
+of the packed rows, so one sort holds about one partition's output. One
+statement writes the ranges in order through a `UNION ALL`. Each range ends
+in a partial row group, and a checkpoint rewrites adjacent row groups that
+fit in fewer, so the build keeps a bound only between ranges of at least
+three row groups. On the enwik9 corpus (10.9M rows, 0.92 GiB of text) at 24
+threads and a 48 GiB memory limit, a case-insensitive `ngram(3)` build peaks
+at 3.6 GiB of process memory and a `sparse(3, 8)` build at 6.4 GiB
+(`docs/sparse-grams.md`), and the release block in the README reports the
+case-sensitive index it measures; an index is about the size of its text.
 
 A query's memory is reserved up front and released with the query, including
 on interrupt: the manifest, the per-worker segment workspace, and the

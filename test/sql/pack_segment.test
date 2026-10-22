@@ -57,6 +57,46 @@ ORDER BY segment_no;
 1	2	2097151
 2	1	2097152
 
+# Groups of one to hundreds of thousands of rowids, arriving in scan order and
+# in random order across a whole segment, through a parallel aggregate whose
+# threads each hold partial states that the finalize merges: every group packs
+# to the bytes the codec writes for its rowid list. Groups 3 to 7 cluster in
+# one stretch of the table and sprinkle a few rows over the rest, so the merge
+# meets small and large partial states of one group.
+statement ok
+CREATE TABLE pack_input AS
+SELECT
+	CASE WHEN i BETWEEN 1000000 AND 1199999 OR i % 1009 = 7 THEN 3 + i % 5
+		WHEN i % 10 < 3 THEN i % 3
+		ELSE 8 + hash(i) % 200000 END AS g,
+	(g % 3) * 1048576 + CASE WHEN i % 4 = 0 THEN i % 1048576 ELSE hash(i * 31) % 1048576 END AS r
+FROM range(3000000) t(i);
+
+query III
+SELECT count(*) > 190000,
+	count(*) FILTER (WHERE packed.postings <> encoded OR packed.rowid_count <> len(rowids)
+		OR packed.min_rowid <> list_min(rowids) OR packed.max_rowid <> list_max(rowids)),
+	max(packed.rowid_count) > 200000
+FROM (
+	SELECT g, ngram_pack_segment(r::BIGINT) AS packed, ngram_encode_postings(list(r::BIGINT)) AS encoded,
+		list_distinct(list(r::BIGINT)) AS rowids
+	FROM pack_input GROUP BY g);
+----
+true	0	true
+
+# A sliding window combines partial states without consuming them.
+query II
+SELECT count(*), count(*) FILTER (WHERE packed.postings <> encoded)
+FROM (
+	SELECT ngram_pack_segment(r::BIGINT) OVER w AS packed, ngram_encode_postings(list(r::BIGINT) OVER w) AS encoded
+	FROM (SELECT * FROM pack_input WHERE g < 8 OR g % 50 = 0 LIMIT 50000)
+	WINDOW w AS (PARTITION BY g ORDER BY r DESC ROWS BETWEEN 120 PRECEDING AND 80 FOLLOWING));
+----
+50000	0
+
+statement ok
+DROP TABLE pack_input;
+
 # a group no row reaches has no segment to describe
 query II
 SELECT gram, ngram_pack_segment(r::BIGINT) FILTER (WHERE r > 100) AS s

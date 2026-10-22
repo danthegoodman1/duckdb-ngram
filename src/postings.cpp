@@ -358,8 +358,9 @@ idx_t VarintSize(uint32_t value) {
 }
 
 //! One block of a state's stream. The bytes follow the header in the same
-//! arena allocation, so appending a block is one bump.
-struct RowidBlock {
+//! arena allocation, so appending a block is one bump. The alignment pads the
+//! header to 16 bytes where pointers take 4.
+struct alignas(8) RowidBlock {
 	RowidBlock *next;
 	uint32_t size;
 	uint32_t capacity;

@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -9,8 +10,12 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "ngram/catalog.hpp"
 #include "ngram/index_state.hpp"
+#include "ngram/lake.hpp"
 #include "ngram/search_core.hpp"
 #include "ngram/settings.hpp"
 #include "ngram_extension.hpp"
@@ -56,6 +61,9 @@ struct QueryBindData : public TableFunctionData {
 	//! The index's options as bound; ngram_search keeps these semantics if a
 	//! prepared query outlives its index.
 	GramOptions bound_options;
+	//! ngram_candidates over a DuckLake table: the candidates, found while
+	//! binding at the statement's snapshot.
+	shared_ptr<const vector<int64_t>> lake_rowids;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<QueryBindData>(*this);
@@ -128,6 +136,86 @@ static void BindQueryTarget(ClientContext &context, const char *fn, const string
 	result.column_name = col.Name().GetIdentifierName();
 }
 
+//! The indexed column of a DuckLake table `fn` searches: `column`, or the
+//! table's only indexed column; and the index's options.
+static LakeIndex LakeSearchIndex(ClientContext &context, const char *fn, const ResolvedTarget &target,
+                                 const string &column) {
+	LakeReader reader(context, target.catalog_name);
+	auto indexes = ReadLakeRegistry(reader, target.schema_name, target.table_name);
+	vector<LakeIndex> matching;
+	for (auto &index : indexes) {
+		if (column.empty() || StringUtil::CIEquals(index.column_name, column)) {
+			matching.push_back(index);
+		}
+	}
+	if (matching.empty()) {
+		if (LakeWrittenByTransaction(context, target.catalog_name)) {
+			// the reader sees the indexes committed before this transaction
+			throw BinderException("%s: no committed ngram index exists on %s; an index this transaction created is "
+			                      "usable once it commits",
+			                      fn, target.table_name);
+		}
+		if (column.empty()) {
+			throw BinderException("%s: no ngram index exists on %s; build one with PRAGMA create_ngram_index", fn,
+			                      target.table_name);
+		}
+		throw BinderException("%s: no ngram index exists on %s.%s; build one with PRAGMA create_ngram_index", fn,
+		                      target.table_name, column);
+	}
+	if (matching.size() > 1) {
+		vector<string> columns;
+		for (auto &index : matching) {
+			columns.push_back(index.column_name);
+		}
+		throw BinderException("%s: %s has ngram indexes on multiple columns (%s); pass col := '...' to choose", fn,
+		                      target.table_name, StringUtil::Join(columns, ", "));
+	}
+	auto &index = matching[0];
+	if (!index.error.empty()) {
+		throw InvalidInputException("%s: the ngram index on %s.%s is unreadable: %s", fn, target.table_name,
+		                            index.column_name, index.error);
+	}
+	if (!target.entry->ColumnExists(Identifier(index.column_name)) ||
+	    target.entry->GetColumn(Identifier(index.column_name)).Type().id() != LogicalTypeId::VARCHAR) {
+		throw BinderException("%s: the ngram index on %s references column %s, which is no longer a VARCHAR column", fn,
+		                      target.table_name, index.column_name);
+	}
+	return index;
+}
+
+//! ngram_search over a DuckLake table is the table's own scan filtered by
+//! __ngram_search_match, the search's predicate, which the optimizer
+//! extension answers through the index (rewrite.cpp). A DuckDB table takes
+//! the regular bind below.
+static unique_ptr<TableRef> SearchBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	auto table_input = RequireStringArg(input.inputs[0], "ngram_search", "table");
+	auto target = ResolveTarget(context, table_input, string(), false);
+	if (!IsLakeTable(*target.entry)) {
+		return nullptr;
+	}
+	auto needle = RequireStringArg(input.inputs[1], "ngram_search", "needle");
+	string column;
+	auto column_entry = input.named_parameters.find("col");
+	if (column_entry != input.named_parameters.end()) {
+		column = RequireStringArg(column_entry->second, "ngram_search", "col");
+		if (column.empty()) {
+			throw BinderException("ngram_search: col cannot be empty");
+		}
+	}
+	auto index = LakeSearchIndex(context, "ngram_search", target, column);
+	string projection;
+	for (auto &col : target.entry->GetColumns().Logical()) {
+		projection += (projection.empty() ? "" : ", ") + Ident(col.Name().GetIdentifierName());
+	}
+	auto sql = "SELECT " + projection + " FROM " + target.Qualified() + " WHERE " +
+	           SystemFunction("__ngram_search_match") + "(" + Ident(index.column_name) + ", " + Lit(needle) + ", " +
+	           (index.options.case_insensitive ? "true" : "false") + ")";
+	Parser parser(context);
+	parser.ParseQuery(sql);
+	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+	return make_uniq<SubqueryRef>(std::move(select));
+}
+
 //! ngram_search(table, needle[, col := ...]) returns every row of `table`
 //! whose indexed column contains `needle`, folded like the index build over a
 //! case-insensitive index and compared byte-wise over a case-sensitive one.
@@ -198,6 +286,24 @@ static unique_ptr<FunctionData> CandidatesBind(ClientContext &context, TableFunc
 	result->needle = RequireStringArg(input.inputs[2], "ngram_candidates", "needle");
 	if (column.empty()) {
 		throw BinderException("ngram_candidates: column cannot be empty");
+	}
+	auto target = ResolveTarget(context, table_input, column, false);
+	if (IsLakeTable(*target.entry)) {
+		// the candidates belong to this statement's snapshot
+		if (input.binder) {
+			input.binder->SetAlwaysRequireRebind();
+		}
+		auto index = LakeSearchIndex(context, "ngram_candidates", target, column);
+		auto candidates =
+		    ProbeLakeIndex(context, *target.entry, index.column_name,
+		                   vector<LakeNeedle> {LakeNeedle {result->needle, false}}, LakeProbeMode::CANDIDATES);
+		if (!candidates.use_index) {
+			throw InvalidInputException("ngram_candidates: %s", candidates.reason);
+		}
+		result->lake_rowids = candidates.rowids;
+		return_types = {LogicalType::BIGINT};
+		names = {"rowid"};
+		return result;
 	}
 	BindQueryTarget(context, "ngram_candidates", table_input, column, *result);
 	return_types = {LogicalType::BIGINT};
@@ -506,6 +612,8 @@ struct CandidatesGlobalState : public GlobalTableFunctionState {
 
 	//! Short-needle mode: emit every indexed rowid (rowid <= hwm) instead.
 	bool all_rowids = false;
+	//! A DuckLake table's candidates, emitted from `offset`.
+	shared_ptr<const vector<int64_t>> lake_rowids;
 	bool scan_initialized = false;
 	unique_ptr<TableFilterSet> scan_filters;
 	TableScanState scan_state;
@@ -516,6 +624,10 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
                                                                  TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<QueryBindData>();
 	auto state = make_uniq<CandidatesGlobalState>();
+	if (bind.lake_rowids) {
+		state->lake_rowids = bind.lake_rowids;
+		return state;
+	}
 
 	auto &base = ResolveExistingTable(context, bind.catalog_name, bind.schema_name, bind.table_name, "table");
 	auto &storage = base.GetStorage();
@@ -556,6 +668,14 @@ static unique_ptr<GlobalTableFunctionState> CandidatesInitGlobal(ClientContext &
 
 static void CandidatesFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<CandidatesGlobalState>();
+	if (state.lake_rowids) {
+		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.lake_rowids->size() - state.offset);
+		auto result = FlatVector::GetDataMutable<int64_t>(output.data[0]);
+		memcpy(result, state.lake_rowids->data() + state.offset, count * sizeof(int64_t));
+		state.offset += count;
+		output.SetChildCardinality(count);
+		return;
+	}
 	if (state.all_rowids) {
 		if (state.hwm < 0) {
 			// the index was built on an empty table: no indexed rows
@@ -626,6 +746,7 @@ void RegisterSearchFunctions(ExtensionLoader &loader) {
 
 	TableFunction search("ngram_search", {LogicalType::VARCHAR, LogicalType::VARCHAR}, SearchFunction, SearchBind,
 	                     SearchInitGlobal, SearchInitLocal);
+	search.bind_replace = SearchBindReplace;
 	search.get_partition_data = SearchGetPartitionData;
 	search.projection_pushdown = true;
 	search.supports_pushdown_extract = SearchSupportsPushdownExtract;

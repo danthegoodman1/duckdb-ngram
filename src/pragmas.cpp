@@ -12,6 +12,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "ngram/build_sql.hpp"
 #include "ngram/index_state.hpp"
+#include "ngram/lake.hpp"
 #include "ngram_extension.hpp"
 
 #include <algorithm>
@@ -119,10 +120,13 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 	auto table_input = parameters.values[0].ToString();
 	auto options = ParseCreateOptions(parameters);
 	auto target = ResolveTarget(context, table_input, parameters.values[1].ToString(), true);
+	if (IsLakeTable(*target.entry)) {
+		return LakeCreateIndexScript(context, target, options);
+	}
 	if (!target.entry->IsDuckTable()) {
 		// the index reads rowids and row storage directly; a table living in a
 		// foreign catalog (sqlite, postgres, ...) has neither
-		throw BinderException("create_ngram_index: %s is not a DuckDB base table", table_input);
+		throw BinderException("create_ngram_index: %s is neither a DuckDB nor a DuckLake table", table_input);
 	}
 	return CreateIndexScript(context, target, options);
 }
@@ -130,6 +134,9 @@ static string CreateNgramIndexQuery(ClientContext &context, const FunctionParame
 //! The drop script of the index `index_ref` in `catalog_name`: the form that
 //! needs no base table, for orphaned, malformed and old-format rows.
 static string DropByReference(ClientContext &context, const string &catalog_name, const string &index_ref) {
+	if (IsLakeCatalog(context, catalog_name)) {
+		return LakeDropIndexByReference(context, catalog_name, index_ref);
+	}
 	auto database = DatabaseManager::Get(context).GetDatabase(context, Identifier(catalog_name));
 	if (!database || database->IsReadOnly()) {
 		throw InvalidInputException("drop_ngram_index: catalog %s is missing or read-only", catalog_name);
@@ -166,6 +173,9 @@ static string DropNgramIndexQuery(ClientContext &context, const FunctionParamete
 	auto table_input = parameters.values[0].ToString();
 	auto column_name = parameters.values[1].ToString();
 	auto target = ResolveTarget(context, table_input, column_name, false);
+	if (IsLakeTable(*target.entry)) {
+		return LakeDropIndexScript(context, target);
+	}
 	auto indexes = ExistingIndexes(context, target);
 	RequireUniqueIndexColumns(indexes);
 	if (indexes.empty()) {
@@ -183,8 +193,11 @@ static string DropNgramIndexQuery(ClientContext &context, const FunctionParamete
 //! statement sees one snapshot; only the list of indexes is resolved at bind.
 static string IndexStatsSelect(ClientContext &context, const string &table_input) {
 	auto target = ResolveTarget(context, table_input, string(), false);
+	if (IsLakeTable(*target.entry)) {
+		return LakeIndexStatsSelect(context, target);
+	}
 	if (!target.entry->IsDuckTable()) {
-		throw BinderException("ngram_index_stats: %s is not a DuckDB base table", table_input);
+		throw BinderException("ngram_index_stats: %s is neither a DuckDB nor a DuckLake table", table_input);
 	}
 	auto indexes = ExistingIndexes(context, target);
 	RequireUniqueIndexColumns(indexes);
@@ -288,6 +301,8 @@ static unique_ptr<GlobalTableFunctionState> IndexesInitGlobal(ClientContext &con
 		state->rows.insert(state->rows.end(), std::make_move_iterator(observed.begin()),
 		                   std::make_move_iterator(observed.end()));
 	}
+	auto lake = ObserveLakeCatalogs(context);
+	state->rows.insert(state->rows.end(), std::make_move_iterator(lake.begin()), std::make_move_iterator(lake.end()));
 	std::sort(state->rows.begin(), state->rows.end(), [](const ObservedIndex &left, const ObservedIndex &right) {
 		if (left.catalog_name != right.catalog_name) {
 			return left.catalog_name < right.catalog_name;
@@ -331,8 +346,16 @@ static string RefreshNgramIndexQuery(ClientContext &context, const FunctionParam
 	int64_t max_rows = 0;
 	ParseRefreshParameters(parameters, only_column, bounded, max_rows);
 	auto target = ResolveTarget(context, table_input, string(), false);
+	if (IsLakeTable(*target.entry)) {
+		if (bounded) {
+			// a DuckLake refresh reads the change feed by snapshot, not by row id
+			throw InvalidInputException("ngram_refresh: max_rows applies to DuckDB tables; %s is a DuckLake table",
+			                            table_input);
+		}
+		return LakeRefreshScript(context, target, only_column);
+	}
 	if (!target.entry->IsDuckTable()) {
-		throw BinderException("ngram_refresh: %s is not a DuckDB base table", table_input);
+		throw BinderException("ngram_refresh: %s is neither a DuckDB nor a DuckLake table", table_input);
 	}
 	return RefreshScript(context, target, only_column, bounded, max_rows);
 }
@@ -354,8 +377,11 @@ static string CompactNgramIndexQuery(ClientContext &context, const FunctionParam
 		}
 	}
 	auto target = ResolveTarget(context, table_input, string(), false);
+	if (IsLakeTable(*target.entry)) {
+		return LakeCompactScript(context, target, only_column, purge);
+	}
 	if (!target.entry->IsDuckTable()) {
-		throw BinderException("ngram_compact: %s is not a DuckDB base table", table_input);
+		throw BinderException("ngram_compact: %s is neither a DuckDB nor a DuckLake table", table_input);
 	}
 	return CompactScript(context, target, only_column, purge);
 }

@@ -4,6 +4,7 @@
 #include "duckdb/storage/table/index_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/execution/index/unbound_index.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -3073,6 +3074,68 @@ static void TestGramKeyCollisions() {
 	}
 }
 
+//! A statement prepared through the client API, as the C API and JDBC keep
+//! them, answers each execution at that execution's snapshot: the candidates
+//! a plan carries hold for one snapshot, and DuckDB plans the statement again.
+//! DuckLake comes from the build's loadable extensions in `extension_dir`.
+static void TestLakePreparedRebind(const string &extension_dir, const string &path) {
+	auto fs = FileSystem::CreateLocal();
+	auto data_path = path + "_data";
+	DBConfig config;
+	config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+	{
+		DuckDB db(nullptr, &config);
+		LoadNgram(db);
+		Connection con(db);
+		Check(con, "LOAD '" + extension_dir + "/parquet/parquet.duckdb_extension'");
+		Check(con, "LOAD '" + extension_dir + "/ducklake/ducklake.duckdb_extension'");
+		Check(con, "ATTACH 'ducklake:" + path + "' AS lk (DATA_PATH '" + data_path + "/', DATA_INLINING_ROW_LIMIT 0)");
+		Check(con, "CREATE TABLE lk.docs (id INTEGER, s VARCHAR)");
+		Check(con, "CALL lk.set_option('parquet_row_group_size', 256, table_name => 'docs')");
+		Check(con, "INSERT INTO lk.docs SELECT range, CASE WHEN range = 7 THEN 'a quokka' ELSE 'plain ' || range "
+		           "END FROM range(4096)");
+		Check(con, "PRAGMA create_ngram_index('lk.docs', 's')");
+		Check(con, "SET ngram_auto_accelerate = true");
+		auto explain = [&]() {
+			return Query(con, "EXPLAIN SELECT count(*) FROM lk.docs WHERE s LIKE '%quokka%'")
+			    ->Collection()
+			    .GetValue(1, 0)
+			    .ToString();
+		};
+		auto plan = explain();
+		auto prepared = con.Prepare("SELECT count(*) FROM lk.docs WHERE s LIKE '%quokka%'");
+		if (prepared->HasError()) {
+			throw std::runtime_error(prepared->GetError());
+		}
+		auto expect = [&](int64_t expected, const char *step) {
+			auto result = prepared->Execute();
+			if (result->HasError()) {
+				throw std::runtime_error(result->GetError());
+			}
+			auto count = result->Collection().GetValue(0, 0).GetValue<int64_t>();
+			if (count != expected) {
+				throw std::runtime_error(
+				    StringUtil::Format("lake prepared statement %s: expected %lld, got %lld", step, expected, count));
+			}
+		};
+		expect(1, "before any write");
+		Connection writer(db);
+		Check(writer, "INSERT INTO lk.docs VALUES (5000, 'another quokka')");
+		expect(2, "after an insert");
+		Check(writer, "UPDATE lk.docs SET s = 'no longer' WHERE id = 7");
+		expect(1, "after an update");
+		Check(writer, "PRAGMA ngram_refresh('lk.docs')");
+		expect(1, "after a refresh");
+		if (plan.find("__ngram_lake_rowids") == string::npos || explain().find("__ngram_lake_rowids") == string::npos) {
+			throw std::runtime_error("the lake prepared-statement test planned no index read:\n" + plan);
+		}
+	}
+	RemoveDatabase(path);
+	if (fs->DirectoryExists(data_path)) {
+		fs->RemoveDirectory(data_path);
+	}
+}
+
 //! One harness test: its mechanism, its name, and the run.
 struct HarnessTest {
 	string mechanism;
@@ -3084,7 +3147,8 @@ struct HarnessTest {
 //! several patterns keep their union. Mechanisms: lifecycle (guards, fences,
 //! WAL and checkpoint seals), registry (rows, identity, corruption, scale),
 //! fixtures (persisted formats, when a fixtures directory is given), query
-//! (cancellation, publication order, memory peak, key collisions).
+//! (cancellation, publication order, memory peak, key collisions), lake
+//! (DuckLake tables, when the build has the DuckLake extension).
 static bool Selected(const HarnessTest &test, const vector<string> &patterns) {
 	if (patterns.empty()) {
 		return true;
@@ -3134,6 +3198,15 @@ int main(int argc, char **argv) {
 		}
 		auto unique = database + "." + to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
 		string executable = argv[0];
+		// the harness sits in <build>/extension/ngram, beside the build's
+		// other loadable extensions
+		auto parent = [](const string &file) {
+			auto slash = file.rfind('/');
+			return slash == string::npos ? string(".") : file.substr(0, slash);
+		};
+		auto extension_dir = parent(parent(executable));
+		auto has_ducklake =
+		    FileSystem::CreateLocal()->FileExists(extension_dir + "/ducklake/ducklake.duckdb_extension");
 		vector<string> scratch;
 		auto path = [&](const string &suffix) {
 			scratch.push_back(unique + "." + suffix);
@@ -3240,6 +3313,10 @@ int main(int argc, char **argv) {
 		     []() {
 			     TestGramKeyCollisions();
 		     }},
+		    {"lake", "prepared-rebind",
+		     [&]() {
+			     TestLakePreparedRebind(extension_dir, path("lake"));
+		     }},
 		};
 		idx_t ran = 0;
 		for (auto &test : tests) {
@@ -3248,6 +3325,10 @@ int main(int argc, char **argv) {
 			}
 			if (test.mechanism == "fixtures" && fixtures.empty()) {
 				std::cerr << "fixtures/" << test.name << " skipped: no fixtures directory given\n";
+				continue;
+			}
+			if (test.mechanism == "lake" && !has_ducklake) {
+				std::cerr << "lake/" << test.name << " skipped: the build has no DuckLake extension\n";
 				continue;
 			}
 			std::cerr << "== " << test.mechanism << "/" << test.name << "\n";

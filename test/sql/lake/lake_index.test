@@ -1,0 +1,260 @@
+# name: test/sql/lake/lake_index.test
+# description: ngram indexes on DuckLake tables: create, search, refresh, compact, drop, statistics and listing
+# group: [lake]
+
+require ngram
+
+require parquet
+
+require ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/lake_index.ducklake' AS lk (DATA_PATH '{TEST_DIR}/lake_index_data/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lk.docs (id INTEGER, s VARCHAR, t VARCHAR);
+
+# small row groups, so the candidates of a rare needle leave most of them unread
+statement ok
+CALL lk.set_option('parquet_row_group_size', 1024, table_name => 'docs');
+
+# rows 2 and 5 contain the grams of 'tent' but not the substring
+statement ok
+INSERT INTO lk.docs(id, s) VALUES
+	(1, 'Hello world'),
+	(2, 'often entered'),
+	(3, NULL),
+	(4, ''),
+	(5, 'ten cents'),
+	(6, 'a tent pitched'),
+	(7, 'TENT SHOUTING'),
+	(8, 'öft ÖFT often'),
+	(9, 'contentment'),
+	(10, 'ab'),
+	(11, 'connection reset by peer');
+
+statement ok
+INSERT INTO lk.docs(id, s) SELECT 100 + range, 'filler row ' || range FROM range(20000);
+
+statement ok
+PRAGMA create_ngram_index('lk.docs', 's');
+
+query IIIIII
+SELECT database_name, schema_name, table_name, column_name, tokenizer, status FROM ngram_indexes();
+----
+lk	main	docs	s	ngram(3)	READY
+
+# a case-insensitive index answers ngram_search case-insensitively
+query II
+SELECT id, s FROM ngram_search('lk.docs', 'tent') ORDER BY id;
+----
+6	a tent pitched
+7	TENT SHOUTING
+9	contentment
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'ÖFT') ORDER BY id;
+----
+8
+
+# ngram_candidates proposes a superset of the matches: the traps share the grams
+query I
+SELECT count(*) FROM ngram_candidates('lk.docs', 's', 'tent') WHERE rowid IN (SELECT rowid FROM lk.docs WHERE id IN (6, 7, 9));
+----
+3
+
+query II
+EXPLAIN SELECT * FROM ngram_search('lk.docs', 'tent');
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids\(rowid\).*
+
+# a needle shorter than a gram cannot probe, and the search scans
+query I
+SELECT count(*) FROM ngram_search('lk.docs', 'ab');
+----
+1
+
+query II
+EXPLAIN SELECT * FROM ngram_search('lk.docs', 'ab');
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+# rows inserted after the index's snapshot come from DuckLake's change feed
+statement ok
+INSERT INTO lk.docs(id, s) VALUES (30000, 'late tent row'), (30001, 'late noise');
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'tent') ORDER BY id;
+----
+6
+7
+9
+30000
+
+query IIII
+SELECT segments > 0, generations, remaining_tail, stale_reason FROM ngram_index_stats('lk.docs');
+----
+true	1	2	NULL
+
+statement ok
+PRAGMA ngram_refresh('lk.docs');
+
+# the refresh covers the snapshot it read and commits the next one
+query III
+SELECT generations, remaining_tail, current_snapshot - covered_snapshot FROM ngram_index_stats('lk.docs');
+----
+2	0	1
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'tent') ORDER BY id;
+----
+6
+7
+9
+30000
+
+# a refresh with nothing new leaves the index alone
+statement ok
+PRAGMA ngram_refresh('lk.docs');
+
+query I
+SELECT generations FROM ngram_index_stats('lk.docs');
+----
+2
+
+statement ok
+DELETE FROM lk.docs WHERE id = 6;
+
+statement ok
+PRAGMA ngram_compact('lk.docs');
+
+query II
+SELECT generations, fragmented_keys FROM ngram_index_stats('lk.docs');
+----
+1	0
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'tent') ORDER BY id;
+----
+7
+9
+30000
+
+# purge drops the deleted row's postings
+statement ok
+CREATE TABLE before_purge AS SELECT posting_entries FROM ngram_index_stats('lk.docs');
+
+statement ok
+PRAGMA ngram_compact('lk.docs', purge = true);
+
+query I
+SELECT (SELECT posting_entries FROM ngram_index_stats('lk.docs')) < posting_entries FROM before_purge;
+----
+true
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'tent') ORDER BY id;
+----
+7
+9
+30000
+
+# a second index on the table, and ngram_search choosing between them
+statement ok
+UPDATE lk.docs SET t = 'other ' || s WHERE id < 20;
+
+statement ok
+PRAGMA create_ngram_index('lk.docs', 't', case_insensitive = false);
+
+statement error
+SELECT * FROM ngram_search('lk.docs', 'tent');
+----
+has ngram indexes on multiple columns
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'TENT', col := 't') ORDER BY id;
+----
+7
+
+query II
+SELECT column_name, case_insensitive FROM ngram_index_stats('lk.docs') ORDER BY ALL;
+----
+s	true
+t	false
+
+statement error
+PRAGMA create_ngram_index('lk.docs', 't');
+----
+already exists
+
+statement error
+PRAGMA ngram_refresh('lk.docs', 100);
+----
+max_rows applies to DuckDB tables
+
+statement ok
+PRAGMA ngram_refresh('lk.docs');
+
+statement ok
+PRAGMA drop_ngram_index('lk.docs', 't');
+
+query II
+SELECT column_name, status FROM ngram_indexes() ORDER BY ALL;
+----
+s	READY
+
+# drop by reference names the catalog
+statement ok
+SET VARIABLE ref = (SELECT index_ref FROM ngram_indexes() WHERE database_name = 'lk');
+
+statement ok
+PRAGMA drop_ngram_index(getvariable('ref'), catalog = 'lk');
+
+query I
+SELECT count(*) FROM ngram_indexes();
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lk' AND schema_name = '__ngram' AND table_name LIKE 'segments_%';
+----
+0
+
+statement error
+SELECT * FROM ngram_search('lk.docs', 'tent');
+----
+no ngram index exists on docs
+
+# a sparse index
+statement ok
+PRAGMA create_ngram_index('lk.docs', 's', tokenizer = 'sparse');
+
+query I
+SELECT tokenizer FROM ngram_indexes();
+----
+sparse(3, 8)
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'connection reset') ORDER BY id;
+----
+11
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'tent') ORDER BY id;
+----
+7
+9
+30000
+
+# DuckLake lists tables by name alone, so an index needs a table name no other
+# schema of the lake uses
+statement ok
+CREATE SCHEMA lk.other;
+
+statement ok
+CREATE TABLE lk.other.docs (id INTEGER, s VARCHAR);
+
+statement error
+PRAGMA create_ngram_index('lk.other.docs', 's');
+----
+several tables named docs

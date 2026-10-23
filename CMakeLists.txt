@@ -30,7 +30,10 @@ set(EXTENSION_SOURCES
     src/probe.cpp
     src/search_core.cpp
     src/search_functions.cpp
-    src/rewrite.cpp)
+    src/rewrite.cpp
+    src/lake_catalog.cpp
+    src/lake_maintenance.cpp
+    src/lake_query.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

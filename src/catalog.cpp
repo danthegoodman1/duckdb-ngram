@@ -1,3 +1,5 @@
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "ngram/catalog.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -5,6 +7,8 @@
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -410,8 +414,24 @@ bool ParseFormat4StatsName(const string &name, string &index_ref) {
 
 ResolvedTarget ResolveTarget(ClientContext &context, const string &table_input, const string &column_name,
                              bool require_column) {
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, QualifiedName::Parse(table_input));
-	auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::THROW_EXCEPTION);
+	auto name = QualifiedName::Parse(table_input);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, name);
+	auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+	if (!entry && name.Path().size() == 2) {
+		// db.table names a table of an attached database's default schema
+		// when no schema of that name exists, as it does in a query
+		auto database = DatabaseManager::Get(context).GetDatabase(context, name.Schema());
+		if (database) {
+			auto schema = database->GetCatalog().GetDefaultSchema();
+			EntryLookupInfo catalog_lookup(
+			    CatalogType::TABLE_ENTRY,
+			    QualifiedName(name.Schema(), schema ? *schema : Identifier(DEFAULT_SCHEMA), name.Name()));
+			entry = Catalog::GetEntry(context, catalog_lookup, OnEntryNotFound::RETURN_NULL);
+		}
+	}
+	if (!entry) {
+		entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::THROW_EXCEPTION);
+	}
 	// a TABLE_ENTRY lookup can also return a view (they share a catalog set)
 	if (entry->type != CatalogType::TABLE_ENTRY) {
 		if (entry->type == CatalogType::VIEW_ENTRY) {

@@ -209,10 +209,26 @@ SELECT lake_mismatches('quokka'), lake_mismatches('default');
 ----
 0	0
 
+# the recreated index serves queries, and a gate at 0.5 sends a needle in
+# every row to a scan
+statement ok
+SET ngram_lake_max_row_group_fraction = 1.0;
+
+query II
+EXPLAIN SELECT * FROM ngram_search('lk.docs', 'quokka');
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+SET ngram_lake_max_row_group_fraction = 0.5;
+
 query II
 EXPLAIN SELECT * FROM ngram_search('lk.docs', 'quokka');
 ----
 physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+RESET ngram_lake_max_row_group_fraction;
 
 # a table dropped and created again under the same name
 statement ok

@@ -10,6 +10,14 @@ first query of the process), three plans of
   gated   ngram_auto_accelerate on, the gate at its setting (--fraction)
   scan    ngram_auto_accelerate off
 
+and, with --plans, any of
+
+  plan         EXPLAIN of the index plan: planning alone, the extension's
+               reads of the lake included
+  plan-warm    EXPLAIN of the index plan after the query ran once in the process
+  index-warm   the index plan run a second time in one process, timed
+  scan-warm    the scan run a second time in one process, timed
+
 and reports the median wall time, the bytes and requests DuckDB's HTTP log
 records (zero for a lake on local disk), the candidates and the share of the
 table's row groups they fall in as the extension's gate computes them, the
@@ -54,14 +62,16 @@ def run(duckdb, script, timeout=3600):
     return proc.stdout
 
 
-def measure(args, prelude, settings, query):
-    """(seconds, answer, bytes, requests) of `query` as a process's first query."""
+def measure(args, prelude, settings, query, warm=False, explain=False):
+    """(seconds, answer, bytes, requests) of `query` as a process's first
+    query, or with `warm` its second; with `explain`, of planning it alone."""
     log = tempfile.mktemp(suffix=".csv")
-    script = "\n".join([".bail on", ".mode csv", ".headers off", prelude] + settings + [
+    timed = "EXPLAIN " + query if explain else query
+    script = "\n".join([".bail on", ".mode csv", ".headers off", prelude] + settings + ([query] if warm else []) + [
         "CALL enable_logging('HTTP', storage = 'memory');",
         ".print @@BEGIN",
         ".timer on",
-        query,
+        timed,
         ".timer off",
         ".print @@END",
         # the log keeps each header's case as the server sent it
@@ -72,7 +82,9 @@ def measure(args, prelude, settings, query):
     body = out.split("@@BEGIN", 1)[1].split("@@END", 1)[0]
     seconds = sum(float(m.group(1)) for m in TIMER.finditer(body))
     answer = [line for line in body.splitlines() if re.match(r"^\d+,-?\d+$", line)]
-    if len(answer) != 1:
+    if explain:
+        answer = []
+    elif len(answer) != 1:
         raise RuntimeError("expected one count,hash line, got: %s" % body[-500:])
     total = requests = 0
     if os.path.exists(log):
@@ -115,7 +127,7 @@ def main():
     ap.add_argument("--column", required=True)
     ap.add_argument("--needles", default=",".join(NEEDLES))
     ap.add_argument("--procs", type=int, default=3)
-    ap.add_argument("--fraction", default="0.6", help="ngram_lake_max_row_group_fraction for the gated plan")
+    ap.add_argument("--fraction", default="0.9", help="ngram_lake_max_row_group_fraction for the gated plan")
     ap.add_argument("--plans", default="index,gated,scan")
     ap.add_argument("--duckdb", default=DEFAULT_DUCKDB)
     ap.add_argument("--json", default=None, help="write the rows here")
@@ -127,6 +139,10 @@ def main():
                   "SET ngram_lake_max_row_group_fraction = %s;" % args.fraction],
         "scan": ["SET ngram_auto_accelerate = false;"],
     }
+    variants = {"index": ("index", {}), "gated": ("gated", {}), "scan": ("scan", {}),
+                "plan": ("index", {"explain": True}),
+                "plan-warm": ("index", {"explain": True, "warm": True}), "index-warm": ("index", {"warm": True}),
+                "scan-warm": ("scan", {"warm": True})}
     chosen = args.plans.split(",")
     rows = []
     print("| needle | candidates | rgs hit % | gate | " + " | ".join("%s ms | %s MB | %s GETs" % (p, p, p) for p in chosen) +
@@ -138,8 +154,9 @@ def main():
         row = dict(needle=needle, candidates=count, row_group_share=share, gate=gate)
         answers = set()
         for plan in chosen:
-            runs = [measure(args, prelude, plans[plan], query) for _ in range(args.procs)]
-            answers.update(r[1] for r in runs)
+            settings, mode = variants[plan]
+            runs = [measure(args, prelude, plans[settings], query, **mode) for _ in range(args.procs)]
+            answers.update(r[1] for r in runs if r[1])
             row[plan] = dict(ms=1000 * statistics.median(r[0] for r in runs),
                              mb=statistics.median(r[2] for r in runs) / 1e6,
                              gets=statistics.median(r[3] for r in runs), answer=runs[0][1])

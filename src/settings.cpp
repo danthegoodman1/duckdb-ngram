@@ -34,12 +34,14 @@ static constexpr idx_t DEFAULT_MAX_GRAMS_PER_QUERY = 3;
 //! 24-thread crossover, rounded toward scanning.
 static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.02;
 static constexpr int64_t DEFAULT_MAX_PROBE_ROWIDS = 100000000;
-//! A DuckLake query's scan reads every row group holding a candidate, and a
-//! row group read for a few candidates costs about what a scan pays for it.
-//! On an 11.7 GB table over simulated S3 the index beat a scan up to about 60%
-//! of 16,384-row groups and 85% of 122,880-row groups; the default takes the
-//! lower.
-static constexpr double DEFAULT_MAX_LAKE_ROW_GROUP_FRACTION = 0.6;
+//! A DuckLake query's scan reads every row group holding a candidate, and the
+//! gate decides after the postings reads, so a scan it picks saves only the
+//! row-id filter. On an 11.7 GB table over simulated S3, at 16,384- and
+//! 122,880-row groups, the index beat a plain scan at every needle whose
+//! candidates hit up to 86% of the row groups, and took 0.97 to 1.08 times a
+//! plain scan's time from 96% on; the gate's scan was slower than the index at
+//! every needle it took. The default, 1.0, never scans.
+static constexpr double DEFAULT_MAX_LAKE_ROW_GROUP_FRACTION = 1.0;
 //! A DuckLake query reads every probed gram's postings in one pass, and each
 //! gram it leaves out can add data row groups to read: on a 218M-row table
 //! over simulated S3, probing all 4 grams of "quokka" instead of 3 cut its

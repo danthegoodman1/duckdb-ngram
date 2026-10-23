@@ -275,7 +275,16 @@ SELECT count(*) FROM lk.docs WHERE s LIKE '%tent%';
 ----
 20
 
-# candidates spread over most row groups send the query to a scan
+# candidates spread over most row groups read the index by default, and a
+# gate below their share sends the query to a scan
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%filler%';
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+SET ngram_lake_max_row_group_fraction = 0.5;
+
 query II
 EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%filler%';
 ----
@@ -362,7 +371,13 @@ statement ok
 SELECT count(*) FROM lk.docs WHERE s LIKE '%Pitched%';
 
 statement ok
+SET ngram_lake_max_row_group_fraction = 0.5;
+
+statement ok
 SELECT count(*) FROM lk.docs WHERE s LIKE '%filler%';
+
+statement ok
+RESET ngram_lake_max_row_group_fraction;
 
 query I
 SELECT count(*) FROM duckdb_logs WHERE message LIKE 'ngram: lk.main.docs.s reads % candidates%';
@@ -410,7 +425,7 @@ SELECT count(*) FROM lk.gappy WHERE s LIKE '%gappy%';
 2048
 
 statement ok
-RESET ngram_lake_max_row_group_fraction;
+SET ngram_lake_max_row_group_fraction = 0.99;
 
 query II
 EXPLAIN SELECT count(*) FROM lk.gappy WHERE s LIKE '%gappy%';

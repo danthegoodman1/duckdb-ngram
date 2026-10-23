@@ -4,7 +4,10 @@ What the extension owns, what it reads from the host, and the invariants the
 tests hold it to. `README.md` states the contract for users; this note says
 why the contract holds. `docs/stale-updates.md` proves the rowid guard;
 `docs/upstream/` records the host behaviors the design works around;
-`docs/review/` holds the measurements behind the numbers quoted here.
+`docs/review/` holds the measurements behind the numbers quoted here. This
+note describes indexes on DuckDB tables; `docs/ducklake.md` describes those on
+DuckLake tables, which keep the postings layout and replace the guard with
+DuckLake's row ids, change feed and snapshot isolation.
 
 ## Ownership
 

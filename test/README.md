@@ -19,9 +19,9 @@ build/release/test/unittest 'test/sql/*'    # the suite alone
 build/release/test/unittest test/sql/ngram_api.test
 ```
 
-The files in `test/sql/lake` index DuckLake tables. They need DuckLake,
-Parquet and the SQLite scanner, which a build links when it is configured with
-`NGRAM_DUCKLAKE=1`; other builds skip them. DuckLake links CRoaring, which
+The files in `test/sql/lake` index DuckLake tables (`docs/ducklake.md`).
+They need DuckLake, Parquet and the SQLite scanner, which a build links when
+it is configured with `NGRAM_DUCKLAKE=1`; other builds skip them. DuckLake links CRoaring, which
 `scripts/build_croaring.sh` installs under `build/deps`:
 
 ```bash
@@ -105,13 +105,15 @@ run across refactors. The CI seeds are in `.github/workflows/Correctness.yml`.
 ## Continuous integration
 
 `Correctness.yml` runs on every push: the release suite with the harness, the
-fixed-seed drivers, a format check of `src` and `test`, and a focused
-ASAN/UBSAN debug build (warnings are errors for the extension's sources) of
-the query, concurrency and resource files plus the harness. `Nightly.yml`
-runs the drivers at full size, the whole suite and the harness under
-ASAN/UBSAN, and the concurrency tests and the query harness under
-ThreadSanitizer with the host's suppressions plus `test/tsan-suppressions.txt`
-(each entry explained in the file). The ThreadSanitizer lane is advisory, as
-the host's own is: its log is reviewed and its exit code does not fail the
-nightly, because which reports appear depends on thread interleaving. `MainDistributionPipeline.yml` builds the distributed binaries
-and runs the suite on each platform.
+fixed-seed drivers, a format check of `src` and `test`, an `NGRAM_DUCKLAKE=1`
+build that runs the lake suite, the harness's lake test and the fixed-seed
+lake drivers, and a focused ASAN/UBSAN debug build (warnings are errors for
+the extension's sources) of the query, concurrency and resource files plus the
+harness. `Nightly.yml` runs the drivers at full size, the lake drivers among
+them, the whole suite and the harness under ASAN/UBSAN, and the concurrency
+tests and the query harness under ThreadSanitizer with the host's suppressions
+plus `test/tsan-suppressions.txt` (each entry explained in the file). The
+ThreadSanitizer lane is advisory, as the host's own is: its log is reviewed
+and its exit code does not fail the nightly, because which reports appear
+depends on thread interleaving. `MainDistributionPipeline.yml` builds the
+distributed binaries and runs the suite on each platform.

@@ -108,6 +108,69 @@ jobs:
           timeout 600s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 20 --rows 4000 --seed 20261316
           timeout 600s python3 scripts/churn_maintenance.py --duckdb build/release/duckdb --rounds 20 --rows 4000 --seed 20261318 --no-stale-expected
 
+  # A build that links DuckLake and the SQLite scanner (NGRAM_DUCKLAKE=1), for
+  # the lake tests, the harness's lake mechanism and the fixed-seed lake
+  # drivers. The release job's build has neither and skips those tests.
+  lake-correctness:
+    name: DuckLake suite and fixed-seed checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
+      NGRAM_DUCKLAKE: 1
+      PYTHONHASHSEED: 0
+    steps:
+      - name: Check out pinned sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify submodule pins
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/verify_pins.sh
+          echo "duckdb=$(git ls-tree HEAD duckdb | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler cache
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ccache-lake-${{ steps.pins.outputs.duckdb }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}
+          restore-keys: |
+            ccache-lake-${{ steps.pins.outputs.duckdb }}-
+          max-size: 1G
+
+      - name: Build release with DuckLake
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e build/release
+          timeout 600s scripts/build_croaring.sh
+          timeout 3600s make release GEN=ninja
+          ccache --show-stats
+          # The lake tests skip themselves on a build without DuckLake.
+          build/release/duckdb -noheader -list -c "SELECT count(*) FROM duckdb_extensions() WHERE extension_name IN ('ducklake', 'sqlite_scanner') AND loaded" | grep -qx 2
+
+      - name: Run the lake suite and the harness's lake tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 900s build/release/test/unittest 'test/sql/lake/*'
+          timeout 600s cmake --build build/release --target ngram_checkpoint_gap_test
+          # With no DuckLake extension the harness skips its one lake test and exits 2.
+          timeout 600s build/release/extension/ngram/ngram_checkpoint_gap_test "$RUNNER_TEMP/harness.db" --only lake
+
+      - name: Run fixed-seed lake differential and concurrency gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 1500s python3 scripts/lake_differential.py --duckdb build/release/duckdb --trials 2 --steps 15 --seed 20261401
+          timeout 1500s python3 scripts/lake_differential.py --duckdb build/release/duckdb --catalog sqlite --trials 1 --steps 15 --seed 20261402
+          timeout 600s python3 scripts/lake_concurrency.py --duckdb build/release/duckdb --seconds 120 --rows 8000 --seed 20261403
+
   release-evidence-strict:
     name: Release evidence matches current source
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'

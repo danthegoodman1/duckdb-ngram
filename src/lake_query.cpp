@@ -272,12 +272,14 @@ static void ProbeAtSnapshot(ClientContext &context, TableCatalogEntry &table, co
 			last_group = group;
 		}
 	}
-	// DuckLake counts a table's rows from its statistics; without them the
-	// highest candidate stands in for the table's extent
+	// The table's row groups: its live rows, which DuckLake counts from its
+	// statistics, fill at least this many, and its row ids span at least to
+	// the highest candidate. Deleted rows leave gaps in the row ids, so after
+	// many deletes the span is the larger.
 	auto cardinality = table.GetStorageInfo(context).cardinality;
-	auto table_rows = cardinality.IsValid() ? NumericCast<int64_t>(cardinality.GetIndex())
-	                                        : (rowids.empty() ? int64_t(0) : rowids.back() + 1);
-	auto table_groups = MaxValue<int64_t>((table_rows + group_rows - 1) / group_rows, 1);
+	auto table_rows = cardinality.IsValid() ? NumericCast<int64_t>(cardinality.GetIndex()) : int64_t(0);
+	auto span_groups = rowids.empty() ? int64_t(1) : rowids.back() / group_rows + 1;
+	auto table_groups = MaxValue<int64_t>((table_rows + group_rows - 1) / group_rows, span_groups);
 	result.row_group_fraction = double(groups_hit) / double(table_groups);
 	if (limits.max_row_group_fraction >= 0 && result.row_group_fraction > limits.max_row_group_fraction) {
 		result.reason =

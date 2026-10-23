@@ -19,6 +19,17 @@ build/release/test/unittest 'test/sql/*'    # the suite alone
 build/release/test/unittest test/sql/ngram_api.test
 ```
 
+The files in `test/sql/lake` index DuckLake tables. They need DuckLake,
+Parquet and the SQLite scanner, which a build links when it is configured with
+`NGRAM_DUCKLAKE=1`; other builds skip them. DuckLake links CRoaring, which
+`scripts/build_croaring.sh` installs under `build/deps`:
+
+```bash
+scripts/build_croaring.sh
+NGRAM_DUCKLAKE=1 GEN=ninja make release
+build/release/test/unittest 'test/sql/lake/*'
+```
+
 ## The C++ harness: `test/cpp/ngram_maintenance_checkpoint_gap.cpp`
 
 Invariants SQL cannot control: a pause between a pragma's expansion and its
@@ -33,6 +44,7 @@ selectable:
 | `registry` | registry rows, bootstrap, catalog identity across copies, corruption, execution-time identity races, a 10,000-row registry |
 | `fixtures` | the persisted format-3, format-4 and format-5 databases in `test/fixtures` (see its README), each refused until rebuilt |
 | `query` | cancellation through a streamed result and through the maintenance append hook, ordered candidate streams, the publication barrier, the probe's memory peak, same-size key collisions |
+| `lake` | a statement prepared through the client API over a DuckLake table, executed after other connections' writes and refresh; it loads the build's DuckLake extension and is skipped when the build has none |
 
 ```bash
 cmake --build build/release --target ngram_checkpoint_gap_test
@@ -66,6 +78,24 @@ python3 scripts/sparse_grams_check.py --cases 3000 --seed 1               # spar
 python3 scripts/churn_maintenance.py --rounds 40 --seed 12345             # interleaved DML, checkpoints and maintenance
 python3 scripts/crash_maintenance.py --seed 12345                         # SIGKILL during maintenance, then reopen
 ```
+
+Two drivers cover DuckLake tables and need an `NGRAM_DUCKLAKE=1` build. The
+differential applies random writes, ngram maintenance, DuckLake's file merges,
+rewrites, inline flushes and snapshot expiry, DDL and ALTERs to a lake table,
+and after every step compares the index's answers with a scan. The concurrency
+driver runs writer, maintainer, reader and DDL processes against one lake on a
+SQLite catalog; each reader compares the index with a scan inside one
+transaction, and every ngram maintenance call that loses a conflict must
+succeed when run again. Both keep their lakes under `build/lake_runs` only
+with `--keep`.
+
+```bash
+python3 scripts/lake_differential.py --trials 6 --seed 101                # both tokenizers, a DuckDB catalog
+python3 scripts/lake_differential.py --trials 4 --seed 202 --catalog sqlite
+python3 scripts/lake_concurrency.py --seconds 300 --seed 303              # add --tokenizer sparse for a sparse index
+```
+
+`scripts/lake_bench.py` times the index against a scan on a lake of your own.
 
 `scripts/ngram_harness.py` holds what they share: the CLI runner, the
 format-aware registry lookup, the storage digests and the multiset oracle.

@@ -1,0 +1,403 @@
+# name: test/sql/lake/lake_transactions.test
+# description: DuckLake indexes inside transactions, across prepared statements, under concurrent maintenance, and
+# group: [lake]
+
+#              after snapshot expiry
+
+require ngram
+
+require parquet
+
+require ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/lake_tx.ducklake' AS lk (DATA_PATH '{TEST_DIR}/lake_tx_data/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lk.docs (id INTEGER, s VARCHAR);
+
+statement ok
+CALL lk.set_option('parquet_row_group_size', 256, table_name => 'docs');
+
+statement ok
+INSERT INTO lk.docs SELECT range, CASE WHEN range IN (11, 4000) THEN 'quokka ' || range ELSE 'plain ' || range END FROM range(5000);
+
+statement ok
+PRAGMA create_ngram_index('lk.docs', 's');
+
+# a transaction that wrote the lake reads its own uncommitted rows by a scan:
+# an update keeps its row's id and changes the row with no record the index
+# could read
+statement ok
+BEGIN;
+
+statement ok
+UPDATE lk.docs SET s = 'local quokka' WHERE id = 20;
+
+statement ok
+INSERT INTO lk.docs VALUES (9000, 'local insert quokka');
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+11
+20
+4000
+9000
+
+query II
+EXPLAIN SELECT * FROM ngram_search('lk.docs', 'quokka');
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+11
+4000
+
+# a read-only transaction keeps the snapshot it started with, and so does
+# the index it reads
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+11
+4000
+
+statement ok con2
+INSERT INTO lk.docs VALUES (9001, 'committed quokka');
+
+statement ok con2
+PRAGMA ngram_refresh('lk.docs');
+
+query I con1
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+11
+4000
+
+statement ok con1
+COMMIT;
+
+query I con1
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+11
+4000
+9001
+
+# a prepared statement plans again for every execution, so its candidates
+# always belong to the snapshot it runs at
+statement ok
+PREPARE search AS SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+statement ok
+PREPARE scan AS SELECT id FROM lk.docs WHERE s LIKE '%quokka%' ORDER BY id;
+
+query I
+EXECUTE scan;
+----
+11
+4000
+9001
+
+statement ok
+INSERT INTO lk.docs VALUES (9002, 'prepared quokka');
+
+statement ok
+UPDATE lk.docs SET s = 'updated quokka' WHERE id = 30;
+
+query I
+EXECUTE search;
+----
+11
+30
+4000
+9001
+9002
+
+query I
+EXECUTE scan;
+----
+11
+30
+4000
+9001
+9002
+
+statement ok
+PRAGMA ngram_compact('lk.docs');
+
+query I
+EXECUTE scan;
+----
+11
+30
+4000
+9001
+9002
+
+# two maintenance calls on one lake: DuckLake commits one, and the other
+# fails with a conflict and succeeds when run again
+statement ok con1
+BEGIN;
+
+statement ok con1
+PRAGMA ngram_refresh('lk.docs');
+
+statement ok con2
+INSERT INTO lk.docs VALUES (9003, 'conflict quokka');
+
+statement ok con2
+PRAGMA ngram_refresh('lk.docs');
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*onflict.*
+
+statement ok
+CREATE TABLE lk.notes (id INTEGER, body VARCHAR);
+
+statement ok
+INSERT INTO lk.notes VALUES (1, 'a quokka note');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+PRAGMA create_ngram_index('lk.notes', 'body');
+
+statement ok con2
+PRAGMA ngram_refresh('lk.docs');
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*onflict.*
+
+statement ok
+PRAGMA create_ngram_index('lk.notes', 'body');
+
+query I
+SELECT id FROM ngram_search('lk.notes', 'quokka');
+----
+1
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+11
+30
+4000
+9001
+9002
+9003
+
+# a create that rolls back leaves no index
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA drop_ngram_index('lk.notes', 'body');
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ngram_indexes() WHERE table_name = 'notes';
+----
+1
+
+# expiring the snapshots between the covered snapshot and now leaves the
+# change feed without the history it reads; queries stay exact
+statement ok
+INSERT INTO lk.docs VALUES (9004, 'expired quokka');
+
+statement ok
+CALL ducklake_expire_snapshots('lk', older_than => now());
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+11
+30
+4000
+9001
+9002
+9003
+9004
+
+# the expired history may have held an ALTER, so the index is stale until
+# rebuilt
+query I
+SELECT status FROM ngram_indexes() WHERE table_name = 'docs';
+----
+SCAN_ONLY
+
+statement error
+PRAGMA ngram_refresh('lk.docs');
+----
+expired
+
+statement ok
+PRAGMA drop_ngram_index('lk.docs', 's');
+
+statement ok
+PRAGMA create_ngram_index('lk.docs', 's');
+
+# with no schema change since the index's refresh, expiry leaves it usable:
+# the rows inserted since come from the insert snapshot each row carries
+statement ok
+INSERT INTO lk.docs VALUES (9005, 'after rebuild quokka');
+
+statement ok
+CALL ducklake_expire_snapshots('lk', older_than => now());
+
+query I
+SELECT status FROM ngram_indexes() WHERE table_name = 'docs';
+----
+READY
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+11
+30
+4000
+9001
+9002
+9003
+9004
+9005
+
+statement ok
+PRAGMA ngram_refresh('lk.docs');
+
+query II
+SELECT remaining_tail, generations FROM ngram_index_stats('lk.docs');
+----
+0	2
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+11
+30
+4000
+9001
+9002
+9003
+9004
+9005
+
+# maintenance reads the lake's committed state, so it refuses a transaction
+# that has written the lake
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lk.docs VALUES (9100, 'uncommitted quokka');
+
+statement error
+PRAGMA ngram_refresh('lk.docs');
+----
+this transaction has already written DuckLake catalog lk
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE lk.drafts (id INTEGER, body VARCHAR);
+
+statement error
+PRAGMA create_ngram_index('lk.drafts', 'body');
+----
+this transaction has already written DuckLake catalog lk
+
+statement ok
+ROLLBACK;
+
+# an index created in a transaction serves queries once it commits
+statement ok
+CREATE TABLE lk.drafts (id INTEGER, body VARCHAR);
+
+statement ok
+INSERT INTO lk.drafts VALUES (1, 'a draft quokka');
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA create_ngram_index('lk.drafts', 'body');
+
+statement error
+SELECT * FROM ngram_search('lk.drafts', 'quokka');
+----
+no committed ngram index exists on drafts
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA create_ngram_index('lk.drafts', 'body');
+
+statement ok
+COMMIT;
+
+query I
+SELECT id FROM ngram_search('lk.drafts', 'quokka');
+----
+1
+
+# a transaction whose snapshot expires while it runs reads the table by a
+# scan: the index can no longer be read at that snapshot
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT count(*) FROM lk.docs WHERE s LIKE '%quokka%';
+----
+8
+
+statement ok con2
+INSERT INTO lk.docs VALUES (9200, 'late quokka');
+
+statement ok con2
+CALL ducklake_expire_snapshots('lk', older_than => now());
+
+statement ok con1
+SET ngram_auto_accelerate = true;
+
+query I con1
+SELECT count(*) FROM lk.docs WHERE s LIKE '%quokka%';
+----
+8
+
+query II con1
+EXPLAIN SELECT count(*) FROM lk.docs WHERE s LIKE '%quokka%';
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+statement ok con1
+COMMIT;
+
+query I con1
+SELECT count(*) FROM lk.docs WHERE s LIKE '%quokka%';
+----
+9

@@ -2,7 +2,8 @@ name: Nightly
 
 # The runs too long for a pull request: the whole SQL suite and the C++
 # harness under ASAN/UBSAN, the crash and churn drivers at their default
-# sizes on a release build, and the concurrency tests and the query harness
+# sizes on a release build, the DuckLake drivers at full size on a build that
+# links DuckLake, and the concurrency tests and the query harness
 # under ThreadSanitizer in the host's own configuration (clang, RelWithDebInfo,
 # the host's suppressions). It runs on the schedule, on dispatch, and on a push
 # that changes this file or the suppressions, so a change to the lanes is
@@ -75,6 +76,59 @@ jobs:
           timeout 1800s python3 scripts/differential_search.py --duckdb build/release/duckdb --trials 8 --rows 8000 --seed 20261314 | tail -n 3 | tee -a "$GITHUB_STEP_SUMMARY"
           timeout 1800s python3 scripts/differential_search.py --duckdb build/release/duckdb --transparent --trials 8 --rows 8000 --seed 20261315 | tail -n 3 | tee -a "$GITHUB_STEP_SUMMARY"
           timeout 1800s python3 scripts/sparse_grams_check.py --duckdb build/release/duckdb --cases 20000 --seed "$GITHUB_RUN_ID" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The differential and the concurrency driver on fixed seeds and on the
+  # run's own seed, which each prints so a failure can be rerun; the log keeps
+  # each driver's whole output and the summary its last lines.
+  lake-drivers:
+    name: DuckLake drivers at full size
+    runs-on: ubuntu-24.04
+    timeout-minutes: 420
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
+      NGRAM_DUCKLAKE: 1
+      PYTHONHASHSEED: 0
+    steps:
+      - name: Check out pinned sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Verify submodule pins
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/verify_pins.sh
+          echo "duckdb=$(git ls-tree HEAD duckdb | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler cache
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ccache-lake-${{ steps.pins.outputs.duckdb }}-${{ hashFiles('src/**', 'CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}
+          restore-keys: |
+            ccache-lake-${{ steps.pins.outputs.duckdb }}-
+          max-size: 1G
+
+      - name: Build release with DuckLake
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 600s scripts/build_croaring.sh
+          timeout 3600s make release GEN=ninja
+
+      - name: Run the drivers
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "source $(git rev-parse HEAD), duckdb ${{ steps.pins.outputs.duckdb }}" >> "$GITHUB_STEP_SUMMARY"
+          timeout 5400s python3 scripts/lake_differential.py --duckdb build/release/duckdb --trials 4 --seed 20261401 2>&1 | tee -a /dev/stderr | tail -n 5 >> "$GITHUB_STEP_SUMMARY"
+          timeout 5400s python3 scripts/lake_differential.py --duckdb build/release/duckdb --trials 3 --seed "$GITHUB_RUN_ID" 2>&1 | tee -a /dev/stderr | tail -n 5 >> "$GITHUB_STEP_SUMMARY"
+          timeout 5400s python3 scripts/lake_differential.py --duckdb build/release/duckdb --catalog sqlite --trials 2 --seed 20261402 2>&1 | tee -a /dev/stderr | tail -n 5 >> "$GITHUB_STEP_SUMMARY"
+          timeout 900s python3 scripts/lake_concurrency.py --duckdb build/release/duckdb --seconds 300 --seed 20261403 2>&1 | tee -a /dev/stderr | tail -n 5 >> "$GITHUB_STEP_SUMMARY"
+          timeout 900s python3 scripts/lake_concurrency.py --duckdb build/release/duckdb --seconds 300 --tokenizer sparse --seed "$GITHUB_RUN_ID" 2>&1 | tee -a /dev/stderr | tail -n 5 >> "$GITHUB_STEP_SUMMARY"
 
   debug-sanitizers-full:
     name: Whole suite and harness under ASAN and UBSAN

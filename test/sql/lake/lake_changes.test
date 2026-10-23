@@ -1,0 +1,259 @@
+# name: test/sql/lake/lake_changes.test
+# description: a DuckLake index stays exact through updates, deletes, compaction, inline flushes, snapshot expiry,
+# group: [lake]
+
+#              time travel and schema changes
+
+require ngram
+
+require parquet
+
+require ducklake
+
+# once with every insert written to Parquet, once with small inserts inlined
+# into the catalog
+foreach inline 0 100
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/lake_changes_{inline}.ducklake' AS lk (DATA_PATH '{TEST_DIR}/lake_changes_{inline}_data/', DATA_INLINING_ROW_LIMIT {inline});
+
+statement ok
+CREATE TABLE lk.docs (id INTEGER, s VARCHAR);
+
+statement ok
+CALL lk.set_option('parquet_row_group_size', 512, table_name => 'docs');
+
+statement ok
+INSERT INTO lk.docs SELECT range, CASE WHEN range % 997 = 0 THEN 'a quokka ' || range ELSE 'plain row ' || range END FROM range(10000);
+
+statement ok
+INSERT INTO lk.docs VALUES (20000, 'second quokka batch'), (20001, 'second plain batch');
+
+statement ok
+PRAGMA create_ngram_index('lk.docs', 's');
+
+statement ok
+SET VARIABLE expected = (SELECT list(id ORDER BY id) FROM lk.docs WHERE contains(lower(s), 'quokka'));
+
+query I
+SELECT list(id ORDER BY id) = getvariable('expected') FROM ngram_search('lk.docs', 'quokka');
+----
+true
+
+# an update gives a row a new version under the same row id; the change feed
+# returns it until the next refresh
+statement ok
+UPDATE lk.docs SET s = 'now a quokka' WHERE id = 5;
+
+statement ok
+UPDATE lk.docs SET s = 'no longer' WHERE id = 997;
+
+statement ok
+DELETE FROM lk.docs WHERE id = 1994;
+
+statement ok
+INSERT INTO lk.docs VALUES (30000, 'inserted quokka'), (30001, 'inserted plain');
+
+query I
+SELECT list(id ORDER BY id) FROM ngram_search('lk.docs', 'quokka') WHERE id IN (5, 997, 1994, 30000);
+----
+[5, 30000]
+
+# every needle answers as a scan does, through updates, deletes and the feed
+statement ok
+CREATE MACRO lake_mismatches(needle) AS (
+	SELECT count(*) FROM (
+		(SELECT id FROM ngram_search('lk.docs', needle) EXCEPT ALL SELECT id FROM lk.docs WHERE contains(lower(s), lower(needle)))
+		UNION ALL
+		(SELECT id FROM lk.docs WHERE contains(lower(s), lower(needle)) EXCEPT ALL SELECT id FROM ngram_search('lk.docs', needle))));
+
+query IIII
+SELECT lake_mismatches('quokka'), lake_mismatches('plain row 99'), lake_mismatches('no longer'), lake_mismatches('second');
+----
+0	0	0	0
+
+statement ok
+PRAGMA ngram_refresh('lk.docs');
+
+query IIII
+SELECT lake_mismatches('quokka'), lake_mismatches('plain row 99'), lake_mismatches('no longer'), lake_mismatches('second');
+----
+0	0	0	0
+
+# merging adjacent files keeps row ids and each row's snapshot
+statement ok
+INSERT INTO lk.docs VALUES (40000, 'merge quokka');
+
+statement ok
+INSERT INTO lk.docs VALUES (40001, 'merge plain');
+
+statement ok
+CALL ducklake_merge_adjacent_files('lk');
+
+query II
+SELECT lake_mismatches('quokka'), lake_mismatches('merge');
+----
+0	0
+
+# rewriting files with deletes keeps row ids and stamps the rows anew, which
+# sends them through the change feed again
+statement ok
+DELETE FROM lk.docs WHERE id BETWEEN 100 AND 3000;
+
+statement ok
+CALL ducklake_rewrite_data_files('lk', 'docs', delete_threshold => 0);
+
+query II
+SELECT lake_mismatches('quokka'), lake_mismatches('plain row 3')
+----
+0	0
+
+statement ok
+PRAGMA ngram_refresh('lk.docs');
+
+query II
+SELECT lake_mismatches('quokka'), lake_mismatches('plain row 3')
+----
+0	0
+
+# inlined rows moved to Parquet keep their row ids
+statement ok
+INSERT INTO lk.docs VALUES (50000, 'inlined quokka');
+
+statement ok
+CALL ducklake_flush_inlined_data('lk');
+
+query I
+SELECT lake_mismatches('quokka');
+----
+0
+
+# time travel reads another snapshot than the index's, and scans
+statement ok
+SET VARIABLE before_delete = (SELECT id FROM ducklake_current_snapshot('lk'));
+
+statement ok
+DELETE FROM lk.docs WHERE id = 30000;
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+query I
+SELECT count(*) FROM lk.docs AT (VERSION => getvariable('before_delete')) WHERE s LIKE '%inserted quokka%';
+----
+1
+
+query I
+SELECT count(*) FROM lk.docs WHERE s LIKE '%inserted quokka%';
+----
+0
+
+query II
+EXPLAIN SELECT count(*) FROM lk.docs WHERE s LIKE '%inlined quokka%';
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+SET ngram_auto_accelerate = false;
+
+# a schema change elsewhere in the lake leaves the index usable
+statement ok
+CREATE TABLE lk.other (x INTEGER);
+
+query II
+EXPLAIN SELECT * FROM ngram_search('lk.docs', 'inlined quokka');
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+query I
+SELECT stale_reason FROM ngram_index_stats('lk.docs');
+----
+NULL
+
+# a column dropped and added back reads its default for every older row, with
+# no feed entry: the index is stale, and queries scan
+statement ok
+ALTER TABLE lk.docs DROP COLUMN s;
+
+statement ok
+ALTER TABLE lk.docs ADD COLUMN s VARCHAR DEFAULT 'default quokka';
+
+query I
+SELECT count(*) = (SELECT count(*) FROM lk.docs) FROM ngram_search('lk.docs', 'quokka');
+----
+true
+
+query II
+EXPLAIN SELECT * FROM ngram_search('lk.docs', 'inlined quokka');
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+query II
+SELECT status, reason FROM ngram_indexes();
+----
+SCAN_ONLY	<REGEX>:.*altered.*
+
+statement error
+PRAGMA ngram_refresh('lk.docs');
+----
+cannot be maintained
+
+statement ok
+PRAGMA drop_ngram_index('lk.docs', 's');
+
+statement ok
+PRAGMA create_ngram_index('lk.docs', 's');
+
+query II
+SELECT lake_mismatches('quokka'), lake_mismatches('default');
+----
+0	0
+
+# the recreated index serves queries, and a gate at 0.5 sends a needle in
+# every row to a scan
+statement ok
+SET ngram_lake_max_row_group_fraction = 1.0;
+
+query II
+EXPLAIN SELECT * FROM ngram_search('lk.docs', 'quokka');
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+SET ngram_lake_max_row_group_fraction = 0.5;
+
+query II
+EXPLAIN SELECT * FROM ngram_search('lk.docs', 'quokka');
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+RESET ngram_lake_max_row_group_fraction;
+
+# a table dropped and created again under the same name
+statement ok
+DROP TABLE lk.docs;
+
+statement ok
+CREATE TABLE lk.docs (id INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO lk.docs VALUES (1, 'fresh quokka');
+
+query I
+SELECT count(*) FROM ngram_search('lk.docs', 'quokka');
+----
+1
+
+query I
+SELECT status FROM ngram_indexes();
+----
+SCAN_ONLY
+
+statement ok
+DROP MACRO lake_mismatches;
+
+statement ok
+DETACH lk;
+
+endloop

@@ -1,0 +1,433 @@
+# name: test/sql/lake/lake_rewrite.test
+# description: LIKE, ILIKE and contains over an indexed DuckLake column: which shapes read the index, and that every
+# group: [lake]
+
+#              shape answers as a scan does
+
+require ngram
+
+require parquet
+
+require ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/lake_rewrite.ducklake' AS lk (DATA_PATH '{TEST_DIR}/lake_rewrite_data/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lk.docs (id INTEGER, s VARCHAR, n INTEGER);
+
+statement ok
+CALL lk.set_option('parquet_row_group_size', 256, table_name => 'docs');
+
+statement ok
+INSERT INTO lk.docs SELECT range,
+	CASE WHEN range % 1000 = 3 THEN 'A Tent Pitched ' || range
+	     WHEN range % 1000 = 500 THEN 'contentment ' || range
+	     ELSE 'filler text ' || range END,
+	range % 7
+FROM range(20000);
+
+statement ok
+PRAGMA create_ngram_index('lk.docs', 's');
+
+# the rewrite is opt-in
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Tent%';
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Tent%';
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Tent%Pitched%';
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE contains(s, 'Tent');
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s ILIKE '%tent%';
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Tent%' AND n = 3;
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Tent%' AND contains(s, 'Pitched');
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+# shapes the index cannot narrow: a single-character wildcard, a needle
+# shorter than a gram, an OR, and NOT
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Te_t%';
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Te%';
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Tent%' OR n = 3;
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE NOT contains(s, 'Tent');
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+# every shape answers as the scan does, as a multiset in both directions
+
+statement ok
+CREATE OR REPLACE TABLE accelerated AS SELECT * FROM lk.docs WHERE s LIKE '%Tent%';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TABLE plain AS SELECT * FROM lk.docs WHERE s LIKE '%Tent%';
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM ((TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE accelerated AS SELECT * FROM lk.docs WHERE s LIKE '%tent%';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TABLE plain AS SELECT * FROM lk.docs WHERE s LIKE '%tent%';
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM ((TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE accelerated AS SELECT * FROM lk.docs WHERE s ILIKE '%TENT%';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TABLE plain AS SELECT * FROM lk.docs WHERE s ILIKE '%TENT%';
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM ((TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE accelerated AS SELECT * FROM lk.docs WHERE contains(s, 'content');
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TABLE plain AS SELECT * FROM lk.docs WHERE contains(s, 'content');
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM ((TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE accelerated AS SELECT * FROM lk.docs WHERE s LIKE '%Tent%Pitched 3%';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TABLE plain AS SELECT * FROM lk.docs WHERE s LIKE '%Tent%Pitched 3%';
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM ((TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE accelerated AS SELECT * FROM lk.docs WHERE s LIKE '%Te_t%';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TABLE plain AS SELECT * FROM lk.docs WHERE s LIKE '%Te_t%';
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM ((TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE accelerated AS SELECT * FROM lk.docs WHERE s LIKE '%Tent%' OR n = 3;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TABLE plain AS SELECT * FROM lk.docs WHERE s LIKE '%Tent%' OR n = 3;
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM ((TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE accelerated AS SELECT * FROM lk.docs WHERE contains(s, 'Tent') AND n < 4;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TABLE plain AS SELECT * FROM lk.docs WHERE contains(s, 'Tent') AND n < 4;
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM ((TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE accelerated AS SELECT * FROM lk.docs WHERE s LIKE '%entment 1500';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE OR REPLACE TABLE plain AS SELECT * FROM lk.docs WHERE s LIKE '%entment 1500';
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM ((TABLE accelerated EXCEPT ALL TABLE plain) UNION ALL (TABLE plain EXCEPT ALL TABLE accelerated));
+----
+0
+
+# ILIKE needs a case-insensitive index; a case-sensitive one answers
+# contains and LIKE
+statement ok
+PRAGMA drop_ngram_index('lk.docs', 's');
+
+statement ok
+PRAGMA create_ngram_index('lk.docs', 's', case_insensitive = false);
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s ILIKE '%tent%';
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Tent%';
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+query I
+SELECT count(*) FROM lk.docs WHERE s LIKE '%Tent%';
+----
+20
+
+query I
+SELECT count(*) FROM lk.docs WHERE s LIKE '%tent%';
+----
+20
+
+# candidates spread over most row groups read the index by default, and a
+# gate below their share sends the query to a scan
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%filler%';
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+SET ngram_lake_max_row_group_fraction = 0.5;
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%filler%';
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+SET ngram_lake_max_row_group_fraction = 0.01;
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%Tent%';
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+statement ok
+RESET ngram_lake_max_row_group_fraction;
+
+# settings are checked when a query reads them
+statement ok
+SET ngram_lake_max_row_group_fraction = -1;
+
+statement error
+SELECT count(*) FROM lk.docs WHERE s LIKE '%Tent%';
+----
+non-negative
+
+statement ok
+RESET ngram_lake_max_row_group_fraction;
+
+# a join and a subquery each scan the indexed table through the index
+query I
+SELECT count(*) FROM lk.docs a JOIN lk.docs b ON a.id = b.id WHERE a.s LIKE '%Tent%' AND b.n < 7;
+----
+20
+
+query I
+SELECT count(*) FROM (SELECT * FROM lk.docs WHERE contains(s, 'Pitched')) WHERE id % 2000 = 3;
+----
+10
+
+# DuckLake's change-feed functions scan the table for the rows of other
+# snapshots, and keep their own filters: a row inserted with the needle and
+# updated before the index was built still comes back from the feed of its
+# insert, though the index proposes it for no needle it held then
+statement ok
+INSERT INTO lk.docs VALUES (90000, 'feed quokka', 0);
+
+statement ok
+SET VARIABLE inserted = (SELECT id FROM ducklake_current_snapshot('lk'));
+
+statement ok
+UPDATE lk.docs SET s = 'feed plain' WHERE id = 90000;
+
+statement ok
+PRAGMA drop_ngram_index('lk.docs', 's');
+
+statement ok
+PRAGMA create_ngram_index('lk.docs', 's', case_insensitive = false);
+
+query I
+SELECT count(*) FROM ducklake_table_insertions('lk', 'main', 'docs', getvariable('inserted'), getvariable('inserted')) WHERE s LIKE '%quokka%';
+----
+1
+
+query I
+SELECT count(*) FROM ducklake_table_changes('lk', 'main', 'docs', getvariable('inserted'), getvariable('inserted')) WHERE s LIKE '%quokka%';
+----
+1
+
+query II
+EXPLAIN SELECT count(*) FROM ducklake_table_insertions('lk', 'main', 'docs', getvariable('inserted'), getvariable('inserted')) WHERE s LIKE '%quokka%';
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*
+
+query I
+SELECT count(*) FROM lk.docs WHERE s LIKE '%quokka%';
+----
+0
+
+# DuckDB's log records whether each query read the index, and why not
+statement ok
+CALL enable_logging(level = 'info', storage = 'memory');
+
+statement ok
+SELECT count(*) FROM lk.docs WHERE s LIKE '%Pitched%';
+
+statement ok
+SET ngram_lake_max_row_group_fraction = 0.5;
+
+statement ok
+SELECT count(*) FROM lk.docs WHERE s LIKE '%filler%';
+
+statement ok
+RESET ngram_lake_max_row_group_fraction;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'ngram: lk.main.docs.s reads % candidates%';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'ngram: lk.main.docs.s scans without the index: candidates fall in %';
+----
+1
+
+# deleted rows leave gaps in the row ids: a needle in every live row hits
+# every row group the ids span, which is the whole table, so an open gate
+# still reads the index. DuckLake counts the live rows once a rewrite drops
+# the deleted ones, and the row ids keep their gaps
+statement ok
+CREATE TABLE lk.gappy (id INTEGER, s VARCHAR);
+
+statement ok
+CALL lk.set_option('parquet_row_group_size', 256, table_name => 'gappy');
+
+statement ok
+INSERT INTO lk.gappy SELECT range, 'gappy row ' || range FROM range(4096);
+
+statement ok
+DELETE FROM lk.gappy WHERE id % 2 = 0;
+
+statement ok
+CALL ducklake_rewrite_data_files('lk', 'gappy', delete_threshold => 0);
+
+statement ok
+PRAGMA create_ngram_index('lk.gappy', 's');
+
+statement ok
+SET ngram_lake_max_row_group_fraction = 1.0;
+
+query II
+EXPLAIN SELECT count(*) FROM lk.gappy WHERE s LIKE '%gappy%';
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+query I
+SELECT count(*) FROM lk.gappy WHERE s LIKE '%gappy%';
+----
+2048
+
+statement ok
+SET ngram_lake_max_row_group_fraction = 0.99;
+
+query II
+EXPLAIN SELECT count(*) FROM lk.gappy WHERE s LIKE '%gappy%';
+----
+physical_plan	<!REGEX>:.*__ngram_lake_rowids.*

@@ -34,6 +34,20 @@ static constexpr idx_t DEFAULT_MAX_GRAMS_PER_QUERY = 3;
 //! 24-thread crossover, rounded toward scanning.
 static constexpr double DEFAULT_MAX_CANDIDATE_FRACTION = 0.02;
 static constexpr int64_t DEFAULT_MAX_PROBE_ROWIDS = 100000000;
+//! A DuckLake query's scan reads every row group holding a candidate, and the
+//! gate decides after the postings reads, so a scan it picks saves only the
+//! row-id filter. On an 11.7 GB table over simulated S3, at 16,384- and
+//! 122,880-row groups, the index beat a plain scan at every needle whose
+//! candidates hit up to 86% of the row groups, and took 0.97 to 1.08 times a
+//! plain scan's time from 96% on; the gate's scan was slower than the index at
+//! every needle it took. The default, 1.0, never scans.
+static constexpr double DEFAULT_MAX_LAKE_ROW_GROUP_FRACTION = 1.0;
+//! A DuckLake query reads every probed gram's postings in one pass, and each
+//! gram it leaves out can add data row groups to read: on a 218M-row table
+//! over simulated S3, probing all 4 grams of "quokka" instead of 3 cut its
+//! candidates from 47 to 9 and its time from 223 to 139 ms, and all 12 of
+//! "Kierkegaardian" cut 305 to 6 and 422 to 166 ms.
+static constexpr idx_t DEFAULT_MAX_LAKE_GRAMS_PER_QUERY = 12;
 static constexpr idx_t MAX_PROBE_MEMORY_BYTES = 256ULL * 1024ULL * 1024ULL;
 
 template <class T>
@@ -53,6 +67,17 @@ idx_t MaxGramsPerQuery(ClientContext &context) {
 	}
 	if (k < 1) {
 		throw InvalidInputException("ngram_max_grams_per_query must be at least 1, got %lld", k);
+	}
+	return static_cast<idx_t>(k);
+}
+
+idx_t MaxLakeGramsPerQuery(ClientContext &context) {
+	int64_t k;
+	if (!TryGetSetting(context, "ngram_lake_max_grams_per_query", k)) {
+		return DEFAULT_MAX_LAKE_GRAMS_PER_QUERY;
+	}
+	if (k < 1) {
+		throw InvalidInputException("ngram_lake_max_grams_per_query must be at least 1, got %lld", k);
 	}
 	return static_cast<idx_t>(k);
 }
@@ -78,6 +103,18 @@ idx_t MaxProbeRowids(ClientContext &context) {
 		throw InvalidInputException("ngram_max_probe_rowids must be at least 1, got %lld", count);
 	}
 	return NumericCast<idx_t>(count);
+}
+
+double MaxLakeRowGroupFraction(ClientContext &context) {
+	double fraction;
+	if (!TryGetSetting(context, "ngram_lake_max_row_group_fraction", fraction)) {
+		return DEFAULT_MAX_LAKE_ROW_GROUP_FRACTION;
+	}
+	if (std::isnan(fraction) || fraction < 0) {
+		throw InvalidInputException("ngram_lake_max_row_group_fraction must be a non-negative fraction, got %s",
+		                            to_string(fraction));
+	}
+	return fraction;
 }
 
 idx_t ProbeMemoryBudget(ClientContext &context) {
@@ -109,6 +146,10 @@ void RegisterSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("ngram_max_grams_per_query",
 	                          "ngram index queries probe at most this many of the needle's rarest grams",
 	                          LogicalType::BIGINT, Value::BIGINT(DEFAULT_MAX_GRAMS_PER_QUERY));
+	config.AddExtensionOption("ngram_lake_max_grams_per_query",
+	                          "ngram index queries over DuckLake tables probe at most this many of the needle's "
+	                          "rarest grams",
+	                          LogicalType::BIGINT, Value::BIGINT(DEFAULT_MAX_LAKE_GRAMS_PER_QUERY));
 	config.AddExtensionOption("ngram_max_candidate_fraction",
 	                          "full-result ngram queries scan when the fetch-equivalent candidate bound (dense spans "
 	                          "discounted, extra projected columns charged) exceeds this fraction of the indexed rows",
@@ -116,6 +157,11 @@ void RegisterSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("ngram_max_probe_rowids",
 	                          "hard limit on posting rowids an ngram query may decode before scanning or erroring",
 	                          LogicalType::BIGINT, Value::BIGINT(DEFAULT_MAX_PROBE_ROWIDS));
+	config.AddExtensionOption(
+	    "ngram_lake_max_row_group_fraction",
+	    "queries over DuckLake tables scan instead of reading their candidates when those fall in "
+	    "more than this fraction of the table's row groups",
+	    LogicalType::DOUBLE, Value::DOUBLE(DEFAULT_MAX_LAKE_ROW_GROUP_FRACTION));
 	config.AddExtensionOption("ngram_build_partitions",
 	                          "how many rowid-range partitions index build, refresh and compact split their packing "
 	                          "pass into; 0 sizes it from memory_limit",

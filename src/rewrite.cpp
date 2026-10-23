@@ -1,9 +1,11 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -14,6 +16,7 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "ngram/catalog.hpp"
 #include "ngram/index_state.hpp"
+#include "ngram/lake.hpp"
 #include "ngram/search_core.hpp"
 #include "ngram/settings.hpp"
 #include "ngram_extension.hpp"
@@ -659,20 +662,171 @@ static void TryRewriteGet(ClientContext &context, LogicalGet &get) {
 	}
 }
 
-static void RewriteOperator(ClientContext &context, LogicalOperator &op) {
+//===----------------------------------------------------------------------===//
+// DuckLake tables
+//
+// A scan of a DuckLake table keeps DuckLake's own scan function. The rewrite
+// adds one pushed filter on the rowid column, __ngram_lake_rowids, holding the
+// candidates the index proposes at the statement's snapshot (ProbeLakeIndex),
+// so the scan skips every row group that holds no candidate and the original
+// filters recheck the rest. ngram_search over a DuckLake table binds to such a
+// scan filtered by __ngram_search_match, which asks for the index whatever
+// ngram_auto_accelerate says. A plan with candidates holds for the snapshot it
+// was planned at alone; DuckDB plans a prepared statement that reads a
+// database again for every execution, so none runs with another's.
+//===----------------------------------------------------------------------===//
+
+static constexpr const char *LAKE_SEARCH_MATCH = "__ngram_search_match";
+
+//! The needle of an ngram_search predicate, __ngram_search_match(col,
+//! 'needle', case_insensitive), pushed as a table filter.
+static bool CollectSearchMatch(const Expression &expr, vector<RewriteNeedle> &needles) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
+		auto &conjunction = expr.Cast<BoundConjunctionExpression>();
+		bool found = false;
+		if (conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+			for (auto &child : conjunction.GetChildren()) {
+				found = CollectSearchMatch(*child, needles) || found;
+			}
+		}
+		return found;
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &func = expr.Cast<BoundFunctionExpression>();
+	if (func.Function().GetName() != LAKE_SEARCH_MATCH || func.GetChildren().size() != 3 ||
+	    func.GetChildren()[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
+	    func.GetChildren()[2]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &needle = func.GetChildren()[1]->Cast<BoundConstantExpression>().GetValue();
+	auto &folded = func.GetChildren()[2]->Cast<BoundConstantExpression>().GetValue();
+	if (needle.IsNull() || folded.IsNull()) {
+		return false;
+	}
+	needles.push_back(RewriteNeedle {StringValue::Get(needle), folded.GetValue<bool>()});
+	return true;
+}
+
+static bool CollectLakeNeedles(const TableFilter &filter, vector<RewriteNeedle> &needles) {
+	bool search = false;
+	switch (filter.filter_type) {
+	case TableFilterType::LEGACY_CONJUNCTION_AND:
+		for (auto &child : filter.Cast<LegacyConjunctionAndFilter>().child_filters) {
+			search = CollectLakeNeedles(*child, needles) || search;
+		}
+		return search;
+	case TableFilterType::EXPRESSION_FILTER: {
+		auto &expr = *filter.Cast<ExpressionFilter>().expr;
+		search = CollectSearchMatch(expr, needles);
+		CollectExprNeedles(expr, needles);
+		return search;
+	}
+	default:
+		return false;
+	}
+}
+
+//! Pushes `filter` on the scan's rowid, adding rowid to the scanned columns
+//! without adding it to the scan's output.
+static void PushRowidFilter(LogicalGet &get, unique_ptr<Expression> filter) {
+	auto &column_ids = get.GetColumnIds();
+	optional_idx position;
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		if (column_ids[i].IsRowIdColumn()) {
+			position = i;
+		}
+	}
+	if (!position.IsValid()) {
+		if (get.projection_ids.empty()) {
+			// an empty projection outputs every scanned column
+			for (idx_t i = 0; i < column_ids.size(); i++) {
+				get.projection_ids.emplace_back(i);
+			}
+		}
+		position = get.AddColumnId(COLUMN_IDENTIFIER_ROW_ID).GetIndex();
+	}
+	get.table_filters.PushFilter(ProjectionIndex(position.GetIndex()), make_uniq<ExpressionFilter>(std::move(filter)));
+}
+
+static void TryRewriteLakeGet(ClientContext &context, LogicalGet &get, bool auto_accelerate) {
+	auto table = get.GetTable();
+	if (!table || !IsLakeTable(*table) || !get.table_filters.HasFilters()) {
+		return;
+	}
+	// a time-travel scan reads another snapshot than the statement's own, and
+	// so do DuckLake's change-feed functions, which scan the table through its
+	// own scan function with arguments; a scan of the table itself has none
+	if (get.at_clause || get.extra_info.sample_options || !get.parameters.empty() || !get.named_parameters.empty()) {
+		return;
+	}
+	auto &columns = table->GetColumns();
+	auto &scanned_columns = get.GetColumnIds();
+	vector<std::pair<string, vector<RewriteNeedle>>> probeable;
+	bool search = false;
+	for (auto &entry : get.table_filters) {
+		auto projection_index = entry.GetIndex();
+		if (projection_index >= scanned_columns.size()) {
+			continue;
+		}
+		auto &scanned = scanned_columns[projection_index];
+		if (scanned.IsVirtualColumn()) {
+			continue;
+		}
+		auto &column = columns.GetColumn(scanned.ToLogical());
+		if (column.Type().id() != LogicalTypeId::VARCHAR) {
+			continue;
+		}
+		vector<RewriteNeedle> needles;
+		search = CollectLakeNeedles(entry.Filter(), needles) || search;
+		if (!needles.empty()) {
+			probeable.emplace_back(column.Name().GetIdentifierName(), std::move(needles));
+		}
+	}
+	if (probeable.empty() || (!search && !auto_accelerate)) {
+		return;
+	}
+	for (auto &candidate : probeable) {
+		vector<LakeNeedle> needles;
+		for (auto &needle : candidate.second) {
+			needles.push_back(LakeNeedle {needle.text, needle.requires_ci});
+		}
+		auto candidates = ProbeLakeIndex(context, *table, candidate.first, needles);
+		// CALL enable_logging(level = 'info') shows each choice in duckdb_logs
+		auto column = table->ParentCatalog().GetName().GetIdentifierName() + "." +
+		              table->ParentSchema().name.GetIdentifierName() + "." + table->name.GetIdentifierName() + "." +
+		              candidate.first;
+		if (!candidates.use_index) {
+			DUCKDB_LOG_INFO(context, "ngram: %s scans without the index: %s", column, candidates.reason);
+			continue;
+		}
+		DUCKDB_LOG_INFO(context,
+		                "ngram: %s reads %llu candidates (%llu from %llu grams' postings, %llu from the change "
+		                "feed) in %.1f%% of its row groups",
+		                column, candidates.rowids->size(), candidates.posting_candidates, candidates.grams_probed,
+		                candidates.tail_candidates, 100 * candidates.row_group_fraction);
+		PushRowidFilter(get, LakeRowidFilter(candidates, make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0)));
+		get.row_group_order_options.reset();
+		return;
+	}
+}
+
+static void RewriteOperator(ClientContext &context, LogicalOperator &op, bool auto_accelerate) {
 	for (auto &child : op.children) {
-		RewriteOperator(context, *child);
+		RewriteOperator(context, *child, auto_accelerate);
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		TryRewriteGet(context, op.Cast<LogicalGet>());
+		auto &get = op.Cast<LogicalGet>();
+		if (auto_accelerate) {
+			TryRewriteGet(context, get);
+		}
+		TryRewriteLakeGet(context, get, auto_accelerate);
 	}
 }
 
 static void NgramOptimizeFunction(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-	if (!AutoAccelerateEnabled(input.context)) {
-		return;
-	}
-	RewriteOperator(input.context, *plan);
+	RewriteOperator(input.context, *plan, AutoAccelerateEnabled(input.context));
 }
 
 //===----------------------------------------------------------------------===//

@@ -5,6 +5,7 @@
 #include "ngram/build_sql.hpp"
 #include "ngram/fence.hpp"
 #include "ngram/gram.hpp"
+#include "ngram/lake.hpp"
 #include "ngram/postings.hpp"
 #include "ngram/rowid_guard.hpp"
 #include "ngram/settings.hpp"
@@ -22,6 +23,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ngram::RegisterPragmas(loader);
 	ngram::RegisterSearchFunctions(loader);
 	ngram::RegisterRewrite(loader);
+	ngram::RegisterLake(loader);
 }
 
 void NgramExtension::Load(ExtensionLoader &loader) {

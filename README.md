@@ -22,6 +22,9 @@ rowid guard on its base table so updates and vacuum cannot silently invalidate
 those postings. Load `ngram` before writing a guarded table; stock DuckDB can
 read it, but guarded-table DML is unsupported without the custom index type.
 
+The same pragmas and queries index [DuckLake tables](#ducklake-tables), with
+the index stored in the lake beside the table.
+
 ---
 
 ## Contents
@@ -32,6 +35,7 @@ read it, but guarded-table DML is unsupported without the custom index type.
 - [The correctness contract](#the-correctness-contract)
 - [Staleness and fail-closed recovery](#staleness-and-fail-closed-recovery)
 - [Maintenance](#maintenance)
+- [DuckLake tables](#ducklake-tables)
 - [API reference](#api-reference)
 - [Settings](#settings)
 - [Performance expectations](#performance-expectations)
@@ -417,6 +421,43 @@ is the storage aggregation to read before deciding on maintenance.
 
 ---
 
+## DuckLake tables
+
+The pragmas, functions and rewrite above work on DuckLake tables too:
+
+```sql
+ATTACH 'ducklake:metadata.ducklake' AS lk (DATA_PATH 's3://bucket/lake/');
+
+PRAGMA create_ngram_index('lk.logs', 'message');
+SET ngram_auto_accelerate = true;
+SELECT count(*) FROM lk.logs WHERE message LIKE '%connection reset%';
+PRAGMA ngram_refresh('lk.logs');
+```
+
+The index lives in the lake's `__ngram` schema: a registry row and a postings
+table keyed by DuckLake row ids, which DuckLake never reuses. A query reads
+the postings and the change feed since the last refresh at its own snapshot,
+and DuckLake's scan then reads only the row groups that hold a candidate. Every answer is
+that of a scan at the query's snapshot:
+
+- Any number of clients may write the table, with or without `ngram` loaded;
+  a query finds their rows in the change feed until a refresh indexes them.
+- Maintenance from any client commits one call at a time per lake. A call
+  that loses a conflict fails and succeeds when run again.
+- A query in a transaction that has written the lake scans, as do time travel
+  and DuckLake's change-feed functions.
+- An `ALTER` or `DROP` of the table after the last refresh makes the index
+  stale: its queries scan until it is dropped and created again.
+
+On a 218M-row, 11.7 GB table over simulated S3 (20 ms per request), a rare
+needle takes 0.37 s against a 5.2 s scan, and 82 ms against 1.6 s once the
+process has cached the files; a needle in 11% of the row groups takes 2.0 s.
+
+[`docs/ducklake.md`](docs/ducklake.md) describes the storage, the guarantees,
+staleness, the costs and the limits.
+
+---
+
 ## API reference
 
 ### Index lifecycle
@@ -619,9 +660,11 @@ SELECT * FROM ngram_unpack_postings(           -- every (gram_key, segment_no, r
 | `ngram_max_candidate_fraction` | `0.02` | A full-result ngram query scans instead of probing when its fetch-equivalent candidate bound exceeds this fraction of the indexed rows. The bound counts each candidate of a scattered segment as one fetch, discounts a segment whose candidates could be read as range scans to its rowid span over four, and multiplies by one plus the projected columns beyond the recheck's, charged per candidate because the match rate is unknown at planning and every such column is one more fetch per kept row. The raw candidate API does not use this fetch-versus-scan policy. The default is the measured break-even on enwik9 (`docs/review/2026-09-09`): a scattered fetch costs 0.8 to 1.5 µs of CPU at one thread and 0.22 to 0.29 µs of wall time at 24 threads against 92 ns and 6.3 ns for a scanned row; a needle with a 3.2% candidate bound still beats the scan at every thread count, one at 3.6% loses at 24 threads, and 2% rounds toward scanning. |
 | `ngram_max_grams_per_query` | `3` | How many of the needle's rarest grams to probe; for a sparse index, the rarest of its covering grams. Each extra gram costs another posting-list decode but can narrow the candidate set; the default balances those costs for natural-language text. |
 | `ngram_max_probe_rowids` | `100000000` | Hard upper bound on posting rowids decoded by one query. Exact query paths scan instead when the estimate exceeds it; `ngram_candidates` returns a resource-limit error. |
+| `ngram_lake_max_row_group_fraction` | `1.0` | A query over a DuckLake table scans without the index when its candidates fall in more than this fraction of the table's row groups; the default never does. The decision follows the postings reads and saves only the row-id filter: measured, a query whose candidates hit nearly every row group took at most 7% longer than a plain scan, and the gate's scan was slower still. Lower it if `scripts/lake_bench.py` shows the index losing on your store. `ngram_search` follows it; `ngram_candidates` does not. |
+| `ngram_lake_max_grams_per_query` | `12` | How many of the needle's rarest grams a query over a DuckLake table probes. Each extra gram costs one more postings lookup and can cut the candidates, and with them the data row groups the scan reads, each of which costs far more than a lookup. |
 | `ngram_build_partitions` | `0` | How many rowid-range partitions `create_ngram_index`, `ngram_refresh` and `ngram_compact` split their packing pass into. Build and refresh size zero from `memory_limit` using a sample; compact instead uses fine segment-aligned ranges without sampling the base. Because range width is rounded down to whole segments, auto can emit up to nearly twice its 4096-range request. An explicit value overrides either policy. Raise it if a build runs out of memory on unusually long rows, or lower it to pack in fewer passes. The index it produces is identical whatever you set. |
 
-All five are session settings; set them per connection.
+All seven are session settings; set them per connection.
 
 **For exact/full-result queries, raising or lowering these never changes the
 rows returned**, only the strategy and time taken. Probing fewer grams can only
@@ -733,7 +776,8 @@ public-domain status. Review [Wikimedia reuse guidance](https://dumps.wikimedia.
   rename, then rebuild.
 - One index per (table, column). Multi-column indexes do not exist; build one
   index per column you search.
-- Temporary tables and non-DuckDB catalogs are not supported.
+- Indexes cover persistent DuckDB tables and DuckLake tables. Temporary
+  tables and other catalogs take none.
 - Inside an explicit transaction, DuckDB's pragma preprocessor sets
   `current_transaction_invalidation_policy` for the duration of a multi-statement
   pragma expansion and restores DuckDB's default afterwards, not whatever you had
@@ -762,6 +806,15 @@ cd duckdb-ngram
 make                # release build; ./build/release/duckdb has the extension linked in
 make test           # the C++ harness, then the sqllogictest suite
 GEN=ninja make debug        # DEBUG + AddressSanitizer build
+```
+
+The DuckLake tests and drivers need a build that links DuckLake and the
+SQLite scanner; DuckLake links CRoaring:
+
+```sh
+scripts/build_croaring.sh                    # installs CRoaring under build/deps
+NGRAM_DUCKLAKE=1 GEN=ninja make release
+build/release/test/unittest 'test/sql/lake/*'
 ```
 
 The loadable binary is

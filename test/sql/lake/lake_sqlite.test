@@ -1,0 +1,107 @@
+# name: test/sql/lake/lake_sqlite.test
+# description: ngram indexes on a DuckLake lake whose catalog is a SQLite database, as several processes share one
+# group: [lake]
+
+require ngram
+
+require parquet
+
+require ducklake
+
+require sqlite_scanner
+
+# in WAL mode a SQLite reader never blocks the writer, so one connection's
+# open transaction leaves another free to commit
+statement ok
+ATTACH 'ducklake:sqlite:{TEST_DIR}/lake_sqlite.sqlite' AS lk (DATA_PATH '{TEST_DIR}/lake_sqlite_data/', DATA_INLINING_ROW_LIMIT 0, META_JOURNAL_MODE 'wal');
+
+statement ok
+CREATE TABLE lk.docs (id INTEGER, s VARCHAR);
+
+statement ok
+CREATE TABLE lk.notes (id INTEGER, body VARCHAR);
+
+statement ok
+CALL lk.set_option('parquet_row_group_size', 64, table_name => 'docs');
+
+statement ok
+INSERT INTO lk.docs SELECT range, CASE WHEN range IN (5, 900) THEN 'quokka ' || range ELSE 'plain ' || range END FROM range(1000);
+
+statement ok
+INSERT INTO lk.notes VALUES (1, 'a quokka note'), (2, 'a plain note');
+
+# the first creates in a lake also create its registry; of two concurrent
+# ones DuckLake commits one, and the other succeeds when run again
+statement ok con1
+BEGIN;
+
+statement ok con1
+PRAGMA create_ngram_index('lk.docs', 's');
+
+statement ok con2
+BEGIN;
+
+statement ok con2
+PRAGMA create_ngram_index('lk.notes', 'body');
+
+statement ok con1
+COMMIT;
+
+statement error con2
+COMMIT;
+----
+<REGEX>:.*onflict.*
+
+statement ok con2
+PRAGMA create_ngram_index('lk.notes', 'body');
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+5
+900
+
+query I
+SELECT id FROM ngram_search('lk.notes', 'quokka');
+----
+1
+
+statement ok
+INSERT INTO lk.docs VALUES (2000, 'late quokka');
+
+query I
+SELECT id FROM ngram_search('lk.docs', 'quokka') ORDER BY id;
+----
+5
+900
+2000
+
+statement ok
+PRAGMA ngram_refresh('lk.docs');
+
+statement ok
+PRAGMA ngram_compact('lk.docs', purge = true);
+
+query II
+SELECT generations, remaining_tail FROM ngram_index_stats('lk.docs');
+----
+1	0
+
+statement ok
+SET ngram_auto_accelerate = true;
+
+query II
+EXPLAIN SELECT * FROM lk.docs WHERE s LIKE '%quokka%';
+----
+physical_plan	<REGEX>:.*__ngram_lake_rowids.*
+
+query I
+SELECT count(*) FROM lk.docs WHERE s LIKE '%quokka%';
+----
+3
+
+query II
+SELECT table_name, status FROM ngram_indexes() ORDER BY ALL;
+----
+docs	READY
+notes	READY
